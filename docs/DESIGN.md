@@ -641,6 +641,15 @@ Two choices are computed per client rather than assumed: CloudFront flat-rate ve
 pay-as-you-go (PAYG) pricing, and Bot Control Common versus Targeted. Both are recorded as
 open in [`adr/README.md`](adr/README.md).
 
+For a large planned event a **CloudFront flat-rate plan is often the better fit** — a
+predictable monthly charge over the event window is usually cheaper than PAYG at the request
+volumes a full waiting room drives, and it caps cost exposure. It is **not the default today**
+for a mechanical reason: the Terraform AWS provider cannot yet create a distribution on a
+flat-rate plan ([hashicorp/terraform-provider-aws#45450](https://github.com/hashicorp/terraform-provider-aws/issues/45450)
+— configurable in the console, not in the provider). Until that lands (PR #49235), deployments
+are PAYG; a flat-rate plan is selected manually per event and cancelled afterwards (the O4
+runbook covers post-event cancellation).
+
 ---
 
 ## 13. Requirement coverage

@@ -28,7 +28,7 @@ Decisions deferred until measurement or a client engagement supplies the input.
 | Question | Resolves how |
 |---|---|
 | Bot Control Common versus Targeted | Run Targeted in Count mode during a real event and measure what it catches that Common does not. Ten times the per-request cost. |
-| Flat-rate versus pay-as-you-go CloudFront pricing | Compute per client from event size, poll interval and Bot Control tier. The crossover is non-monotonic. |
+| Flat-rate versus pay-as-you-go CloudFront pricing | Flat-rate is usually the better fit for a large planned event (predictable, caps exposure), but the Terraform provider cannot create a flat-rate distribution yet ([#45450](https://github.com/hashicorp/terraform-provider-aws/issues/45450), PR #49235). PAYG is the default until it lands; flat-rate is selected manually per event. The crossover is otherwise non-monotonic in event size, poll interval and Bot Control tier. |
 | Session credential format | Whether to follow an HMAC-over-concatenation scheme or a JWT. The required property is only that it signs different inputs from the admission token. |
 | Signing key rotation | Compromise permits minting admission for every event in the deployment. |
 | Standby inflow measurement placement | Authorizer-local versus centrally aggregated. |

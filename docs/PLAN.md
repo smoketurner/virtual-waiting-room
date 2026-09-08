@@ -132,7 +132,9 @@ event; authorizer fails open.
       Note VPC origins require an internet gateway present but unused, forbid Lambda@Edge
       origin triggers, and are unavailable in GovCloud (DESIGN §12)
 - [ ] `var.enable_vpc` for ATO-constrained clients — design the seam now, do not retrofit
-- [ ] Flat-rate plan subscription as a variable [O6]
+- [ ] Flat-rate plan subscription [O6] — the better fit for a large planned event, but the
+      AWS provider cannot create a flat-rate distribution yet (terraform-provider-aws#45450).
+      Default PAYG until it lands; document manual per-event selection + post-event cancellation
 - [ ] CloudWatch alarms and a shipped dashboard — the metrics an operator acts on, not
       every metric available
 - [ ] Publish the OpenAPI specification for public and admin surfaces [N8]
