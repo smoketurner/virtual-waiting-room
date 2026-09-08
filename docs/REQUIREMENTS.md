@@ -9,10 +9,6 @@ criterion. `MUST` = mandatory; `SHOULD` = strong default, overridable per client
 
 ### 1.1 Event lifecycle
 
-Queue-it runs every waiting room through four phases. This adopts the same model. Three of
-the four phases serve static operator-authored pages; only `active` runs the queueing
-machinery.
-
 | ID | Requirement | Acceptance |
 |---|---|---|
 | F0.1 | An event MUST progress through **idle → pre-queue → active → post-event** phases. | Each phase is observable and the transitions are scheduled or manual. |
@@ -25,16 +21,14 @@ machinery.
 | F0.8 | The system MUST support a **maintenance mode** that parks all visitors on an operator page. | Enabling it holds every visitor regardless of mode or capacity. |
 
 **Fairness by mode.** Scheduled events randomize among pre-queue participants; standby
-activation queues first-in-first-out. This mirrors Queue-it and is deliberate: randomization
-neutralizes arrival-speed advantage when everyone knows the start time, while FIFO is the
-fair model when a spike is unplanned and nobody was waiting.
+activation queues first-in, first-out (FIFO).
 
 ### 1.2 Pre-queue (scheduled events)
 
 | ID | Requirement | Acceptance |
 |---|---|---|
 | F1.1 | During the pre-queue phase, visitors MUST be held on a countdown page rather than assigned a position. | A visitor arriving at T−10min sees a countdown; no `Positions` item is written. |
-| F1.2 | The pre-queue page MUST be servable entirely from CDN cache, making zero calls to API Gateway, DynamoDB, or SQS per view. | Origin request count during the pre-queue phase is independent of visitor count. |
+| F1.2 | The pre-queue page MUST be servable entirely from content delivery network (CDN) cache, making zero calls to API Gateway, DynamoDB, or Simple Queue Service (SQS) per view. | Origin request count during the pre-queue phase is independent of visitor count. |
 | F1.3 | At T−0 the system MUST assign queue positions to pre-queue participants in **randomized** order, and the ordering MUST NOT be predictable before that moment. | Assigned position shows no correlation with registration time; positions are uniformly distributed; the permutation key does not exist before T−0. |
 | F1.4 | Position assignment for pre-queue participants MUST complete promptly at the scheduled start. | 1,000,000 participants assigned in one write; elapsed time independent of cohort size. |
 | F1.5 | The randomization MUST be auditable after the fact. | A third party given the published seed, participant count, and registration indices recomputes every position and reproduces the ordering exactly. |
@@ -55,7 +49,7 @@ fair model when a spike is unplanned and nobody was waiting.
 | ID | Requirement | Acceptance |
 |---|---|---|
 | F3.1 | A visitor MUST be able to read their own position and the current serving position. | `GET /queue_num` and `GET /status` return correct values. |
-| F3.2 | The operator MUST be able to control admission rate during the event. | `POST /admin/rate` changes the target rate; effect visible within cache TTL. |
+| F3.2 | The operator MUST be able to control admission rate during the event. | `POST /admin/rate` changes the target rate; effect visible within the cache time to live (TTL). |
 | F3.3 | Admitted visitors MUST receive a cryptographically verifiable token. | Token is signed; signature verifies at the authorizer without a backend call. |
 | F3.4 | The origin MUST reject requests without a valid token or session. | A request with no credential, an expired one, or one for another event is denied. |
 | F3.5 | After validating an admission token once, the system MUST establish a **session** so the visitor is not re-checked against a single-use token on every subsequent request. | A visitor navigates to a second page without re-presenting the admission token and is not re-queued. |
@@ -77,9 +71,6 @@ fair model when a spike is unplanned and nobody was waiting.
 
 ### 1.6 Operator experience
 
-An event that cannot be observed and adjusted while running cannot be operated. Queue-it
-sells traffic intelligence and custom themes as separate products.
-
 | ID | Requirement | Acceptance |
 |---|---|---|
 | F5.1 | The operator MUST see live event metrics: inflow, outflow, queue depth, admitted, no-show rate, expiry rate. | Metrics visible in CloudWatch within one 60 s metric period. |
@@ -96,24 +87,20 @@ sells traffic intelligence and custom themes as separate products.
 | F6.2 | The identifier MUST be signed by the client, not by the waiting room. | The waiting room verifies a signature over data it never stores. |
 | F6.3 | Bot-blocking decisions SHOULD be enforceable at event start rather than during the pre-queue. | An operator can choose to admit suspected bots to the pre-queue and block them at randomization. |
 
-**Why F6.3.** Blocking a detected bot on arrival reveals the detection while there is still
-time to modify the client and rejoin. Queue-it's Hype Event Protection defers the block to
-sale start, "after genuine visitors have secured their spots."
-
 
 ---
 
 ## 2. Capacity
 
-Stated as requirements on the deployed system, not on AWS defaults. Every figure below
-requires the pre-event preparation in §4: quota increases filed and tables pre-warmed.
+Requirements on the deployed system, not on AWS defaults. Every figure requires the
+pre-event preparation in §4.
 
 | ID | Requirement | Acceptance |
 |---|---|---|
 | C1 | The pre-queue MUST support at least 1,000,000 concurrent participants. | Load test sustains 1M countdown-page holders. |
 | C2 | Position assignment for the pre-queue cohort MUST be atomic — no interval in which some participants hold positions and others do not. | Assignment completes in a single conditional write; a reader either sees the pre-queue unassigned or sees every participant assigned. |
 | C3 | The live-join path MUST sustain ≥ 10,000 joins/sec at default quotas, and ≥ 40,000/sec with quota increases filed. | Load test at both levels; zero duplicates at each. |
-| C4 | Polling load MUST be independent of visitor count at the origin. | Origin RPS for `/status` stays flat as waiters scale from 10K to 1M. |
+| C4 | Polling load MUST be independent of visitor count at the origin. | Origin requests per second (RPS) for `/status` stays flat as waiters scale from 10K to 1M. |
 | C5 | The system MUST handle a spike arriving in under 5 seconds without dropping joins. | Joins are durably enqueued even when compute has not yet scaled. |
 
 ---
@@ -128,7 +115,7 @@ requires the pre-event preparation in §4: quota increases filed and tables pre-
 | N4 | The system MUST support commercial AWS regions and AWS GovCloud (US). | Both variants deploy and pass functional tests. |
 | N5 | Infrastructure MUST be expressed as Terraform. | No manual console steps in the deployment path. |
 | N6 | A full deployment SHOULD be small enough to read and reason about in one sitting. | Target ≤ 80 Terraform-managed resources for the core module. |
-| N7 | Bot and abuse mitigation MUST be present at the edge. | WAF with Bot Control and ASN matching is deployed by default. |
+| N7 | Bot and abuse mitigation MUST be present at the edge. | A Web Application Firewall (WAF) with Bot Control and Autonomous System Number (ASN) matching is deployed by default. |
 | N8 | The API MUST be documented as an OpenAPI specification. | Spec published; client and admin surfaces generated from it. |
 | N9 | Concurrent events in one deployment MUST be isolated from each other. | One event driven to its throughput ceiling does not increase queue-join latency or error rate for another event in the same deployment. |
 
@@ -136,13 +123,12 @@ requires the pre-event preparation in §4: quota increases filed and tables pre-
 
 ## 4. Operational
 
-Contractual deliverables. Without these the capacity requirements in §2 are not met: an
-unprepared on-demand table throttles at ~4,000 writes/s regardless of what the code does.
+Contractual deliverables. Without these the capacity requirements in §2 are not met.
 
 | ID | Requirement | Acceptance |
 |---|---|---|
 | O1 | DynamoDB tables MUST be pre-warmed before each event. | Warm throughput ≥ the event's target write rate, verified before T−0. |
-| O2 | Service quota increases MUST be filed with lead time. | API Gateway RPS and DynamoDB per-table WRU confirmed raised before T−0. |
+| O2 | Service quota increases MUST be filed with lead time. | API Gateway RPS and DynamoDB per-table write request units (WRU) confirmed raised before T−0. |
 | O3 | A load test at the event's target rate MUST be executed before the event. | Report produced and reviewed with the client. |
 | O4 | The operator MUST be able to adjust admission rate, reset, or pause mid-event. | Documented runbook procedures, exercised in rehearsal. |
 | O5 | New WAF rules MUST be observed in Count mode before being promoted to Block. | No rule enters Block without one event's worth of Count data. |
@@ -150,26 +136,23 @@ unprepared on-demand table throttles at ~4,000 writes/s regardless of what the c
 
 ---
 
-## 5. Deliberately deferred
+## 5. Out of scope
 
-Queue-it ships these; we do not, yet. Listed so the gap is a decision rather than an
-oversight.
+Not required for the current release. Rationale in [`adr/README.md`](./adr/README.md).
 
-| Capability | Why deferred |
-|---|---|
-| Invite-only waiting rooms (identifier + MFA gating) | Real revenue feature for loyalty and members-only sales. F6.1 is the primitive it builds on; the full flow is post-v1. |
-| Proof-of-Work challenges | Raises bot compute cost. Needs client-side work; WAF challenge actions cover much of it initially. |
-| CAPTCHA softblock before queue entry | WAF's CAPTCHA action covers the common case. |
-| Native app SDKs (iOS, Android, React Native) | A genuine gap for ticketing clients, who see heavy app traffic. Post-v1. |
-| Connector breadth — 25+ platform integrations | **This is Queue-it's actual moat.** We ship a CloudFront/origin authorizer, which covers CDN-fronted origins. Matching their breadth is a multi-year product commitment, not a v1 goal. |
+- Invite-only waiting rooms with multi-factor authentication (MFA) gating. F6.1 is the
+  primitive it would build on.
+- Proof-of-Work challenges and CAPTCHA softblock before queue entry.
+- Native application software development kits (SDKs) for iOS, Android and React Native.
+- Platform connector breadth beyond the CloudFront/origin authorizer.
 
 ## 6. Explicit non-goals
 
 - Physical-location queueing (restaurants, clinics, service counters).
 - Replacing the client's CDN or WAF. We integrate with them.
-- Multi-tenant SaaS. We are not a Cloud Service Provider; see DESIGN §12.
+- Multi-tenant software as a service (SaaS). We are not a Cloud Service Provider.
 - Gapless position sequences.
 - Sub-second join latency. Queue join is latency-insensitive by nature.
 - Visitor engagement widgets and marketing data collection. Not infrastructure.
-- Email or SMS notification of queue position. Requires collecting personal data, which
+- Email or Short Message Service (SMS) notification of queue position. Requires collecting personal data, which
   conflicts with the posture that no visitor data leaves the client's account.

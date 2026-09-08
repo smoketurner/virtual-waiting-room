@@ -3,9 +3,8 @@
 Delivers [`REQUIREMENTS.md`](./REQUIREMENTS.md) per [`DESIGN.md`](./DESIGN.md).
 Requirement IDs in brackets.
 
-Phases are ordered by dependency and risk, not by calendar. Phase 0 exists to kill
-unknowns before they cost real work; Phase 3 is protected because it is the one place
-where being wrong is unrecoverable in production.
+Phases are ordered by dependency and risk. Decisions referenced here are recorded in
+[`adr/`](./adr/).
 
 ---
 
@@ -42,9 +41,8 @@ Throwaway code. Measures what documentation cannot settle.
 - [ ] Operator-authored static page per phase, CDN-cached [F0.2]
 - [ ] Protection rules (path, header, cookie, user agent), evaluated locally at the
       authorizer [F0.6]
-- [ ] **Standby mode**: CloudWatch alarm on `AWS/CloudFront` `Requests` (60 s period,
-      `us-east-1`) → EventBridge → phase Lambda. Worst-case activation latency ~125 s;
-      document that standby does not protect against sub-2-minute spikes.
+- [ ] Standby mode: CloudWatch alarm on `AWS/CloudFront` `Requests` (60 s period,
+      `us-east-1`) → EventBridge → phase Lambda. Activation latency ~125 s worst case
       [F0.4, F0.7]
 - [ ] Scheduled and standby coexisting on one origin [F0.3, F0.5]
 
@@ -55,13 +53,14 @@ Throwaway code. Measures what documentation cannot settle.
       no cookies forwarded — DESIGN §8)
 - [ ] Registration writes `PreQueue {r, i, t}` with `attribute_not_exists(r)`; `i` from
       `ADD prequeue_counter` [F2.5]
-- [ ] **Seeded permutation, not a materialised shuffle** (DESIGN §4.2–4.4). At T−0, one
-      `UpdateItem` on `Counters` setting `shuffle_seed`, `participant_count` and `phase`,
-      guarded by `attribute_not_exists(shuffle_seed)`. **No per-participant writes, no
-      `Scan`.** Position derived on read as `PRP(seed, i, N)`. [F1.3, F1.4, F1.5, C2]
-- [ ] PRP implementation: 4-round balanced Feistel, `HMAC-SHA256(seed, round || x)` as the
-      round function, cycle-walking into `[0, N)`. Property tests: bijectivity over the
-      full domain at N ≤ 10⁶, uniformity by chi-square, determinism across processes
+- [ ] Seeded permutation (DESIGN §4.2, ADR-0002): at T−0 one `UpdateItem` on `Counters`
+      setting `shuffle_seed`, `participant_count` and `phase`, guarded by
+      `attribute_not_exists(shuffle_seed)`. Position derived on read as `PRP(seed, i, N)`
+      [F1.3, F1.4, F1.5, C2]
+- [ ] Pseudorandom permutation (PRP): 4-round balanced Feistel, `HMAC-SHA256(seed, round
+      || x)` round function, cycle-walking into `[0, N)`. Property tests for bijectivity
+      over the full domain at N ≤ 10⁶, uniformity by chi-square, determinism across
+      processes
 
 ### 1d. Live join
 - [ ] REST API `AWS` integration → SQS `SendMessage`, request validator with JSON Schema,
@@ -70,10 +69,8 @@ Throwaway code. Measures what documentation cannot settle.
 - [ ] `BatchSize` / `MaximumBatchingWindowInSeconds` variables, default 100 / 1s
 - [ ] SQS ESM Provisioned Mode as an opt-in variable, default off — mutually exclusive with
       the maximum-concurrency setting
-- [ ] **Per-event partition**: one SQS queue and one Lambda function per event, each with
-      **reserved concurrency** so a runaway event cannot drain the shared account pool.
-      Not shuffle sharding — serverless resources are free at rest, so full partitioning
-      beats partial isolation (DESIGN §12) [N9]
+- [ ] Per-event partition: one SQS queue and one Lambda function per event, each with
+      reserved concurrency (ADR-0008) [N9]
 
 ### 1e. Read path
 - [ ] `/status` (phase, serving position, rate, operator message — one payload),
@@ -83,19 +80,19 @@ Throwaway code. Measures what documentation cannot settle.
 - [ ] Deploy-time signing key into Secrets Manager
 - [ ] `/generate_token` — single-use admission token, short expiry [F3.3]
 - [ ] Authorizer decision tree: session → token → protection match → 302 [F3.4]
-- [ ] **Session minting after token validation**, signed over different inputs from the
-      token, scoped per event, token stripped from the URL [F3.5, F3.6]
+- [ ] Session cookie set after token validation (ADR-0011), signed over different inputs
+      from the token, scoped per event, token stripped from the URL [F3.5, F3.6]
 - [ ] Sliding and fixed session validity modes [F3.7]
-- [ ] **Fail-open with time-limited bypass; configurable** [F4.1, F4.2, F4.3]
-- [ ] **No-show compensating outflow controller** — measure arrivals against releases,
-      smooth, bound the correction, adjust `serving_counter` on a 10 s schedule.
-      **Arrival counter sharded ×10** (`arrivals#0..9`), since a 60,000/min admission rate
-      is 1,000 writes/s and would hit the single-item ceiling (DESIGN §5). [F3.2, F3.8]
+- [ ] Fail open with a time-limited bypass cookie, configurable (ADR-0009)
+      [F4.1, F4.2, F4.3]
+- [ ] No-show compensating outflow controller: measure arrivals against releases, smooth,
+      bound the correction, adjust `serving_counter` on a 10 s schedule. Arrival counter
+      sharded ×10 (`arrivals#0..9`) [F3.2, F3.8]
 - [ ] Decide signing-key rotation (open question 2)
 
 ### 1g. Entry gating and abuse mitigation
-- [ ] **Client-signed identifier verification at join** — membership ID, promo code, order
-      reference; signed by the client, verified by us, stored by neither [F6.1, F6.2]
+- [ ] Client-signed identifier verification at join — membership ID, promo code, order
+      reference; verified but never stored [F6.1, F6.2]
 - [ ] Deferred bot enforcement: admit to pre-queue, block at randomization [F6.3]
 
 ### 1h. Operator surface
@@ -111,11 +108,10 @@ Throwaway code. Measures what documentation cannot settle.
 ### 1i. Control plane
 - [ ] Admin API: `/admin/phase`, `/admin/rate`, `/admin/message`, `/admin/reset`,
       `/admin/rules`, `/metrics`, `/update_session` [F3.10, F5.5]
-- [ ] **Deterministic position expiry in the controller** — query `expires_at` past due
-      with `status = issued`, mark expired, advance `max_expired_position`. **DynamoDB TTL
-      cannot drive this**: it deletes "within a few days" and expired items stay readable
-      until deleted (DESIGN §5). TTL is enabled only for post-event storage reclamation,
-      with `FilterExpression` on reads that could see a pending-delete item. [F3.9]
+- [ ] Position expiry in the controller (ADR-0006): query `expires_at` past due with
+      `status = issued`, mark expired, advance `max_expired_position`. Time to live (TTL)
+      enabled only for post-event storage reclamation, with `FilterExpression` on reads
+      that could see a pending-delete item [F3.9]
 
 **Exit:** all endpoints correct; every lifecycle phase serves its page; pre-queue assigns
 fairly and reproducibly; a visitor browses multiple pages on one session; standby activates
@@ -127,12 +123,11 @@ event; authorizer fails open.
 ## Phase 2 — Terraform module
 
 - [ ] `modules/core` — DynamoDB, SQS, Lambdas, IAM, regional REST API + validator [N5]
-- [ ] `modules/edge` — CloudFront with **three separate cache behaviours**: polled
-      endpoints (Min TTL 1 s, **no cookie forwarding**), write endpoints (uncached),
-      protected origin (uncached, session cookie forwarded). **Min TTL must be >0 and
-      cookies must not be forwarded on polled behaviours or request collapsing is
-      disabled** and C4 fails (DESIGN §8). WAF: Bot Control + ASN match + Anti-DDoS in
-      Count. [N7, O5, C4]
+- [ ] `modules/edge` — CloudFront with three cache behaviours per ADR-0013: polled
+      endpoints (Min TTL 1 s, no cookie forwarding), write endpoints (uncached), protected
+      origin (uncached, session cookie forwarded). Web Application Firewall (WAF) with Bot
+      Control, Autonomous System Number (ASN) match and anti-DDoS in Count mode
+      [N7, O5, C4]
 - [ ] `modules/authorizer` — origin authorizer plus optional CloudFront VPC origin.
       Note VPC origins require an internet gateway present but unused, forbid Lambda@Edge
       origin triggers, and are unavailable in GovCloud (DESIGN §12)
@@ -154,29 +149,26 @@ event; authorizer fails open.
 The one place where being wrong is unrecoverable in production.
 
 - [ ] Repeatable load harness as a deliverable, not a test script [O3]
-- [ ] **Pre-queue path**: 1M registrations, then assignment as a single write. Assert
-      bijectivity across the full cohort (every position in `[0, N)` issued exactly once),
-      no correlation between registration time and assigned position, and that the seed is
-      absent before T−0 [F1.3, F1.4, C1, C2]
-- [ ] **Live-join path**: 10K/sec at default quotas and 40K/sec with increases filed; zero
+- [ ] Pre-queue path: 1M registrations, assignment as a single write. Assert bijectivity
+      across the full cohort, no correlation between registration time and assigned
+      position, and that the seed is absent before T−0 [F1.3, F1.4, C1, C2]
+- [ ] Live-join path: 10K/s at default quotas and 40K/s with increases filed; zero
       duplicates at both; gap rate measured [F2.2, C3]
 - [ ] Raise quotas and pre-warm *before* testing the live-join path above defaults, or the
       test measures throttling rather than the design. Pre-queue assignment needs neither,
       since it is one write [O1, O2]
-- [ ] `/status` origin RPS flat from 10K to 1M waiters — **this validates request
-      collapsing**, so assert origin fetches ≈ elapsed/TTL and not a function of waiter
-      count [C4]
+- [ ] `/status` origin requests per second (RPS) flat from 10K to 1M waiters: assert
+      origin fetches ≈ elapsed/TTL, not a function of waiter count [C4]
 - [ ] Fail-open verified: waiting room returning 5xx, origin still reachable [F4.1]
-- [ ] **Session continuity**: a visitor browses N pages after admission without being
+- [ ] Session continuity: a visitor browses N pages after admission without being
       re-queued [F3.5]
-- [ ] **No-show compensation**: with an injected 30% no-show rate and a 500/min target,
+- [ ] No-show compensation: with an injected 30% no-show rate and a 500/min target,
       measured origin arrivals converge on 500/min [F3.8]
-- [ ] **Standby activation**: inflow crossing the threshold queues new visitors without
-      operator action within the ~125 s worst case; unprotected paths stay unqueued
-      [F0.4, F0.6]
+- [ ] Standby activation: inflow crossing the threshold queues new visitors within the
+      ~125 s worst case; unprotected paths stay unqueued [F0.4, F0.6]
 - [ ] Spike arriving in <5s does not drop joins [C5]
-- [ ] **Event isolation**: drive one event to its throughput ceiling and assert a second
-      event in the same deployment sees no change in join latency or error rate [N9]
+- [ ] Event isolation: drive one event to its throughput ceiling; a second event in the
+      same deployment sees no change in join latency or error rate [N9]
 
 **Exit:** reproducible report. Demonstrating a million assigned positions is itself the
 primary sales asset.
@@ -187,17 +179,18 @@ primary sales asset.
 
 What makes this a service rather than a repository.
 
-- [ ] **Pre-event readiness checklist** [O1, O2, O3] — API Gateway RPS increase filed,
-      DynamoDB per-table WRU increase filed, tables pre-warmed, Provisioned Mode enabled,
-      load test executed, rollback plan. Billable.
+- [ ] Pre-event readiness checklist [O1, O2, O3] — API Gateway RPS increase filed,
+      DynamoDB per-table write request unit (WRU) increase filed, tables pre-warmed,
+      Provisioned Mode enabled, load test executed, rollback plan
 - [ ] Operator runbook [O4, O5] — rate adjustment, reset, pause, incident response,
       COUNT-then-BLOCK promotion, post-event flat-rate plan cancellation
-- [ ] Waiting-room reference client — countdown, position, ETA, auto-advance; **429 retry
-      with jitter** [F4.5]; **404 means re-join with a fresh UUIDv7** [F4.4]; UUIDv7 via the
-      `uuid` package
+- [ ] Waiting-room reference client — countdown, position, estimated time of arrival
+      (ETA), auto-advance; 429 retry with jitter [F4.5]; 404 means re-join with a fresh
+      universally unique identifier version 7 (UUIDv7) [F4.4]; UUIDv7 via the `uuid`
+      package
 - [ ] Client integration guide: CloudFront/ALB/CDN placement
-- [ ] **Per-client cost model** [O6] — poll interval is the dominant variable; compute
-      flat-rate vs PAYG crossover and include pre-warming
+- [ ] Per-client cost model [O6] — poll interval is the dominant variable; compute the
+      flat-rate versus pay-as-you-go (PAYG) crossover and include pre-warming
 
 ---
 
@@ -205,34 +198,27 @@ What makes this a service rather than a repository.
 
 Ships second, priced separately. No CloudFront, no edge compute, no VPC origins.
 
-- [ ] Internal ALB gating with the token authorizer; origin access via security groups and
-      IAM [N4]
+- [ ] Internal Application Load Balancer (ALB) gating with the token authorizer; origin
+      access via security groups and Identity and Access Management (IAM) [N4]
 - [ ] Replace CDN cache collapse for `/status` — the read-scaling story differs
       materially inside the boundary
 - [ ] Document the commercial-CloudFront-fronting-GovCloud-origin data-boundary question
-      for the client's AO
+      for the client's Authorizing Official (AO)
 - [ ] Validate deploy in a real GovCloud account
 
 ---
 
 ## Deferred
 
-Queue-it ships these; we do not yet. Recorded as decisions, not oversights.
+Out of scope for this release; see REQUIREMENTS §5.
 
-- **Invite-only waiting rooms** (identifier + MFA gating). F6.1 is the primitive; the full
-  flow is post-v1.
-- **Proof-of-Work challenges** and **CAPTCHA softblock** — WAF challenge actions cover much
-  of this initially.
-- **Native app SDKs** (iOS, Android, React Native). A genuine gap for ticketing clients,
-  who see heavy app traffic.
-- **Connector breadth.** Queue-it ships 25+ connectors across edge, server-side, native app
-  and ecommerce platforms, with a published version and support policy. This is their actual
-  moat. We ship a CloudFront/origin authorizer covering CDN-fronted origins.
+- Invite-only waiting rooms with multi-factor authentication (MFA) gating
+- Proof-of-Work challenges and CAPTCHA softblock
+- Native application SDKs (iOS, Android, React Native)
+- Platform connector breadth beyond the CloudFront/origin authorizer
 - OpenID identity-provider adapter
-- Hi/Lo leasing and strided sequences — documented escape hatches, unbuilt
-- Multi-region / global tables
-- Additional platform connectors beyond the origin authorizer
-- CloudFront SaaS Manager variant for a single client with many branded domains
+- Multi-region and global tables
+- CloudFront SaaS Manager variant for a client with many branded domains
 
 ---
 
@@ -240,9 +226,9 @@ Queue-it ships these; we do not yet. Recorded as decisions, not oversights.
 
 | Risk | Mitigation |
 |---|---|
-| Pre-queue randomization is disputed as unfair by a client's users | Recorded seed makes it auditable and reproducible [F1.5]; document the fairness argument up front |
+| Pre-queue randomization disputed as unfair | Recorded seed makes it auditable and reproducible [F1.5]; document the fairness model up front |
 | Client poll interval drives cost more than any infrastructure choice | Configurable, default 10s, modelled per client [O6] |
 | Load harness cannot generate 1M participants from one source | Distributed harness; budget for it in Phase 3 |
-| GovCloud variant larger than estimated — no CloudFront, no VPC origins | Phase 5, priced separately; no date until commercial ships |
-| On-call burden — failure during an on-sale is career-ending for the client | Price as incident-critical infrastructure, not a care plan; cap concurrent engagements |
-| Connector breadth versus Queue-it's 25+ | Product scope decision; one authorizer covers CDN-fronted origins |
+| GovCloud variant larger than estimated — no CloudFront, no virtual private cloud (VPC) origins | Phase 5, priced separately; no date until commercial ships |
+| On-call burden during a live event | Price as incident-critical infrastructure; cap concurrent engagements |
+| Connector breadth | Product scope decision; one authorizer covers content delivery network (CDN) fronted origins |

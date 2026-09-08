@@ -7,7 +7,8 @@ into your origin at a rate it can survive.
 **Status: design phase.** No runnable code yet.
 
 - [`docs/REQUIREMENTS.md`](./docs/REQUIREMENTS.md) — numbered, testable requirements
-- [`docs/DESIGN.md`](./docs/DESIGN.md) — architecture and rationale, every claim sourced
+- [`docs/DESIGN.md`](./docs/DESIGN.md) — how the system works, with sourced constraints
+- [`docs/adr/`](./docs/adr/) — architecture decision records: why it works that way
 - [`docs/PLAN.md`](./docs/PLAN.md) — phased implementation plan
 
 ## Why this exists
@@ -37,12 +38,13 @@ rate, plus standby across the rest of the site for visitors who hit the homepage
 ## How it works
 
 ```
-  WAF ──► CloudFront ──► API Gateway ──► SQS ──► Lambda ──► DynamoDB
+  Web Application
+  Firewall (WAF) ──► CloudFront ──► API Gateway ──► SQS ──► Lambda ──► DynamoDB
    │          │              (direct integration, no compute in the burst path)
    │          └─ /status: Min TTL 1s, no cookies forwarded — CloudFront collapses
    │             simultaneous misses into one origin fetch, so origin load is
    │             independent of how many people are waiting
-   └─ Bot Control · ASN matching · Anti-DDoS
+   └─ Bot Control · Autonomous System Number (ASN) matching · anti-DDoS
 ```
 
 Admission is a signed token, validated once and exchanged for a session cookie, so the
@@ -54,7 +56,7 @@ origin never calls the waiting room on the hot path.
   arriving early an advantage, so everyone arrives at once. Holding early arrivals on a
   countdown page and randomizing them at the start removes that incentive.
 - **Randomization is one database write.** The queue order is a seeded pseudorandom
-  permutation computed on read, not a million stored rows. Assignment for a million-person
+  permutation (PRP) computed on read, not a million stored rows. Assignment for a million-person
   cohort is a single conditional write, so there is no window where some people have
   positions and others do not.
 - **No compute in the ingest path.** API Gateway writes straight to SQS. The burst never
@@ -72,14 +74,14 @@ origin never calls the waiting room on the hot path.
 [Queue-it](https://queue-it.com) has run this problem since 2010 — 150+ billion visitors,
 1,000+ organizations — and publishes a great deal about how their system works. This
 project deliberately follows their architecture wherever they have learned something: the
-redirect-and-signed-token model, pre-queue randomization for scheduled events with FIFO for
-threshold-triggered ones, a separately-signed session after the first token validation,
-closed-loop outflow control that compensates for no-shows, and failing open when the
-waiting room is unreachable.
+redirect-and-signed-token model, pre-queue randomization for scheduled events with
+first-in-first-out (FIFO) for threshold-triggered ones, a separately-signed session after
+the first token validation, closed-loop outflow control that compensates for no-shows, and
+failing open when the waiting room is unreachable.
 
 The difference is deployment model, not architecture. Queue-it is hosted SaaS with 25+
 platform connectors; that breadth is their moat and this does not attempt to match it. If
-you want a managed service with an SLA and connectors for every stack, buy theirs. This is
+you want a managed service with a service level agreement (SLA) and connectors for every stack, buy theirs. This is
 for the cases where the traffic cannot leave your account, or the price cannot be
 enterprise.
 
