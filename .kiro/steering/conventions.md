@@ -2,12 +2,36 @@
 
 ## Rust
 
-- Edition 2024, `resolver = "3"`, pinned Rust via `rust-toolchain.toml`. `thiserror` for
-  library errors, `anyhow` for binaries. `tracing` for logging
-  (`error!`/`warn!`/`info!`/`debug!`), never `println!`.
-- Newtypes over primitives (`EventId(String)`, `RegistrationIndex(u64)`); enums for state
-  machines, not boolean flags. Prefer `let…else` for early returns; keep the happy path
-  unindented. Explicit destructuring over `matches!` so a field change breaks the build.
+**Runtime:** latest stable via `rustup`. Edition 2024, `resolver = "3"`.
+
+| purpose | tool |
+|---|---|
+| build & deps | `cargo` |
+| lint | `cargo clippy --all-targets --all-features -- -D warnings` |
+| format | `cargo fmt` |
+| test | `cargo test` |
+| supply chain | `cargo deny check` (advisories, licenses, bans) |
+| safety check | `cargo careful test` (stdlib debug assertions + UB checks) |
+
+### Style
+
+- Prefer `for` loops with mutable accumulators over long iterator chains.
+- Shadow variables through transformations (no `raw_x`/`parsed_x` prefixes).
+- Prefer patterns that break on type changes: no `_` arms, exhaustive `match` over `matches!`,
+  explicit fields over `..`.
+- `let…else` for early returns; keep the happy path unindented.
+
+### Type design
+
+- Newtypes over primitives (`EventId(String)`, `RegistrationIndex(u64)`), not bare `u64`.
+- Enums for state machines, not boolean flags.
+- `thiserror` for libraries, `anyhow` for binaries.
+- `tracing` for logging (`error!`/`warn!`/`info!`/`debug!`), never `println!`.
+
+### Performance
+
+Write efficient code by default: correct algorithm, appropriate data structures, no
+unnecessary allocations. Profile before micro-optimizing, and measure after.
 
 ### Dependency pinning (non-negotiable)
 
