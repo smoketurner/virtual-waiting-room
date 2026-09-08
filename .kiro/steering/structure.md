@@ -16,14 +16,18 @@ docs/                         Human-facing narrative (source of the SDD)
   steering/                   Persistent rules loaded into every session (this dir)
 ```
 
-Planned code layout (Phase 1+; not yet created):
+Code layout (`infra/` created; `crates/` Phase 1+):
 
 ```
+infra/                        All Terraform — kept separate from the Rust workspace
+  environments/
+    dev/                      The only deployable root (terraform apply runs here)
+  modules/
+    core/                     DynamoDB, SQS, Lambdas, IAM, regional REST API + validator
+    edge/                     CloudFront (3 cache behaviours), WAF
+    authorizer/               Origin authorizer + optional CloudFront VPC origin
 crates/                       Rust workspace — one crate per Lambda + shared lib
-modules/
-  core/                       DynamoDB, SQS, Lambdas, IAM, regional REST API + validator
-  edge/                       CloudFront (3 cache behaviours), WAF
-  authorizer/                 Origin authorizer + optional CloudFront VPC origin
+  <crate>/src/                e.g. assign_position, authorizer, controller, admin
 examples/                     Deployable example + generated variable reference
 openapi/                      OpenAPI spec; public + admin surfaces generated from it
 ```

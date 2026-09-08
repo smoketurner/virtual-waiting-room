@@ -41,5 +41,5 @@ module "edge" {
 #   name_prefix                = var.name_prefix
 #   tags                       = local.common_tags
 #   signing_key_parameter_arn  = module.core.signing_key_parameter_arn
-#   lambda_artifact_path       = "../../target/lambda/authorizer/bootstrap.zip"
+#   lambda_artifact_path       = "../../../target/lambda/authorizer/bootstrap.zip"
 # }

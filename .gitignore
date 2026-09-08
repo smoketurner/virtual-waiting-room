@@ -43,4 +43,4 @@ terraform.rc
 
 # Terraform-generated placeholder Lambda zip (archive_file rebuilds it; source
 # bootstrap is tracked)
-modules/core/placeholder-lambda/placeholder.zip
+infra/modules/core/placeholder-lambda/placeholder.zip
