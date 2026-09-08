@@ -4,8 +4,9 @@ A virtual waiting room for AWS. Absorbs traffic spikes that would otherwise take
 your site — ticket on-sales, product drops, registration windows — and meters visitors
 into your origin at a rate it can survive, in fair first-come first-served order.
 
-**Status: design phase.** No runnable code yet. See [`docs/DESIGN.md`](./docs/DESIGN.md)
-and [`docs/PLAN.md`](./docs/PLAN.md).
+**Status: design phase.** No runnable code yet. See [`docs/DESIGN.md`](./docs/DESIGN.md),
+[`docs/PLAN.md`](./docs/PLAN.md), and the September 2026 service-release audit in
+[`docs/AUDIT-2026-09.md`](./docs/AUDIT-2026-09.md).
 
 ## Why this exists
 

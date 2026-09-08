@@ -46,8 +46,10 @@ first-served queue.
    decision follows from this asymmetry.
 2. **No compute in the ingest path.** The burst hits a service integration, not a
    function. Cold starts and concurrency limits must not exist at the front door.
-3. **Zero cost at rest.** No always-on infrastructure. An idle waiting room should bill
-   pennies per month.
+3. **Near-zero cost at rest.** No always-on infrastructure; an idle waiting room should
+   bill pennies per month. **With one deliberate exception:** DynamoDB on-demand tables
+   scale from their previous peak, and an idle table has none, so tables are *pre-warmed*
+   (billed) ahead of a known event. Cheap at rest, paid before it matters — see §4.3b.
 4. **The client owns the data and the account.** We ship infrastructure-as-code, not a
    hosted service.
 5. **Boring where it counts.** The counter is the product. It gets the least clever
@@ -61,8 +63,9 @@ first-served queue.
 
 ```
                     ┌──────────────────────────────────────────┐
-                    │  AWS WAF + Bot Control                   │
-                    │  (blocks scripted/scalper traffic)       │
+                    │  AWS WAF + Bot Control + ASN match       │
+                    │  + Anti-DDoS rule group (COUNT by        │
+                    │    default — see §3.1a)                  │
                     └────────────────────┬─────────────────────┘
                                          │
                     ┌────────────────────▼─────────────────────┐
@@ -95,6 +98,28 @@ first-served queue.
                     │  Counters │ Positions │ Tokens           │
                     └──────────────────────────────────────────┘
 ```
+
+### 3.1a Bot mitigation, and why Anti-DDoS ships in Count mode
+
+Three WAF layers, in increasing order of how much trouble they can cause:
+
+1. **Bot Control** — the bot-vs-human discrimination layer. Safe to run in Block.
+2. **ASN matching** (June 2025) — match on the Autonomous System Number of the source IP.
+   Scalper infrastructure concentrates in a small number of hosting ASNs, making this
+   cheap and effective for exactly this workload.
+3. **`AWSManagedRulesAntiDDoSRuleSet`** (June 2025) — detects, labels and challenges
+   requests suspected of participating in L7 DDoS. Adds a Challenge action alongside
+   Block/Count and needs 50 WCU.
+
+**The third ships in Count mode by default, deliberately.** It establishes a traffic
+baseline, and this workload has a pathological one: a waiting room's "normal" is zero
+traffic, and its legitimate peak is shaped exactly like a volumetric attack. AWS warns
+that baselines established during an attack take two to three times as long to settle.
+Running it in Block for a first on-sale risks challenging legitimate visitors at the
+worst possible moment.
+
+Promotion to Block is an explicit per-client decision after observing at least one real
+event. The operator runbook documents the COUNT-then-BLOCK discipline.
 
 ### 3.2 Request flow — being admitted
 
@@ -158,18 +183,59 @@ let end = ddb.update_item()
 let start = end - n + 1;          // this batch owns [start, end]
 ```
 
-Throughput scales linearly with `BatchSize`. SQS standard queues support batches up to
-10,000 (batches >10 require `MaximumBatchingWindowInSeconds ≥ 1`):
+The *counter* ceiling scales linearly with `BatchSize`. SQS standard queues support
+batches up to 10,000 (batches >10 require `MaximumBatchingWindowInSeconds ≥ 1`):
 
-| BatchSize | Window | Counter ceiling |
-|---|---|---|
-| 10 | 0s | 10K/sec |
-| **100** | **1s** | **100K/sec ← default** |
-| 1,000 | 1s | 1M/sec |
-| 5,000 | 1–2s | ~5M/sec (6 MB payload cap ≈ 10–12K records) |
+| BatchSize | Window | Counter WCU/s | Counter ceiling |
+|---|---|---|---|
+| 10 | 0s | 1,000 | 10K/sec |
+| **100** | **1s** | **1,000** | **100K/sec** |
+| 1,000 | 1s | 1,000 | 1M/sec |
+| 5,000 | 1–2s | 1,000 | ~5M/sec (6 MB payload cap ≈ 10–12K records) |
 
 The 1-second batching window adds ~1s to *joining* a queue in which users then wait
 minutes. It is imperceptible. Both values are Terraform variables.
+
+### 4.3a The counter is not the real ceiling — `Positions` is
+
+Batching amortizes the *counter* write. It does nothing for the position writes. Each
+batch performs **one** `UpdateItem` against `Counters` and **N** `PutItem`s against
+`Positions` — one per visitor, unavoidably.
+
+`Positions` is keyed on a UUIDv7 `request_id`, so it is evenly distributed across
+partitions and has no hot-key problem. But it is still bounded by the DynamoDB
+**per-table** on-demand quota:
+
+| Limit | Value | Adjustable |
+|---|---|---|
+| On-demand per-table write quota | 40,000 WRU/s | Yes — Service Quotas |
+| **Brand-new / long-idle table** | **~4,000 writes/s** | Via pre-warming (§4.3b) |
+| Single-partition write limit | 1,000 WCU/s | No — but irrelevant here (keys are distributed) |
+
+**So the real ingest ceiling is ~40,000 joins/sec at default quotas**, regardless of
+`BatchSize`. Raising `BatchSize` above ~40 buys counter headroom that `Positions` cannot
+use. The quota increase must be requested *in advance* — it is a pre-event readiness item
+(§8) alongside the API Gateway RPS increase.
+
+### 4.3b Cold-start capacity: pre-warm before every event
+
+On-demand capacity scales to roughly **double the previous peak**, and a new table starts
+at ~4,000 writes/sec. **A waiting room is idle by definition — it has no meaningful
+previous peak.** Left alone, a freshly deployed waiting room throttles at ~4,000
+joins/sec at exactly the moment an on-sale begins. This is the most likely way a first
+production deployment fails.
+
+DynamoDB **warm throughput** (Nov 2024; GovCloud Jan 2025) addresses this directly:
+
+> Warm throughput value isn't a maximum limit on your table's capacity — rather, it's the
+> minimum throughput that your table is prepared to handle instantaneously. If you
+> pre-warm a table to support 100,000 write requests per second, your table will be ready
+> to handle that traffic immediately.
+
+Reading the warm throughput value is free; pre-warming is billed. `warm_throughput_*` is
+therefore a Terraform variable on `Positions` and `Counters`, and **pre-warming is a
+billable line item in the pre-event readiness engagement** — a real per-event cost with a
+concrete failure it prevents.
 
 ### 4.4 Gap tolerance
 
@@ -298,9 +364,26 @@ The counter is not the constraint after §4.3. In order:
 |---|---|---|---|
 | 1 | API Gateway account throttle (refill rate) | 10,000 RPS/region | Yes — Service Quotas, needs lead time |
 | 2 | API Gateway burst bucket | 5,000 requests | Not directly — derived from the RPS quota |
-| 3 | Lambda concurrency | 1,000 | Yes |
-| 4 | SQS ESM poller ramp | +300/min → 1,250 max | No |
-| 5 | DynamoDB counter | 100K/sec at defaults | Via `BatchSize` |
+| 3 | **DynamoDB `Positions` per-table write quota** | **40,000 WRU/s** | **Yes — Service Quotas (§4.3a)** |
+| 4 | **DynamoDB cold-start capacity** | **~4,000 writes/s** | **Yes — pre-warm (§4.3b)** |
+| 5 | Lambda concurrency | 1,000 | Yes |
+| 6 | SQS ESM poller ramp | +300/min → 1,250 max | Yes — Provisioned Mode (below) |
+| 7 | DynamoDB counter | ≥100K/sec at defaults | Via `BatchSize` — not binding |
+
+### Lambda Provisioned Mode for SQS ESM
+
+The default ESM ramp (+300 concurrent/minute) is too slow for a spike that arrives in
+under five seconds. Provisioned Mode (Nov 2025) scales **3× faster** (up to 1,000
+concurrent executions per minute) and supports **16× higher concurrency** (up to 20,000),
+configured as min (2–200) and max (2–2000) event pollers. Each poller handles up to
+1 MB/s, 10 concurrent invokes, or 10 SQS polling calls per second. Billed in Event Poller
+Units.
+
+**Constraint for the Terraform module:** provisioned mode cannot be combined with the
+maximum-concurrency setting — concurrency is controlled through poller count instead.
+
+It costs money at rest, so it is an opt-in variable defaulting to off, enabled as part of
+pre-event readiness.
 
 ### How the throttle actually behaves
 
@@ -493,6 +576,37 @@ dedicated infrastructure anyway.
 Deploying per-client means the client inherits AWS's existing GovCloud authorization
 under their own ATO, and we are a systems integrator writing Terraform. Blast radius
 is one client. Each client pays their own AWS bill. The reusable asset is the module.
+
+### Protecting the origin with CloudFront VPC origins
+
+CloudFront **VPC origins** (Nov 2024) serve content from ALBs, NLBs, or EC2 instances in
+*private* subnets, making CloudFront the sole ingress and removing the need for a public
+IP on the origin.
+
+This matters more here than it does for a typical site. The waiting room's entire purpose
+is ensuring nobody reaches the origin without a token. VPC origins make that
+*architecturally* enforceable rather than merely policy-enforced — the origin is not
+reachable from the internet at all, so bypassing the queue is not a matter of guessing a
+URL. The token authorizer stops being the only line of defense.
+
+It is also the natural fit for the GovCloud variant's ALB gating, **subject to verifying
+VPC origins availability in the target GovCloud region** — the supported-region list is
+explicit and this has not yet been confirmed.
+
+### On CloudFront SaaS Manager (multi-tenant distributions)
+
+CloudFront SaaS Manager (April 2025) offers multi-tenant distributions with reusable
+templates, per-tenant parameters and ACM integration. **It does not apply to this
+deployment model** — it is tooling for exactly the multi-tenant architecture this section
+rejects. We deploy into the client's account, where a client has one domain and their own
+certificate.
+
+There is one narrower case where it genuinely fits: a *single* client running many
+concurrent branded events — a ticketing company with dozens of venue domains, a retailer
+with several brands. There, one client account holds many waiting-room front-ends and
+SaaS Manager removes real per-domain toil. That is a Phase 5+ variant for a specific
+customer profile, not a change to the core module. Note multi-tenant distributions
+support **only WAF V2 web ACLs**.
 
 ### GovCloud variant
 

@@ -31,13 +31,16 @@ If either fails, the design changes before any real work is spent.
 ## Phase 1 — Core (3–4 weeks)
 
 ### 1a. Counter and ingest
-- [ ] `Counters` / `Positions` / `Tokens` tables, `PAY_PER_REQUEST`, PITR on
+- [ ] `Counters` / `Positions` / `Tokens` tables, `PAY_PER_REQUEST`, PITR on,
+      `warm_throughput_*` and optional `max_throughput_*` as variables (DESIGN §4.3a/b)
+- [ ] `BatchSize` / `MaximumBatchingWindowInSeconds` as variables, default 100 / 1s
+- [ ] SQS ESM **Provisioned Mode** as an opt-in variable (default off) — note it is
+      mutually exclusive with the maximum-concurrency setting (DESIGN §8)
 - [ ] `assign_queue_num`: parse/validate client UUIDv7, partition valid from invalid,
       **increment the counter by the valid count only** (DESIGN §8a — incrementing by
       `records.len()` lets malformed payloads burn queue positions), batch range
       allocation, `attribute_not_exists(request_id)` on write (fixes upstream's
       redelivery double-assign)
-- [ ] `BatchSize` / `MaximumBatchingWindowInSeconds` as variables, default 100 / 1s
 - [ ] DLQ + `ReportBatchItemFailures` partial-batch responses
 
 ### 1b. Read path
@@ -63,8 +66,10 @@ If either fails, the design changes before any real work is spent.
 
 - [ ] `modules/core` — DynamoDB, SQS, Lambdas, IAM, regional REST API + request validator
 - [ ] `modules/edge` — CloudFront, cache policies (`/queue_num` 24h,
-      `/serving_num` 5s, `/public_key` 24h), WAF + Bot Control
-- [ ] `modules/authorizer` — API Gateway authorizer for the client's protected origin
+      `/serving_num` 5s, `/public_key` 24h), WAF: Bot Control + ASN match + Anti-DDoS
+      rule group **in Count mode by default** (DESIGN §3.1a)
+- [ ] `modules/authorizer` — API Gateway authorizer for the client's protected origin,
+      plus optional **CloudFront VPC origin** so the origin has no public IP (DESIGN §9)
 - [ ] `var.enable_vpc` — conditional `vpc_config` + endpoints for ATO-constrained
       clients (§5). Design the seam now; do not retrofit it.
 - [ ] CloudWatch alarms — port the useful subset of upstream's 35, not all of them
@@ -83,7 +88,10 @@ traffic the client hired us to survive.
 
 - [ ] Repeatable load harness as a **first-class deliverable**, not a test script
 - [ ] Verify at 10K, 50K, 100K joins/sec: **zero duplicate positions**, gap rate
-      within tolerance, ordering preserved
+      within tolerance, ordering preserved. **Note the `Positions` table quota (~40,000
+      WRU/s default) is the real ceiling — file the increase and pre-warm before testing
+      above it, or the test measures DynamoDB throttling rather than the design
+      (DESIGN §4.3a/b).**
 - [ ] Confirm `/serving_num` cache collapse — origin RPS must stay flat as waiters scale
 - [ ] Tune `BatchSize` against measured reality; publish the table
 - [ ] Cold-start / ramp behavior for a spike arriving in <5s
@@ -98,9 +106,12 @@ itself the primary sales asset.*
 The part that makes this a service rather than a repo.
 
 - [ ] **Pre-event readiness checklist** (§8) — API Gateway quota increase filed with
-      lead time, Lambda concurrency raised, provisioned concurrency warmed, load test
-      at target rate, rollback plan. Billable deliverable.
-- [ ] Operator runbook: mid-event rate adjustment, reset, incident response
+      lead time, **DynamoDB per-table WRU quota increase filed (§4.3a)**, **tables
+      pre-warmed via warm throughput (§4.3b — billable line item)**, Lambda concurrency
+      raised, **SQS ESM Provisioned Mode enabled**, provisioned concurrency warmed, load
+      test at target rate, rollback plan. Billable deliverable.
+- [ ] Operator runbook: mid-event rate adjustment, reset, incident response,
+      **COUNT-then-BLOCK promotion discipline for the Anti-DDoS rule group (§3.1a)**
 - [ ] Waiting-room page reference implementation (position, ETA, auto-advance).
       **Must treat HTTP 429 as expected and retry with jittered backoff** — API
       Gateway's burst bucket will shed a few requests at t=0 of any large on-sale, and
@@ -112,6 +123,10 @@ The part that makes this a service rather than a repo.
 - [ ] Cost model per event size. **CloudFront request volume dominates** — it is ~17× the
       API Gateway bill — and the client poll interval is the single largest lever
       (DESIGN §8a). Model it explicitly rather than leaving it at the upstream 5s.
+      **Also evaluate CloudFront flat-rate pricing (Nov 2025)** — unevaluated, and
+      CloudFront is the dominant cost line.
+- [ ] Per-event pre-warming cost model (DESIGN §4.3b) — this is billed, and it is the
+      difference between a working on-sale and a throttled one.
 
 ---
 
@@ -122,6 +137,8 @@ Ships second, priced separately.
 - [ ] ALB/origin gating to replace edge gating (no CloudFront in GovCloud)
 - [ ] Document the commercial-CloudFront-fronting-GovCloud-origin data-boundary
       question for the client's AO
+- [ ] **Verify CloudFront VPC origins availability in the target GovCloud region**
+      (DESIGN §9 — the supported-region list is explicit and unconfirmed)
 - [ ] Validate deploy in a real GovCloud account — the artifact an agency buyer wants
       to see before signing
 
