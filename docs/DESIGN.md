@@ -589,9 +589,18 @@ is ensuring nobody reaches the origin without a token. VPC origins make that
 reachable from the internet at all, so bypassing the queue is not a matter of guessing a
 URL. The token authorizer stops being the only line of defense.
 
-It is also the natural fit for the GovCloud variant's ALB gating, **subject to verifying
-VPC origins availability in the target GovCloud region** — the supported-region list is
-explicit and this has not yet been confirmed.
+It is **not** available for the GovCloud variant — the supported-region list is 34
+commercial regions only, with neither `us-gov-west-1` nor `us-gov-east-1` present
+(verified; see AUDIT-2026-09 §9). Combined with CloudFront's own absence from GovCloud,
+that variant must protect the origin using an internal ALB with the token authorizer and
+security-group/IAM enforcement, with no managed CloudFront integration to lean on.
+
+Constraints for the commercial module: no Lambda@Edge origin triggers (forecloses an
+alternative authorizer design), no gRPC, inbound NACLs not evaluated (outbound must allow
+ephemeral TCP 1024–65535), and the VPC must have an internet gateway *present* even though
+it is not used for routing to the origin. VPC origins can be shared across accounts via
+AWS RAM, which helps if a client separates the waiting room from the protected
+application.
 
 ### On CloudFront SaaS Manager (multi-tenant distributions)
 

@@ -123,8 +123,10 @@ The part that makes this a service rather than a repo.
 - [ ] Cost model per event size. **CloudFront request volume dominates** — it is ~17× the
       API Gateway bill — and the client poll interval is the single largest lever
       (DESIGN §8a). Model it explicitly rather than leaving it at the upstream 5s.
-      **Also evaluate CloudFront flat-rate pricing (Nov 2025)** — unevaluated, and
-      CloudFront is the dominant cost line.
+      **Also evaluate CloudFront flat-rate pricing (Nov 2025)** — evaluated in
+      AUDIT §8: pay-as-you-go wins 5–20× because plan allowances are monthly while a
+      waiting room's traffic is one burst. Default to PAYG; offer flat-rate as an opt-in
+      for clients who need a not-to-exceed number (no overage charges even under attack).
 - [ ] Per-event pre-warming cost model (DESIGN §4.3b) — this is billed, and it is the
       difference between a working on-sale and a throttled one.
 
@@ -134,11 +136,11 @@ The part that makes this a service rather than a repo.
 
 Ships second, priced separately.
 
-- [ ] ALB/origin gating to replace edge gating (no CloudFront in GovCloud)
+- [ ] ALB/origin gating to replace edge gating (no CloudFront in GovCloud, **and no VPC
+      origins either** — verified unavailable, AUDIT §9). Origin protection is internal
+      ALB + token authorizer + security groups/IAM, built from primitives.
 - [ ] Document the commercial-CloudFront-fronting-GovCloud-origin data-boundary
       question for the client's AO
-- [ ] **Verify CloudFront VPC origins availability in the target GovCloud region**
-      (DESIGN §9 — the supported-region list is explicit and unconfirmed)
 - [ ] Validate deploy in a real GovCloud account — the artifact an agency buyer wants
       to see before signing
 
@@ -165,6 +167,7 @@ pre-event operations are the product.
 | Risk | Mitigation |
 |---|---|
 | Client poll interval drives cost more than any infra choice | Make it configurable; default 10s not 5s; model it in the Phase 4 cost model |
+| GovCloud variant is more work than estimated — no CloudFront, no VPC origins, origin protection built from primitives | Keep it Phase 5, priced separately; do not promise a GovCloud date until the commercial module ships |
 | Load test can't reach 100K/sec from one source | Distributed harness; budget for it in Phase 3 |
 | On-call burden — a failure during an on-sale is career-ending for the client | Price as incident-critical infrastructure, not a $150/mo care plan. Cap concurrent engagements. |
 | AWS ships a replacement | Unlikely — they just deprecated theirs and pointed at Marketplace |
