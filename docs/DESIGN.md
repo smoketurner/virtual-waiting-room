@@ -52,7 +52,7 @@ Everything else follows from three further rules:
                         ▼
                   Pre-queue set in DynamoDB
 
-  T−0           EventBridge → assign_queue_num_batch (Rust)
+  T−0           EventBridge → assign_positions_batch (Rust)
                   ├─ shuffle participant set with a recorded seed
                   ├─ single UpdateItem ADD claims the whole range
                   └─ paced BatchWriteItem into Positions
@@ -66,7 +66,7 @@ Everything else follows from three further rules:
 ```
   WAF (Bot Control + ASN match + Anti-DDoS in Count)
         │
-  CloudFront   /queue_num 24h per request_id · /serving_num 5s global · /public_key 24h
+  CloudFront   /status 5s global · /queue_num 24h per request_id · /public_key 24h
         │
   API Gateway REST (regional)
     request validator rejects malformed bodies
@@ -74,7 +74,7 @@ Everything else follows from three further rules:
         │
   SQS standard + DLQ                      ← the shock absorber
         │ BatchSize 100 / window 1s
-  assign_queue_num (Rust, arm64)
+  assign_position (Rust, arm64)
     partition valid/invalid → ADD :valid_count → BatchWriteItem
         │
   DynamoDB  Counters · Positions · Tokens   (on-demand, pre-warmed)
@@ -90,7 +90,7 @@ a previous request.
   Outflow controller increments serving_counter
     target rate adjusted for measured no-show rate      ← closed loop, §5
         │
-  Visitor polls /serving_num, sees serving ≥ own position
+  Visitor polls /status, sees serving ≥ own position
         │
   POST /generate_token → single-use admission token, short expiry
         │
@@ -148,7 +148,22 @@ communication that determines whether a queue feels fair or feels broken.
 capacity. Given the state machine it is nearly free to implement, and it is the control an
 operator reaches for when something has gone wrong downstream.
 
-### 3.2 Modes
+### 3.2 How the lifecycle is implemented
+
+| Concern | AWS mechanism |
+|---|---|
+| Phase state | An attribute on the `Counters` item in DynamoDB. One conditional `UpdateItem` transitions a phase. |
+| Scheduled transitions | EventBridge Scheduler rules, one per transition, invoking a Rust Lambda. |
+| Manual transitions | The same Lambda behind the admin API, so scheduled and manual paths share one code path. |
+| Phase pages | Client-supplied HTML in S3, served through CloudFront with a long TTL. Phase changes swap the cache behaviour target, not the page content. |
+| Current phase for clients | `/status`, a globally cached 5-second endpoint carrying phase, serving position, and operator message in one payload. |
+| Maintenance mode | A phase override attribute checked before the normal phase; set and cleared through the admin API. |
+
+The phase page and the `/status` endpoint together mean a visitor in idle or post-event
+generates **one CloudFront cache hit and nothing else**. No Lambda, no DynamoDB read, no
+API Gateway request.
+
+### 3.3 Modes
 
 **Scheduled** — a known start time. Idle → pre-queue → randomized assignment at T−0 →
 active. §4.
@@ -172,6 +187,23 @@ header, cookie, or user agent, distributed to the authorizer and evaluated local
 Unmatched requests are never queued, in any phase or mode. Because rules can match headers
 and user agent, they double as coarse anti-automation; WAF (§9) does the actual scoring.
 
+### 3.4 How standby is implemented
+
+Standby needs an inflow measurement that does not itself become load, and an activation
+decision that reaches the authorizer quickly.
+
+| Concern | AWS mechanism |
+|---|---|
+| Inflow measurement | CloudFront standard logs already count requests per behaviour. A CloudWatch metric math alarm on request rate is the trigger — no counting in our own code, no per-request write. |
+| Activation decision | The alarm targets EventBridge, which invokes the phase Lambda to flip the event to `ACTIVE`. |
+| Reaching the authorizer | The authorizer reads phase from the same `/status` payload it already fetches, cached 5 seconds. Activation therefore propagates in one cache TTL. |
+| Deactivation | A second alarm on sustained low inflow, with a longer evaluation period so the queue does not flap. |
+| Manual override | Admin API sets a forced phase that suppresses both alarms. |
+
+Using CloudFront's own request metrics rather than counting requests ourselves is the point:
+the measurement is free, already aggregated, and cannot become a bottleneck at exactly the
+moment traffic spikes.
+
 ---
 
 ## 4. Pre-queue
@@ -180,7 +212,7 @@ Satisfies F1.1–F1.5, C1, C2.
 
 **Countdown page.** Static HTML and JavaScript served from CloudFront with a long TTL.
 Visitor count does not generate origin load (F1.2). The page polls a single globally-cached
-`/pre_queue_status` endpoint for the transition to open.
+`/status` endpoint for the transition to open.
 
 **Registration.** A visitor arriving during the pre-queue registers a UUIDv7 into a
 pre-queue set. This is one write per visitor, spread across the entire pre-queue window
@@ -228,13 +260,21 @@ release_next          = target_rate / (1 − smoothed_no_show_rate)
 ```
 
 The no-show rate is smoothed across intervals to avoid oscillation, and the correction is
-bounded so a transient measurement error cannot release a damaging burst. The controller
-runs on a schedule (default 10-second intervals) rather than per-request.
+bounded so a transient measurement error cannot release a damaging burst.
+
+**How it runs.** An EventBridge Scheduler rule invokes the controller Lambda on a fixed
+interval (default 10 seconds). The controller reads release and arrival counters from the
+`Counters` item, computes the correction, and writes the new `serving_counter` with a single
+`UpdateItem`. Arrivals are counted by the authorizer at admission and reported through
+`/update_session`; the aggregate lives on the same item, so the controller does one read and
+one write per interval regardless of event size.
 
 **Position expiry is the other half.** A released position that is never claimed within the
-configured window expires, and the serving counter advances past it (F3.9). Expiry reclaims
-capacity from no-shows; the controller compensates for them in advance. Both are needed:
-expiry alone reacts too slowly to keep the origin at target during a short event.
+configured window expires, and the serving counter advances past it (F3.9). Expiry is driven
+by DynamoDB TTL on the `Positions` item plus a scheduled sweeper for positions whose expiry
+must advance the counter. Expiry reclaims capacity from no-shows after the fact; the
+controller compensates for them in advance. Both are needed — expiry alone reacts too slowly
+to hold the origin at target during a short event.
 
 ---
 
@@ -348,27 +388,45 @@ that safe.
 
 ---
 
-## 8. Read path and caching
+## 8. API surface and caching
 
-Satisfies F3.1, C4.
+Satisfies F3.1, F5.5, C4.
 
-| Path | TTL | Cache key |
-|---|---|---|
-| `/queue_num` | 24h | `event_id` + `request_id` |
-| `/public_key` | 24h | `event_id` |
-| `/serving_num` | 5s | global |
-| `/queue_pos_expiry` | 5s | `event_id` + `request_id` |
-| `/pre_queue_status` | 5s | global |
-| `/assign_queue_num` | none | — |
+### Public
 
-A position never changes once assigned, so it is cached per visitor for a day.
-`/serving_num` is the endpoint every waiter polls; a 5-second global cache collapses a
-million pollers into one origin fetch per interval (C4). Read hotspots are solved with
-cache, not sharding.
+| Path | TTL | Cache key | Purpose |
+|---|---|---|---|
+| `/status` | 5s | global | Phase, serving position, admission rate, operator message — **one payload, one poll** |
+| `/queue_num` | 24h | `event_id` + `request_id` | Own position; 404 means re-join |
+| `/queue_pos_expiry` | 5s | `event_id` + `request_id` | Seconds until position lapses |
+| `/public_key` | 24h | `event_id` | Signature verification material |
+| `/join` | none | — | Join the queue or pre-queue; client-supplied UUIDv7 |
+| `/generate_token` | none | — | Exchange a served position for an admission token |
 
-**The client poll interval is the dominant cost variable in the whole system** — it
-multiplies CloudFront requests, WAF inspections, and Bot Control charges simultaneously.
-Default is 10 seconds, not the 5 the deprecated solution used.
+**`/status` is deliberately one endpoint, not four.** Every waiting visitor polls it, so
+collapsing phase, serving position, rate and operator message into a single globally-cached
+payload means one CloudFront request per visitor per interval instead of several. Since the
+poll interval is the dominant cost variable in the system (§13), the shape of this endpoint
+is a cost decision as much as an API decision.
+
+A position never changes once assigned, so `/queue_num` is cached per visitor for a day. The
+5-second global cache on `/status` collapses a million pollers into one origin fetch per
+interval (C4). Read hotspots are solved with cache, not sharding.
+
+### Admin (SigV4)
+
+| Path | Purpose |
+|---|---|
+| `/admin/phase` | Transition phase; force or clear maintenance mode |
+| `/admin/rate` | Set target admission rate |
+| `/admin/message` | Publish an operator message to waiting visitors |
+| `/admin/reset` | Reset event state |
+| `/admin/rules` | Update protection rules |
+| `/metrics` | Event metrics as JSON for the client's own tooling |
+| `/update_session` | Report completion or abandonment; feeds the outflow controller |
+
+Every operator action is here, and the scheduled paths call the same Lambdas. There is no
+capability available through a console that is unavailable through the API.
 
 ---
 
@@ -448,27 +506,29 @@ An event that cannot be observed and adjusted while it runs is not usable in pro
 Queue-it sells traffic intelligence and custom themes as separate products; both are table
 stakes.
 
-**Live metrics.** Inflow, outflow, queue depth, admitted count, measured no-show rate, and
-expiry rate, exposed as CloudWatch metrics and a JSON endpoint. The no-show and expiry
-figures are not vanity numbers — they are the inputs to the outflow controller (§5), so an
-operator watching them can see *why* the release rate is what it is.
+| Capability | AWS mechanism |
+|---|---|
+| Live metrics | Lambdas emit EMF-formatted logs; CloudWatch derives inflow, outflow, queue depth, admitted, no-show rate, expiry rate without a separate metrics pipeline. A dashboard ships with the module. |
+| Metrics for the client's own tooling | `/metrics`, a cached JSON endpoint reading the same `Counters` item. |
+| Branding | Client HTML, CSS and assets in S3, served through CloudFront. The module ships a reference theme; the client overrides the bucket contents. No fork, no rebuild. |
+| Operator messaging | A string attribute on the `Counters` item, published through the admin API, delivered in the existing `/status` payload. Zero additional requests. |
+| Position and estimated wait | `/queue_num` returns position; the client computes wait from the measured admission rate in `/status`. Recomputed as the operator changes the rate. |
+| Operator actions | Admin REST API with SigV4, backed by the same Lambdas as the scheduled paths. |
 
-**Branding.** The waiting page is a template the client supplies assets to, not a page they
-fork the module to change. A generically-branded waiting room is unsellable: for the client
-this page is their storefront on the day that matters most.
+**Two design points worth stating.**
 
-**Messaging.** The operator can publish a message to waiting visitors mid-event — stock
-confirmation, a delay explanation, an apology. It rides in the same cached JSON as the
-serving counter, so it costs nothing extra to deliver and reaches every waiter within the
-cache TTL. This is the control that turns an incident into a communicated incident.
+The operator message rides in the `/status` payload the waiting page already polls every
+five seconds. Broadcasting to a million waiting visitors therefore costs one DynamoDB write
+and no additional requests — the message reaches everyone within a cache TTL. This is the
+control that turns an incident into a *communicated* incident.
 
-**Position and estimated wait.** Both displayed to the visitor. Estimated wait is derived
-from the measured admission rate rather than a static assumption, so it degrades gracefully
-when the operator changes the rate mid-event.
+Estimated wait is derived from the measured admission rate, not a static assumption, so it
+degrades gracefully when the operator changes the rate mid-event rather than showing a
+number that has quietly become fiction.
 
 **API-first.** Every operator action — rate change, phase transition, reset, pause,
-maintenance mode, message publish — is an API call. There is no console in v1, and no
-action that requires one. Clients drive it from their own tooling or from Terraform.
+maintenance mode, message publish — is an API call. There is no console, and no action that
+requires one. Clients drive it from their own tooling or Terraform.
 
 ---
 
@@ -539,7 +599,7 @@ CloudFront in a commercial region pointing at GovCloud origins, which raises a d
 question for the client's Authorizing Official.
 
 Consequences: no edge gating, no managed origin protection, and no CDN cache collapse for
-`/serving_num` inside the boundary. Origin protection is built from primitives — internal
+`/status` inside the boundary. Origin protection is built from primitives — internal
 ALB, token authorizer, security groups and IAM. This is a materially different topology, not
 a configuration flag, and is priced separately.
 

@@ -54,8 +54,8 @@ fair model when a spike is unplanned and nobody was waiting.
 
 | ID | Requirement | Acceptance |
 |---|---|---|
-| F3.1 | A visitor MUST be able to read their own position and the current serving position. | `GET /queue_num`, `GET /serving_num` return correct values. |
-| F3.2 | The operator MUST be able to control admission rate during the event. | `POST /increment_serving_counter` admits N more visitors; effect visible within cache TTL. |
+| F3.1 | A visitor MUST be able to read their own position and the current serving position. | `GET /queue_num` and `GET /status` return correct values. |
+| F3.2 | The operator MUST be able to control admission rate during the event. | `POST /admin/rate` changes the target rate; effect visible within cache TTL. |
 | F3.3 | Admitted visitors MUST receive a cryptographically verifiable token. | Token is signed; signature verifies at the authorizer without a backend call. |
 | F3.4 | The origin MUST reject requests without a valid token or session. | A request with no credential, an expired one, or one for another event is denied. |
 | F3.5 | After validating an admission token once, the system MUST establish a **session** so the visitor is not re-checked against a single-use token on every subsequent request. | A visitor navigates to a second page without re-presenting the admission token and is not re-queued. |
@@ -115,7 +115,7 @@ achievable only with the pre-event preparation in §4.
 | C1 | The pre-queue MUST support at least 1,000,000 concurrent participants. | Load test sustains 1M countdown-page holders. |
 | C2 | Batch position assignment MUST sustain ≥ 4,000 writes/sec. | 1M positions in ≤ 5 min, zero throttling. |
 | C3 | The live-join path MUST sustain ≥ 10,000 joins/sec at default quotas, and ≥ 40,000/sec with quota increases filed. | Load test at both levels; zero duplicates at each. |
-| C4 | Polling load MUST be independent of visitor count at the origin. | Origin RPS for `/serving_num` stays flat as waiters scale from 10K to 1M. |
+| C4 | Polling load MUST be independent of visitor count at the origin. | Origin RPS for `/status` stays flat as waiters scale from 10K to 1M. |
 | C5 | The system MUST handle a spike arriving in under 5 seconds without dropping joins. | Joins are durably enqueued even when compute has not yet scaled. |
 
 ---
@@ -131,7 +131,7 @@ achievable only with the pre-event preparation in §4.
 | N5 | Infrastructure MUST be expressed as Terraform. | No manual console steps in the deployment path. |
 | N6 | The deployed resource count SHOULD be materially lower than the deprecated AWS solution's 151. | Target ≤ 80 resources for the core module. |
 | N7 | Bot and abuse mitigation MUST be present at the edge. | WAF with Bot Control and ASN matching is deployed by default. |
-| N8 | The API contract SHOULD remain compatible with the deprecated AWS solution. | Existing integrations work against the documented endpoints. |
+| N8 | The API MUST be documented as an OpenAPI specification. | Spec published; client and admin surfaces generated from it. |
 
 ---
 

@@ -3,11 +3,13 @@
 Delivers [`REQUIREMENTS.md`](./REQUIREMENTS.md) per [`DESIGN.md`](./DESIGN.md).
 Requirement IDs in brackets.
 
-**~12–14 weeks to a sellable commercial-region product.** GovCloud follows.
+Phases are ordered by dependency and risk, not by calendar. Phase 0 exists to kill
+unknowns before they cost real work; Phase 3 is protected because it is the one place
+where being wrong is unrecoverable in production.
 
 ---
 
-## Phase 0 — Spike (3–5 days)
+## Phase 0 — Spike
 
 Throwaway code. Measures what documentation cannot settle.
 
@@ -22,7 +24,7 @@ Throwaway code. Measures what documentation cannot settle.
 
 ---
 
-## Phase 1 — Core (8–10 weeks)
+## Phase 1 — Core
 
 ### 1a. Data and counter
 - [ ] `Counters`, `Positions`, `Tokens` — on-demand, PITR, `warm_throughput_*` and optional
@@ -43,7 +45,7 @@ Throwaway code. Measures what documentation cannot settle.
 ### 1c. Pre-queue
 - [ ] Static countdown page, CDN-cached, zero origin calls per view [F1.1, F1.2]
 - [ ] Pre-queue registration (identity only, spread across the window) [C1]
-- [ ] `/pre_queue_status`, globally cached
+- [ ] `/status` carries phase, so the countdown page polls one globally-cached endpoint
 - [ ] EventBridge-triggered batch assignment: seeded shuffle, recorded seed, paced
       `BatchWriteItem` within the configured window [F1.3, F1.4, F1.5, C2]
 
@@ -55,7 +57,8 @@ Throwaway code. Measures what documentation cannot settle.
       the maximum-concurrency setting
 
 ### 1e. Read path
-- [ ] `/queue_num`, `/serving_num`, `/waiting_num`, `/queue_pos_expiry` [F3.1]
+- [ ] `/status` (phase, serving position, rate, operator message — one payload),
+      `/queue_num`, `/queue_pos_expiry` [F3.1]
 
 ### 1f. Admission, session, and outflow control
 - [ ] Deploy-time signing key into Secrets Manager
@@ -83,8 +86,8 @@ Throwaway code. Measures what documentation cannot settle.
 - [ ] Every operator action available via API; no console dependency [F5.5]
 
 ### 1i. Control plane
-- [ ] `/increment_serving_counter`, `/update_session`, `/reset_initial_state`,
-      `/expired_tokens`, `/num_active_tokens` [F3.10]
+- [ ] Admin API: `/admin/phase`, `/admin/rate`, `/admin/message`, `/admin/reset`,
+      `/admin/rules`, `/metrics`, `/update_session` [F3.10, F5.5]
 - [ ] Scheduled position-expiry sweeper [F3.9]
 
 **Exit:** all endpoints correct; every lifecycle phase serves its page; pre-queue assigns
@@ -94,7 +97,7 @@ event; authorizer fails open.
 
 ---
 
-## Phase 2 — Terraform module (2 weeks)
+## Phase 2 — Terraform module
 
 - [ ] `modules/core` — DynamoDB, SQS, Lambdas, IAM, regional REST API + validator [N5]
 - [ ] `modules/edge` — CloudFront, cache policies, WAF (Bot Control + ASN match + Anti-DDoS
@@ -103,16 +106,17 @@ event; authorizer fails open.
 - [ ] `var.enable_vpc` for ATO-constrained clients — design the seam now, do not retrofit
 - [ ] Flat-rate plan subscription as a variable [O6]
 - [ ] CloudWatch alarms — the useful subset, not all 35 from the deprecated solution
+- [ ] Publish the OpenAPI specification for public and admin surfaces [N8]
 - [ ] `examples/` and generated variable reference
 - [ ] Verify resource count ≤ 80 [N6] and idle monthly cost under $5 [N1]
 - [ ] Confirm no component runs outside the client's account [N3] and the endpoint
-      contract matches the deprecated solution [N8]
+      surface matches the published OpenAPI specification [N8]
 
 **Exit:** `terraform apply` from a clean account to a working deployment [N2].
 
 ---
 
-## Phase 3 — Load validation (1.5 weeks)
+## Phase 3 — Load validation
 
 The one place where being wrong is unrecoverable in production.
 
@@ -123,7 +127,7 @@ The one place where being wrong is unrecoverable in production.
       duplicates at both; gap rate measured [F2.2, C3]
 - [ ] Raise quotas and pre-warm *before* testing above defaults, or the test measures
       throttling rather than the design [O1, O2]
-- [ ] `/serving_num` origin RPS flat from 10K to 1M waiters [C4]
+- [ ] `/status` origin RPS flat from 10K to 1M waiters [C4]
 - [ ] Fail-open verified: waiting room returning 5xx, origin still reachable [F4.1]
 - [ ] **Session continuity**: a visitor browses N pages after admission without being
       re-queued [F3.5]
@@ -138,7 +142,7 @@ primary sales asset.
 
 ---
 
-## Phase 4 — Operational product (1 week)
+## Phase 4 — Operational product
 
 What makes this a service rather than a repository.
 
@@ -156,13 +160,13 @@ What makes this a service rather than a repository.
 
 ---
 
-## Phase 5 — GovCloud variant (2 weeks)
+## Phase 5 — GovCloud variant
 
 Ships second, priced separately. No CloudFront, no edge compute, no VPC origins.
 
 - [ ] Internal ALB gating with the token authorizer; origin access via security groups and
       IAM [N4]
-- [ ] Replace CDN cache collapse for `/serving_num` — the read-scaling story differs
+- [ ] Replace CDN cache collapse for `/status` — the read-scaling story differs
       materially inside the boundary
 - [ ] Document the commercial-CloudFront-fronting-GovCloud-origin data-boundary question
       for the client's AO

@@ -46,8 +46,6 @@ Redis held eight integers, and everything else — the VPC, the NAT gateway, the
 endpoints, the Lambdas forced into private subnets — existed only to reach it.
 Removing it removes all of that.
 
-The API contract is kept compatible, so existing integrations port over.
-
 ## Design highlights
 
 - **The burst is removed, not absorbed.** Assigning queue positions by arrival order
