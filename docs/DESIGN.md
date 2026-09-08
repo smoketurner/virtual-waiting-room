@@ -121,6 +121,13 @@ worst possible moment.
 Promotion to Block is an explicit per-client decision after observing at least one real
 event. The operator runbook documents the COUNT-then-BLOCK discipline.
 
+**Cost note:** WAF is mandatory in this design, not optional, and it is billed per
+request inspected ($0.60/M) on top of Bot Control ($10/mo + $1/M Common, **$10/M
+Targeted**). Against the polling volume a waiting room generates, this is a first-order
+cost — frequently larger than the CloudFront bill itself. It is the main reason a
+CloudFront flat-rate plan, which bundles WAF and Bot Control, is usually cheaper than
+pay-as-you-go here (AUDIT-2026-09 §8).
+
 ### 3.2 Request flow — being admitted
 
 ```
@@ -442,9 +449,11 @@ three origin requests regardless of how long they wait or how often they poll:
 *(1,000,000 visitors, 20-minute average wait, 5-second poll interval, 2-hour event.)*
 
 **The entire saving is $7.50 per million-visitor event.** CloudFront costs ~17× the API
-Gateway bill either way. The real cost lever is the client poll interval, not the API
-flavor — moving from 5s to 10s polling saves $90 on the same event, twelve times more
-than the API choice:
+Gateway bill either way — and WAF, mandatory in this design and billed per inspected
+request, is larger still (AUDIT §8). The API flavor is not where the money is. The real
+cost lever is the client poll interval, which drives CloudFront, WAF and Bot Control
+charges together — moving from 5s to 10s polling saves $90 of CloudFront alone on the
+same event, plus proportional WAF and bot charges:
 
 ```
 poll every  2s -> 600 polls/visitor -> CloudFront $452.25

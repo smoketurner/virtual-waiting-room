@@ -123,10 +123,11 @@ The part that makes this a service rather than a repo.
 - [ ] Cost model per event size. **CloudFront request volume dominates** — it is ~17× the
       API Gateway bill — and the client poll interval is the single largest lever
       (DESIGN §8a). Model it explicitly rather than leaving it at the upstream 5s.
-      **Also evaluate CloudFront flat-rate pricing (Nov 2025)** — evaluated in
-      AUDIT §8: pay-as-you-go wins 5–20× because plan allowances are monthly while a
-      waiting room's traffic is one burst. Default to PAYG; offer flat-rate as an opt-in
-      for clients who need a not-to-exceed number (no overage charges even under attack).
+      **CloudFront flat-rate vs pay-as-you-go (AUDIT §8)** — default to a flat-rate plan
+      sized to the client's event profile. PAYG must buy WAF ($5 ACL + $1/rule +
+      $0.60/M) and Bot Control ($10/mo + $1/M Common, $10/M Targeted) separately; the
+      flat-rate plan bundles them. Crossover depends on event size, poll interval and
+      Common vs Targeted, so compute per client — do not assume.
 - [ ] Per-event pre-warming cost model (DESIGN §4.3b) — this is billed, and it is the
       difference between a working on-sale and a throttled one.
 
