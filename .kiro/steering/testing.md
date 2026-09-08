@@ -23,6 +23,13 @@ visible fairness failure at 1,000,000 people. Tests are the primary evidence.
   - **Uniform** — chi-square across deciles within the critical value.
   - **Deterministic** — same `(seed, i, N)` yields the same position across processes.
   - **Seed absence** — no position is computable before the seed is written at T−0.
+  - **Contiguous assembly** — across the 10 pre-queue shards, the assembled global index space
+    is exactly `[0, N)` with `N` = Σ shard counts.
+  - **Burned slot** — with an injected registration-write failure (counter incremented, no
+    `PreQueue` row), the space stays contiguous, `PRP` stays bijective, and the burned index
+    resolves to a position that maps to no one (absorbed like a live-join gap, F2.3).
+  - **Straggler race** — a join that raced the seal reconstructs `i ≥ participant_count`;
+    `/queue_num` returns a live-join position and never calls `PRP` out of domain.
 - **Atomic counter (design §5).** Under concurrent load, the set of issued positions has
   **zero duplicates**; gaps are permitted and their rate is measured, not eliminated.
 - **Idempotent join** — repeating a join with the same `request_id` consumes no extra
