@@ -58,7 +58,21 @@ If either fails, the design changes before any real work is spent.
       `get_list_expired_tokens`, `get_num_active_tokens`
 - [ ] Queue-position expiry sweeper (EventBridge scheduled)
 
-**Exit:** all 13 endpoints answer correctly against a locally-driven deployment.
+### 1e. Pre-queue (DESIGN §3.0 / DECISIONS D1)
+- [ ] Static countdown page, CloudFront-cached, zero backend calls
+- [ ] Pre-queue registration (lighter than a queue position — identity only)
+- [ ] Randomized batch assignment at T-0; must be verifiably fair and auditable
+- [ ] `/pre_queue_status` for the countdown page to poll (globally cached)
+
+### 1f. Fail-open (DESIGN principle 6 / DECISIONS D2)
+- [ ] Authorizer failure mode configurable, **defaulting to open** with a time-limited
+      bypass cookie
+- [ ] Client-side retry in the background while bypassed
+
+**Exit:** all endpoints answer correctly, pre-queue assigns fairly, and the authorizer fails open, against a locally-driven deployment.
+
+---
+
 
 ---
 
@@ -87,11 +101,15 @@ concurrency is the entire product, and the failure mode only appears under exact
 traffic the client hired us to survive.
 
 - [ ] Repeatable load harness as a **first-class deliverable**, not a test script
-- [ ] Verify at 10K, 50K, 100K joins/sec: **zero duplicate positions**, gap rate
-      within tolerance, ordering preserved. **Note the `Positions` table quota (~40,000
-      WRU/s default) is the real ceiling — file the increase and pre-warm before testing
-      above it, or the test measures DynamoDB throttling rather than the design
-      (DESIGN §4.3a/b).**
+- [ ] Verify at 10K, 50K, 100K joins/sec on the **live-join path**: **zero duplicate
+      positions**, gap rate within tolerance, ordering preserved. **Note the `Positions`
+      table quota (~40,000 WRU/s default) is the real ceiling — file the increase and
+      pre-warm before testing above it, or the test measures DynamoDB throttling rather
+      than the design (DESIGN §4.3a/b).**
+- [ ] **Verify the pre-queue batch assignment separately** (DESIGN §3.0) — this is the
+      path a real scheduled on-sale uses, and it is a *scheduled* write rate we control
+      (~3,333/s for 1M over 5 min), not a burst. Assert fairness of the randomization and
+      zero duplicate positions across the whole assigned set.
 - [ ] Confirm `/serving_num` cache collapse — origin RPS must stay flat as waiters scale
 - [ ] Tune `BatchSize` against measured reality; publish the table
 - [ ] Cold-start / ramp behavior for a spike arriving in <5s

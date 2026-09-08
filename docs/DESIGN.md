@@ -54,12 +54,49 @@ first-served queue.
    hosted service.
 5. **Boring where it counts.** The counter is the product. It gets the least clever
    implementation available that meets the throughput target.
+6. **Fail open, never closed.** If the waiting room is unavailable, visitors proceed to
+   the origin rather than being blocked. A waiting room that fails closed converts our
+   outage into the client's outage, which is worse than having no waiting room at all.
+   Queue-it's Direct Pass does exactly this: on service disruption, visitors "continue to
+   your site with a time-out cookie while the Connector retries connection in the
+   background." The authorizer's failure mode is configurable and defaults to open.
 
 ---
 
 ## 3. Architecture
 
-### 3.1 Request flow — joining the queue
+### 3.0 Pre-queue: the scheduled-event path
+
+**This is the primary path for any event with a known start time**, which is nearly every
+real use case — ticket on-sales, product drops, registration windows.
+
+Early visitors are held on a **static countdown page served entirely from CloudFront
+cache** — no API Gateway, no DynamoDB, no SQS. When the timer reaches zero, the assembled
+participants are **randomized** and assigned queue positions as a scheduled batch, not by
+live arrival order.
+
+This follows Queue-it's published design, which describes randomizing pre-queue visitors
+"like a raffle" to neutralize "any advantage to arriving early."
+
+**The reason is load, not just fairness — and the arithmetic is decisive:**
+
+| Approach | Assignment load at T-0 |
+|---|---|
+| Live arrival order | 1M visitors over 1–5s = **200,000–1,000,000 writes/s** |
+| Pre-queue + batch assign over 5 min | **3,333 writes/s** |
+
+The second fits inside the *default* 40,000 WRU/s DynamoDB quota with room to spare. The
+first requires raising two quotas by 25× and 100× and still risks throttling.
+
+Assigning positions by arrival order makes arriving early an advantage, which guarantees
+that everyone arrives at once. **The thundering herd is manufactured by the fairness
+model, not imposed by the users.** Removing the incentive removes most of the load
+problem — and is *more* fair, since a fast connection stops conferring an advantage.
+
+The live-join path (§3.1) remains, but it serves walk-up arrivals after the event opens,
+not the scheduled peak.
+
+### 3.1 Request flow — joining the queue (live path)
 
 ```
                     ┌──────────────────────────────────────────┐
