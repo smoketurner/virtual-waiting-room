@@ -3,7 +3,7 @@
 Delivers [`REQUIREMENTS.md`](./REQUIREMENTS.md) per [`DESIGN.md`](./DESIGN.md).
 Requirement IDs in brackets.
 
-**~7–9 weeks to a sellable commercial-region product.** GovCloud follows.
+**~9–11 weeks to a sellable commercial-region product.** GovCloud follows.
 
 ---
 
@@ -22,7 +22,7 @@ Throwaway code. Measures what documentation cannot settle.
 
 ---
 
-## Phase 1 — Core (4–5 weeks)
+## Phase 1 — Core (6–7 weeks)
 
 ### 1a. Data and counter
 - [ ] `Counters`, `Positions`, `Tokens` — on-demand, PITR, `warm_throughput_*` and optional
@@ -47,20 +47,33 @@ Throwaway code. Measures what documentation cannot settle.
 ### 1d. Read path
 - [ ] `/queue_num`, `/serving_num`, `/waiting_num`, `/queue_pos_expiry` [F3.1]
 
-### 1e. Tokens and authorizer
-- [ ] Deploy-time RSA keypair, private key in Secrets Manager
-- [ ] `/generate_token` RS256; `/public_key` JWKS [F3.3]
-- [ ] Rust authorizer: verify sig/exp/aud/iss, JWKS in `OnceCell` [F3.4]
-- [ ] **Fail-open with time-limited bypass cookie; configurable** [F4.1, F4.2, F4.3]
-- [ ] Decide JWKS rotation (open question 2)
+### 1e. Admission, session, and outflow control
+- [ ] Deploy-time signing key into Secrets Manager
+- [ ] `/generate_token` — single-use admission token, short expiry [F3.3]
+- [ ] Authorizer decision tree: session → token → protection match → 302 [F3.4]
+- [ ] **Session minting after token validation**, signed over different inputs from the
+      token, scoped per event, token stripped from the URL [F3.5, F3.6]
+- [ ] Sliding and fixed session validity modes [F3.7]
+- [ ] **Fail-open with time-limited bypass; configurable** [F4.1, F4.2, F4.3]
+- [ ] **No-show compensating outflow controller** — measure arrivals against releases,
+      smooth, bound the correction, adjust `serving_counter` on a schedule [F3.2, F3.8]
+- [ ] Decide signing-key rotation (open question 2)
 
-### 1f. Control plane
+### 1f. Operating modes
+- [ ] Protection rules (path, header, cookie, user agent), distributed to the authorizer
+      and evaluated locally [F0.4]
+- [ ] **Standby mode**: inflow measurement, threshold activation and deactivation, manual
+      override [F0.2, F0.5]
+- [ ] Scheduled and standby coexisting on one origin [F0.1, F0.3]
+
+### 1g. Control plane
 - [ ] `/increment_serving_counter`, `/update_session`, `/reset_initial_state`,
-      `/expired_tokens`, `/num_active_tokens` [F3.2, F3.6]
-- [ ] Scheduled position-expiry sweeper [F3.5]
+      `/expired_tokens`, `/num_active_tokens` [F3.10]
+- [ ] Scheduled position-expiry sweeper [F3.9]
 
-**Exit:** all endpoints correct; pre-queue assigns fairly and reproducibly; authorizer
-fails open.
+**Exit:** all endpoints correct; pre-queue assigns fairly and reproducibly; a visitor
+browses multiple pages on one session; standby activates on threshold; authorizer fails
+open.
 
 ---
 
@@ -95,6 +108,12 @@ The one place where being wrong is unrecoverable in production.
       throttling rather than the design [O1, O2]
 - [ ] `/serving_num` origin RPS flat from 10K to 1M waiters [C4]
 - [ ] Fail-open verified: waiting room returning 5xx, origin still reachable [F4.1]
+- [ ] **Session continuity**: a visitor browses N pages after admission without being
+      re-queued [F3.5]
+- [ ] **No-show compensation**: with an injected 30% no-show rate and a 500/min target,
+      measured origin arrivals converge on 500/min [F3.8]
+- [ ] **Standby activation**: inflow crossing the threshold queues new visitors without
+      operator action; unprotected paths stay unqueued [F0.2, F0.4]
 - [ ] Spike arriving in <5s does not drop joins [C5]
 
 **Exit:** reproducible report. Demonstrating a million assigned positions is itself the

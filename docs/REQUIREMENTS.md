@@ -7,7 +7,17 @@ criterion. `MUST` = mandatory; `SHOULD` = strong default, overridable per client
 
 ## 1. Functional
 
-### 1.1 Pre-queue (scheduled events)
+### 1.1 Operating modes
+
+| ID | Requirement | Acceptance |
+|---|---|---|
+| F0.1 | The system MUST support **scheduled** events with a known start time. | A configured event opens at its scheduled time. |
+| F0.2 | The system MUST support **standby** mode: dormant year-round, activating automatically when inflow crosses an operator-configured threshold. | Below threshold, visitors pass through untouched. Above it, new visitors are queued without operator action. |
+| F0.3 | Both modes MUST be able to run simultaneously on one origin. | A scheduled room on `/product/x` with a low admission rate coexists with standby protection across the whole site. |
+| F0.4 | The operator MUST be able to declare which requests are protected, by path, header, cookie, or user agent. | An unprotected path is never queued, regardless of mode or load. |
+| F0.5 | Standby activation and deactivation MUST be observable and manually overridable. | Operator can force-activate or force-dormant; state is visible in metrics. |
+
+### 1.2 Pre-queue (scheduled events)
 
 | ID | Requirement | Acceptance |
 |---|---|---|
@@ -17,7 +27,7 @@ criterion. `MUST` = mandatory; `SHOULD` = strong default, overridable per client
 | F1.4 | Position assignment for pre-queue participants MUST complete within an operator-configured window. | 1,000,000 positions assigned within 5 minutes. |
 | F1.5 | The randomization MUST be auditable after the fact. | A stored seed plus the participant set reproduces the exact assignment. |
 
-### 1.2 Queue join (live arrivals)
+### 1.3 Queue join (live arrivals)
 
 | ID | Requirement | Acceptance |
 |---|---|---|
@@ -28,18 +38,22 @@ criterion. `MUST` = mandatory; `SHOULD` = strong default, overridable per client
 | F2.5 | Repeating a join with the same request ID MUST NOT consume an additional position. | Duplicate submission returns the original position. |
 | F2.6 | Malformed joins MUST NOT consume queue positions. | Sending N malformed payloads leaves the counter unchanged. |
 
-### 1.3 Waiting and admission
+### 1.4 Waiting and admission
 
 | ID | Requirement | Acceptance |
 |---|---|---|
 | F3.1 | A visitor MUST be able to read their own position and the current serving position. | `GET /queue_num`, `GET /serving_num` return correct values. |
 | F3.2 | The operator MUST be able to control admission rate during the event. | `POST /increment_serving_counter` admits N more visitors; effect visible within cache TTL. |
-| F3.3 | Admitted visitors MUST receive a cryptographically verifiable token. | Token is RS256-signed; signature verifies against the published JWKS. |
-| F3.4 | The origin MUST reject requests without a valid token. | A request with no token, an expired token, or a token for another event is denied. |
-| F3.5 | Queue positions MUST expire if unused within an operator-configured period. | Position expires; the serving counter advances past it. |
-| F3.6 | Sessions MUST be markable as completed or abandoned. | `POST /update_session` updates counters. |
+| F3.3 | Admitted visitors MUST receive a cryptographically verifiable token. | Token is signed; signature verifies at the authorizer without a backend call. |
+| F3.4 | The origin MUST reject requests without a valid token or session. | A request with no credential, an expired one, or one for another event is denied. |
+| F3.5 | After validating an admission token once, the system MUST establish a **session** so the visitor is not re-checked against a single-use token on every subsequent request. | A visitor navigates to a second page without re-presenting the admission token and is not re-queued. |
+| F3.6 | The session MUST be separately signed from the admission token, over different inputs. | A captured admission token cannot be replayed as a session credential, or vice versa. |
+| F3.7 | Session lifetime MUST support both a sliding window (extended on activity) and a hard cap from issue time. | Both modes configurable per event; hard cap does not extend regardless of activity. |
+| F3.8 | Admission rate control MUST compensate for **no-shows** — admitted visitors who never arrive at the origin. | With a 30% no-show rate and a target of 500/min, actual origin arrivals converge on 500/min, not 350. |
+| F3.9 | Queue positions MUST expire if unused within an operator-configured period. | Position expires; the serving counter advances past it. |
+| F3.10 | Sessions MUST be markable as completed or abandoned. | Counters update; the figures feed F3.8. |
 
-### 1.4 Failure behaviour
+### 1.5 Failure behaviour
 
 | ID | Requirement | Acceptance |
 |---|---|---|

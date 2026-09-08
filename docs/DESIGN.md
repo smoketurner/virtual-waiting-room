@@ -80,25 +80,80 @@ Everything else follows from three further rules:
   DynamoDB  Counters · Positions · Tokens   (on-demand, pre-warmed)
 ```
 
-### 2.3 Admission
+### 2.3 Admission and session
+
+Admission is a two-credential design, following Queue-it's published model. The admission
+token proves the visitor cleared the line; the session cookie proves they already did so on
+a previous request.
 
 ```
-  Operator or inlet strategy increments serving_counter
+  Outflow controller increments serving_counter
+    target rate adjusted for measured no-show rate      ← closed loop, §5
         │
   Visitor polls /serving_num, sees serving ≥ own position
         │
-  POST /generate_token → RS256 JWT
+  POST /generate_token → single-use admission token, short expiry
         │
-  Origin request with Bearer token
+  Origin request carrying the token
         │
-  token_authorizer (Rust) verifies sig/exp/aud/iss; JWKS cached in-process
+  authorizer (Rust, at CloudFront or the origin)
+    ├─ session cookie present and valid?  → continue
+    ├─ admission token present and valid? → mint session cookie, strip token, continue
+    └─ neither, and request is protected? → 302 to the waiting room
         │
-  Origin — private subnet behind CloudFront VPC origin (commercial regions)
+  Origin — private subnet behind a CloudFront VPC origin (commercial regions)
 ```
+
+**Why the session cookie is mandatory, not an optimization.** The admission token travels
+on the URL. The URL changes the moment the visitor clicks anything. Without a session, the
+visitor loses their credential on their second page view and is bounced back to the queue —
+a correctness failure, not a performance one. The connector validates the token once, mints
+the cookie, and strips the token from the URL.
+
+The two credentials are signed over **different inputs** so neither can be replayed as the
+other.
+
+Every authorizer decision — protection match, session check, token check, expiry — is local.
+No call to the waiting-room backend on the hot path. This is what allows the authorizer to
+run at the edge and add only the cost of a signature verification per request.
 
 ---
 
-## 3. Pre-queue
+## 3. Operating modes
+
+Satisfies F0.1–F0.5.
+
+Two modes, independently configurable and able to run together on one origin.
+
+**Scheduled** — an event with a known start time. Pre-queue, randomized assignment, then
+metered admission. §4.
+
+**Standby** — the queue is dormant. The authorizer evaluates every request but its action is
+*continue* until measured inflow crosses an operator-configured threshold, at which point
+new visitors without a session begin to be queued. This is insurance against unplanned
+spikes: a social post, a news mention, an unannounced restock. Queue-it reports retail,
+financial services, and airline customers buying it specifically for this.
+
+The authorizer's code is identical in both states; only the action changes. A dormant queue
+costs a signature verification per request and nothing at the backend, which is why standby
+is cheap to leave enabled year-round.
+
+**Protection rules.** The operator declares which requests are subject to queueing, matching
+on path, header, cookie, or user agent. Rules are distributed to the authorizer and
+evaluated locally. Unmatched requests are never queued, in any mode.
+
+The combination that matters in practice — and which Queue-it's architect cites as a real
+customer configuration — is a scheduled room with a deliberately low admission rate on the
+high-demand path, plus standby across the whole site to catch visitors who flood the
+homepage instead of the product page.
+
+Because protection rules can match on headers and user agent, they double as coarse
+anti-automation: an operator can route suspicious signatures into the queue regardless of
+load. This is rule-based, not ML-scored; WAF (§9) does the scoring.
+
+---
+
+## 4. Pre-queue
 
 Satisfies F1.1–F1.5, C1, C2.
 
@@ -128,11 +183,45 @@ First-come-first-served applies to live joins after opening (F2.1).
 
 ---
 
-## 4. Counter
+## 5. Outflow control
+
+Satisfies F3.2, F3.8, F3.10.
+
+The operator declares a capacity — say 500 arrivals per minute — and the system releases
+visitors at that rate. Naively this is "increment `serving_counter` by 500 each minute."
+
+**That undercounts, because of no-shows.** A fraction of visitors whose turn arrives never
+click through: they switched tabs, closed the browser, or gave up. Releasing exactly 500
+positions delivers materially fewer than 500 real arrivals, so the origin runs below the
+capacity the client is paying to use, and everyone still waiting waits longer than
+necessary. Queue-it's architect names this as one of the genuinely hard parts of the
+problem.
+
+The fix is a closed loop. `/update_session` already reports completions and abandonments;
+those figures feed back into the release rate:
+
+```
+observed_arrival_rate = arrivals in the last interval
+no_show_rate          = 1 − (observed_arrival_rate / released_last_interval)
+release_next          = target_rate / (1 − smoothed_no_show_rate)
+```
+
+The no-show rate is smoothed across intervals to avoid oscillation, and the correction is
+bounded so a transient measurement error cannot release a damaging burst. The controller
+runs on a schedule (default 10-second intervals) rather than per-request.
+
+**Position expiry is the other half.** A released position that is never claimed within the
+configured window expires, and the serving counter advances past it (F3.9). Expiry reclaims
+capacity from no-shows; the controller compensates for them in advance. Both are needed:
+expiry alone reacts too slowly to keep the origin at target during a short event.
+
+---
+
+## 6. Counter
 
 Satisfies F2.2, F2.3, C3.
 
-### 4.1 Atomic sequence, not sharding
+### 6.1 Atomic sequence, not sharding
 
 Write sharding is the reflexive answer to a hot DynamoDB key, and it does not apply.
 Sharded counters are sum-only: they answer "how many" but cannot issue a unique ordered
@@ -143,7 +232,7 @@ documents the guarantee: writes to a single item are applied serially, and each 
 returned exactly once. No transactions, no optimistic concurrency control, no experiment
 needed.
 
-### 4.2 Batch range allocation
+### 6.2 Batch range allocation
 
 One increment claims a whole batch's worth of positions:
 
@@ -161,7 +250,7 @@ Increment by the count of **valid** messages, never `records.len()` — otherwis
 malformed payloads consumes positions without producing queue members, a cheap
 denial-of-fairness attack (F2.6).
 
-### 4.3 The real ceiling is `Positions`, not the counter
+### 6.3 The real ceiling is `Positions`, not the counter
 
 Batching amortizes the counter write. It does nothing for position writes, which are one
 per visitor.
@@ -177,7 +266,7 @@ So the live-join ceiling is ~40,000/sec at default quotas. `BatchSize` above ~40
 counter headroom that `Positions` cannot use. Default `BatchSize` is 100 with a 1-second
 window, which costs one second on join in a queue where users then wait minutes.
 
-### 4.4 Cold-start capacity
+### 6.4 Cold-start capacity
 
 On-demand tables serve ~4,000 writes/sec when new and grow to twice their previous peak. A
 waiting room is idle by definition and has no meaningful previous peak, so an unprepared
@@ -187,14 +276,14 @@ DynamoDB warm throughput fixes this: pre-warming sets the throughput a table can
 instantaneously. Reading the value is free; pre-warming is billed. This is O1 — a
 contractual pre-event step, not an optimization.
 
-### 4.5 Sequences versus statistics
+### 6.5 Sequences versus statistics
 
 | Counter | Kind | Sharding |
 |---|---|---|
 | `queue_counter`, `serving_counter` | sequence | never |
 | `token_counter`, `completed_counter`, `abandoned_counter`, `expired_queue_counter` | statistic | permitted if hot |
 
-### 4.6 Gap tolerance
+### 6.6 Gap tolerance
 
 An SDK retry after a 5xx, or a function dying mid-batch, burns positions without issuing
 them. Nobody checks whether a queue skipped a number (F2.3). This tolerance is what permits
@@ -202,7 +291,7 @@ the cheapest approach; an inventory system could not make the same trade.
 
 ---
 
-## 5. Ingest
+## 7. Ingest
 
 Satisfies F2.4–F2.6, C5.
 
@@ -238,7 +327,7 @@ that safe.
 
 ---
 
-## 6. Read path and caching
+## 8. Read path and caching
 
 Satisfies F3.1, C4.
 
@@ -262,13 +351,28 @@ Default is 10 seconds, not the 5 the deprecated solution used.
 
 ---
 
-## 7. Security and abuse mitigation
+## 9. Security and abuse mitigation
 
 Satisfies F3.3, F3.4, N7, O5.
 
-**Tokens.** RS256 JWT with claims `{sub, aud=event_id, iss, exp, token_use}`. The private
-key is generated at deploy time into Secrets Manager; the public JWKS is served and cached
-for 24 hours. The Rust authorizer holds the JWKS in a `OnceCell` rather than re-fetching.
+**Credentials.** Two artifacts, signed with the same key over **different inputs** so
+neither can be replayed as the other (F3.6):
+
+- *Admission token* — proves the visitor cleared the line. Carries event id, queue id, and
+  expiry. Travels on the URL, so it is short-lived and validated once.
+- *Session* — minted by the authorizer after the token validates, scoped per event so a
+  visitor can hold sessions for several waiting rooms concurrently. Supports both a sliding
+  window extended on activity and a hard cap from issue time (F3.7); a hard cap is what you
+  want for a ticket on-sale, where a session should not live indefinitely because someone
+  keeps clicking.
+
+The signing key is per-deployment and lives in Secrets Manager, distributed to the
+authorizer. **Its compromise permits minting admission for every event in that
+deployment**, so it is rotated on a schedule and treated as the deployment's most sensitive
+material.
+
+The authorizer holds keys and protection rules in memory, so every decision is local with no
+backend round-trip (§2.3).
 
 **WAF, three layers:**
 
@@ -296,7 +400,7 @@ bill. See §10.
 
 ---
 
-## 8. Failure behaviour
+## 10. Failure behaviour
 
 Satisfies F4.1–F4.5.
 
@@ -318,7 +422,7 @@ into a visible outage.
 
 ---
 
-## 9. Deployment
+## 11. Deployment
 
 Satisfies N2, N3, N4, N5.
 
@@ -369,7 +473,7 @@ a configuration flag, and is priced separately.
 
 ---
 
-## 10. Cost model
+## 12. Cost model
 
 Satisfies O6.
 
@@ -401,7 +505,7 @@ event and measuring, not from the price sheet.
 
 ---
 
-## 11. Sources
+## 13. Sources
 
 | Claim | Source |
 |---|---|
@@ -423,20 +527,28 @@ event and measuring, not from the price sheet.
 | CloudFront flat-rate tiers and allowances | [CloudFront pricing](https://aws.amazon.com/cloudfront/pricing/) |
 | VPC origins; supported regions exclude GovCloud | [Restrict access with VPC origins](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-vpc-origins.html) |
 | CloudFront unavailable in GovCloud | [Setting up CloudFront with GovCloud resources](https://docs.aws.amazon.com/govcloud-us/latest/UserGuide/setting-up-cloudfront.html) |
-| Pre-queue randomization; redirect-and-token integration; Direct Pass fail-open | [How Queue-it Works](https://www.queue-it.com/developers/how-queue-it-works), [What's New August 2025](https://queue-it.com/blog/whats-new-august-2025/) |
+| Pre-queue randomization; redirect-and-token integration; Direct Pass fail-open; connector taxonomy and security tradeoffs | [How Queue-it Works](https://www.queue-it.com/developers/how-queue-it-works), [What's New August 2025](https://queue-it.com/blog/whats-new-august-2025/) |
+| Distributed FIFO, open-window outflow control, no-show compensation, DynamoDB backbone at "a couple hundred thousand TPS", Safety Net, simultaneous scheduled + standby configuration | [Virtual Waiting Room System Design, Smooth Scaling ep. 17](https://queue-it.com/smooth-scaling-podcast/ep017-virtual-waiting-room-architecture/) — Mojtaba Sarooghi, Distinguished Product Architect, Queue-it |
+| Two-credential model: single-use URL token validated once, then a separately-signed per-event session cookie; sliding vs fixed session validity; triggers matched on URL, headers, cookies, user agent; local validation with no backend round-trip | [Queue-it's architecture: the queue token, the cookie, and safety-net mode](https://blog.crawlex.net/blog/queue-it-architecture/) — teardown of Queue-it's open-source connector implementations |
 | FedRAMP cost and timeline | Published 3PAO and FedRAMP advisory pricing, cross-checked across sources |
 | Deprecated solution: 151 resources, 4,866 LOC, 26 VPC/Redis-coupled | Read directly from the archived repository |
 
 ---
 
-## 12. Open questions
+## 14. Open questions
 
 1. Pre-queue randomization algorithm — must be verifiably fair and auditable from a
    recorded seed.
-2. JWKS rotation. The deprecated solution has no rotation story.
-3. Bot Control Common versus Targeted (§10) — resolve by measurement.
-4. Inlet strategy interface: port the deprecated periodic and max-size Lambdas, or expose
-   the API and let clients drive it.
-5. Connector breadth. Queue-it ships 25+ platform connectors; we ship one authorizer.
-   Product scope decision.
-6. Whether to port the OpenID adapter at all — 618 LOC upstream, lowest value.
+2. Signing key rotation. Compromise permits minting admission for every event in the
+   deployment; the deprecated AWS solution has no rotation story.
+3. Session credential format. Whether to follow Queue-it's HMAC-over-concatenation or use a
+   JWT — the security property required is only that it signs different inputs from the
+   admission token.
+4. Standby inflow measurement. Where the threshold is evaluated (authorizer-local versus
+   centrally aggregated) and how quickly activation must occur to be useful.
+5. No-show controller tuning — smoothing window and correction bounds (§5), which need a
+   real event's data.
+6. Bot Control Common versus Targeted (§12) — resolve by measurement.
+7. Connector breadth. Queue-it ships 25+ platform connectors across CDNs and application
+   frameworks; we ship a CloudFront/origin authorizer. Product scope decision.
+8. Whether to port the OpenID adapter at all — 618 LOC upstream, lowest value.

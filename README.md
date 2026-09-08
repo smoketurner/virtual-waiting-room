@@ -33,6 +33,9 @@ This project is a maintained, open-source alternative — rebuilt rather than fo
 | Runtime | Python 3 + Chalice | Rust (arm64) |
 | Infrastructure as code | CloudFormation | Terraform |
 | Scheduled-event handling | live arrival order | pre-queue with randomized assignment |
+| Standby / peak protection | none | dormant year-round, auto-activates on inflow |
+| After admission | token re-checked per request | session credential, separately signed |
+| Admission rate | open-loop | closed-loop, compensates for no-shows |
 | Failure behaviour | undefined | fails open |
 | Maintained | no | yes |
 
