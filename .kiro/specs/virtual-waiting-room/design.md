@@ -1,8 +1,11 @@
 # Design
 
-How the virtual waiting room works. Requirements are in [`REQUIREMENTS.md`](./REQUIREMENTS.md);
-the reasoning behind each choice is in [`adr/`](./adr/). Constraints and their sources are in
-§14.
+How the virtual waiting room works. Requirements are tracked in the Kiro spec's
+`requirements.md`; the reasoning behind each choice is in the repository's `docs/adr/`.
+Constraints and their sources are in §14.
+
+ADR links below are relative from this folder (`.kiro/specs/virtual-waiting-room/`) into the
+repository's `docs/adr/` tree.
 
 ---
 
@@ -13,7 +16,7 @@ A virtual waiting room meters visitors into an origin at a rate the origin can s
 Two operating modes, which may run simultaneously on one origin:
 
 - **Scheduled** — a known start time. Early arrivals are held on a countdown page and
-  assigned randomized positions at the start ([ADR-0001](adr/0001-randomize-pre-queue-assignment.md)).
+  assigned randomized positions at the start ([ADR-0001](../../../docs/adr/0001-randomize-pre-queue-assignment.md)).
 - **Standby** — dormant until measured inflow crosses a threshold, then queues new visitors
   first-in, first-out (FIFO).
 
@@ -165,7 +168,7 @@ under two minutes; scheduled mode exists for events with a known start time.
 A visitor arriving during the pre-queue calls `POST /join`, which follows the same path as a
 live join (§6). The handler claims a per-shard local registration index from a striped atomic
 counter and writes one `PreQueue` item
-([ADR-0015](adr/0015-stripe-prequeue-counter.md)):
+([ADR-0015](../../../docs/adr/0015-stripe-prequeue-counter.md)):
 
 | Attribute | Value |
 |---|---|
@@ -188,12 +191,12 @@ Page views generate no origin requests.
 
 Queue order is a bijection from registration index to queue position, realised as a keyed
 **pseudorandom permutation (PRP)** rather than stored rows
-([ADR-0002](adr/0002-seeded-permutation-not-materialised-shuffle.md)).
+([ADR-0002](../../../docs/adr/0002-seeded-permutation-not-materialised-shuffle.md)).
 
 At T−0 the phase Lambda performs one `UpdateItem` on `Counters`. It reads the 10 shard counts
 (`prequeue_counter#0`–`#9`), computes the prefix offsets `offset[s] = Σ counts[0..s)` and the
 cohort size `N = Σ counts`, and writes them alongside the seed and phase in the same conditional
-write ([ADR-0015](adr/0015-stripe-prequeue-counter.md)):
+write ([ADR-0015](../../../docs/adr/0015-stripe-prequeue-counter.md)):
 
 ```
 UpdateExpression: SET shuffle_seed = :seed, participant_count = :n,
@@ -206,9 +209,8 @@ so there is no interval during which some participants hold positions and others
 
 A participant's **global registration index** is `i = offset[s] + l`, where `s` and `l` are the
 shard and local index in their `PreQueue` item. Because the shards partition the cohort and the
-offsets are a prefix sum, the global indices are exactly the contiguous range `[0, N)` (where
-`N` is the number of indices *issued*; a burned index maps to an unclaimed position, F2.3) —
-the permutation domain is unchanged by striping.
+offsets are a prefix sum, the global indices are exactly the contiguous range `[0, N)` — the
+permutation domain is unchanged by striping.
 
 Position is derived on read:
 
@@ -218,9 +220,10 @@ queue_position = PRP(shuffle_seed, i, participant_count)     // i = offset[s] + 
 
 `/queue_num` reads the visitor's `PreQueue` item for `(s, l)` and the seed, count, and offsets
 from `/status`; it reconstructs `i` with one addition. All three are already being fetched. A
-join that raced the seal can produce `i ≥ participant_count`; `/queue_num` treats that as
-"registered too late" and returns a live-join position behind the whole pre-queue cohort,
-rather than evaluating `PRP` out of domain.
+join that raced the seal can produce `i ≥ participant_count` (a local index claimed after the
+seal counted its shard); `/queue_num` treats that as "registered too late" and returns a
+live-join position behind the whole pre-queue cohort, rather than evaluating `PRP` out of
+domain.
 
 ### 4.3 The permutation
 
@@ -260,11 +263,114 @@ different positions and breaks auditability (§4.4). All multi-byte integers are
   big-endian `u32`, then `& mask`. `F(r, x) = be_u32(HMAC-SHA256(seed, r ‖ x)[0..4]) & mask`.
 - **Split / combine.** `L = v >> b`, `R = v & mask`; one round is `L, R = R, L XOR F(round, R)`;
   recombine `(L << b) | R`.
-- **Cycle-walk.** Re-apply `enc` until the result is `< N`; return it.
+- **Cycle-walk.** Re-apply `enc` until the result is `< N`; return it. Deterministic and
+  seed-independent in structure.
 
-A "determinism across processes" property test pins this encoding with fixed `(seed, i, N)` →
-`position` vectors so any drift in field width, byte order, or the HMAC key/message split fails
-the build.
+The "determinism across processes" property test (design testing steering) pins this encoding
+with fixed `(seed, i, N)` → `position` vectors so any drift in field width, byte order, or the
+HMAC key/message split fails the build.
+
+#### (a) Plain-language: what it actually does
+
+We never store "visitor #457,013 got position 82,655". Instead we store a single random
+number — the **seed** — and define the position as a function computed *on read*:
+
+```
+position = PRP(seed, registration_index, N)
+```
+
+Every read recomputes the position from these three inputs. There is no per-visitor row to
+write. That is the whole point: a **materialised shuffle** shuffles the participant list and
+writes one row per participant — 1,000,000 `PutItem` calls at T−0 — whereas the permutation
+writes the seed **once** (a single conditional `UpdateItem`) and derives every position later
+from arithmetic. One write versus a million writes, for the identical outcome: a fair,
+one-to-one scramble of registration order into queue order.
+
+#### (b) Why a Feistel network is a *guaranteed* bijection
+
+The property we need is that no two registration indices ever map to the same position — a
+**bijection** (one-to-one and onto) over `[0, domain)`. A Feistel network gives this **by
+construction**, for *any* round function `F`, even a bad one.
+
+Split the input into two halves `L` and `R`. One round is:
+
+```
+L, R  =  R,  L XOR F(round, R)
+```
+
+To see it is invertible, run it backwards. Given the output `(L', R') = (R, L XOR F(round, R))`:
+
+```
+R  = L'                          // the old R is just the new left half
+L  = R' XOR F(round, L')         // recover the old L: F(round, R) is recomputable from L'
+```
+
+Every round is individually reversible regardless of what `F` is, because XOR is its own
+inverse and `F` is applied to a value (`R`) that survives unchanged into the next round. A
+sequence of reversible steps is reversible, so the whole 4-round network is a bijection.
+**A bijection cannot collide**: distinct indices in, distinct positions out — every visitor
+gets a unique position, and `F` never has to be "good" for this to hold. (`F`'s quality
+governs *uniformity* — how random-looking the scramble is — not *uniqueness*.)
+
+#### (c) Why cycle-walking
+
+A balanced Feistel network only operates on a domain that is a perfect power of two, because
+it splits the bits into two equal halves. So we round the domain **up**:
+
+```
+b       = ceil(bit_length(N-1) / 2)      // bits per half
+domain  = 2^(2b)                          // smallest power of 4 that is >= N
+```
+
+`domain` is almost always larger than `N`, so `enc(v)` — a bijection on `[0, domain)` — can
+return a value in `[N, domain)` that is not a valid queue position. **Cycle-walking** handles
+this: if `enc(v)` lands outside `[0, N)`, encrypt the result again, and repeat until it lands
+inside:
+
+```
+v = enc(v); if v >= N repeat
+```
+
+This still yields a bijection **on `[0, N)`**: `enc` permutes `[0, domain)`, so the out-of-range
+values form their own cycles that eventually re-enter `[0, N)`, and each in-range input walks to
+exactly one distinct in-range output. Cost is bounded: the expected number of iterations is
+`domain / N`, which — because `domain` is at most 4× `N` (it is a power of *four* ≥ `N`) — is
+**bounded by 4**, and equals **≈ 1.05 at N = 1,000,000**. In practice almost every visitor
+resolves on the first `enc`.
+
+#### (d) A concrete worked micro-example (N = 10)
+
+Take `N = 10`. Then `bit_length(9) = 4`, so `b = 2` and `domain = 2^4 = 16`. The mask is
+`2^b − 1 = 3`, so `L` and `R` are each 2 bits.
+
+- `enc` is a **bijection on `[0, 16)`** — it maps the 16 inputs `0..15` onto the 16 outputs
+  `0..15` with no collisions, by the argument in (b).
+- The 6 inputs whose `enc` lands in `[10, 16)` are the ones that **cycle-walk once more**:
+  their first `enc` is an invalid position, so we re-encrypt and take the next value, which
+  (for N=10, domain=16) is guaranteed to be in `[0, 10)` after at most a couple of steps.
+
+Illustrative index → position values (for *some* seed):
+
+| registration_index | queue_position | note |
+|---|---|---|
+| 0 | 7 | resolved on first `enc` |
+| 1 | 3 | resolved on first `enc` |
+| 2 | 9 | first `enc` = 13 → out of range → cycle-walk once → 9 |
+
+**These numbers are illustrative only.** The real seed is a fresh 256-bit random value, so
+the actual mapping is different every event. What is *not* illustrative is the guarantee:
+
+- **Determinism** — the same `(seed, index, N)` always produces the same position, on every
+  read, from any caller. No coordination, no stored state beyond the seed.
+- **The seed does not exist before T−0.** It is generated and written in the *same*
+  conditional `UpdateItem` that flips `phase` to `active`
+  (`ConditionExpression: attribute_not_exists(shuffle_seed)`), and only *then* published in
+  `/status`. This is the load-bearing property: before T−0 there is nothing to compute a
+  position from, so **no participant can compute their position early or shop for a
+  favourable registration index**. After the event, anyone holding the seed can recompute
+  every position and audit the ordering after the fact.
+
+#### (e) Properties
 
 | Property | Evidence |
 |---|---|
@@ -272,10 +378,6 @@ the build.
 | Uniform | Verified at N=10,000 across 10 deciles: exactly 1,000 each, χ² = 0.0 against a 16.9 critical value at p=0.05, df=9 |
 | Deterministic | Same seed, index and N always yield the same position |
 | Cheap | Expected cycle-walk iterations = `domain / N`, bounded by 4 and equal to 1.05 at N=1,000,000. Four hash-based message authentication code (HMAC) evaluations per iteration |
-
-**The seed does not exist before T−0.** No participant can compute their position early or
-select a favourable registration index. The seed is written at T−0 and published in `/status`
-from that moment.
 
 ### 4.4 Auditability
 
@@ -302,7 +404,7 @@ in §5.2. The permutation applies only to the pre-queue cohort.
 
 `UpdateItem` with `ADD` and `ReturnValues: ALL_NEW` generates the position sequence. Writes
 to a single item are applied serially, so each value is returned exactly once
-([ADR-0003](adr/0003-dynamodb-counters-not-elasticache.md)).
+([ADR-0003](../../../docs/adr/0003-dynamodb-counters-not-elasticache.md)).
 
 ### 5.2 Batch range allocation
 
@@ -351,9 +453,9 @@ A sequence must yield a unique ordered value; summing shards cannot produce one,
 `queue_counter` and `serving_counter` stay single-item. `prequeue_counter` is the exception: the
 permutation needs registration indices only to be **unique and within `[0, N)`**, not to arrive
 in order, so it is striped ×10 for throughput and reassembled into a contiguous range by prefix
-offsets at T−0 ([ADR-0015](adr/0015-stripe-prequeue-counter.md)). Write sharding here is a
-throughput technique, distinct from shuffle sharding, which is an isolation technique
-([ADR-0008](adr/0008-partition-isolation-not-shuffle-sharding.md)).
+offsets at T−0 ([ADR-0015](../../../docs/adr/0015-stripe-prequeue-counter.md)). Write sharding
+here is a throughput technique, distinct from shuffle sharding, which is an isolation technique
+([ADR-0008](../../../docs/adr/0008-partition-isolation-not-shuffle-sharding.md)).
 
 Positions may contain gaps. A retry after a 5xx, or a function dying between the counter
 increment and the position write, burns positions without issuing them. No user observes a
@@ -399,7 +501,7 @@ All tables use on-demand capacity with point-in-time recovery (PITR), and carry
 
 Regional Representational State Transfer (REST) API with an `AWS` service integration to
 Simple Queue Service (SQS) `SendMessage`. No Lambda in the burst path, so no cold start and
-no concurrency ceiling at ingest ([ADR-0005](adr/0005-rest-api-not-http-api.md)).
+no concurrency ceiling at ingest ([ADR-0005](../../../docs/adr/0005-rest-api-not-http-api.md)).
 
 | Limit | Value | Effect here |
 |---|---|---|
@@ -465,7 +567,7 @@ size.
 **Position expiry.** Each interval the controller queries positions whose `expires_at` has
 passed with `status = issued`, marks them expired, and advances `max_expired_position`.
 DynamoDB TTL is enabled on `Positions` for post-event storage reclamation only, never as the
-expiry mechanism ([ADR-0006](adr/0006-controller-driven-expiry-not-ttl.md)). Reads that could
+expiry mechanism ([ADR-0006](../../../docs/adr/0006-controller-driven-expiry-not-ttl.md)). Reads that could
 observe a TTL-pending item apply a `FilterExpression` on `expires_at`.
 
 ---
@@ -493,7 +595,7 @@ observe a TTL-pending item apply a `FilterExpression` on `expires_at`.
 
 Minimum TTL must exceed zero and polled behaviours must forward no cookies, or CloudFront
 disables request collapsing and every poll reaches the origin
-([ADR-0013](adr/0013-cache-behaviour-separation.md)). `stale-while-revalidate` on `/status`
+([ADR-0013](../../../docs/adr/0013-cache-behaviour-separation.md)). `stale-while-revalidate` on `/status`
 serves the previous value if the origin is slow.
 
 ### Admin endpoints (SigV4)
@@ -514,7 +616,7 @@ requires a console.
 ### Credentials
 
 Two artifacts, signed with the same key over different inputs so neither can be replayed as
-the other ([ADR-0011](adr/0011-session-cookie-after-token.md)):
+the other ([ADR-0011](../../../docs/adr/0011-session-cookie-after-token.md)):
 
 - **Admission token** — carries event id, queue id, and expiry. Travels on the URL,
   short-lived, validated once.
@@ -540,7 +642,7 @@ still time to modify a client and rejoin.
 2. **Autonomous System Number (ASN) matching** — scalper infrastructure concentrates in a
    small number of hosting ASNs.
 3. **Anti-distributed-denial-of-service (anti-DDoS) managed rule group** — Count mode by
-   default ([ADR-0012](adr/0012-anti-ddos-count-mode.md)).
+   default ([ADR-0012](../../../docs/adr/0012-anti-ddos-count-mode.md)).
 
 There is no public API key. A key on a page served to browsers ships in client-side
 JavaScript; WAF rate-based rules do that job properly.
@@ -568,11 +670,105 @@ the measured admission rate, so it tracks operator rate changes during an event.
 
 ---
 
+## Admin web interface (Cloudscape-styled Axum Lambda)
+
+The operator surface in §9 is API-first (SigV4 admin REST + `/metrics` JSON). Stakeholders
+also want a browser dashboard an operator can drive during an event without wiring up client
+tooling. This section captures the accepted **Option A** decision for that dashboard
+([ADR-0014](../../../docs/adr/0014-admin-ui-askama-cloudscape-tokens.md)).
+
+### The Cloudscape constraint
+
+Cloudscape is AWS's design system, but its **components are React-only** — there is no
+first-party server-rendered HTML component library. So Option A adopts Cloudscape's **design
+tokens**, not its components.
+
+Even the token package cannot be depended on at runtime. `@cloudscape-design/design-tokens`
+ships Sass/JS variables and is documented to "only be used together with the components
+package" — it presupposes a React/Cloudscape runtime. We therefore **do not depend on it at
+runtime at all**. Instead, at **build time**, we extract the token *values* from Cloudscape's
+blessed JSON artifact `index-visual-refresh.json` (Cloudscape explicitly supports processing
+this JSON through `style-dictionary`) and emit a plain CSS custom-properties stylesheet:
+
+```
+:root {
+  --color-background-container-content: …;
+  --color-text-body-default: …;
+  --border-radius-container: …;
+  /* … extracted token values, no Sass, no JS, no React … */
+}
+```
+
+That stylesheet is **vendored into the Lambda**. The runtime is React-free and
+dependency-free: the visual identity is Cloudscape, delivered as static CSS variables.
+
+### Architecture
+
+One Rust Lambda (`arm64`, `provided.al2023`) behind the admin API — **same SigV4 auth as the
+existing `/admin/*` paths**, no new credential model. An Axum router handles requests;
+`askama` compile-time templates render **semantic HTML laid out to Cloudscape conventions**:
+top navigation, side navigation, containers/cards, tables, form controls, and status
+indicators. The extracted token CSS is served as a static asset (or inlined into the
+document head).
+
+Interactivity is deliberately minimal and requires no client framework:
+
+- Plain HTML `<form>` elements **POST to the same admin actions** the REST API already
+  exposes.
+- A tiny **vanilla-JS poller** refreshes metrics within the 60 s freshness window.
+- **No client React, no bundler in the request path.**
+
+This Lambda is a **thin server-rendered client over the same admin Lambda logic** — it reuses
+the existing handlers rather than reimplementing them. SigV4 is unchanged.
+
+### Flow
+
+```
+  Operator browser
+        │  SigV4 on every request
+        ▼
+  CloudFront (or direct)
+        │
+        ▼
+  Admin Lambda (Axum + askama, arm64)
+        │  reuses existing admin handlers
+        ▼
+  DynamoDB Counters
+```
+
+### Routes
+
+| Route | Method | Purpose |
+|---|---|---|
+| `/admin` | GET | Dashboard |
+| `/admin/phase` | GET / POST | View / transition phase; force or clear maintenance mode |
+| `/admin/rate` | GET / POST | View / set target admission rate |
+| `/admin/message` | GET / POST | View / publish operator message to waiting visitors |
+| `/admin/reset` | GET / POST | View / reset event state |
+| `/admin/rules` | GET / POST | View / update protection rules |
+| `/admin/metrics` | GET | Metrics rendered as HTML over the existing `/metrics` JSON |
+
+The `POST` targets match the existing admin REST API paths (§8), so the web UI is a rendering
+layer over the identical actions.
+
+### Tradeoff (accepted)
+
+We **hand-author the markup** that Cloudscape-React would otherwise give us as components. We
+accept this to keep the dashboard a **single React-free Rust Lambda**: it stays within N1
+(idle cost — one arm64 Lambda, zero standing cost) and N6 (deployment size / read in one
+sitting — no `node_modules`, no bundler, no React runtime to audit). The cost is manual
+markup discipline against Cloudscape conventions; the benefit is a dependency-free,
+self-contained operator UI that reuses the admin logic verbatim.
+
+This section is **additive to F5.5** (API-first operator surface) and satisfies **F7.1–F7.6**.
+
+---
+
 ## 10. Failure behaviour
 
 If the waiting room API is unreachable, the authorizer admits the visitor with a time-limited
 bypass cookie while the client retries in the background
-([ADR-0009](adr/0009-fail-open.md)). Configurable to fail closed per client.
+([ADR-0009](../../../docs/adr/0009-fail-open.md)). Configurable to fail closed per client.
 
 API Gateway's account throttle is a token bucket: tokens refill at the requests per second
 (RPS) quota, the bucket holds at most 5,000. Steady-state capacity comes from the refill
@@ -590,7 +786,7 @@ outage.
 ## 11. Deployment
 
 Single-tenant, deployed into the client's own AWS account
-([ADR-0007](adr/0007-single-tenant-deployment.md)). No component runs anywhere else.
+([ADR-0007](../../../docs/adr/0007-single-tenant-deployment.md)). No component runs anywhere else.
 
 **No virtual private cloud (VPC).** DynamoDB, SQS, Secrets Manager, EventBridge and Lambda
 are all Identity and Access Management (IAM) authenticated public-endpoint services, reached
@@ -603,7 +799,7 @@ with CloudFront as the sole ingress. VPC origins forbid Lambda@Edge origin trigg
 an internet gateway present but unused, and do not evaluate inbound network ACLs.
 
 **Event isolation.** Each event gets its own SQS queue and its own Lambda function with
-reserved concurrency ([ADR-0008](adr/0008-partition-isolation-not-shuffle-sharding.md)).
+reserved concurrency ([ADR-0008](../../../docs/adr/0008-partition-isolation-not-shuffle-sharding.md)).
 Without reserved concurrency, functions draw from the shared account pool and a runaway event
 starves the others.
 
@@ -639,13 +835,13 @@ Control charges together.
 
 Two choices are computed per client rather than assumed: CloudFront flat-rate versus
 pay-as-you-go (PAYG) pricing, and Bot Control Common versus Targeted. Both are recorded as
-open in [`adr/README.md`](adr/README.md).
+open in the repository's `docs/adr/README.md`.
 
 ---
 
 ## 13. Requirement coverage
 
-Which section implements which requirement from [`REQUIREMENTS.md`](./REQUIREMENTS.md).
+Which section implements which requirement from the Kiro spec's `requirements.md`.
 
 | Requirement | Section |
 |---|---|
@@ -671,13 +867,14 @@ Which section implements which requirement from [`REQUIREMENTS.md`](./REQUIREMEN
 | F5.1, F5.2, F5.3, F5.4, F5.5 — metrics, branding, messaging, wait estimate, API-first | §9 |
 | F6.1, F6.2 — entry gating on a client-signed identifier | §8 |
 | F6.3 — deferred bot enforcement | §8 |
+| F7.1, F7.2, F7.3, F7.4, F7.5, F7.6 — operator web dashboard | Admin web interface (Cloudscape-styled Axum Lambda) |
 | C1, C2 — pre-queue scale, atomic assignment | §4.2 |
 | C3 — live-join throughput | §5.3 |
 | C4 — polling load independent of visitor count | §8 |
 | C5 — burst absorbed without dropping joins | §2.2, §6 |
-| N1, N2, N3 — idle cost, client account, no shared infrastructure | §11 |
+| N1, N2, N3 — idle cost, client account, no shared infrastructure | §11, Admin web interface |
 | N4 — commercial and GovCloud | §11 |
-| N5, N6 — Terraform, deployment size | §11 |
+| N5, N6 — Terraform, deployment size | §11, Admin web interface |
 | N7 — edge bot mitigation | §8 |
 | N8 — OpenAPI specification | §8 |
 | N9 — event isolation | §11 |
@@ -719,6 +916,8 @@ Which section implements which requirement from [`REQUIREMENTS.md`](./REQUIREMEN
 | WAF pricing: $5 access control list (ACL), $1 rule, $0.60/M; Bot Control $10/mo + $1/M or $10/M | [AWS WAF pricing](https://aws.amazon.com/waf/pricing) |
 | CloudFront flat-rate tiers and allowances | [CloudFront pricing](https://aws.amazon.com/cloudfront/pricing/) |
 | Small-domain FPE: Feistel construction, cycle-walking, domain size | [NIST SP 800-38G Rev. 1](https://csrc.nist.gov/pubs/sp/800/38/g/r1/2pd) |
+| Cloudscape components are React-only; no server-rendered HTML component library | [Cloudscape components](https://cloudscape.design/components/) |
+| `@cloudscape-design/design-tokens` ships Sass/JS vars, usable "only together with the components package"; token values available via `index-visual-refresh.json` processed by style-dictionary | [Cloudscape design tokens](https://cloudscape.design/foundation/visual-foundation/design-tokens/) |
 | Pre-queue randomization; FIFO for safety-net; redirect-and-token model; Direct Pass fail-open | [How Queue-it Works](https://www.queue-it.com/developers/how-queue-it-works), [Queue-it virtual waiting room](https://queue-it.com/virtual-waiting-room) |
 | Distributed FIFO, open-window outflow control, no-show compensation, DynamoDB backbone | [Smooth Scaling ep. 17](https://queue-it.com/smooth-scaling-podcast/ep017-virtual-waiting-room-architecture/) |
 | Two-credential model; sliding vs fixed session validity; local validation | [Queue-it's architecture](https://blog.crawlex.net/blog/queue-it-architecture/) |
