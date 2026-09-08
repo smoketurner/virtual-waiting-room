@@ -9,33 +9,30 @@ Every quantitative claim is sourced in §14.
 
 ## 1. Approach
 
-A virtual waiting room meters visitors into an origin at a rate it can survive. The hard
-part is not the queue; it is the arrival burst.
+A virtual waiting room meters visitors into an origin at a rate the origin can sustain. The
+difficult part is the arrival burst, not the queue.
 
-**The central design decision is that we do not absorb the burst — we remove the incentive
-that creates it.** If queue position is assigned by arrival order, arriving early is an
-advantage, so everyone arrives in the same second. Randomizing position assignment among
-everyone present at the scheduled start removes that advantage, and with it two orders of
-magnitude of peak load:
+Assigning queue positions in arrival order makes early arrival advantageous, which
+concentrates arrivals into the first seconds after an event opens. Randomizing position
+assignment among all participants present at the scheduled start removes that advantage.
+For a 1M-visitor event:
 
-| Approach | Write rate at T−0 for 1M visitors |
-|---|---|
-| Live arrival order | 200,000–1,000,000/sec |
-| Pre-queue, randomized, assigned over 5 min | 3,333/sec |
+| Assignment method | Write rate at T−0 | Against a 40,000 WRU/s table quota |
+|---|---|---|
+| Arrival order, 1M arriving over 1–5 s | 200,000–1,000,000/s | 5–25× over, after a quota increase |
+| Pre-queue, randomized, written over 5 min | 3,333/s | 8% of the default quota |
 
-The second fits inside default AWS quotas. The first does not fit inside raised ones. This
-follows Queue-it's published design, which randomizes pre-queue visitors "like a raffle" to
-neutralize "any advantage to arriving early."
+Queue-it applies the same approach, describing pre-queue visitors as randomized "like a
+raffle" at the start time to neutralize "any advantage to arriving early."
 
-Everything else follows from three further rules:
+Three further constraints shape the rest of the design:
 
-1. **Gaps are free; duplicates are not.** A skipped position is invisible to users. Two
-   users holding position 40,001 is a correctness failure. This asymmetry permits the
-   cheapest correct counter implementation.
-2. **No compute in the ingest path.** The burst reaches a service integration, not a
-   function. Cold starts and concurrency limits must not exist at the front door.
-3. **Fail open.** A waiting room that fails closed converts our outage into the client's
-   outage — worse than having no waiting room.
+1. **Gaps are acceptable; duplicates are not.** A skipped position is not observable by
+   users. Two visitors holding position 40,001 is a correctness failure. This asymmetry
+   permits an atomic counter rather than transactions (§6).
+2. **No compute in the ingest path.** Arrivals reach an API Gateway service integration, not
+   a Lambda function, so cold starts and concurrency limits do not apply at ingest (§7).
+3. **Fail open.** If the waiting room is unavailable, visitors proceed to the origin (§11).
 
 ---
 
@@ -54,7 +51,7 @@ Everything else follows from three further rules:
   T−0           EventBridge → assign_positions_batch (Rust)
                   ├─ shuffle participant set with a recorded seed
                   ├─ single UpdateItem ADD claims the whole range
-                  └─ paced BatchWriteItem into Positions
+                  └─ PutItem per position, conditional, rate-limited
                         │
                         ▼
   T+            Visitors poll /queue_num → position assigned
@@ -71,19 +68,19 @@ Everything else follows from three further rules:
     request validator rejects malformed bodies
     type: aws → SQS SendMessage          ← no Lambda in the burst path
         │
-  SQS standard + DLQ                      ← the shock absorber
+  SQS standard + DLQ                       (absorbs arrival burst)
         │ BatchSize 100 / window 1s
   assign_position (Rust, arm64)
-    partition valid/invalid → ADD :valid_count → BatchWriteItem
+    partition valid/invalid → ADD :valid_count → conditional PutItem per record
         │
   DynamoDB  Counters · Positions · Tokens   (on-demand, pre-warmed)
 ```
 
 ### 2.3 Admission and session
 
-Admission is a two-credential design, following Queue-it's published model. The admission
-token proves the visitor cleared the line; the session cookie proves they already did so on
-a previous request.
+Two credentials. The admission token proves the visitor reached the front of the queue; the
+session cookie proves the token was already validated on an earlier request. Queue-it uses
+the same split.
 
 ```
   Outflow controller increments serving_counter
@@ -103,11 +100,15 @@ a previous request.
   Origin — private subnet behind a CloudFront VPC origin (commercial regions)
 ```
 
-**Why the session cookie is mandatory, not an optimization.** The admission token travels
-on the URL. The URL changes the moment the visitor clicks anything. Without a session, the
-visitor loses their credential on their second page view and is bounced back to the queue —
-a correctness failure, not a performance one. The connector validates the token once, mints
-the cookie, and strips the token from the URL.
+**The session is required for correctness, not performance.** The admission token is
+carried as a URL query parameter. The URL changes on the visitor's next navigation, so
+without a session the credential is lost on the second page view and the visitor is
+re-queued. The authorizer validates the token once, sets the session cookie, and strips the
+token from the URL before forwarding to the origin.
+
+Queue-it implements this with a `queueittoken` URL parameter and a
+`QueueITAccepted-SDFrts345E-V3_{eventId}` cookie, the latter signed over a different
+concatenation than the token so neither can be replayed as the other.
 
 The two credentials are signed over **different inputs** so neither can be replayed as the
 other.
@@ -139,13 +140,11 @@ Three of the four phases serve a **static, operator-authored page from CDN cache
 when nothing is happening, and why the phases that appear to be "nothing" are cheap to
 support.
 
-The idle and post-event pages are not decoration. They are where an operator tells visitors
-what is coming, that stock is available, or where to go next when it has sold out — the
-communication that determines whether a queue feels fair or feels broken.
+The idle and post-event pages carry operator communication: what is coming, whether stock
+remains, where to go once an event has ended.
 
 **Maintenance mode** parks every visitor on an operator page regardless of phase or
-capacity. Given the state machine it is nearly free to implement, and it is the control an
-operator reaches for when something has gone wrong downstream.
+capacity. It is a phase override, used when a downstream system is unavailable.
 
 ### 3.2 How the lifecycle is implemented
 
@@ -171,37 +170,59 @@ active. §4.
 until measured inflow crosses a threshold, at which point new visitors are queued **FIFO**.
 Insurance against unplanned spikes: a social post, a news mention, an unannounced restock.
 
-**Fairness differs by mode, deliberately.** Scheduled events randomize because everyone
-knows the start time, so arrival order measures connection speed rather than intent.
-Standby activation is FIFO because the spike was unplanned and nobody was waiting for a
-starting gun. This is Queue-it's model and the reasoning holds independently.
+**Fairness differs by mode.** Scheduled events randomize: the start time is published, so
+arrival order measures connection latency rather than intent. Standby activation is FIFO:
+the spike is unplanned, so arrival order carries information. Queue-it applies the same
+split.
 
-Both modes run simultaneously on one origin. The configuration Queue-it's architect cites
-from a real customer: a scheduled room with a deliberately low admission rate on the
-high-demand path, plus standby across the whole site to catch visitors who flood the
-homepage instead of the product page.
+Both modes run simultaneously on one origin. Queue-it's architect describes a customer
+configuration of this shape: a scheduled room with a low outflow limit on a specific product
+path, plus site-wide standby for visitors who arrive at the homepage instead.
 
 **Protection rules** declare which requests are subject to queueing, matching on path,
 header, cookie, or user agent, distributed to the authorizer and evaluated locally.
 Unmatched requests are never queued, in any phase or mode. Because rules can match headers
 and user agent, they double as coarse anti-automation; WAF (§9) does the actual scoring.
 
-### 3.4 How standby is implemented
+### 3.4 Standby activation
 
-Standby needs an inflow measurement that does not itself become load, and an activation
-decision that reaches the authorizer quickly.
+Standby requires an inflow measurement that does not itself become load under the traffic it
+is measuring.
 
-| Concern | AWS mechanism |
+**Measurement.** CloudFront publishes a `Requests` metric per distribution to CloudWatch in
+`us-east-1`, in the `AWS/CloudFront` namespace, at **1-minute granularity**. Default
+CloudFront metrics carry no additional charge and do not count against CloudWatch quotas
+([CloudFront monitoring](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/monitoring-using-cloudwatch.html)).
+
+The alternative — counting requests in our own code — would place a write on the hot path at
+exactly the moment traffic spikes. CloudFront already counts every request; using its metric
+costs nothing and cannot be a bottleneck.
+
+**The 1-minute granularity is a real constraint, and it bounds what standby can promise.**
+
+| Step | Latency |
 |---|---|
-| Inflow measurement | CloudFront standard logs already count requests per behaviour. A CloudWatch metric math alarm on request rate is the trigger — no counting in our own code, no per-request write. |
-| Activation decision | The alarm targets EventBridge, which invokes the phase Lambda to flip the event to `ACTIVE`. |
-| Reaching the authorizer | The authorizer reads phase from the same `/status` payload it already fetches, cached 5 seconds. Activation therefore propagates in one cache TTL. |
-| Deactivation | A second alarm on sustained low inflow, with a longer evaluation period so the queue does not flap. |
-| Manual override | Admin API sets a forced phase that suppresses both alarms. |
+| Metric publication | up to 60 s |
+| Alarm evaluation (1 period) | up to 60 s |
+| `/status` cache TTL | up to 5 s |
+| **Total worst case** | **~125 s** |
 
-Using CloudFront's own request metrics rather than counting requests ourselves is the point:
-the measurement is free, already aggregated, and cannot become a bottleneck at exactly the
-moment traffic spikes.
+Standby therefore protects against a spike that persists for minutes — a social post, a
+news mention, a marketing send. It does not protect against a spike that arrives and
+saturates the origin in under two minutes. Scheduled mode exists for events with a known
+start time precisely because standby cannot react fast enough for them.
+
+| Concern | Mechanism |
+|---|---|
+| Inflow measurement | CloudWatch alarm on `AWS/CloudFront` `Requests`, `Sum` statistic, 60 s period, in `us-east-1` |
+| Activation | Alarm state change to `ALARM` → EventBridge rule → phase Lambda sets `ACTIVE` |
+| Propagation to the authorizer | Authorizer reads phase from `/status`, cached 5 s |
+| Deactivation | Second alarm on sustained low `Requests`, longer evaluation period so the queue does not flap |
+| Manual override | Admin API sets a forced phase that suppresses both alarms |
+
+Queue-it describes the same feature as Safety Net: "if traffic inflow exceeds the thresholds
+you configure, only then will the online queue activate." Their FAQ frames the choice as
+"Always Visible" versus "Visible at Peak," which maps to our scheduled and standby modes.
 
 ---
 
@@ -209,29 +230,89 @@ moment traffic spikes.
 
 Satisfies F1.1–F1.5, C1, C2.
 
-**Countdown page.** Static HTML and JavaScript served from CloudFront with a long TTL.
-Visitor count does not generate origin load (F1.2). The page polls a single globally-cached
-`/status` endpoint for the transition to open.
+### 4.1 Registration
 
-**Registration.** A visitor arriving during the pre-queue registers a UUIDv7 into a
-pre-queue set. This is one write per visitor, spread across the entire pre-queue window
-(typically minutes to hours), not concentrated at T−0.
+A visitor arriving during the pre-queue writes one item to `PreQueue`, keyed on a
+client-generated UUIDv7. Writes are spread across the pre-queue window, typically minutes
+to hours, so the rate is a fraction of the arrival rate at T−0 under arrival-order
+assignment.
 
-**Assignment at T−0.** An EventBridge schedule triggers a Rust function that:
+The countdown page itself is static HTML and JavaScript in S3 behind CloudFront. It polls
+`/status`, which is cached globally for 5 seconds, so page views generate no origin
+requests (F1.2).
 
-1. Reads the participant set.
-2. Shuffles it using a seed recorded to the `Counters` item, making the result reproducible
-   and auditable (F1.5).
-3. Claims the full position range with one `UpdateItem ADD :n`.
-4. Writes positions with paced `BatchWriteItem`, rate-limited to the configured window
-   (F1.4).
+### 4.2 Assignment at T−0
 
-Because the write rate is scheduled rather than driven by arrivals, it is a parameter we
-choose rather than a burst we survive.
+EventBridge Scheduler invokes a Rust function that:
 
-**Fairness.** Randomization is the fairness model for scheduled events: everyone present at
-T−0 has equal probability of any position, regardless of connection speed or geography.
+1. Records a random seed to the `Counters` item.
+2. Claims the full position range with one `UpdateItem` using `ADD queue_counter :n`,
+   `ReturnValues: ALL_NEW`.
+3. Scans `PreQueue`, shuffles with a PRNG seeded from step 1, and writes positions.
+
+The seed makes the assignment reproducible: given the participant set and the seed, the
+mapping can be recomputed and audited (F1.5).
+
+### 4.3 Why the position write is `PutItem`, not `BatchWriteItem`
+
+`BatchWriteItem` is the obvious choice for bulk writes and is wrong here.
+
+| Constraint | Value | Consequence |
+|---|---|---|
+| Items per call | 25 | 1M positions = 40,000 calls |
+| Conditional expressions | **Not supported** | Cannot enforce `attribute_not_exists(request_id)` |
+| Write capacity | Billed per item, not per call | No WCU saving over `PutItem` |
+| Partial failure | `UnprocessedItems` returned; caller must retry with backoff | Retry logic is required either way |
+
+From the [API reference](https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_BatchWriteItem.html):
+"you cannot specify conditions on individual put and delete requests."
+
+F2.5 requires that a repeated write for the same `request_id` does not consume a second
+position. That is a conditional write. `BatchWriteItem` cannot express it, and it saves no
+capacity — a batched put costs the same WCU as an individual one. The only thing it reduces
+is HTTP request count.
+
+The design therefore uses `PutItem` with `ConditionExpression: attribute_not_exists(request_id)`,
+issued concurrently.
+
+### 4.4 Assignment throughput
+
+Item size is approximately 300 bytes (`request_id`, `event_id`, `queue_position`,
+`entry_time`, `status`), so each write costs 1 WCU.
+
+| Window | Write rate | Concurrent writes in flight at 8 ms p99 |
+|---|---|---|
+| 1 min | 16,667/s | ~133 |
+| 5 min | 3,333/s | ~27 |
+| 15 min | 1,111/s | ~9 |
+
+Concurrent writes in flight is not Lambda concurrency. One function instance holds many
+outstanding futures; 3,333 writes/sec at 8 ms is 27 in flight, which a single instance
+sustains.
+
+Three constraints bound the window:
+
+- **Lambda timeout is 900 seconds** ([Lambda quotas](https://docs.aws.amazon.com/lambda/latest/dg/gettingstarted-limits.html)).
+  A single invocation cannot cover a window longer than 15 minutes.
+- **`Positions` table write quota is 40,000 WRU/s by default**, adjustable. A window under
+  25 seconds for 1M positions would exceed it.
+- **Cold-table capacity is ~4,000 writes/s** without pre-warming (§6.4).
+
+For windows beyond 900 seconds, or to remove the single point of failure, the function
+writes a checkpoint to `Counters` and re-invokes itself via EventBridge. Default window is
+5 minutes, which requires 3,333 writes/s — under the default table quota with pre-warming
+and inside one invocation.
+
+### 4.5 Fairness
+
+Randomization is the fairness model for scheduled events: every participant present at T−0
+has equal probability of any position, independent of connection speed or geography.
 First-come-first-served applies to live joins after opening (F2.1).
+
+Queue-it uses the same split. Their documentation describes randomizing pre-queue visitors
+"like a raffle" when the timer reaches zero, and their FAQ states that safety-net activation
+operates as a FIFO queue. Their stated rationale is that randomization "prevents speedy bots
+from getting an unfair advantage."
 
 ---
 
@@ -246,8 +327,8 @@ visitors at that rate. Naively this is "increment `serving_counter` by 500 each 
 click through: they switched tabs, closed the browser, or gave up. Releasing exactly 500
 positions delivers materially fewer than 500 real arrivals, so the origin runs below the
 capacity the client is paying to use, and everyone still waiting waits longer than
-necessary. Queue-it's architect names this as one of the genuinely hard parts of the
-problem.
+necessary. Queue-it's architect identifies no-shows as a primary difficulty in outflow
+control.
 
 The fix is a closed loop. `/update_session` already reports completions and abandonments;
 those figures feed back into the release rate:
@@ -402,11 +483,10 @@ Satisfies F3.1, F5.5, C4.
 | `/join` | none | — | Join the queue or pre-queue; client-supplied UUIDv7 |
 | `/generate_token` | none | — | Exchange a served position for an admission token |
 
-**`/status` is deliberately one endpoint, not four.** Every waiting visitor polls it, so
-collapsing phase, serving position, rate and operator message into a single globally-cached
-payload means one CloudFront request per visitor per interval instead of several. Since the
-poll interval is the dominant cost variable in the system (§13), the shape of this endpoint
-is a cost decision as much as an API decision.
+**`/status` combines four values into one endpoint.** Every waiting visitor polls it. Phase,
+serving position, admission rate and operator message in one globally-cached payload costs
+one CloudFront request per visitor per interval instead of four. At 1M visitors polling every
+10 seconds for 20 minutes, that is 120M requests rather than 480M.
 
 A position never changes once assigned, so `/queue_num` is cached per visitor for a day. The
 5-second global cache on `/status` collapses a million pollers into one origin fetch per
@@ -452,24 +532,21 @@ material.
 The authorizer holds keys and protection rules in memory, so every decision is local with no
 backend round-trip (§2.3).
 
-**Gating queue entry on a client-issued identifier.** The strongest anti-bot lever available
-is refusing entry to anyone the client cannot vouch for. The client signs an identifier it
-already holds — a membership number, promo code, order reference — with a shared key, and
-the waiting room verifies the signature at join time (F6.1, F6.2). The waiting room stores
-none of that data and cannot mint identifiers itself.
+**Entry gating on a client-issued identifier.** The client signs an identifier it already
+holds — membership number, promo code, order reference — with a shared key. The waiting room
+verifies the signature at join time and stores nothing (F6.1, F6.2).
 
-This inverts the usual bot problem. Instead of trying to detect automation from request
-signatures, the queue admits only visitors the client has already established a
-relationship with. Queue-it ships this as their Queue Token SDK, and their published
-customer results — a Japanese gaming company keeping out 225,000 bots and non-members
-during an invite-only drop — reflect the difference between detecting bots and never
-letting them in.
+This changes the problem from detecting automation to verifying a prior relationship.
+Queue-it ships this as the Queue Token SDK, with implementations in Java, .NET, Ruby and
+JavaScript. Their documented use case: "when running a members-only ticketing sale, the
+venue could require members to enter their membership ID to get a spot in the waiting room."
+One published customer result is a gaming company excluding 225,000 bots and non-members
+from an invite-only drop.
 
-**Timing of enforcement.** Where an operator can identify likely bots during the pre-queue,
-they may choose to admit them to the pre-queue and block at randomization rather than at
-arrival (F6.3). Blocking early reveals the detection and gives operators of automated
-clients time to retool and rejoin before the sale starts. Queue-it sells this as Hype Event
-Protection; for us it is a configuration choice that costs nothing to support.
+**Enforcement timing.** Blocking a detected bot on arrival reveals the detection while
+there is still time to modify the client and rejoin. Deferring the block to randomization
+removes that window (F6.3). Queue-it sells this as Hype Event Protection, describing it as
+blocking bots "only at the sale start—after genuine visitors have secured their spots."
 
 **WAF, three layers:**
 
@@ -501,29 +578,24 @@ bill. See §10.
 
 Satisfies F5.1–F5.5.
 
-An event that cannot be observed and adjusted while it runs is not usable in production.
-Queue-it sells traffic intelligence and custom themes as separate products; both are table
-stakes.
+Queue-it sells traffic intelligence and custom themes as separate products. Both are
+required to operate an event.
 
 | Capability | AWS mechanism |
 |---|---|
 | Live metrics | Lambdas emit EMF-formatted logs; CloudWatch derives inflow, outflow, queue depth, admitted, no-show rate, expiry rate without a separate metrics pipeline. A dashboard ships with the module. |
 | Metrics for the client's own tooling | `/metrics`, a cached JSON endpoint reading the same `Counters` item. |
-| Branding | Client HTML, CSS and assets in S3, served through CloudFront. The module ships a reference theme; the client overrides the bucket contents. No fork, no rebuild. |
+| Branding | Client HTML, CSS and assets in S3 behind CloudFront. The module ships a reference theme; the client overrides bucket contents. No fork required. |
 | Operator messaging | A string attribute on the `Counters` item, published through the admin API, delivered in the existing `/status` payload. Zero additional requests. |
 | Position and estimated wait | `/queue_num` returns position; the client computes wait from the measured admission rate in `/status`. Recomputed as the operator changes the rate. |
 | Operator actions | Admin REST API with SigV4, backed by the same Lambdas as the scheduled paths. |
 
-**Two design points worth stating.**
+The operator message is delivered in the `/status` payload the waiting page already polls.
+Broadcasting to 1M waiting visitors costs one `UpdateItem` and zero additional requests;
+delivery completes within one cache TTL.
 
-The operator message rides in the `/status` payload the waiting page already polls every
-five seconds. Broadcasting to a million waiting visitors therefore costs one DynamoDB write
-and no additional requests — the message reaches everyone within a cache TTL. This is the
-control that turns an incident into a *communicated* incident.
-
-Estimated wait is derived from the measured admission rate, not a static assumption, so it
-degrades gracefully when the operator changes the rate mid-event rather than showing a
-number that has quietly become fiction.
+Estimated wait is computed from the measured admission rate rather than a configured
+constant, so it tracks operator rate changes during an event.
 
 **API-first.** Every operator action — rate change, phase transition, reset, pause,
 maintenance mode, message publish — is an API call. There is no console, and no action that
@@ -572,12 +644,11 @@ IAM-authenticated public-endpoint services. Functions outside a VPC reach them o
 network with no NAT gateway and no VPC endpoints. Nothing in this design needs private
 networking, so nothing pays for it.
 
-This is worth stating explicitly because the obvious alternative — a Redis or Memcached tier
-for the counters — forces the opposite. A cache tier requires VPC attachment, which forces
-every function that touches a counter into private subnets, which then needs VPC endpoints
-for every AWS service those functions call, plus a NAT gateway, subnets, route tables and
-flow logs. Choosing DynamoDB for eight integers avoids that entire subtree and roughly
-$330/month of idle cost.
+The alternative is a Redis or Memcached tier for the counters. ElastiCache requires VPC
+attachment, which places every function touching a counter in a private subnet, which then
+requires VPC endpoints for each AWS service those functions call, plus a NAT gateway,
+subnets, route tables and flow logs. Measured cost of that topology in an existing reference
+deployment: 26 additional resources and approximately $330/month idle.
 
 A VPC remains available as an opt-in variable for clients whose ATO boundary mandates
 private-subnet compute regardless of IAM. That is policy, not architecture; the Lambda code
@@ -655,6 +726,12 @@ event and measuring, not from the price sheet.
 | Pre-queue randomization; redirect-and-token integration; Direct Pass fail-open; connector taxonomy and security tradeoffs | [How Queue-it Works](https://www.queue-it.com/developers/how-queue-it-works), [What's New August 2025](https://queue-it.com/blog/whats-new-august-2025/) |
 | Distributed FIFO, open-window outflow control, no-show compensation, DynamoDB backbone at "a couple hundred thousand TPS", Safety Net, simultaneous scheduled + standby configuration | [Virtual Waiting Room System Design, Smooth Scaling ep. 17](https://queue-it.com/smooth-scaling-podcast/ep017-virtual-waiting-room-architecture/) — Mojtaba Sarooghi, Distinguished Product Architect, Queue-it |
 | Two-credential model: single-use URL token validated once, then a separately-signed per-event session cookie; sliding vs fixed session validity; triggers matched on URL, headers, cookies, user agent; local validation with no backend round-trip | [Queue-it's architecture: the queue token, the cookie, and safety-net mode](https://blog.crawlex.net/blog/queue-it-architecture/) — teardown of Queue-it's open-source connector implementations |
+| Queue Token SDK: client-signed identifier gating queue entry; members-only ticketing use case | [Queue-it Connectors](https://queue-it.com/developers/connectors/) |
+| Hype Event Protection: blocking bots at sale start rather than on arrival; 225,000 bots excluded from an invite-only drop | [Queue-it bad bot protection](https://www.queue-it.com/bad-bot-protection) |
+| Safety Net activation on configured inflow threshold; "Always Visible" vs "Visible at Peak"; randomization for scheduled and FIFO for safety-net | [Queue-it virtual waiting room](https://queue-it.com/virtual-waiting-room) |
+| `BatchWriteItem`: 25 items per call, 16 MB per call, no conditional expressions, `UnprocessedItems` partial-failure model | [BatchWriteItem API reference](https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_BatchWriteItem.html) |
+| Lambda timeout 900 s; synchronous invocation payload 6 MB | [Lambda quotas](https://docs.aws.amazon.com/lambda/latest/dg/gettingstarted-limits.html) |
+| CloudFront default metrics: 1-minute granularity, `us-east-1`, no additional charge, do not count against CloudWatch quotas | [Monitor CloudFront metrics with CloudWatch](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/monitoring-using-cloudwatch.html) |
 | FedRAMP cost and timeline | Published 3PAO and FedRAMP advisory pricing, cross-checked across sources |
 | Cost of a Redis/Memcached counter tier: VPC attachment, NAT gateway, VPC endpoints, ~$330/mo idle | Measured from an existing AWS reference deployment of this pattern |
 

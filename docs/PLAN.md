@@ -38,7 +38,9 @@ Throwaway code. Measures what documentation cannot settle.
 - [ ] Operator-authored static page per phase, CDN-cached [F0.2]
 - [ ] Protection rules (path, header, cookie, user agent), evaluated locally at the
       authorizer [F0.6]
-- [ ] **Standby mode**: inflow measurement, threshold activation, manual override
+- [ ] **Standby mode**: CloudWatch alarm on `AWS/CloudFront` `Requests` (60 s period,
+      `us-east-1`) → EventBridge → phase Lambda. Worst-case activation latency ~125 s;
+      document that standby does not protect against sub-2-minute spikes.
       [F0.4, F0.7]
 - [ ] Scheduled and standby coexisting on one origin [F0.3, F0.5]
 
@@ -46,8 +48,11 @@ Throwaway code. Measures what documentation cannot settle.
 - [ ] Static countdown page, CDN-cached, zero origin calls per view [F1.1, F1.2]
 - [ ] Pre-queue registration (identity only, spread across the window) [C1]
 - [ ] `/status` carries phase, so the countdown page polls one globally-cached endpoint
-- [ ] EventBridge-triggered batch assignment: seeded shuffle, recorded seed, paced
-      `BatchWriteItem` within the configured window [F1.3, F1.4, F1.5, C2]
+- [ ] EventBridge-triggered batch assignment: seed recorded to `Counters`, one
+      `UpdateItem ADD` to claim the range, then `PutItem` with
+      `attribute_not_exists(request_id)` per position — **not `BatchWriteItem`, which
+      cannot express conditions** (DESIGN §4.3). Checkpoint and re-invoke for windows
+      beyond the 900 s Lambda timeout. [F1.3, F1.4, F1.5, C2]
 
 ### 1d. Live join
 - [ ] REST API → SQS integration, request validator, DLQ,
