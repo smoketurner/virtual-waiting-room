@@ -292,16 +292,42 @@ The counter is not the constraint after §4.3. In order:
 
 | # | Limit | Default | Adjustable |
 |---|---|---|---|
-| 1 | API Gateway account throttle | 10,000 RPS/region | Yes — Service Quotas, needs lead time |
-| 2 | API Gateway **burst** quota | 5,000 | **No** — set by the service team |
+| 1 | API Gateway account throttle (refill rate) | 10,000 RPS/region | Yes — Service Quotas, needs lead time |
+| 2 | API Gateway burst bucket | 5,000 requests | Not directly — derived from the RPS quota |
 | 3 | Lambda concurrency | 1,000 | Yes |
 | 4 | SQS ESM poller ramp | +300/min → 1,250 max | No |
 | 5 | DynamoDB counter | 100K/sec at defaults | Via `BatchSize` |
 
-Item 2 matters most: an on-sale is pure burst, and that quota cannot be raised. This is
-why **pre-event readiness is a first-class deliverable**, not an afterthought — quota
-increases filed with lead time, provisioned concurrency warmed, load test executed at
-target rate. It is also the work Queue-it's sales engineers perform for enterprise
+### How the throttle actually behaves
+
+API Gateway uses a token bucket. Tokens refill at the account RPS quota and the bucket
+holds at most 5,000. **Steady-state capacity is governed by the refill rate, not the
+bucket size.** The bucket only absorbs instantaneous submissions arriving faster than
+the refill rate can service; when it empties, clients receive `429 Too Many Requests`.
+
+The burst quota is
+[not directly adjustable](https://docs.aws.amazon.com/apigateway/latest/developerguide/limits.html) —
+"determined by the API Gateway service team based on the overall RPS quota for the
+account in the Region." Raising the RPS quota is the only lever that influences it.
+
+**This is a smoothing buffer, not a ceiling on event size.** A 200,000-visitor on-sale
+against a 50,000 RPS quota drains the bucket in the first instant and refills it within
+seconds; a small number of visitors see a 429 at t=0 and succeed on retry. The failure
+mode is a brief burst of retries, not a capped event.
+
+Two consequences, both of which the product must handle explicitly:
+
+1. **Client retry behavior matters as much as the quota.** The waiting-room page must
+   treat a 429 as expected and retry with jittered backoff rather than surfacing an
+   error. A client that fails closed converts a smoothing event into an outage. This is
+   a requirement on the reference implementation, not a nicety.
+2. **File the RPS increase early.** It is the only way to grow the burst bucket, and
+   Service Quotas requests above the default open a support case rather than
+   auto-approving.
+
+This is why **pre-event readiness is a first-class deliverable**, not an afterthought —
+quota increases filed with lead time, provisioned concurrency warmed, load test executed
+at target rate. It is also the work Queue-it's sales engineers perform for enterprise
 accounts, and therefore billable.
 
 ---

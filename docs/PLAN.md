@@ -97,7 +97,10 @@ The part that makes this a service rather than a repo.
       lead time, Lambda concurrency raised, provisioned concurrency warmed, load test
       at target rate, rollback plan. Billable deliverable.
 - [ ] Operator runbook: mid-event rate adjustment, reset, incident response
-- [ ] Waiting-room page reference implementation (position, ETA, auto-advance)
+- [ ] Waiting-room page reference implementation (position, ETA, auto-advance).
+      **Must treat HTTP 429 as expected and retry with jittered backoff** — API
+      Gateway's burst bucket will shed a few requests at t=0 of any large on-sale, and
+      a page that fails closed turns a smoothing event into an outage (DESIGN §8).
 - [ ] Client integration guide: CloudFront/ALB/CDN placement
 - [ ] Cost model per event size
 
