@@ -130,6 +130,7 @@ requires the pre-event preparation in §4: quota increases filed and tables pre-
 | N6 | A full deployment SHOULD be small enough to read and reason about in one sitting. | Target ≤ 80 Terraform-managed resources for the core module. |
 | N7 | Bot and abuse mitigation MUST be present at the edge. | WAF with Bot Control and ASN matching is deployed by default. |
 | N8 | The API MUST be documented as an OpenAPI specification. | Spec published; client and admin surfaces generated from it. |
+| N9 | Concurrent events in one deployment MUST be isolated from each other. | One event driven to its throughput ceiling does not increase queue-join latency or error rate for another event in the same deployment. |
 
 ---
 

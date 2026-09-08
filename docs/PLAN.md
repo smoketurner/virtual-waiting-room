@@ -68,6 +68,10 @@ Throwaway code. Measures what documentation cannot settle.
 - [ ] `BatchSize` / `MaximumBatchingWindowInSeconds` variables, default 100 / 1s
 - [ ] SQS ESM Provisioned Mode as an opt-in variable, default off — mutually exclusive with
       the maximum-concurrency setting
+- [ ] **Per-event partition**: one SQS queue and one Lambda function per event, each with
+      **reserved concurrency** so a runaway event cannot drain the shared account pool.
+      Not shuffle sharding — serverless resources are free at rest, so full partitioning
+      beats partial isolation (DESIGN §12) [N9]
 
 ### 1e. Read path
 - [ ] `/status` (phase, serving position, rate, operator message — one payload),
@@ -166,6 +170,8 @@ The one place where being wrong is unrecoverable in production.
       operator action within the ~125 s worst case; unprotected paths stay unqueued
       [F0.4, F0.6]
 - [ ] Spike arriving in <5s does not drop joins [C5]
+- [ ] **Event isolation**: drive one event to its throughput ceiling and assert a second
+      event in the same deployment sees no change in join latency or error rate [N9]
 
 **Exit:** reproducible report. Demonstrating a million assigned positions is itself the
 primary sales asset.

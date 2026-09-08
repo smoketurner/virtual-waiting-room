@@ -496,7 +496,7 @@ contractual pre-event step, not an optimization.
 
 ### 6.5 Sequences versus statistics
 
-| Counter | Kind | Sharding |
+| Counter | Kind | Write sharding |
 |---|---|---|
 | `queue_counter`, `serving_counter` | sequence | **never** — sharding destroys ordering |
 | `arrivals` | statistic | **sharded ×10** — hot at high admission rates (§5) |
@@ -504,6 +504,13 @@ contractual pre-event step, not an optimization.
 
 A sequence must yield a unique ordered value; summing shards cannot produce one. A statistic
 needs only a total, so shards can be summed on read.
+
+**This is write sharding, not shuffle sharding.** The two are unrelated and the shared word
+invites confusion. Write sharding spreads writes across N keys to escape the 1,000 WCU/s
+single-item limit — a *throughput* technique. [Shuffle
+sharding](https://builder.aws.com/content/3F06NpJ8YeoIGP8VHTw4n81pFn8/workload-isolation-using-shuffle-sharding)
+assigns each tenant a random subset of nodes from a pool so that one tenant's failure reaches
+few others — an *isolation* technique. See §12 for why the latter does not apply here.
 
 ### 6.6 Gap tolerance
 
@@ -826,7 +833,7 @@ into a visible outage.
 
 ## 12. Deployment
 
-Satisfies N1, N2, N3, N4, N5, N6.
+Satisfies N1, N2, N3, N4, N5, N6, N9.
 
 **Single-tenant, in the client's account.** Hosting other organizations' waiting rooms
 would make us a Cloud Service Provider requiring our own FedRAMP authorization
@@ -852,6 +859,46 @@ deployment: 26 additional resources and approximately $330/month idle.
 A VPC remains available as an opt-in variable for clients whose ATO boundary mandates
 private-subnet compute regardless of IAM. That is policy, not architecture; the Lambda code
 is identical either way.
+
+### Isolation between concurrent events
+
+A single deployment may run several events at once — a scheduled room on one path plus
+standby across the site (§3.3), or a client running multiple product drops. Those events
+share Lambda concurrency, table throughput, and one SQS queue, so a single event generating
+disproportionate load can degrade the others.
+
+**Shuffle sharding does not apply.** The technique assigns each tenant a random subset of N
+nodes from a pool of M, so two tenants rarely share every node and one tenant's failure
+reaches few others. It requires three conditions, and this design satisfies none of them:
+
+| Condition | Status here |
+|---|---|
+| Multiple tenants share infrastructure | No — single-tenant, in the client's own account |
+| The operator assigns tenants to nodes | No — DynamoDB, Lambda, SQS and CloudFront each own their own fleets. There is no node pool to assign |
+| Per-tenant dedication is too expensive | No — see below |
+
+The third condition is the decisive one. Shuffle sharding exists to avoid provisioning M
+dedicated resources when M is large and each costs money at rest. Serverless resources cost
+nothing at rest, so **full partitioning is available and strictly better**:
+
+| Approach | Resources for 20 concurrent events | Idle cost | Blast radius |
+|---|---|---|---|
+| Partition: one queue + one function per event | 20 queues, 20 functions | $0 | 1 event |
+| Shuffle shard: M=8 queues, N=2 per event | 8 queues | $0 | ~5 events per node; 1 in 28 event pairs share both nodes |
+
+Partitioning gives complete isolation for the same idle cost. Shuffle sharding gives partial
+isolation and exists only to reduce a resource count that is already free.
+
+**The design therefore isolates by partition:** each event gets its own SQS queue, its own
+Lambda function with reserved concurrency, and its own item in `Counters`. Reserved
+concurrency is what makes this real — without it, functions draw from the shared account
+concurrency pool and a runaway event starves the others regardless of how many functions
+exist.
+
+This holds until table count becomes the constraint: DynamoDB allows 2,500 tables per region
+by default and up to 10,000 on request. Events share tables and are separated by
+`event_id`, so that ceiling is far away. If a deployment ever exceeded it, shuffle sharding
+would become the right answer — and would need revisiting then.
 
 ### GovCloud variant
 
@@ -938,6 +985,8 @@ event and measuring, not from the price sheet.
 | Request collapsing disabled by Min TTL 0 or cookie forwarding; `stale-while-revalidate` | [DDoS resilience with HTTP caching on CloudFront](https://repost.aws/articles/ARTocYphbwQnWtTz8FXrwqew/ddos-resilience-with-http-caching-on-cloudfront) |
 | REST API integration timeout 29 s (hard), request payload 10 MB | [Quotas for configuring and running a REST API](https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-execution-service-limits-table.html) |
 | SQS standard at-least-once delivery, best-effort ordering; `ReportBatchItemFailures`; visibility timeout ≥ 6× function timeout | [Using Lambda with Amazon SQS](https://docs.aws.amazon.com/lambda/latest/dg/with-sqs.html) |
+| Shuffle sharding: random per-tenant node subsets to limit blast radius; requires a node pool the operator assigns | [Workload isolation using shuffle-sharding](https://builder.aws.com/content/3F06NpJ8YeoIGP8VHTw4n81pFn8/workload-isolation-using-shuffle-sharding) — Colm MacCárthaigh, AWS Builders' Library |
+| DynamoDB tables per region: 2,500 default, up to 10,000 on request | [Quotas in DynamoDB](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/ServiceQuotas.html) |
 | Cost of a Redis/Memcached counter tier: VPC attachment, NAT gateway, VPC endpoints, ~$330/mo idle | Measured from an existing AWS reference deployment of this pattern |
 
 ---
