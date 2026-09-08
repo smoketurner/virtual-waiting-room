@@ -241,6 +241,31 @@ PRP(seed, i, N):  v = i
                   loop: v = enc(v); if v < N return v      // cycle-walk
 ```
 
+#### Frozen wire encoding (audit contract)
+
+The permutation is part of the audit contract: a third party must recompute every position
+byte-for-byte. The following encoding is **frozen** — an implementation that deviates produces
+different positions and breaks auditability (§4.4). All multi-byte integers are **big-endian**.
+
+- **Domain.** `b = ceil(bit_length(N - 1) / 2)`; `domain = 2^(2b)`; `mask = 2^b - 1`. Both
+  halves are exactly `b` bits. `N = 1` is a degenerate single-element identity (no rounds run).
+- **Rounds.** Exactly **4** rounds, `round ∈ {0, 1, 2, 3}` in ascending order.
+- **HMAC key.** The 256-bit `shuffle_seed`, used verbatim as the HMAC-SHA256 key. It is the key,
+  never part of the message.
+- **Message `r || x`.** The concatenation of exactly two fixed-width fields, total **5 bytes**:
+  - `r` — the round number as **1 byte** (`0x00`–`0x03`).
+  - `x` — the right half `R` as a **4-byte big-endian `u32`** (zero-padded; `R < 2^b ≤ 2^32`,
+    since `b ≤ 32` for `N ≤ 2^64`).
+- **Output → integer.** Take the **first 4 bytes** of the 32-byte HMAC output, interpret as a
+  big-endian `u32`, then `& mask`. `F(r, x) = be_u32(HMAC-SHA256(seed, r ‖ x)[0..4]) & mask`.
+- **Split / combine.** `L = v >> b`, `R = v & mask`; one round is `L, R = R, L XOR F(round, R)`;
+  recombine `(L << b) | R`.
+- **Cycle-walk.** Re-apply `enc` until the result is `< N`; return it.
+
+A "determinism across processes" property test pins this encoding with fixed `(seed, i, N)` →
+`position` vectors so any drift in field width, byte order, or the HMAC key/message split fails
+the build.
+
 | Property | Evidence |
 |---|---|
 | Bijective | Feistel networks are invertible by construction; cycle-walking preserves this on the restricted domain. Verified: 200,000 samples at N=1,000,000 gave 200,000 distinct positions |

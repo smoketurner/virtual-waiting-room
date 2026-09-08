@@ -21,7 +21,9 @@ visible fairness failure at 1,000,000 people. Tests are the primary evidence.
   - **Bijective** over the full domain for N up to 10⁶ — no two indices map to the same
     position; every position in `[0, N)` is hit exactly once.
   - **Uniform** — chi-square across deciles within the critical value.
-  - **Deterministic** — same `(seed, i, N)` yields the same position across processes.
+  - **Deterministic** — same `(seed, i, N)` yields the same position across processes. Pin the
+    frozen wire encoding (design §4.3) with fixed `(seed, i, N)` → `position` vectors so any
+    drift in field width, byte order, or the HMAC key/message split fails the build.
   - **Seed absence** — no position is computable before the seed is written at T−0.
   - **Contiguous assembly** — across the 10 pre-queue shards, the assembled global index space
     is exactly `[0, N)` with `N` = Σ shard counts.
