@@ -105,12 +105,12 @@ event; authorizer fails open.
 - [ ] `modules/authorizer` — origin authorizer plus optional CloudFront VPC origin
 - [ ] `var.enable_vpc` for ATO-constrained clients — design the seam now, do not retrofit
 - [ ] Flat-rate plan subscription as a variable [O6]
-- [ ] CloudWatch alarms — the useful subset, not all 35 from the deprecated solution
+- [ ] CloudWatch alarms and a shipped dashboard — the metrics an operator acts on, not
+      every metric available
 - [ ] Publish the OpenAPI specification for public and admin surfaces [N8]
 - [ ] `examples/` and generated variable reference
 - [ ] Verify resource count ≤ 80 [N6] and idle monthly cost under $5 [N1]
-- [ ] Confirm no component runs outside the client's account [N3] and the endpoint
-      surface matches the published OpenAPI specification [N8]
+- [ ] Confirm no component runs outside the client's account [N3]
 
 **Exit:** `terraform apply` from a clean account to a working deployment [N2].
 
@@ -187,7 +187,7 @@ Queue-it ships these; we do not yet. Recorded as decisions, not oversights.
 - **Connector breadth.** Queue-it ships 25+ connectors across edge, server-side, native app
   and ecommerce platforms, with a published version and support policy. This is their actual
   moat. We ship a CloudFront/origin authorizer covering CDN-fronted origins.
-- OpenID adapter (618 LOC upstream, lowest value)
+- OpenID identity-provider adapter
 - Hi/Lo leasing and strided sequences — documented escape hatches, unbuilt
 - Multi-region / global tables
 - Additional platform connectors beyond the origin authorizer

@@ -129,7 +129,7 @@ achievable only with the pre-event preparation in §4.
 | N3 | The system MUST NOT require us to operate shared infrastructure on clients' behalf. | No component runs in a Smoke Turner account. |
 | N4 | The system MUST support commercial AWS regions and AWS GovCloud (US). | Both variants deploy and pass functional tests. |
 | N5 | Infrastructure MUST be expressed as Terraform. | No manual console steps in the deployment path. |
-| N6 | The deployed resource count SHOULD be materially lower than the deprecated AWS solution's 151. | Target ≤ 80 resources for the core module. |
+| N6 | A full deployment SHOULD be small enough to read and reason about in one sitting. | Target ≤ 80 Terraform-managed resources for the core module. |
 | N7 | Bot and abuse mitigation MUST be present at the edge. | WAF with Bot Control and ASN matching is deployed by default. |
 | N8 | The API MUST be documented as an OpenAPI specification. | Spec published; client and admin surfaces generated from it. |
 

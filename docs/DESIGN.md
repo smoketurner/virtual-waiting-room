@@ -1,10 +1,9 @@
 # Design
 
-Implementation of [`REQUIREMENTS.md`](./REQUIREMENTS.md). A maintained replacement for
-the deprecated [`aws-solutions/virtual-waiting-room-on-aws`](https://github.com/aws-solutions/virtual-waiting-room-on-aws)
-(archived November 2025), rebuilt in Rust and Terraform.
+Implementation of [`REQUIREMENTS.md`](./REQUIREMENTS.md). An AWS-native virtual waiting
+room, deployed into the operator's own account.
 
-Every quantitative claim is sourced in §11.
+Every quantitative claim is sourced in §14.
 
 ---
 
@@ -483,10 +482,10 @@ Protection; for us it is a configuration choice that costs nothing to support.
    three times longer to settle. Promotion to Block is a per-client decision after
    observing one real event.
 
-**No public API key.** The deprecated solution's public API key ships in client-side
-JavaScript and is trivially extracted; it is a throttling handle, not a control. WAF
-rate-based rules do the job properly. API keys remain available on REST if a client wants a
-revocable handle for a partner integration.
+**No public API key.** A public API key on a page served to browsers ships in client-side
+JavaScript and is trivially extracted, so it is a throttling handle rather than a control.
+WAF rate-based rules do that job properly. API keys remain available on REST if a client
+wants a revocable handle for a partner integration.
 
 **Origin protection.** In commercial regions, CloudFront VPC origins place the origin in a
 private subnet with CloudFront as the sole ingress, making "nobody reaches the origin
@@ -568,23 +567,17 @@ module.
 CloudFront SaaS Manager is tooling for the multi-tenant architecture this rejects. It fits
 one narrow case — a single client running many branded domains — as a later variant.
 
-**What the deprecated solution deployed, and why we do not.** It used ElastiCache Redis for
-eight integer counters. Redis requires VPC attachment, so 12 of its 20 Lambdas ran in a VPC,
-which cost them five VPC endpoints, three subnets, a NAT gateway, an EIP, route tables, and
-flow logs — 26 of 151 resources existing solely to reach eight integers, plus roughly
-$330/month idle.
+**Why there is no VPC.** DynamoDB, SQS, Secrets Manager, EventBridge and Lambda are all
+IAM-authenticated public-endpoint services. Functions outside a VPC reach them over the AWS
+network with no NAT gateway and no VPC endpoints. Nothing in this design needs private
+networking, so nothing pays for it.
 
-DynamoDB, SQS, Secrets Manager, EventBridge and Lambda are IAM-authenticated public-endpoint
-services. Functions outside a VPC reach them with no NAT and no endpoints.
-
-| | Deprecated solution | This design |
-|---|---|---|
-| Counters | ElastiCache Redis, MultiAZ | DynamoDB atomic counters |
-| Networking | VPC, NAT, 5 endpoints, flow logs | none |
-| Resources | 151 | target ≤ 80 |
-| Idle cost | ~$330/mo | ~$0 plus pre-warming |
-| Runtime | Python 3 + Chalice | Rust, `provided.al2023`, arm64 |
-| IaC | CloudFormation | Terraform |
+This is worth stating explicitly because the obvious alternative — a Redis or Memcached tier
+for the counters — forces the opposite. A cache tier requires VPC attachment, which forces
+every function that touches a counter into private subnets, which then needs VPC endpoints
+for every AWS service those functions call, plus a NAT gateway, subnets, route tables and
+flow logs. Choosing DynamoDB for eight integers avoids that entire subtree and roughly
+$330/month of idle cost.
 
 A VPC remains available as an opt-in variable for clients whose ATO boundary mandates
 private-subnet compute regardless of IAM. That is policy, not architecture; the Lambda code
@@ -663,7 +656,7 @@ event and measuring, not from the price sheet.
 | Distributed FIFO, open-window outflow control, no-show compensation, DynamoDB backbone at "a couple hundred thousand TPS", Safety Net, simultaneous scheduled + standby configuration | [Virtual Waiting Room System Design, Smooth Scaling ep. 17](https://queue-it.com/smooth-scaling-podcast/ep017-virtual-waiting-room-architecture/) — Mojtaba Sarooghi, Distinguished Product Architect, Queue-it |
 | Two-credential model: single-use URL token validated once, then a separately-signed per-event session cookie; sliding vs fixed session validity; triggers matched on URL, headers, cookies, user agent; local validation with no backend round-trip | [Queue-it's architecture: the queue token, the cookie, and safety-net mode](https://blog.crawlex.net/blog/queue-it-architecture/) — teardown of Queue-it's open-source connector implementations |
 | FedRAMP cost and timeline | Published 3PAO and FedRAMP advisory pricing, cross-checked across sources |
-| Deprecated solution: 151 resources, 4,866 LOC, 26 VPC/Redis-coupled | Read directly from the archived repository |
+| Cost of a Redis/Memcached counter tier: VPC attachment, NAT gateway, VPC endpoints, ~$330/mo idle | Measured from an existing AWS reference deployment of this pattern |
 
 ---
 
@@ -672,7 +665,7 @@ event and measuring, not from the price sheet.
 1. Pre-queue randomization algorithm — must be verifiably fair and auditable from a
    recorded seed.
 2. Signing key rotation. Compromise permits minting admission for every event in the
-   deployment; the deprecated AWS solution has no rotation story.
+   deployment, so rotation cannot be an afterthought.
 3. Session credential format. Whether to follow Queue-it's HMAC-over-concatenation or use a
    JWT — the security property required is only that it signs different inputs from the
    admission token.
@@ -683,4 +676,5 @@ event and measuring, not from the price sheet.
 6. Bot Control Common versus Targeted (§13) — resolve by measurement.
 7. Connector breadth. Queue-it ships 25+ platform connectors across CDNs and application
    frameworks; we ship a CloudFront/origin authorizer. Product scope decision.
-8. Whether to port the OpenID adapter at all — 618 LOC upstream, lowest value.
+8. Whether an OpenID identity-provider adapter is worth building, or whether entry
+   gating on a client-signed identifier (§9) covers the same need more simply.

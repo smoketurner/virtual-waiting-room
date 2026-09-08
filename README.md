@@ -12,67 +12,71 @@ into your origin at a rate it can survive.
 
 ## Why this exists
 
-AWS published [`virtual-waiting-room-on-aws`](https://github.com/aws-solutions/virtual-waiting-room-on-aws)
-in 2022 and **deprecated it in November 2025**, directing customers to AWS Marketplace
-or to build their own. Existing deployments no longer receive features, fixes, or CVE
-patches.
+Virtual waiting rooms are enterprise software. The established option starts around
+$10K/year, is sales-led, and has no self-serve tier. AWS published a free reference
+implementation in 2022 and [deprecated it in November 2025](https://github.com/aws-solutions/virtual-waiting-room-on-aws),
+pointing customers at AWS Marketplace or at building their own.
 
-Meanwhile the commercial option in this category starts around $10K/year with a
-sales-led onboarding process and no self-serve tier.
+That leaves a gap for organizations that need one but cannot justify enterprise pricing,
+or cannot route their traffic through a third party at all — public sector, regulated
+industries, anyone whose compliance boundary ends at their own AWS account.
 
-This project is a maintained, open-source alternative — rebuilt rather than forked.
+This is a maintained, open-source implementation that deploys into that account.
 
-## How it differs from the deprecated AWS solution
+## What it does
 
-| | AWS solution | This |
-|---|---|---|
-| Counters | ElastiCache Redis (MultiAZ) | DynamoDB atomic counters |
-| Networking | VPC, NAT gateway, 5 VPC endpoints | none required |
-| Resources deployed | 151 | target ≤ 80 |
-| Cost when idle | ~$330/mo | ~$0 plus per-event pre-warming |
-| Runtime | Python 3 + Chalice | Rust (arm64) |
-| Infrastructure as code | CloudFormation | Terraform |
-| Scheduled-event handling | live arrival order | pre-queue with randomized assignment |
-| Standby / peak protection | none | dormant year-round, auto-activates on inflow |
-| Event lifecycle | queue only | idle → pre-queue → active → post-event, plus maintenance |
-| After admission | token re-checked per request | session credential, separately signed |
-| Admission rate | open-loop | closed-loop, compensates for no-shows |
-| Entry gating | none | client-signed identifier (membership ID, promo code) |
-| Operator surface | control-panel sample | live metrics, branding, messaging, API-first |
-| Failure behaviour | undefined | fails open |
-| Maintained | no | yes |
+**Scheduled events.** Early visitors gather on a countdown page. At the start time they
+are randomized into queue positions, then admitted to your origin at a rate you control.
 
-Redis held eight integers, and everything else — the VPC, the NAT gateway, the
-endpoints, the Lambdas forced into private subnets — existed only to reach it.
-Removing it removes all of that.
+**Standby protection.** The queue sits dormant year-round and activates automatically when
+traffic crosses a threshold you set — insurance against a spike nobody planned for.
+
+**Both at once.** A scheduled room on your product page with a deliberately low admission
+rate, plus standby across the rest of the site for visitors who hit the homepage instead.
+
+## How it works
+
+```
+  WAF ──► CloudFront ──► API Gateway ──► SQS ──► Lambda ──► DynamoDB
+   │          │              (direct integration, no compute in the burst path)
+   │          └─ /status cached 5s globally: one poll serves every waiter
+   └─ Bot Control · ASN matching · Anti-DDoS
+```
+
+Admission is a signed token, validated once at the edge and exchanged for a session, so
+the origin never calls the waiting room on the hot path.
 
 ## Design highlights
 
-- **The burst is removed, not absorbed.** Assigning queue positions by arrival order
-  makes arriving early an advantage, so everyone arrives at once. Randomizing among
-  everyone present at the scheduled start drops peak write load from ~1,000,000/sec to
-  ~3,300/sec — inside default AWS quotas.
-- **No compute in the ingest path.** API Gateway writes straight to SQS; the burst never
-  touches a function.
+- **The burst is removed, not absorbed.** Assigning positions by arrival order makes
+  arriving early an advantage, so everyone arrives at once. Randomizing among everyone
+  present at the start drops peak write load from ~1,000,000/sec to ~3,300/sec — inside
+  default AWS quotas.
+- **No compute in the ingest path.** API Gateway writes straight to SQS. The burst never
+  touches a function, so there are no cold starts and no concurrency ceiling at the door.
+- **Closed-loop admission.** Some admitted visitors never arrive. The controller measures
+  the no-show rate and compensates, so your origin runs at the capacity you paid for.
 - **Fails open.** If the waiting room is unavailable, visitors reach your site. A waiting
-  room that fails closed is worse than none.
-- **Near-zero idle cost.** Nothing runs between events; tables are pre-warmed before one.
-- **Deploys into your account**, commercial regions or GovCloud.
+  room that fails closed turns its own outage into yours.
+- **Near-zero idle cost.** No always-on compute or cache tier. Tables are pre-warmed before
+  an event and cost nothing between them.
+- **Your account, your data.** Commercial regions or GovCloud. Nothing runs anywhere else.
 
 ## Relationship to Queue-it
 
-Queue-it has run this problem since 2010 — 150+ billion visitors, 1,000+ organizations —
-and publishes a great deal about how their system works. This project deliberately follows
-their architecture where they have learned something: the redirect-and-signed-token model,
-pre-queue randomization for scheduled events with FIFO for threshold-triggered ones, a
-separately-signed session after the first token validation, closed-loop outflow control
-that compensates for no-shows, and failing open when the waiting room is unreachable.
+[Queue-it](https://queue-it.com) has run this problem since 2010 — 150+ billion visitors,
+1,000+ organizations — and publishes a great deal about how their system works. This
+project deliberately follows their architecture wherever they have learned something: the
+redirect-and-signed-token model, pre-queue randomization for scheduled events with FIFO for
+threshold-triggered ones, a separately-signed session after the first token validation,
+closed-loop outflow control that compensates for no-shows, and failing open when the
+waiting room is unreachable.
 
-The differences are deployment model, not architecture. Queue-it is hosted SaaS with 25+
-platform connectors — that breadth is their moat and we do not attempt to match it. This
-deploys into a single client's AWS account, which suits organizations that cannot send
-traffic through a third party, and costs a fraction of a $10K+/year enterprise contract at
-the small end of the market.
+The difference is deployment model, not architecture. Queue-it is hosted SaaS with 25+
+platform connectors; that breadth is their moat and this does not attempt to match it. If
+you want a managed service with an SLA and connectors for every stack, buy theirs. This is
+for the cases where the traffic cannot leave your account, or the price cannot be
+enterprise.
 
 ## License
 
