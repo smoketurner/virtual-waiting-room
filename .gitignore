@@ -22,3 +22,25 @@ target
 
 # Local Kiro tooling settings (per-machine, not project content)
 .kiro/settings/
+
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+*.tfvars
+*.tfvars.json
+!example.tfvars
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+# Lock files ARE committed (pin provider versions per environment):
+!**/.terraform.lock.hcl
+
+# Terraform-generated placeholder Lambda zip (archive_file rebuilds it; source
+# bootstrap is tracked)
+modules/core/placeholder-lambda/placeholder.zip

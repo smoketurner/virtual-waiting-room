@@ -1,0 +1,64 @@
+output "table_names" {
+  description = "Map of logical table key to its DynamoDB table name."
+  value = {
+    counters  = aws_dynamodb_table.counters.name
+    prequeue  = aws_dynamodb_table.prequeue.name
+    positions = aws_dynamodb_table.positions.name
+    tokens    = aws_dynamodb_table.tokens.name
+  }
+}
+
+output "table_arns" {
+  description = "Map of logical table key to its DynamoDB table ARN."
+  value = {
+    counters  = aws_dynamodb_table.counters.arn
+    prequeue  = aws_dynamodb_table.prequeue.arn
+    positions = aws_dynamodb_table.positions.arn
+    tokens    = aws_dynamodb_table.tokens.arn
+  }
+}
+
+output "signing_key_parameter_name" {
+  description = "Name of the SSM SecureString parameter holding the signing key. The authorizer, generate_token, and admin functions read it by name (ssm:GetParameter)."
+  value       = aws_ssm_parameter.signing_key.name
+}
+
+output "signing_key_parameter_arn" {
+  description = "ARN of the SSM signing-key parameter, for scoping ssm:GetParameter IAM statements."
+  value       = aws_ssm_parameter.signing_key.arn
+}
+
+output "join_queue_url" {
+  description = "URL of the live-join SQS queue."
+  value       = aws_sqs_queue.join.url
+}
+
+output "join_queue_arn" {
+  description = "ARN of the live-join SQS queue."
+  value       = aws_sqs_queue.join.arn
+}
+
+output "assign_position_function_name" {
+  description = "Name of the assign_position Lambda (placeholder until the Rust artifact is supplied)."
+  value       = aws_lambda_function.assign_position.function_name
+}
+
+output "rest_api_id" {
+  description = "ID of the regional REST API."
+  value       = aws_api_gateway_rest_api.this.id
+}
+
+output "api_invoke_url" {
+  description = "Base invoke URL of the deployed stage, e.g. https://<id>.execute-api.<region>.amazonaws.com/<stage>."
+  value       = aws_api_gateway_stage.this.invoke_url
+}
+
+output "api_gateway_domain_name" {
+  description = "Host of the regional API (no scheme, no stage path). This is the origin the edge module's polled + write behaviours point at; the stage is set as the CloudFront origin_path."
+  value       = "${aws_api_gateway_rest_api.this.id}.execute-api.${data.aws_region.current.region}.amazonaws.com"
+}
+
+output "using_placeholder_lambda" {
+  description = "True when the assign_position function is the vendored placeholder and the SQS event-source mapping is disabled."
+  value       = local.using_placeholder
+}
