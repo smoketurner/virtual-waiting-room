@@ -48,15 +48,18 @@ Throwaway code. Measures what documentation cannot settle.
 - [ ] Static countdown page, CDN-cached, zero origin calls per view [F1.1, F1.2]
 - [ ] Pre-queue registration (identity only, spread across the window) [C1]
 - [ ] `/status` carries phase, so the countdown page polls one globally-cached endpoint
-- [ ] EventBridge-triggered batch assignment: seed recorded to `Counters`, one
-      `UpdateItem ADD` to claim the range, then `PutItem` with
-      `attribute_not_exists(request_id)` per position — **not `BatchWriteItem`, which
-      cannot express conditions** (DESIGN §4.3). Checkpoint and re-invoke for windows
-      beyond the 900 s Lambda timeout. [F1.3, F1.4, F1.5, C2]
+- [ ] EventBridge-triggered batch assignment (DESIGN §4.2): 256-bit seed to `Counters`,
+      one `UpdateItem ADD`/`ALL_NEW` to claim the range, **parallel `Scan` projecting
+      `request_id` only** (1 MB pages, ~286 pages at 1M, 50 segments), Fisher-Yates,
+      then `PutItem` with `attribute_not_exists(request_id)` per position — **not
+      `BatchWriteItem`, which cannot express conditions**. Checkpoint
+      `{seed, offset, range_start}` and re-invoke beyond the 900 s Lambda timeout.
+      [F1.3, F1.4, F1.5, C2]
 
 ### 1d. Live join
-- [ ] REST API → SQS integration, request validator, DLQ,
-      `ReportBatchItemFailures` [F2.1, F2.4, C5]
+- [ ] REST API `AWS` integration → SQS `SendMessage`, request validator with JSON Schema,
+      DLQ with `maxReceiveCount` 5, `FunctionResponseTypes: [ReportBatchItemFailures]`,
+      visibility timeout ≥ 6× function timeout + batching window [F2.1, F2.4, C5]
 - [ ] `BatchSize` / `MaximumBatchingWindowInSeconds` variables, default 100 / 1s
 - [ ] SQS ESM Provisioned Mode as an opt-in variable, default off — mutually exclusive with
       the maximum-concurrency setting
@@ -74,7 +77,9 @@ Throwaway code. Measures what documentation cannot settle.
 - [ ] Sliding and fixed session validity modes [F3.7]
 - [ ] **Fail-open with time-limited bypass; configurable** [F4.1, F4.2, F4.3]
 - [ ] **No-show compensating outflow controller** — measure arrivals against releases,
-      smooth, bound the correction, adjust `serving_counter` on a schedule [F3.2, F3.8]
+      smooth, bound the correction, adjust `serving_counter` on a 10 s schedule.
+      **Arrival counter sharded ×10** (`arrivals#0..9`), since a 60,000/min admission rate
+      is 1,000 writes/s and would hit the single-item ceiling (DESIGN §5). [F3.2, F3.8]
 - [ ] Decide signing-key rotation (open question 2)
 
 ### 1g. Entry gating and abuse mitigation
@@ -93,7 +98,11 @@ Throwaway code. Measures what documentation cannot settle.
 ### 1i. Control plane
 - [ ] Admin API: `/admin/phase`, `/admin/rate`, `/admin/message`, `/admin/reset`,
       `/admin/rules`, `/metrics`, `/update_session` [F3.10, F5.5]
-- [ ] Scheduled position-expiry sweeper [F3.9]
+- [ ] **Deterministic position expiry in the controller** — query `expires_at` past due
+      with `status = issued`, mark expired, advance `max_expired_position`. **DynamoDB TTL
+      cannot drive this**: it deletes "within a few days" and expired items stay readable
+      until deleted (DESIGN §5). TTL is enabled only for post-event storage reclamation,
+      with `FilterExpression` on reads that could see a pending-delete item. [F3.9]
 
 **Exit:** all endpoints correct; every lifecycle phase serves its page; pre-queue assigns
 fairly and reproducibly; a visitor browses multiple pages on one session; standby activates
@@ -105,8 +114,12 @@ event; authorizer fails open.
 ## Phase 2 — Terraform module
 
 - [ ] `modules/core` — DynamoDB, SQS, Lambdas, IAM, regional REST API + validator [N5]
-- [ ] `modules/edge` — CloudFront, cache policies, WAF (Bot Control + ASN match + Anti-DDoS
-      in Count) [N7, O5]
+- [ ] `modules/edge` — CloudFront with **three separate cache behaviours**: polled
+      endpoints (Min TTL 1 s, **no cookie forwarding**), write endpoints (uncached),
+      protected origin (uncached, session cookie forwarded). **Min TTL must be >0 and
+      cookies must not be forwarded on polled behaviours or request collapsing is
+      disabled** and C4 fails (DESIGN §8). WAF: Bot Control + ASN match + Anti-DDoS in
+      Count. [N7, O5, C4]
 - [ ] `modules/authorizer` — origin authorizer plus optional CloudFront VPC origin
 - [ ] `var.enable_vpc` for ATO-constrained clients — design the seam now, do not retrofit
 - [ ] Flat-rate plan subscription as a variable [O6]
@@ -132,7 +145,9 @@ The one place where being wrong is unrecoverable in production.
       duplicates at both; gap rate measured [F2.2, C3]
 - [ ] Raise quotas and pre-warm *before* testing above defaults, or the test measures
       throttling rather than the design [O1, O2]
-- [ ] `/status` origin RPS flat from 10K to 1M waiters [C4]
+- [ ] `/status` origin RPS flat from 10K to 1M waiters — **this validates request
+      collapsing**, so assert origin fetches ≈ elapsed/TTL and not a function of waiter
+      count [C4]
 - [ ] Fail-open verified: waiting room returning 5xx, origin still reachable [F4.1]
 - [ ] **Session continuity**: a visitor browses N pages after admission without being
       re-queued [F3.5]

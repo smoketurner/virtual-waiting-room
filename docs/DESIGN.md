@@ -243,42 +243,65 @@ requests (F1.2).
 
 ### 4.2 Assignment at T−0
 
-EventBridge Scheduler invokes a Rust function that:
+EventBridge Scheduler invokes a Rust function that executes four steps.
 
-1. Records a random seed to the `Counters` item.
-2. Claims the full position range with one `UpdateItem` using `ADD queue_counter :n`,
-   `ReturnValues: ALL_NEW`.
-3. Scans `PreQueue`, shuffles with a PRNG seeded from step 1, and writes positions.
+**Step 1 — record the seed.** A 256-bit random seed is written to the `Counters` item
+before any position is assigned. Given the participant set and this seed, the mapping can be
+recomputed and audited (F1.5).
 
-The seed makes the assignment reproducible: given the participant set and the seed, the
-mapping can be recomputed and audited (F1.5).
+**Step 2 — claim the range.** One `UpdateItem`:
 
-### 4.3 Why the position write is `PutItem`, not `BatchWriteItem`
+```
+UpdateExpression:  ADD queue_counter :n
+ReturnValues:      ALL_NEW
+```
 
-`BatchWriteItem` is the obvious choice for bulk writes and is wrong here.
+Returns the post-increment value. Writes to a single item are serialized, so the returned
+range `[end − n + 1, end]` is owned exclusively by this invocation.
 
-| Constraint | Value | Consequence |
+**Step 3 — read the participant set.** A `Scan` of `PreQueue` with
+`ProjectionExpression: request_id` only.
+
+`Scan` returns at most 1 MB per page and paginates via `LastEvaluatedKey`. At ~300 bytes per
+stored item this is ~3,495 items per page, so 1M participants is ~286 sequential pages. The
+scan therefore uses **parallel segments** (`Segment` / `TotalSegments`): 50 segments reduces
+it to ~6 pages each.
+
+| Metric | Value |
+|---|---|
+| Items per 1 MB page | ~3,495 |
+| Pages for 1M participants | ~286 |
+| RCU (eventually consistent, 128.5 per 1 MB page) | ~36,800 |
+| Memory holding 1M 36-byte UUIDs | ~36 MB |
+
+Projecting only `request_id` matters twice: it keeps the shuffle set at ~36 MB rather than
+~300 MB, and it reduces scanned bytes. Lambda's memory ceiling is 10,240 MB, so either
+fits, but the smaller set leaves headroom for the position map.
+
+**Step 4 — write positions.** Fisher-Yates shuffle over the ID array using a PRNG seeded
+from step 1, then one conditional `PutItem` per participant.
+
+### 4.3 Why `PutItem`, not `BatchWriteItem`
+
+| Constraint | `BatchWriteItem` | Consequence |
 |---|---|---|
 | Items per call | 25 | 1M positions = 40,000 calls |
 | Conditional expressions | **Not supported** | Cannot enforce `attribute_not_exists(request_id)` |
-| Write capacity | Billed per item, not per call | No WCU saving over `PutItem` |
-| Partial failure | `UnprocessedItems` returned; caller must retry with backoff | Retry logic is required either way |
+| Write capacity | Billed per item | No WCU saving over `PutItem` |
+| Partial failure | Returns `UnprocessedItems` | Retry-with-backoff needed either way |
 
 From the [API reference](https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_BatchWriteItem.html):
 "you cannot specify conditions on individual put and delete requests."
 
 F2.5 requires that a repeated write for the same `request_id` does not consume a second
-position. That is a conditional write. `BatchWriteItem` cannot express it, and it saves no
-capacity — a batched put costs the same WCU as an individual one. The only thing it reduces
-is HTTP request count.
+position — a conditional write. `BatchWriteItem` cannot express it and saves no capacity;
+it reduces only HTTP request count. Positions are written with `PutItem` and
+`ConditionExpression: attribute_not_exists(request_id)`, issued concurrently.
 
-The design therefore uses `PutItem` with `ConditionExpression: attribute_not_exists(request_id)`,
-issued concurrently.
+### 4.4 Assignment throughput and its bounds
 
-### 4.4 Assignment throughput
-
-Item size is approximately 300 bytes (`request_id`, `event_id`, `queue_position`,
-`entry_time`, `status`), so each write costs 1 WCU.
+Stored item is ~300 bytes (`request_id`, `event_id`, `queue_position`, `entry_time`,
+`status`), costing 1 WCU per write.
 
 | Window | Write rate | Concurrent writes in flight at 8 ms p99 |
 |---|---|---|
@@ -286,22 +309,22 @@ Item size is approximately 300 bytes (`request_id`, `event_id`, `queue_position`
 | 5 min | 3,333/s | ~27 |
 | 15 min | 1,111/s | ~9 |
 
-Concurrent writes in flight is not Lambda concurrency. One function instance holds many
-outstanding futures; 3,333 writes/sec at 8 ms is 27 in flight, which a single instance
-sustains.
+Writes in flight is not Lambda concurrency; one execution environment holds many outstanding
+futures. At 3,333 writes/s and 8 ms latency, 27 are in flight.
 
-Three constraints bound the window:
+Four constraints bound the window:
 
-- **Lambda timeout is 900 seconds** ([Lambda quotas](https://docs.aws.amazon.com/lambda/latest/dg/gettingstarted-limits.html)).
-  A single invocation cannot cover a window longer than 15 minutes.
-- **`Positions` table write quota is 40,000 WRU/s by default**, adjustable. A window under
-  25 seconds for 1M positions would exceed it.
-- **Cold-table capacity is ~4,000 writes/s** without pre-warming (§6.4).
+| Constraint | Value | Effect |
+|---|---|---|
+| Lambda timeout | 900 s, not adjustable | One invocation cannot cover a window >15 min |
+| `Positions` write quota | 40,000 WRU/s default, adjustable | Window <25 s for 1M exceeds it |
+| Cold-table capacity | ~4,000 writes/s | Requires pre-warming above that (§6.4) |
+| Lambda memory | 10,240 MB max | Bounds the in-memory shuffle set |
 
-For windows beyond 900 seconds, or to remove the single point of failure, the function
-writes a checkpoint to `Counters` and re-invokes itself via EventBridge. Default window is
-5 minutes, which requires 3,333 writes/s — under the default table quota with pre-warming
-and inside one invocation.
+Default window is 5 minutes: 3,333 writes/s, inside one invocation, 8% of the default table
+quota. For longer windows the function writes `{seed, shuffle_offset, range_start}` to
+`Counters` and re-invokes via EventBridge; the shuffle is deterministic from the seed, so a
+resumed invocation reproduces the same ordering without re-reading prior state.
 
 ### 4.5 Fairness
 
@@ -342,19 +365,39 @@ release_next          = target_rate / (1 − smoothed_no_show_rate)
 The no-show rate is smoothed across intervals to avoid oscillation, and the correction is
 bounded so a transient measurement error cannot release a damaging burst.
 
-**How it runs.** An EventBridge Scheduler rule invokes the controller Lambda on a fixed
-interval (default 10 seconds). The controller reads release and arrival counters from the
-`Counters` item, computes the correction, and writes the new `serving_counter` with a single
-`UpdateItem`. Arrivals are counted by the authorizer at admission and reported through
-`/update_session`; the aggregate lives on the same item, so the controller does one read and
-one write per interval regardless of event size.
+**How it runs.** An EventBridge Scheduler rule invokes the controller Lambda every 10
+seconds. It reads the release and arrival counters, computes the correction, and writes the
+new `serving_counter` with one `UpdateItem`.
 
-**Position expiry is the other half.** A released position that is never claimed within the
-configured window expires, and the serving counter advances past it (F3.9). Expiry is driven
-by DynamoDB TTL on the `Positions` item plus a scheduled sweeper for positions whose expiry
-must advance the counter. Expiry reclaims capacity from no-shows after the fact; the
-controller compensates for them in advance. Both are needed — expiry alone reacts too slowly
-to hold the origin at target during a short event.
+**Counting arrivals.** The authorizer increments an arrival counter when it converts an
+admission token into a session. This is one write per admitted visitor. If the operator sets
+a high admission rate — 60,000/min is 1,000/s — that reaches the 1,000 WCU/s single-item
+ceiling. The arrival counter is therefore **sharded across 10 items** (`arrivals#0` through
+`arrivals#9`, chosen by `hash(request_id) % 10`), and the controller sums all ten on each
+interval. This is legitimate here because arrivals are a statistic, not a sequence (§6.5):
+the controller needs the total, never an ordered position.
+
+Cost: 10 reads per 10-second interval, or 1 read/second, independent of event size.
+
+**Position expiry.** A position released but never claimed within the configured window must
+expire so the serving counter can advance past it (F3.9).
+
+**DynamoDB TTL cannot do this.** From the
+[TTL documentation](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/TTL.html):
+"DynamoDB automatically deletes expired items **within a few days** of their expiration
+time" and "Items with valid, expired TTL attributes **might be deleted by the system at any
+time**, typically within a few days after their expiration." Expired items also remain
+visible to reads until deleted: "Use filter expressions to remove expired items from `Scan`
+and `Query` results."
+
+Days of latency is unusable for a mechanism that must reclaim capacity within an event
+lasting minutes. Expiry is therefore driven by the controller itself: each interval it
+queries positions whose `expires_at` has passed and whose `status` is still `issued`, marks
+them `expired`, and advances `max_expired_position`. TTL remains enabled on `Positions`, but
+only for eventual storage reclamation after the event — never as the expiry mechanism.
+
+Reads that could observe a TTL-pending item use `FilterExpression` on `expires_at` so a
+deleted-but-still-visible item is never returned as live.
 
 ---
 
@@ -421,50 +464,139 @@ contractual pre-event step, not an optimization.
 
 | Counter | Kind | Sharding |
 |---|---|---|
-| `queue_counter`, `serving_counter` | sequence | never |
+| `queue_counter`, `serving_counter` | sequence | **never** — sharding destroys ordering |
+| `arrivals` | statistic | **sharded ×10** — hot at high admission rates (§5) |
 | `token_counter`, `completed_counter`, `abandoned_counter`, `expired_queue_counter` | statistic | permitted if hot |
+
+A sequence must yield a unique ordered value; summing shards cannot produce one. A statistic
+needs only a total, so shards can be summed on read.
 
 ### 6.6 Gap tolerance
 
-An SDK retry after a 5xx, or a function dying mid-batch, burns positions without issuing
-them. Nobody checks whether a queue skipped a number (F2.3). This tolerance is what permits
-the cheapest approach; an inventory system could not make the same trade.
+An SDK retry after a 5xx, or a function dying between the counter increment and the position
+write, burns positions without issuing them. No user observes a skipped number (F2.3). This
+tolerance is what permits an atomic counter instead of `TransactWriteItems`, which would
+double the write cost.
+
+### 6.7 Tables
+
+**`Counters`** — PK `event_id`. One item per event holding:
+
+| Attribute | Type | Purpose |
+|---|---|---|
+| `queue_counter` | N | Position sequence |
+| `serving_counter` | N | Admission high-water mark |
+| `max_expired_position` | N | Highest expired position |
+| `arrivals#0`–`arrivals#9` | N | Sharded arrival count (§5) |
+| `phase` | S | `idle` / `pre_queue` / `active` / `post_event` |
+| `phase_override` | S | Maintenance mode, checked before `phase` |
+| `target_rate` | N | Operator-set admissions per minute |
+| `shuffle_seed` | B | 256-bit seed for audit (§4.2) |
+| `operator_message` | S | Delivered in `/status` |
+
+All counter updates are `UpdateItem` with `ADD`. Item stays well under the 400 KB limit.
+
+**`PreQueue`** — PK `request_id` (UUIDv7). Registration during the pre-queue phase. Read
+once at T−0 with a parallel `Scan` projecting `request_id` only.
+
+**`Positions`** — PK `request_id`. Attributes `event_id`, `queue_position`, `entry_time`,
+`status`, `expires_at`, `ttl`.
+
+- Written with `ConditionExpression: attribute_not_exists(request_id)` (F2.5).
+- `entry_time` is server-stamped and authoritative; the UUIDv7 timestamp is client-supplied
+  and untrusted.
+- `expires_at` drives deterministic expiry via the controller (§5).
+- `ttl` is a separate attribute for eventual storage reclamation only, set well after the
+  event ends.
+
+**`Tokens`** — PK `request_id`. Issued admission-token metadata and session status. `ttl` set
+to event end plus a retention margin.
+
+All tables use on-demand capacity with point-in-time recovery, and carry
+`warm_throughput_write_units` sized to the event's target rate (§6.4).
 
 ---
 
 ## 7. Ingest
 
-Satisfies F2.4–F2.6, C5.
+Satisfies F2.1, F2.4–F2.6, C5.
 
-**Regional REST API with a direct SQS integration.** No Lambda in the burst path. SQS
-standard queues are documented as supporting a "nearly unlimited number of API calls per
-second," so ingest is not a constraint; every real limit is downstream.
+### 7.1 Path
 
-**REST, not HTTP API.** HTTP APIs cost $1.00/M against REST's $3.50/M, but API Gateway only
-ever sees CloudFront cache misses — roughly three per visitor regardless of wait length.
-For a million-visitor event that is ~3M billable requests, so the saving is **$7.50**. HTTP
-APIs would cost request validation, API keys, and VTL response mapping, all REST-only. Not
-a trade worth making.
+Regional REST API with an `AWS` service integration to SQS `SendMessage`. No Lambda in the
+burst path, so no cold start and no concurrency ceiling at ingest.
 
-**Client-supplied UUIDv7.** The client generates its own request identifier rather than
-receiving one minted by API Gateway. With a server-minted ID, a client retry produces a new
-ID and burns a second position; with a client-supplied one the retry carries the same value
-and is absorbed by the conditional write (F2.5). v7 over v4 for debuggability — join time is
-recoverable from the ID — and future sort-key headroom. The embedded timestamp is
-client-supplied and never trusted; `entry_time` is stamped server-side.
+Relevant limits:
 
-Browser `crypto.randomUUID()` emits v4 only, so the reference client uses the `uuid`
-package.
+| Limit | Value | Adjustable | Effect here |
+|---|---|---|---|
+| REST API integration timeout | 29 s max | No | Irrelevant: `SendMessage` is single-digit ms |
+| REST API request payload | 10 MB | No | Join payload is ~100 bytes |
+| SQS standard throughput | "nearly unlimited API calls per second, per action" | — | Not a constraint |
+| SQS message size | 1 MiB | No | Not a constraint |
+| Lambda ESM `BatchSize` | 10,000 (>10 requires window ≥1 s) | — | Default 100 / 1 s |
+| Lambda sync invocation payload | 6 MB | No | ~500 B/record caps a batch near 10–12K records |
 
-**Two validation layers.** A gateway request validator rejects malformed bodies
-synchronously with 400 (F2.4). The Lambda re-validates because schema validation cannot
-check UUIDv7 version bits, and because the increment-by-valid-count rule depends on it.
+### 7.2 REST rather than HTTP API
 
-**Recovery.** Invalid messages go to the DLQ via `ReportBatchItemFailures`. The client's
-subsequent `GET /queue_num` returns 404, which the client treats as "re-join with a fresh
-ID" (F4.4). This is also the recovery path for a genuinely lost message. API Gateway
-returning 200 means *accepted into the queue*, not *position assigned*; the 404 loop makes
-that safe.
+HTTP APIs cost $1.00/M against REST's $3.50/M. API Gateway sees only CloudFront cache
+misses — approximately three per visitor regardless of wait duration — so a million-visitor
+event generates ~3M billable requests and the saving is **$7.50**. HTTP APIs do not support
+request validators, API keys, or VTL response mapping. The saving does not justify losing
+request validation.
+
+### 7.3 Client-supplied UUIDv7
+
+The client generates its own request identifier. With `$context.requestId`, a client retry
+produces a new identifier and consumes a second position; with a client-supplied identifier
+the retry carries the same value and is absorbed by the conditional write (F2.5).
+
+v7 over v4 for debuggability — join time is recoverable from the identifier — and sort-key
+headroom if a secondary index is added. The embedded timestamp is client-supplied and is
+never trusted; `entry_time` is stamped server-side and is authoritative.
+
+Browser `crypto.randomUUID()` emits v4 only, so the reference client uses the `uuid` package.
+
+### 7.4 Duplicate and failure handling
+
+SQS standard queues are **at-least-once**: the same message can be delivered more than once,
+and ordering is best-effort. Both are acceptable here and neither is worked around:
+
+- **Duplicates** are absorbed by `attribute_not_exists(request_id)` on the position write.
+  A redelivered message fails the condition and consumes no position.
+- **Ordering** does not matter because positions are allocated per batch from an atomic
+  counter, not from message sequence.
+
+The event source mapping sets `FunctionResponseTypes: [ReportBatchItemFailures]`. Without
+it, one failed record causes the entire batch to be redelivered, re-processing records that
+already succeeded. With it, only failed record identifiers return to the queue.
+
+Queue visibility timeout is set to six times the function timeout plus
+`MaximumBatchingWindowInSeconds`, per AWS guidance, so a slow batch is not redelivered while
+still being processed. `maxReceiveCount` is 5, after which records move to the DLQ.
+
+### 7.5 Validation
+
+Two layers:
+
+1. **Gateway request validator** with a JSON Schema model rejects a malformed or missing
+   `request_id` with 400, synchronously, before the message reaches SQS.
+2. **Lambda re-validation** parses the UUID and checks the version nibble, which JSON Schema
+   cannot express.
+
+The counter is incremented by the count of **valid** records, never `records.len()`.
+Incrementing by record count would let malformed payloads consume queue positions without
+producing queue members (F2.6).
+
+### 7.6 Recovery
+
+Invalid records are reported through `ReportBatchItemFailures` and reach the DLQ after
+`maxReceiveCount`. The client's subsequent `GET /queue_num` returns 404, which the client
+treats as "re-join with a fresh UUIDv7" (F4.4). This is also the recovery path for a record
+lost for any other reason.
+
+API Gateway returning 200 means *accepted into the queue*, not *position assigned*. The
+404-and-rejoin loop is what makes that asymmetry safe, and it is part of the client contract.
 
 ---
 
@@ -474,23 +606,56 @@ Satisfies F3.1, F5.5, C4.
 
 ### Public
 
-| Path | TTL | Cache key | Purpose |
-|---|---|---|---|
-| `/status` | 5s | global | Phase, serving position, admission rate, operator message — **one payload, one poll** |
-| `/queue_num` | 24h | `event_id` + `request_id` | Own position; 404 means re-join |
-| `/queue_pos_expiry` | 5s | `event_id` + `request_id` | Seconds until position lapses |
-| `/public_key` | 24h | `event_id` | Signature verification material |
-| `/join` | none | — | Join the queue or pre-queue; client-supplied UUIDv7 |
-| `/generate_token` | none | — | Exchange a served position for an admission token |
+| Path | Min TTL | Cache key | Cookies forwarded | Purpose |
+|---|---|---|---|---|
+| `/status` | 1 s | path only | **none** | Phase, serving position, admission rate, operator message |
+| `/queue_num` | 1 s | path + `event_id`, `request_id` | **none** | Own position; 404 means re-join |
+| `/queue_pos_expiry` | 1 s | path + `event_id`, `request_id` | **none** | Seconds until position lapses |
+| `/public_key` | 1 s | path + `event_id` | **none** | Signature verification material |
+| `/join` | 0 (uncached) | — | none | Join the queue or pre-queue |
+| `/generate_token` | 0 (uncached) | — | none | Exchange a served position for an admission token |
 
-**`/status` combines four values into one endpoint.** Every waiting visitor polls it. Phase,
-serving position, admission rate and operator message in one globally-cached payload costs
-one CloudFront request per visitor per interval instead of four. At 1M visitors polling every
-10 seconds for 20 minutes, that is 120M requests rather than 480M.
+### Request collapsing is the mechanism behind C4
 
-A position never changes once assigned, so `/queue_num` is cached per visitor for a day. The
-5-second global cache on `/status` collapses a million pollers into one origin fetch per
-interval (C4). Read hotspots are solved with cache, not sharding.
+C4 requires that origin request rate stay flat as waiters scale from 10,000 to 1,000,000.
+That depends entirely on CloudFront **request collapsing**: when N viewers miss the cache
+for the same key simultaneously, CloudFront sends one request to the origin and serves all N
+from the single response.
+
+Collapsing is disabled by two configurations
+([AWS re:Post, DDoS resilience with HTTP caching on CloudFront](https://repost.aws/articles/ARTocYphbwQnWtTz8FXrwqew/ddos-resilience-with-http-caching-on-cloudfront)):
+
+> The following configurations prevent request collapsing from occurring: The Minimum TTL of
+> a cache behavior is set to 0. Cookie forwarding is enabled in the cache policy, the origin
+> request policy, or the legacy cache settings.
+
+Two consequences the design must respect:
+
+1. **Minimum TTL must be greater than zero on every cached behaviour.** A 0-second minimum
+   TTL disables collapsing even if the origin sends `Cache-Control: max-age=5`. Cached
+   behaviours use Min TTL 1 s and the origin sets `Cache-Control: max-age=5` for `/status`;
+   CloudFront honours the origin value when it falls between Min and Max TTL.
+
+2. **The polled endpoints must forward no cookies.** The authorizer needs the session cookie
+   on protected-origin requests, so **that is a separate cache behaviour with caching
+   disabled**. Mixing cookie forwarding into a polled behaviour's cache policy would disable
+   collapsing on the endpoint that 1M visitors are hitting, and the origin would receive
+   every request.
+
+| Behaviour | Path pattern | Caching | Cookies | Origin |
+|---|---|---|---|---|
+| Polled endpoints | `/status`, `/queue_num`, `/queue_pos_expiry`, `/public_key` | Min TTL 1 s | none | API Gateway |
+| Write endpoints | `/join`, `/generate_token` | disabled | none | API Gateway |
+| Protected origin | `/*` (default) | disabled | **session cookie forwarded** | Client origin, via VPC origin |
+
+`stale-while-revalidate` is set on `/status` so a slow origin response serves the previous
+value rather than blocking waiters.
+
+**Poll interval.** A position never changes once assigned, so `/queue_num` is effectively
+static per visitor. `/status` at Min TTL 1 s and origin `max-age=5` collapses 1M pollers into
+at most one origin fetch per 5 seconds. Client poll interval defaults to 10 seconds; it is
+the dominant cost variable in the system, multiplying CloudFront requests, WAF inspections,
+and Bot Control charges together (§13).
 
 ### Admin (SigV4)
 
@@ -733,6 +898,12 @@ event and measuring, not from the price sheet.
 | Lambda timeout 900 s; synchronous invocation payload 6 MB | [Lambda quotas](https://docs.aws.amazon.com/lambda/latest/dg/gettingstarted-limits.html) |
 | CloudFront default metrics: 1-minute granularity, `us-east-1`, no additional charge, do not count against CloudWatch quotas | [Monitor CloudFront metrics with CloudWatch](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/monitoring-using-cloudwatch.html) |
 | FedRAMP cost and timeline | Published 3PAO and FedRAMP advisory pricing, cross-checked across sources |
+| `Scan`: 1 MB page limit, `LastEvaluatedKey` pagination, parallel `Segment`/`TotalSegments`, eventually consistent by default | [Scanning tables in DynamoDB](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Scan.html) |
+| TTL deletes "within a few days"; expired items remain readable until deleted; use filter expressions to exclude them | [Using time to live (TTL) in DynamoDB](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/TTL.html) |
+| `UpdateItem` `ADD` atomic counter; `ReturnValues: ALL_NEW`; `ConditionExpression` support | [UpdateItem API reference](https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_UpdateItem.html) |
+| Request collapsing disabled by Min TTL 0 or cookie forwarding; `stale-while-revalidate` | [DDoS resilience with HTTP caching on CloudFront](https://repost.aws/articles/ARTocYphbwQnWtTz8FXrwqew/ddos-resilience-with-http-caching-on-cloudfront) |
+| REST API integration timeout 29 s (hard), request payload 10 MB | [Quotas for configuring and running a REST API](https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-execution-service-limits-table.html) |
+| SQS standard at-least-once delivery, best-effort ordering; `ReportBatchItemFailures`; visibility timeout ≥ 6× function timeout | [Using Lambda with Amazon SQS](https://docs.aws.amazon.com/lambda/latest/dg/with-sqs.html) |
 | Cost of a Redis/Memcached counter tier: VPC attachment, NAT gateway, VPC endpoints, ~$330/mo idle | Measured from an existing AWS reference deployment of this pattern |
 
 ---
