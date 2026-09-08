@@ -12,11 +12,12 @@ and to reach something demonstrable before something complete.
 Purpose: prove the two assumptions the whole build rests on, in throwaway code.
 If either fails, the design changes before any real work is spent.
 
-- [ ] **HTTP API → SQS.** Stand up `AWS_PROXY` / `SQS-SendMessage`. Confirm
-      `$context.requestId` maps into `MessageAttributes` (replacing REST's
-      `apig_request_id`). **This is open question §10.1 and the single highest-risk
-      unknown** — if it fails, ingest falls back to REST API and we lose ~71% of the
-      per-request cost saving but nothing architectural.
+- [ ] **HTTP API → SQS.** Stand up `AWS_PROXY` / `SQS-SendMessage` and confirm the
+      design in DESIGN §8a end to end: client-supplied UUIDv4 `request_id` in the body
+      survives to the Lambda, WAF rate-based rules replace the public API key, and no
+      response body mapping is needed. Desk research resolved the mechanism; this is
+      confirmation, not investigation. Fallback if something surprises us: REST API
+      (~71% higher per-request cost, no architectural change).
 - [ ] **Atomic range allocation under concurrency.** Hammer one `Counters` item with
       concurrent `UpdateItem ADD :n` / `ALL_NEW`. Assert: zero duplicate positions
       across all allocated ranges. Measure gap rate under induced 5xx.
@@ -31,8 +32,11 @@ If either fails, the design changes before any real work is spent.
 
 ### 1a. Counter and ingest
 - [ ] `Counters` / `Positions` / `Tokens` tables, `PAY_PER_REQUEST`, PITR on
-- [ ] `assign_queue_num`: batch range allocation, `attribute_not_exists(request_id)`
-      on write (fixes upstream's redelivery double-assign)
+- [ ] `assign_queue_num`: parse/validate client UUIDv7, partition valid from invalid,
+      **increment the counter by the valid count only** (DESIGN §8a — incrementing by
+      `records.len()` lets malformed payloads burn queue positions), batch range
+      allocation, `attribute_not_exists(request_id)` on write (fixes upstream's
+      redelivery double-assign)
 - [ ] `BatchSize` / `MaximumBatchingWindowInSeconds` as variables, default 100 / 1s
 - [ ] DLQ + `ReportBatchItemFailures` partial-batch responses
 
@@ -101,6 +105,9 @@ The part that makes this a service rather than a repo.
       **Must treat HTTP 429 as expected and retry with jittered backoff** — API
       Gateway's burst bucket will shed a few requests at t=0 of any large on-sale, and
       a page that fails closed turns a smoothing event into an outage (DESIGN §8).
+      **Must treat a 404 from `/queue_num` as "re-join with a fresh UUIDv7"** — this is
+      the recovery path for a malformed or lost message (DESIGN §8a). Generates UUIDv7
+      via the `uuid` package; `crypto.randomUUID()` is v4-only.
 - [ ] Client integration guide: CloudFront/ALB/CDN placement
 - [ ] Cost model per event size
 
@@ -128,9 +135,9 @@ Ships second, priced separately.
 
 ## Sequencing rationale
 
-Phase 0 exists because §10.1 could invalidate the ingest design, and it costs days to
-find out versus weeks to discover late. Phase 3 is protected because it is the one
-place where being wrong is unrecoverable in production. Phase 4 is what converts a
+Phase 0 exists to confirm the ingest design end-to-end and to measure what desk research
+cannot. Phase 3 is protected because it is the one place where being wrong is
+unrecoverable in production. Phase 4 is what converts a
 GitHub repo into revenue — the code is the credential, the deployment and the
 pre-event operations are the product.
 
@@ -138,7 +145,7 @@ pre-event operations are the product.
 
 | Risk | Mitigation |
 |---|---|
-| `SQS-SendMessage` can't carry the request id | Phase 0; fall back to REST API |
+| HTTP API ingest surprises us in practice | Phase 0 confirmation; fall back to REST API |
 | Load test can't reach 100K/sec from one source | Distributed harness; budget for it in Phase 3 |
 | On-call burden — a failure during an on-sale is career-ending for the client | Price as incident-critical infrastructure, not a $150/mo care plan. Cap concurrent engagements. |
 | AWS ships a replacement | Unlikely — they just deprecated theirs and pointed at Marketplace |

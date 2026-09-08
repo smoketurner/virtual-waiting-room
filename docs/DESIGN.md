@@ -246,8 +246,8 @@ Contract-compatible with upstream, so existing integrations port cleanly.
 
 | Method | Path | Cache | Purpose |
 |---|---|---|---|
-| POST | `/assign_queue_num` | none | Join the queue (→ SQS) |
-| GET | `/queue_num` | 24h per `request_id` | Read own position |
+| POST | `/assign_queue_num` | none | Join the queue (client supplies UUIDv7 `request_id`; → SQS) |
+| GET | `/queue_num` | 24h per `request_id` | Read own position; **404 = re-join with a fresh ID** |
 | GET | `/serving_num` | 5s global | Read current serving position |
 | GET | `/waiting_num` | 5s global | Count still waiting |
 | POST | `/generate_token` | none | Exchange served position for JWT |
@@ -275,9 +275,12 @@ are solved with cache, not shards.
 **`Counters`** — PK `event_id`. One item holding all counters as numeric attributes.
 Atomic `ADD` per §4.
 
-**`Positions`** — PK `request_id`. `{event_id, queue_position, entry_time, status}`.
-Written with `attribute_not_exists(request_id)` so SQS at-least-once redelivery is
-idempotent. *(Upstream lacks this condition and can double-assign on redelivery.)*
+**`Positions`** — PK `request_id` (client-supplied UUIDv7, validated in the Lambda).
+`{event_id, queue_position, entry_time, status}`. Written with
+`attribute_not_exists(request_id)` so SQS at-least-once redelivery *and* client retries
+are both idempotent. *(Upstream lacks this condition and can double-assign on
+redelivery.)* `entry_time` is stamped server-side and is authoritative — the UUIDv7
+timestamp is client-supplied and must never be trusted (§8a).
 
 **`Tokens`** — PK `request_id`. Issued JWT metadata, session status, TTL for automatic
 cleanup.
@@ -332,6 +335,123 @@ accounts, and therefore billable.
 
 ---
 
+## 8a. Request identity and the HTTP API ingest integration
+
+The upstream REST integration derives the visitor's identity from API Gateway's own
+request ID, in two directions:
+
+```
+requestTemplates:                                  # → SQS
+  Action=SendMessage&MessageBody=$input.body
+  &MessageAttribute.1.Name=apig_request_id
+  &MessageAttribute.1.Value.StringValue=$context.requestId
+
+responses.default.responseTemplates:               # → browser
+  {"api_request_id": "$context.requestId"}
+```
+
+The Lambda reads `messageAttributes.apig_request_id` and uses it as the `Positions`
+partition key; the browser needs the same value to poll `/queue_num?request_id=…`.
+Porting this to an HTTP API `SQS-SendMessage` integration hits three constraints.
+
+**1. Message attributes — supported.** `$context` variables are documented mapping
+values. Note the bracket form is required inside a JSON string:
+
+```yaml
+IntegrationSubtype: SQS-SendMessage
+RequestParameters:
+  QueueUrl: !Ref Queue
+  MessageBody: $request.body
+  MessageAttributes: >-
+    {"apig_request_id": {"DataType": "String", "StringValue": "${context.requestId}"}}
+```
+
+**2. Response body transformation — not supported.** HTTP API response parameters
+accept only `append|overwrite|remove:header.name` and `overwrite:statuscode`. There is
+no VTL and no body mapping, so the request ID cannot be returned in a JSON body. A
+response *header* would work, but `x-amz-*`/`x-amzn-*` are reserved and browser access
+requires `Access-Control-Expose-Headers`.
+
+**3. API keys — not supported.** All seven upstream public routes are secured with
+`x-api-key`. HTTP APIs support neither API keys nor usage plans.
+
+**4. Request validation — not supported.** Request validators
+(`x-amazon-apigateway-request-validator`, used by upstream on `/assign_queue_num` as
+`"Validate body"`) are a REST API feature. An HTTP API cannot reject a malformed body
+at the gateway.
+
+Constraints 2 and 4 interlock: because there is no response body mapping, a
+server-generated fallback ID could never be returned to the client, so "generate one if
+the client didn't" is not an available behavior.
+
+### Decision: client-generated UUIDv7 request IDs
+
+The browser generates a [RFC 9562](https://www.rfc-editor.org/rfc/rfc9562.html) UUIDv7
+and sends it in the request body. This resolves constraints 1 and 2 together — the
+client already knows its own ID, so nothing needs to be mapped back out, and the ID
+rides in `MessageBody` rather than a message attribute.
+
+It is also **strictly better than server-minted IDs for retries**. With
+`$context.requestId`, a client retry mints a fresh ID and burns a second queue position.
+With a client-generated UUID, a retry carries the same ID and is absorbed by the
+`attribute_not_exists(request_id)` condition already required in §7.
+
+**Why v7 rather than v4** — honestly, for modest reasons. DynamoDB hashes the partition
+key, so v7's time ordering yields *no* locality benefit on `Positions` (and no
+hot-partition penalty either). The real gains are debuggability — join time is
+recoverable from the ID during incident reconstruction — and headroom if a sort key or
+GSI is added later.
+
+**The embedded timestamp is not trustworthy.** It comes from the client's clock and is
+trivially spoofed. `entry_time` is stamped server-side in the Lambda and remains the
+sole source of truth for ordering and expiry. The v7 timestamp is a debugging
+convenience, never a data source.
+
+Note that browser-native `crypto.randomUUID()` emits v4 only; the reference client needs
+the `uuid` package (≥ v11 exports `uuidv7()`) or a short hand-rolled generator.
+
+### Handling a missing or malformed request ID
+
+Since the gateway cannot validate (constraint 4) and cannot return a generated ID
+(constraint 2), validation happens in `assign_queue_num`:
+
+```rust
+let (valid, invalid): (Vec<_>, Vec<_>) = records.iter()
+    .partition(|r| parse_uuid_v7(&r.body).is_ok());
+
+// increment by the VALID count only
+let end = ddb.update_item()
+    .update_expression("ADD queue_counter :n")
+    .expression_attribute_values(":n", N(valid.len().to_string()))
+    .return_values(ReturnValue::AllNew).send().await?;
+```
+
+**Incrementing by `records.len()` would be a bug with security consequences**: a flood
+of malformed payloads would consume queue positions without producing queue members — a
+cheap denial-of-fairness attack. Allocate only for messages that parse.
+
+Invalid messages are reported through `ReportBatchItemFailures` and land in the DLQ.
+The client's subsequent `GET /queue_num?request_id=…` returns **404**, which the
+waiting-room page treats as "generate a fresh ID and re-join." This is self-healing and
+doubles as the recovery path for a genuinely lost message.
+
+The residual asymmetry is inherent to asynchronous ingest: API Gateway returns 200 for a
+request that may never yield a position. The 200 means *accepted into the queue*, not
+*position assigned*. The 404-and-retry loop is what makes that safe, and it must be
+explicit in the client contract.
+
+### On dropping the API key
+
+The upstream public API key is not a security control — it ships in client-side
+JavaScript and is trivially extracted. It functions as a throttling handle. WAF
+rate-based rules serve that purpose better and are already in the design for bot
+mitigation, so removing the API key costs nothing real.
+
+The **private** API is unaffected: it uses SigV4, carries genuine authorization, and
+stays on a REST API where API keys and usage plans remain available if wanted.
+
+---
+
 ## 9. Deployment model
 
 **Single-tenant, deployed into the client's AWS account. Not multi-tenant SaaS.**
@@ -363,8 +483,11 @@ priced accordingly.
 
 ## 10. Open questions
 
-1. `SQS-SendMessage` HTTP API integration: confirm `$context.requestId` can be mapped
-   into `MessageAttributes` to replace REST's `apig_request_id`. Blocks §3.1 if not.
+1. ~~`SQS-SendMessage` HTTP API integration: confirm `$context.requestId` can be mapped
+   into `MessageAttributes`.~~ **Resolved — see §8a.** Message attributes work; response
+   body mapping does not exist on HTTP APIs and API keys are unsupported. Both are
+   resolved by client-generated UUIDv4 request IDs plus WAF rate limiting in place of
+   the public API key. Phase 0 now confirms rather than investigates.
 2. JWKS rotation story — upstream effectively has none.
 3. Inlet strategy interface: port upstream's periodic/max-size Lambdas, or expose a
    plain API and let clients drive it?
