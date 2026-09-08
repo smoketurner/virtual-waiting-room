@@ -2,17 +2,56 @@
 
 ## Rust
 
-- Edition-current, latest stable via `rustup`. `thiserror` for library errors, `anyhow` for
-  binaries. `tracing` for logging (`error!`/`warn!`/`info!`/`debug!`), never `println!`.
+- Edition 2024, `resolver = "3"`, pinned Rust via `rust-toolchain.toml`. `thiserror` for
+  library errors, `anyhow` for binaries. `tracing` for logging
+  (`error!`/`warn!`/`info!`/`debug!`), never `println!`.
 - Newtypes over primitives (`EventId(String)`, `RegistrationIndex(u64)`); enums for state
   machines, not boolean flags. Prefer `let…else` for early returns; keep the happy path
   unindented. Explicit destructuring over `matches!` so a field change breaks the build.
-- Lints: `clippy --all-targets --all-features -- -D warnings`. Deny `unwrap_used`, `panic`,
-  `todo`, `dbg_macro`, `print_stdout`/`print_stderr`, `await_holding_lock`. Fix every warning
-  from every tool; if one truly can't be fixed, add an inline ignore with a justification.
-- Workspace deps: in the workspace root specify version + `default-features = false` only.
-  Never put `features = [...]` in `[workspace.dependencies]` — each member crate opts in via
-  `workspace = true, features = ["..."]`.
+
+### Dependency pinning (non-negotiable)
+
+- **Exact version pins only.** Every dependency uses `= "=x.y.z"` — no `^`, `~`, or ranges.
+- **`default-features = false` on everything** in `[workspace.dependencies]`.
+- **No `features = [...]` at the workspace root.** Each member crate opts into exactly the
+  features it uses via `dep = { workspace = true, features = ["..."] }`. Enabling a feature at
+  the root forces it on every crate and is forbidden.
+- A new dependency needs a stated reason (see `tech.md`); the crate list is deliberately small.
+
+### Lints — panic-free by construction
+
+`[workspace.lints.clippy]` is inherited by every crate (`[lints] workspace = true`). Run
+`clippy --all-targets --all-features -- -D warnings`. The denylist (matching the reference
+`Cargo.toml`):
+
+```toml
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Panic prevention
+unwrap_used = "deny"
+expect_used = "warn"
+panic = "deny"
+panic_in_result_fn = "deny"
+unimplemented = "deny"
+# No cheating
+allow_attributes = "deny"
+# Code hygiene
+dbg_macro = "deny"
+todo = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+# Safety
+await_holding_lock = "deny"
+large_futures = "deny"
+exit = "deny"
+mem_forget = "deny"
+# Pedantic relaxations (too noisy)
+module_name_repetitions = "allow"
+similar_names = "allow"
+```
+
+Fix every warning from every tool. If one truly can't be fixed, `allow_attributes = "deny"`
+means you cannot silently `#[allow]` it — justify it or remove the cause.
 
 ## Terraform
 
