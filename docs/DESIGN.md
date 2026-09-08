@@ -119,37 +119,58 @@ run at the edge and add only the cost of a signature verification per request.
 
 ---
 
-## 3. Operating modes
+## 3. Event lifecycle and operating modes
 
-Satisfies F0.1–F0.5.
+Satisfies F0.1–F0.8.
 
-Two modes, independently configurable and able to run together on one origin.
+### 3.1 Phases
 
-**Scheduled** — an event with a known start time. Pre-queue, randomized assignment, then
-metered admission. §4.
+Every event moves through four phases, following Queue-it's model:
 
-**Standby** — the queue is dormant. The authorizer evaluates every request but its action is
-*continue* until measured inflow crosses an operator-configured threshold, at which point
-new visitors without a session begin to be queued. This is insurance against unplanned
-spikes: a social post, a news mention, an unannounced restock. Queue-it reports retail,
-financial services, and airline customers buying it specifically for this.
+```
+  IDLE ──────────► PRE-QUEUE ──────────► ACTIVE ──────────► POST-EVENT
+  info page        countdown page        queue + admission   outcome page
+  (static)         (static, cached)      (metered)           (static)
+                                                │
+                                    MAINTENANCE ┘  (any phase, operator-forced)
+```
 
-The authorizer's code is identical in both states; only the action changes. A dormant queue
-costs a signature verification per request and nothing at the backend, which is why standby
-is cheap to leave enabled year-round.
+Three of the four phases serve a **static, operator-authored page from CDN cache**. Only
+`ACTIVE` involves the queueing machinery. This is why a waiting room costs almost nothing
+when nothing is happening, and why the phases that appear to be "nothing" are cheap to
+support.
 
-**Protection rules.** The operator declares which requests are subject to queueing, matching
-on path, header, cookie, or user agent. Rules are distributed to the authorizer and
-evaluated locally. Unmatched requests are never queued, in any mode.
+The idle and post-event pages are not decoration. They are where an operator tells visitors
+what is coming, that stock is available, or where to go next when it has sold out — the
+communication that determines whether a queue feels fair or feels broken.
 
-The combination that matters in practice — and which Queue-it's architect cites as a real
-customer configuration — is a scheduled room with a deliberately low admission rate on the
+**Maintenance mode** parks every visitor on an operator page regardless of phase or
+capacity. Given the state machine it is nearly free to implement, and it is the control an
+operator reaches for when something has gone wrong downstream.
+
+### 3.2 Modes
+
+**Scheduled** — a known start time. Idle → pre-queue → randomized assignment at T−0 →
+active. §4.
+
+**Standby** — dormant. The authorizer evaluates every request but its action is *continue*
+until measured inflow crosses a threshold, at which point new visitors are queued **FIFO**.
+Insurance against unplanned spikes: a social post, a news mention, an unannounced restock.
+
+**Fairness differs by mode, deliberately.** Scheduled events randomize because everyone
+knows the start time, so arrival order measures connection speed rather than intent.
+Standby activation is FIFO because the spike was unplanned and nobody was waiting for a
+starting gun. This is Queue-it's model and the reasoning holds independently.
+
+Both modes run simultaneously on one origin. The configuration Queue-it's architect cites
+from a real customer: a scheduled room with a deliberately low admission rate on the
 high-demand path, plus standby across the whole site to catch visitors who flood the
 homepage instead of the product page.
 
-Because protection rules can match on headers and user agent, they double as coarse
-anti-automation: an operator can route suspicious signatures into the queue regardless of
-load. This is rule-based, not ML-scored; WAF (§9) does the scoring.
+**Protection rules** declare which requests are subject to queueing, matching on path,
+header, cookie, or user agent, distributed to the authorizer and evaluated locally.
+Unmatched requests are never queued, in any phase or mode. Because rules can match headers
+and user agent, they double as coarse anti-automation; WAF (§9) does the actual scoring.
 
 ---
 
@@ -374,6 +395,25 @@ material.
 The authorizer holds keys and protection rules in memory, so every decision is local with no
 backend round-trip (§2.3).
 
+**Gating queue entry on a client-issued identifier.** The strongest anti-bot lever available
+is refusing entry to anyone the client cannot vouch for. The client signs an identifier it
+already holds — a membership number, promo code, order reference — with a shared key, and
+the waiting room verifies the signature at join time (F6.1, F6.2). The waiting room stores
+none of that data and cannot mint identifiers itself.
+
+This inverts the usual bot problem. Instead of trying to detect automation from request
+signatures, the queue admits only visitors the client has already established a
+relationship with. Queue-it ships this as their Queue Token SDK, and their published
+customer results — a Japanese gaming company keeping out 225,000 bots and non-members
+during an invite-only drop — reflect the difference between detecting bots and never
+letting them in.
+
+**Timing of enforcement.** Where an operator can identify likely bots during the pre-queue,
+they may choose to admit them to the pre-queue and block at randomization rather than at
+arrival (F6.3). Blocking early reveals the detection and gives operators of automated
+clients time to retool and rejoin before the sale starts. Queue-it sells this as Hype Event
+Protection; for us it is a configuration choice that costs nothing to support.
+
 **WAF, three layers:**
 
 1. **Bot Control** — bot-versus-human discrimination. Safe in Block.
@@ -400,7 +440,39 @@ bill. See §10.
 
 ---
 
-## 10. Failure behaviour
+## 10. Operator surface
+
+Satisfies F5.1–F5.5.
+
+An event that cannot be observed and adjusted while it runs is not usable in production.
+Queue-it sells traffic intelligence and custom themes as separate products; both are table
+stakes.
+
+**Live metrics.** Inflow, outflow, queue depth, admitted count, measured no-show rate, and
+expiry rate, exposed as CloudWatch metrics and a JSON endpoint. The no-show and expiry
+figures are not vanity numbers — they are the inputs to the outflow controller (§5), so an
+operator watching them can see *why* the release rate is what it is.
+
+**Branding.** The waiting page is a template the client supplies assets to, not a page they
+fork the module to change. A generically-branded waiting room is unsellable: for the client
+this page is their storefront on the day that matters most.
+
+**Messaging.** The operator can publish a message to waiting visitors mid-event — stock
+confirmation, a delay explanation, an apology. It rides in the same cached JSON as the
+serving counter, so it costs nothing extra to deliver and reaches every waiter within the
+cache TTL. This is the control that turns an incident into a communicated incident.
+
+**Position and estimated wait.** Both displayed to the visitor. Estimated wait is derived
+from the measured admission rate rather than a static assumption, so it degrades gracefully
+when the operator changes the rate mid-event.
+
+**API-first.** Every operator action — rate change, phase transition, reset, pause,
+maintenance mode, message publish — is an API call. There is no console in v1, and no
+action that requires one. Clients drive it from their own tooling or from Terraform.
+
+---
+
+## 11. Failure behaviour
 
 Satisfies F4.1–F4.5.
 
@@ -422,7 +494,7 @@ into a visible outage.
 
 ---
 
-## 11. Deployment
+## 12. Deployment
 
 Satisfies N2, N3, N4, N5.
 
@@ -473,7 +545,7 @@ a configuration flag, and is priced separately.
 
 ---
 
-## 12. Cost model
+## 13. Cost model
 
 Satisfies O6.
 
@@ -505,7 +577,7 @@ event and measuring, not from the price sheet.
 
 ---
 
-## 13. Sources
+## 14. Sources
 
 | Claim | Source |
 |---|---|
@@ -535,7 +607,7 @@ event and measuring, not from the price sheet.
 
 ---
 
-## 14. Open questions
+## 15. Open questions
 
 1. Pre-queue randomization algorithm — must be verifiably fair and auditable from a
    recorded seed.
@@ -548,7 +620,7 @@ event and measuring, not from the price sheet.
    centrally aggregated) and how quickly activation must occur to be useful.
 5. No-show controller tuning — smoothing window and correction bounds (§5), which need a
    real event's data.
-6. Bot Control Common versus Targeted (§12) — resolve by measurement.
+6. Bot Control Common versus Targeted (§13) — resolve by measurement.
 7. Connector breadth. Queue-it ships 25+ platform connectors across CDNs and application
    frameworks; we ship a CloudFront/origin authorizer. Product scope decision.
 8. Whether to port the OpenID adapter at all — 618 LOC upstream, lowest value.

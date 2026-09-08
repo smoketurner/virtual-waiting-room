@@ -34,8 +34,11 @@ This project is a maintained, open-source alternative — rebuilt rather than fo
 | Infrastructure as code | CloudFormation | Terraform |
 | Scheduled-event handling | live arrival order | pre-queue with randomized assignment |
 | Standby / peak protection | none | dormant year-round, auto-activates on inflow |
+| Event lifecycle | queue only | idle → pre-queue → active → post-event, plus maintenance |
 | After admission | token re-checked per request | session credential, separately signed |
 | Admission rate | open-loop | closed-loop, compensates for no-shows |
+| Entry gating | none | client-signed identifier (membership ID, promo code) |
+| Operator surface | control-panel sample | live metrics, branding, messaging, API-first |
 | Failure behaviour | undefined | fails open |
 | Maintained | no | yes |
 
@@ -57,6 +60,21 @@ The API contract is kept compatible, so existing integrations port over.
   room that fails closed is worse than none.
 - **Near-zero idle cost.** Nothing runs between events; tables are pre-warmed before one.
 - **Deploys into your account**, commercial regions or GovCloud.
+
+## Relationship to Queue-it
+
+Queue-it has run this problem since 2010 — 150+ billion visitors, 1,000+ organizations —
+and publishes a great deal about how their system works. This project deliberately follows
+their architecture where they have learned something: the redirect-and-signed-token model,
+pre-queue randomization for scheduled events with FIFO for threshold-triggered ones, a
+separately-signed session after the first token validation, closed-loop outflow control
+that compensates for no-shows, and failing open when the waiting room is unreachable.
+
+The differences are deployment model, not architecture. Queue-it is hosted SaaS with 25+
+platform connectors — that breadth is their moat and we do not attempt to match it. This
+deploys into a single client's AWS account, which suits organizations that cannot send
+traffic through a third party, and costs a fraction of a $10K+/year enterprise contract at
+the small end of the market.
 
 ## License
 

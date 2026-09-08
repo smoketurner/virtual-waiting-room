@@ -7,15 +7,27 @@ criterion. `MUST` = mandatory; `SHOULD` = strong default, overridable per client
 
 ## 1. Functional
 
-### 1.1 Operating modes
+### 1.1 Event lifecycle
+
+Queue-it runs every waiting room through four phases. We adopt the same model: it is where
+operators communicate with visitors, and the phases that look like "nothing is happening"
+are the ones that carry the most operational value.
 
 | ID | Requirement | Acceptance |
 |---|---|---|
-| F0.1 | The system MUST support **scheduled** events with a known start time. | A configured event opens at its scheduled time. |
-| F0.2 | The system MUST support **standby** mode: dormant year-round, activating automatically when inflow crosses an operator-configured threshold. | Below threshold, visitors pass through untouched. Above it, new visitors are queued without operator action. |
-| F0.3 | Both modes MUST be able to run simultaneously on one origin. | A scheduled room on `/product/x` with a low admission rate coexists with standby protection across the whole site. |
-| F0.4 | The operator MUST be able to declare which requests are protected, by path, header, cookie, or user agent. | An unprotected path is never queued, regardless of mode or load. |
-| F0.5 | Standby activation and deactivation MUST be observable and manually overridable. | Operator can force-activate or force-dormant; state is visible in metrics. |
+| F0.1 | An event MUST progress through **idle → pre-queue → active → post-event** phases. | Each phase is observable and the transitions are scheduled or manual. |
+| F0.2 | Each phase MUST serve an operator-authored page. | Idle shows event information before the pre-queue opens; post-event shows outcome and next steps. |
+| F0.3 | The system MUST support **scheduled** events with a known start time. | A configured event opens at its scheduled time. |
+| F0.4 | The system MUST support **standby** mode: dormant year-round, activating automatically when inflow crosses an operator-configured threshold. | Below threshold, visitors pass through untouched. Above it, new visitors are queued without operator action. |
+| F0.5 | Both modes MUST run simultaneously on one origin. | A scheduled room on `/product/x` with a low admission rate coexists with standby protection across the whole site. |
+| F0.6 | The operator MUST be able to declare which requests are protected, by path, header, cookie, or user agent. | An unprotected path is never queued, in any mode. |
+| F0.7 | Standby activation MUST be observable and manually overridable. | Operator can force-activate or force-dormant; state is visible in metrics. |
+| F0.8 | The system MUST support a **maintenance mode** that parks all visitors on an operator page. | Enabling it holds every visitor regardless of mode or capacity. |
+
+**Fairness by mode.** Scheduled events randomize among pre-queue participants; standby
+activation queues first-in-first-out. This mirrors Queue-it and is deliberate: randomization
+neutralizes arrival-speed advantage when everyone knows the start time, while FIFO is the
+fair model when a spike is unplanned and nobody was waiting.
 
 ### 1.2 Pre-queue (scheduled events)
 
@@ -62,6 +74,34 @@ criterion. `MUST` = mandatory; `SHOULD` = strong default, overridable per client
 | F4.3 | Fail-open MUST be overridable per client. | A client requiring fail-closed can configure it, with the tradeoff documented. |
 | F4.4 | A join lost downstream MUST be recoverable by the client. | `GET /queue_num` returns 404; the client re-joins with a fresh UUIDv7. |
 | F4.5 | The client MUST treat HTTP 429 as expected and retry with jittered backoff. | Under gateway throttling, no user-visible error; joins succeed on retry. |
+
+### 1.6 Operator experience
+
+A waiting room that cannot be observed and adjusted mid-event is not usable in production.
+Queue-it sells traffic intelligence and branded themes as products; both are table stakes
+rather than extras.
+
+| ID | Requirement | Acceptance |
+|---|---|---|
+| F5.1 | The operator MUST see live event metrics: inflow, outflow, queue depth, admitted, no-show rate, expiry rate. | Metrics visible within one polling interval of reality. |
+| F5.2 | The waiting room page MUST be brandable by the client without forking the module. | Client supplies template assets; no code change required. |
+| F5.3 | The operator MUST be able to publish a message to waiting visitors during an event. | Message appears on the waiting page within the cache TTL. |
+| F5.4 | Waiting visitors MUST see their position and an estimated wait time. | Both displayed and updated as the queue advances. |
+| F5.5 | Every operator action MUST be available through an API, not only a console. | Rate change, reset, pause, message publish, and mode override all scriptable. |
+
+### 1.7 Abuse mitigation
+
+| ID | Requirement | Acceptance |
+|---|---|---|
+| F6.1 | The system MUST support gating **queue entry** on a client-issued signed identifier — a membership ID, promo code, or order reference. | A visitor without a valid identifier cannot join the queue. |
+| F6.2 | The identifier MUST be signed by the client, not by the waiting room. | The waiting room verifies a signature over data it never stores. |
+| F6.3 | Bot-blocking decisions SHOULD be enforceable at event start rather than during the pre-queue. | An operator can choose to admit suspected bots to the pre-queue and block them at randomization. |
+
+**Why F6.3.** Queue-it's Hype Event Protection blocks bots at sale start, after genuine
+visitors have secured positions, specifically so operators do not reveal detection early and
+give bots time to retool and rejoin. This is an operational posture, not a feature — it
+costs nothing to support and materially changes outcomes.
+
 
 ---
 
@@ -111,10 +151,26 @@ between a working on-sale and a throttled one.
 
 ---
 
-## 5. Explicit non-goals
+## 5. Deliberately deferred
+
+Queue-it ships these; we do not, yet. Listed so the gap is a decision rather than an
+oversight.
+
+| Capability | Why deferred |
+|---|---|
+| Invite-only waiting rooms (identifier + MFA gating) | Real revenue feature for loyalty and members-only sales. F6.1 is the primitive it builds on; the full flow is post-v1. |
+| Proof-of-Work challenges | Raises bot compute cost. Needs client-side work; WAF challenge actions cover much of it initially. |
+| CAPTCHA softblock before queue entry | WAF's CAPTCHA action covers the common case. |
+| Native app SDKs (iOS, Android, React Native) | A genuine gap for ticketing clients, who see heavy app traffic. Post-v1. |
+| Connector breadth — 25+ platform integrations | **This is Queue-it's actual moat.** We ship a CloudFront/origin authorizer, which covers CDN-fronted origins. Matching their breadth is a multi-year product commitment, not a v1 goal. |
+
+## 6. Explicit non-goals
 
 - Physical-location queueing (restaurants, clinics, service counters).
 - Replacing the client's CDN or WAF. We integrate with them.
-- Multi-tenant SaaS. We are not a Cloud Service Provider; see DESIGN §9.
+- Multi-tenant SaaS. We are not a Cloud Service Provider; see DESIGN §12.
 - Gapless position sequences.
 - Sub-second join latency. Queue join is latency-insensitive by nature.
+- Visitor engagement widgets and marketing data collection. Not infrastructure.
+- Email or SMS notification of queue position. Requires collecting personal data, which
+  conflicts with the posture that no visitor data leaves the client's account.

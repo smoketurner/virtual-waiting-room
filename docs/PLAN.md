@@ -3,7 +3,7 @@
 Delivers [`REQUIREMENTS.md`](./REQUIREMENTS.md) per [`DESIGN.md`](./DESIGN.md).
 Requirement IDs in brackets.
 
-**~9–11 weeks to a sellable commercial-region product.** GovCloud follows.
+**~12–14 weeks to a sellable commercial-region product.** GovCloud follows.
 
 ---
 
@@ -22,7 +22,7 @@ Throwaway code. Measures what documentation cannot settle.
 
 ---
 
-## Phase 1 — Core (6–7 weeks)
+## Phase 1 — Core (8–10 weeks)
 
 ### 1a. Data and counter
 - [ ] `Counters`, `Positions`, `Tokens` — on-demand, PITR, `warm_throughput_*` and optional
@@ -30,24 +30,34 @@ Throwaway code. Measures what documentation cannot settle.
 - [ ] Batch range allocation; increment by **valid** count only [F2.2, F2.6]
 - [ ] `attribute_not_exists(request_id)` on position writes [F2.5]
 
-### 1b. Pre-queue
+### 1b. Event lifecycle and modes
+- [ ] Phase state machine: idle → pre-queue → active → post-event, plus maintenance
+      [F0.1, F0.8]
+- [ ] Operator-authored static page per phase, CDN-cached [F0.2]
+- [ ] Protection rules (path, header, cookie, user agent), evaluated locally at the
+      authorizer [F0.6]
+- [ ] **Standby mode**: inflow measurement, threshold activation, manual override
+      [F0.4, F0.7]
+- [ ] Scheduled and standby coexisting on one origin [F0.3, F0.5]
+
+### 1c. Pre-queue
 - [ ] Static countdown page, CDN-cached, zero origin calls per view [F1.1, F1.2]
 - [ ] Pre-queue registration (identity only, spread across the window) [C1]
 - [ ] `/pre_queue_status`, globally cached
 - [ ] EventBridge-triggered batch assignment: seeded shuffle, recorded seed, paced
       `BatchWriteItem` within the configured window [F1.3, F1.4, F1.5, C2]
 
-### 1c. Live join
+### 1d. Live join
 - [ ] REST API → SQS integration, request validator, DLQ,
       `ReportBatchItemFailures` [F2.1, F2.4, C5]
 - [ ] `BatchSize` / `MaximumBatchingWindowInSeconds` variables, default 100 / 1s
 - [ ] SQS ESM Provisioned Mode as an opt-in variable, default off — mutually exclusive with
       the maximum-concurrency setting
 
-### 1d. Read path
+### 1e. Read path
 - [ ] `/queue_num`, `/serving_num`, `/waiting_num`, `/queue_pos_expiry` [F3.1]
 
-### 1e. Admission, session, and outflow control
+### 1f. Admission, session, and outflow control
 - [ ] Deploy-time signing key into Secrets Manager
 - [ ] `/generate_token` — single-use admission token, short expiry [F3.3]
 - [ ] Authorizer decision tree: session → token → protection match → 302 [F3.4]
@@ -59,21 +69,28 @@ Throwaway code. Measures what documentation cannot settle.
       smooth, bound the correction, adjust `serving_counter` on a schedule [F3.2, F3.8]
 - [ ] Decide signing-key rotation (open question 2)
 
-### 1f. Operating modes
-- [ ] Protection rules (path, header, cookie, user agent), distributed to the authorizer
-      and evaluated locally [F0.4]
-- [ ] **Standby mode**: inflow measurement, threshold activation and deactivation, manual
-      override [F0.2, F0.5]
-- [ ] Scheduled and standby coexisting on one origin [F0.1, F0.3]
+### 1g. Entry gating and abuse mitigation
+- [ ] **Client-signed identifier verification at join** — membership ID, promo code, order
+      reference; signed by the client, verified by us, stored by neither [F6.1, F6.2]
+- [ ] Deferred bot enforcement: admit to pre-queue, block at randomization [F6.3]
 
-### 1g. Control plane
+### 1h. Operator surface
+- [ ] Live metrics: inflow, outflow, queue depth, admitted, no-show rate, expiry rate
+      [F5.1]
+- [ ] Brandable waiting page — client supplies assets, no module fork [F5.2]
+- [ ] Operator message published into the cached status payload [F5.3]
+- [ ] Position and estimated wait derived from measured admission rate [F5.4]
+- [ ] Every operator action available via API; no console dependency [F5.5]
+
+### 1i. Control plane
 - [ ] `/increment_serving_counter`, `/update_session`, `/reset_initial_state`,
       `/expired_tokens`, `/num_active_tokens` [F3.10]
 - [ ] Scheduled position-expiry sweeper [F3.9]
 
-**Exit:** all endpoints correct; pre-queue assigns fairly and reproducibly; a visitor
-browses multiple pages on one session; standby activates on threshold; authorizer fails
-open.
+**Exit:** all endpoints correct; every lifecycle phase serves its page; pre-queue assigns
+fairly and reproducibly; a visitor browses multiple pages on one session; standby activates
+on threshold; entry gating rejects unsigned identifiers; operator can see and steer a live
+event; authorizer fails open.
 
 ---
 
@@ -155,6 +172,17 @@ Ships second, priced separately. No CloudFront, no edge compute, no VPC origins.
 
 ## Deferred
 
+Queue-it ships these; we do not yet. Recorded as decisions, not oversights.
+
+- **Invite-only waiting rooms** (identifier + MFA gating). F6.1 is the primitive; the full
+  flow is post-v1.
+- **Proof-of-Work challenges** and **CAPTCHA softblock** — WAF challenge actions cover much
+  of this initially.
+- **Native app SDKs** (iOS, Android, React Native). A genuine gap for ticketing clients,
+  who see heavy app traffic.
+- **Connector breadth.** Queue-it ships 25+ connectors across edge, server-side, native app
+  and ecommerce platforms, with a published version and support policy. This is their actual
+  moat. We ship a CloudFront/origin authorizer covering CDN-fronted origins.
 - OpenID adapter (618 LOC upstream, lowest value)
 - Hi/Lo leasing and strided sequences — documented escape hatches, unbuilt
 - Multi-region / global tables
