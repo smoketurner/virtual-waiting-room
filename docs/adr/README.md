@@ -18,6 +18,8 @@ One record per decision. Each states the context, the decision, and its conseque
 | [0011](0011-session-cookie-after-token.md) | Establish a session after validating the admission token |
 | [0012](0012-anti-ddos-count-mode.md) | Ship the anti-DDoS rule group in Count mode |
 | [0013](0013-cache-behaviour-separation.md) | Separate cache behaviours to preserve request collapsing |
+| [0014](0014-admin-ui-askama-cloudscape-tokens.md) | Render the admin UI with askama and Cloudscape design tokens |
+| [0015](0015-stripe-prequeue-counter.md) | Stripe the pre-queue registration counter across 10 shards |
 
 ## Open
 
