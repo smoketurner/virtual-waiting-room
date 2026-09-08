@@ -50,7 +50,21 @@ Smaller artifact and a marginally faster cold start, at the cost of slower build
 **Deliberately not set:** `panic = "abort"` — `lambda_runtime` catches an unwinding handler
 panic and turns it into a 5xx while keeping the sandbox warm; `abort` would torch the execution
 environment on every panic. `opt-level = "z"` — the permutation HMAC and JSON parsing are billed
-CPU time, so size-over-speed is the wrong trade.
+CPU time, so size-over-speed is the wrong trade; `opt-level` 3-vs-`z` for cold start is
+scenario-dependent and is A/B-measured in the Phase 0 spike, not assumed.
+
+### aws-lc-rs cold-start (jitter entropy)
+
+`aws-lc-rs` ≥ 1.14.1 seeds its RNG with CPU jitter entropy, collected once per process init
+(unoptimized, SHA3) — several ms to ~1 s on a cold start, worst on small-memory / frequently-cold
+functions ([smithy-rs #4541](https://github.com/smithy-lang/smithy-rs/discussions/4541),
+[lambdabench.dev/rust](https://lambdabench.dev/rust.html)). This system is idle by definition, so
+cold starts are the common case. **Preferred mitigation: force one real TLS handshake in the Init
+phase** (a cheap warm-up call on the client the handler uses), so the tax lands on boosted Init
+CPU rather than the first invoke — and no entropy source is dropped. The build flag
+`AWS_LC_SYS_NO_JITTER_ENTROPY=1` removes the tax outright but drops one of two defense-in-depth
+entropy sources; given the GovCloud/FIPS posture we lean **against** it. Settle both in the Phase 0
+spike.
 
 ## AWS services (core, commercial regions)
 

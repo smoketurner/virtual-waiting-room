@@ -10,7 +10,7 @@ Throwaway code. Measures what documentation cannot settle.
 
 - [ ] REST API `type: aws` → SQS with a request validator; confirm client UUIDv7 survives to the Lambda and malformed bodies are rejected with 400 [F2.4]
 - [ ] Concurrent `UpdateItem ADD :n` / `ALL_NEW` against one item: assert zero duplicate positions across allocated ranges; measure gap rate under induced 5xx [F2.2, F2.3]
-- [ ] Rust cold start on `provided.al2023` arm64 with an AWS SDK client — decides whether provisioned concurrency is needed
+- [ ] Rust cold start on `provided.al2023` arm64 with an AWS SDK client — decides whether provisioned concurrency is needed. Measure the `aws-lc-rs` CPU-jitter-entropy init tax (aws-lc-rs ≥ 1.14.1 adds several ms–~1 s at process init) and compare mitigations: an **init-phase warm-up TLS handshake** (a cheap call like `list_tables` so the tax lands on boosted Init CPU, no entropy source dropped) versus building with `AWS_LC_SYS_NO_JITTER_ENTROPY=1` (removes it outright but drops one defense-in-depth entropy source — a security trade-off we lean against given the GovCloud/FIPS posture). Also A/B `opt-level` 3 vs `z` on cold-init P50 — scenario-dependent, decide by measurement, not a priori. Sources in the knowledge base (lambdabench.dev/rust, smithy-rs #4541)
 
 **Exit:** findings written down. Nothing else kept.
 
