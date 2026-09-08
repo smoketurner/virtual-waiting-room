@@ -73,8 +73,9 @@ first-served queue.
                     └────────────────────┬─────────────────────┘
                                          │
                     ┌────────────────────▼─────────────────────┐
-                    │  API Gateway HTTP API                    │
-                    │  AWS_PROXY / SQS-SendMessage             │
+                    │  API Gateway REST API (regional)         │
+                    │  type: aws → SQS SendMessage             │
+                    │  request validator rejects bad bodies    │
                     │  ← no Lambda in the burst path           │
                     └────────────────────┬─────────────────────┘
                                          │
@@ -228,7 +229,7 @@ reaches them with no NAT and no endpoints. Removing Redis removes the entire sub
 | Idle cost | ~$300/mo Redis + ~$32/mo NAT | ~$0 |
 | Runtime | Python 3 + Chalice | Rust (`provided.al2023`, arm64) |
 | IaC | CloudFormation | Terraform |
-| Ingest | REST API → SQS (`type: aws`) | HTTP API → SQS (`SQS-SendMessage`) |
+| Ingest | REST API → SQS (`type: aws`) | REST API → SQS, client-supplied UUIDv7 (§8a) |
 
 **A VPC remains available as an opt-in Terraform variable** for clients whose ATO
 boundary mandates private-subnet compute and VPC endpoints regardless of IAM. That is
@@ -335,72 +336,90 @@ accounts, and therefore billable.
 
 ---
 
-## 8a. Request identity and the HTTP API ingest integration
+## 8a. Ingest API flavor and request identity
 
-The upstream REST integration derives the visitor's identity from API Gateway's own
-request ID, in two directions:
+### Decision: REST API (regional), not HTTP API
+
+An earlier draft of this design specified an HTTP API for the public routes, on the
+grounds that HTTP APIs cost $1.00/M requests against REST's $3.50/M — a ~71% saving on
+the highest-volume endpoint. **That reasoning was wrong, because it priced the wrong
+volume.**
+
+API Gateway only ever sees CloudFront *cache misses*. `/queue_num` is cached for 24h per
+`request_id` and `/serving_num` is cached globally for 5s, so a visitor generates roughly
+three origin requests regardless of how long they wait or how often they poll:
+
+| | Requests | Cost |
+|---|---|---|
+| CloudFront | 243,000,000 | $182.25 |
+| API Gateway (cache misses only) | 3,001,440 | |
+| → REST API @ $3.50/M | | **$10.51** |
+| → HTTP API @ $1.00/M | | **$3.00** |
+
+*(1,000,000 visitors, 20-minute average wait, 5-second poll interval, 2-hour event.)*
+
+**The entire saving is $7.50 per million-visitor event.** CloudFront costs ~17× the API
+Gateway bill either way. The real cost lever is the client poll interval, not the API
+flavor — moving from 5s to 10s polling saves $90 on the same event, twelve times more
+than the API choice:
 
 ```
-requestTemplates:                                  # → SQS
-  Action=SendMessage&MessageBody=$input.body
-  &MessageAttribute.1.Name=apig_request_id
-  &MessageAttribute.1.Value.StringValue=$context.requestId
-
-responses.default.responseTemplates:               # → browser
-  {"api_request_id": "$context.requestId"}
+poll every  2s -> 600 polls/visitor -> CloudFront $452.25
+poll every  5s -> 240 polls/visitor -> CloudFront $182.25
+poll every 10s -> 120 polls/visitor -> CloudFront $ 92.25
+poll every 30s ->  40 polls/visitor -> CloudFront $ 32.25
 ```
 
-The Lambda reads `messageAttributes.apig_request_id` and uses it as the `Positions`
-partition key; the browser needs the same value to poll `/queue_num?request_id=…`.
-Porting this to an HTTP API `SQS-SendMessage` integration hits three constraints.
+For $7.50 an HTTP API would cost us **request validation** (REST-only), **API keys and
+usage plans** (REST-only), and **response body mapping via VTL** (REST-only) — and would
+require workarounds invented solely to route around those gaps. Asynchronous ingest
+already carries irreducible complexity (§8a below); adding avoidable complexity on top
+of it to save $7.50 is a bad trade.
 
-**1. Message attributes — supported.** `$context` variables are documented mapping
-values. Note the bracket form is required inside a JSON string:
+Use a **regional** REST API. CloudFront already fronts it; edge-optimized would stack a
+second CDN.
 
-```yaml
-IntegrationSubtype: SQS-SendMessage
-RequestParameters:
-  QueueUrl: !Ref Queue
-  MessageBody: $request.body
-  MessageAttributes: >-
-    {"apig_request_id": {"DataType": "String", "StringValue": "${context.requestId}"}}
-```
+*(HTTP APIs are available in GovCloud — only private integrations are restricted, which
+this design does not use — so region availability is not a factor either way.)*
 
-**2. Response body transformation — not supported.** HTTP API response parameters
-accept only `append|overwrite|remove:header.name` and `overwrite:statuscode`. There is
-no VTL and no body mapping, so the request ID cannot be returned in a JSON body. A
-response *header* would work, but `x-amz-*`/`x-amzn-*` are reserved and browser access
-requires `Access-Control-Expose-Headers`.
+### The HTTP API constraints, recorded
 
-**3. API keys — not supported.** All seven upstream public routes are secured with
-`x-api-key`. HTTP APIs support neither API keys nor usage plans.
+Kept for the record so the question is not relitigated. Porting the upstream
+`SQS-SendMessage` integration to an HTTP API hits four constraints:
 
-**4. Request validation — not supported.** Request validators
-(`x-amazon-apigateway-request-validator`, used by upstream on `/assign_queue_num` as
-`"Validate body"`) are a REST API feature. An HTTP API cannot reject a malformed body
-at the gateway.
+1. **Message attributes — supported.** `$context` variables are documented mapping
+   values; the bracket form is required inside a JSON string:
+   `{"apig_request_id": {"DataType": "String", "StringValue": "${context.requestId}"}}`
+2. **Response body transformation — not supported.** HTTP API response parameters accept
+   only `append|overwrite|remove:header.name` and `overwrite:statuscode`. No VTL, no body
+   mapping.
+3. **API keys — not supported.** Neither API keys nor usage plans exist on HTTP APIs.
+4. **Request validation — not supported.** Request validators
+   (`x-amazon-apigateway-request-validator`) are REST-only.
 
-Constraints 2 and 4 interlock: because there is no response body mapping, a
-server-generated fallback ID could never be returned to the client, so "generate one if
-the client didn't" is not an available behavior.
+Constraints 2 and 4 interlock: with no response body mapping, a server-generated
+fallback ID could never be returned to the client, so "generate one if the client didn't"
+is not an available behavior on an HTTP API.
 
-### Decision: client-generated UUIDv7 request IDs
+### Request identity: client-generated UUIDv7 (retained)
 
-The browser generates a [RFC 9562](https://www.rfc-editor.org/rfc/rfc9562.html) UUIDv7
-and sends it in the request body. This resolves constraints 1 and 2 together — the
-client already knows its own ID, so nothing needs to be mapped back out, and the ID
-rides in `MessageBody` rather than a message attribute.
+The upstream REST integration mints the visitor's identity from `$context.requestId`,
+stamping it onto the SQS message and returning it in the response body. **We keep the
+REST API but do not keep this pattern**, because a client-supplied ID is better on its
+own merits:
 
-It is also **strictly better than server-minted IDs for retries**. With
-`$context.requestId`, a client retry mints a fresh ID and burns a second queue position.
-With a client-generated UUID, a retry carries the same ID and is absorbed by the
-`attribute_not_exists(request_id)` condition already required in §7.
+> With `$context.requestId`, a client retry mints a *fresh* ID and burns a second queue
+> position. With a client-generated ID, the retry carries the same value and is absorbed
+> by the `attribute_not_exists(request_id)` condition in §7.
 
-**Why v7 rather than v4** — honestly, for modest reasons. DynamoDB hashes the partition
+The browser generates an [RFC 9562](https://www.rfc-editor.org/rfc/rfc9562.html) UUIDv7
+and sends it in the request body.
+
+**Why v7 rather than v4** — for modest but real reasons. DynamoDB hashes the partition
 key, so v7's time ordering yields *no* locality benefit on `Positions` (and no
-hot-partition penalty either). The real gains are debuggability — join time is
-recoverable from the ID during incident reconstruction — and headroom if a sort key or
-GSI is added later.
+hot-partition penalty either). The gains are debuggability — join time is recoverable
+from the ID during incident reconstruction — and headroom if a sort key or GSI is added
+later.
 
 **The embedded timestamp is not trustworthy.** It comes from the client's clock and is
 trivially spoofed. `entry_time` is stamped server-side in the Lambda and remains the
@@ -412,8 +431,14 @@ the `uuid` package (≥ v11 exports `uuidv7()`) or a short hand-rolled generator
 
 ### Handling a missing or malformed request ID
 
-Since the gateway cannot validate (constraint 4) and cannot return a generated ID
-(constraint 2), validation happens in `assign_queue_num`:
+On a REST API this gets **two** layers.
+
+**Gateway validation (first layer).** A request validator with a JSON Schema model
+rejects a malformed or missing `request_id` with a 400 before it ever reaches SQS —
+synchronously, so the client learns immediately.
+
+**Lambda validation (backstop).** Schema validation cannot enforce UUIDv7 version bits,
+and defense in depth is cheap here:
 
 ```rust
 let (valid, invalid): (Vec<_>, Vec<_>) = records.iter()
@@ -426,29 +451,32 @@ let end = ddb.update_item()
     .return_values(ReturnValue::AllNew).send().await?;
 ```
 
-**Incrementing by `records.len()` would be a bug with security consequences**: a flood
-of malformed payloads would consume queue positions without producing queue members — a
-cheap denial-of-fairness attack. Allocate only for messages that parse.
+**Incrementing by `records.len()` would be a bug with security consequences**: a flood of
+malformed payloads would consume queue positions without producing queue members — a
+cheap denial-of-fairness attack. Allocate only for messages that parse. Gateway
+validation makes this path rare; it does not make it unnecessary.
 
-Invalid messages are reported through `ReportBatchItemFailures` and land in the DLQ.
-The client's subsequent `GET /queue_num?request_id=…` returns **404**, which the
-waiting-room page treats as "generate a fresh ID and re-join." This is self-healing and
-doubles as the recovery path for a genuinely lost message.
+Invalid messages are reported through `ReportBatchItemFailures` and land in the DLQ. The
+client's subsequent `GET /queue_num?request_id=…` returns **404**, which the waiting-room
+page treats as "generate a fresh ID and re-join." This is self-healing and doubles as the
+recovery path for a genuinely lost message.
 
 The residual asymmetry is inherent to asynchronous ingest: API Gateway returns 200 for a
 request that may never yield a position. The 200 means *accepted into the queue*, not
 *position assigned*. The 404-and-retry loop is what makes that safe, and it must be
 explicit in the client contract.
 
-### On dropping the API key
+### On the public API key
 
 The upstream public API key is not a security control — it ships in client-side
-JavaScript and is trivially extracted. It functions as a throttling handle. WAF
-rate-based rules serve that purpose better and are already in the design for bot
-mitigation, so removing the API key costs nothing real.
+JavaScript and is trivially extracted. It functions as a throttling handle, and WAF
+rate-based rules serve that purpose better.
 
-The **private** API is unaffected: it uses SigV4, carries genuine authorization, and
-stays on a REST API where API keys and usage plans remain available if wanted.
+Because we are on a REST API, API keys and usage plans **remain available** as an
+optional extra (e.g. a client who wants a revocable handle for a partner integration).
+They are simply not the primary mechanism. WAF is.
+
+The **private** API is unaffected: it uses SigV4 and carries genuine authorization.
 
 ---
 
@@ -484,10 +512,11 @@ priced accordingly.
 ## 10. Open questions
 
 1. ~~`SQS-SendMessage` HTTP API integration: confirm `$context.requestId` can be mapped
-   into `MessageAttributes`.~~ **Resolved — see §8a.** Message attributes work; response
-   body mapping does not exist on HTTP APIs and API keys are unsupported. Both are
-   resolved by client-generated UUIDv4 request IDs plus WAF rate limiting in place of
-   the public API key. Phase 0 now confirms rather than investigates.
+   into `MessageAttributes`.~~ **Resolved — see §8a.** Investigated, then reversed: the
+   HTTP API saving is ~$7.50 per million-visitor event because API Gateway sees only
+   CloudFront cache misses. Staying on a regional REST API keeps request validation, API
+   keys and VTL. Client-generated UUIDv7 request IDs are retained on their own merits
+   (retry idempotency).
 2. JWKS rotation story — upstream effectively has none.
 3. Inlet strategy interface: port upstream's periodic/max-size Lambdas, or expose a
    plain API and let clients drive it?

@@ -12,12 +12,12 @@ and to reach something demonstrable before something complete.
 Purpose: prove the two assumptions the whole build rests on, in throwaway code.
 If either fails, the design changes before any real work is spent.
 
-- [ ] **HTTP API → SQS.** Stand up `AWS_PROXY` / `SQS-SendMessage` and confirm the
-      design in DESIGN §8a end to end: client-supplied UUIDv4 `request_id` in the body
-      survives to the Lambda, WAF rate-based rules replace the public API key, and no
-      response body mapping is needed. Desk research resolved the mechanism; this is
-      confirmation, not investigation. Fallback if something surprises us: REST API
-      (~71% higher per-request cost, no architectural change).
+- [ ] **REST API → SQS ingest.** Stand up the regional REST API with `type: aws` direct
+      SQS integration, a request validator on the body, and client-supplied UUIDv7
+      `request_id`. Confirm the ID survives to the Lambda and that a malformed body is
+      rejected with a 400 at the gateway. (API flavor settled in DESIGN §8a — the HTTP
+      API saving was $7.50 per million-visitor event and cost us validation, API keys
+      and VTL.)
 - [ ] **Atomic range allocation under concurrency.** Hammer one `Counters` item with
       concurrent `UpdateItem ADD :n` / `ALL_NEW`. Assert: zero duplicate positions
       across all allocated ranges. Measure gap rate under induced 5xx.
@@ -61,7 +61,7 @@ If either fails, the design changes before any real work is spent.
 
 ## Phase 2 — Terraform module (1.5–2 weeks)
 
-- [ ] `modules/core` — DynamoDB, SQS, Lambdas, IAM, HTTP API
+- [ ] `modules/core` — DynamoDB, SQS, Lambdas, IAM, regional REST API + request validator
 - [ ] `modules/edge` — CloudFront, cache policies (`/queue_num` 24h,
       `/serving_num` 5s, `/public_key` 24h), WAF + Bot Control
 - [ ] `modules/authorizer` — API Gateway authorizer for the client's protected origin
@@ -109,7 +109,9 @@ The part that makes this a service rather than a repo.
       the recovery path for a malformed or lost message (DESIGN §8a). Generates UUIDv7
       via the `uuid` package; `crypto.randomUUID()` is v4-only.
 - [ ] Client integration guide: CloudFront/ALB/CDN placement
-- [ ] Cost model per event size
+- [ ] Cost model per event size. **CloudFront request volume dominates** — it is ~17× the
+      API Gateway bill — and the client poll interval is the single largest lever
+      (DESIGN §8a). Model it explicitly rather than leaving it at the upstream 5s.
 
 ---
 
@@ -145,7 +147,7 @@ pre-event operations are the product.
 
 | Risk | Mitigation |
 |---|---|
-| HTTP API ingest surprises us in practice | Phase 0 confirmation; fall back to REST API |
+| Client poll interval drives cost more than any infra choice | Make it configurable; default 10s not 5s; model it in the Phase 4 cost model |
 | Load test can't reach 100K/sec from one source | Distributed harness; budget for it in Phase 3 |
 | On-call burden — a failure during an on-sale is career-ending for the client | Price as incident-critical infrastructure, not a $150/mo care plan. Cap concurrent engagements. |
 | AWS ships a replacement | Unlikely — they just deprecated theirs and pointed at Marketplace |
