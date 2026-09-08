@@ -1,692 +1,442 @@
-# Virtual Waiting Room — High-Level Design
+# Design
 
-**Status:** Draft
-**License:** Apache-2.0
-**Origin:** Clean-room reimplementation of the concepts in the deprecated
-[`aws-solutions/virtual-waiting-room-on-aws`](https://github.com/aws-solutions/virtual-waiting-room-on-aws)
-(archived 2025-11-03), rewritten in Rust + Terraform with a substantially simpler
-infrastructure footprint.
+Implementation of [`REQUIREMENTS.md`](./REQUIREMENTS.md). A maintained replacement for
+the deprecated [`aws-solutions/virtual-waiting-room-on-aws`](https://github.com/aws-solutions/virtual-waiting-room-on-aws)
+(archived November 2025), rebuilt in Rust and Terraform.
+
+Every quantitative claim is sourced in §11.
 
 ---
 
-## 1. Problem
+## 1. Approach
 
-When demand for a website briefly exceeds what its origin can serve — a ticket on-sale,
-a limited product drop, an exam registration window, a benefits enrollment deadline —
-the origin degrades or fails for *everyone*. Autoscaling does not solve this: the spike
-arrives faster than instances boot, and the database tier usually cannot scale at all.
+A virtual waiting room meters visitors into an origin at a rate it can survive. The hard
+part is not the queue; it is the arrival burst.
 
-A virtual waiting room sits in front of the origin and **meters** visitors into it at a
-rate the origin can survive, holding the remainder in a fair, transparent, first-come
-first-served queue.
+**The central design decision is that we do not absorb the burst — we remove the incentive
+that creates it.** If queue position is assigned by arrival order, arriving early is an
+advantage, so everyone arrives in the same second. Randomizing position assignment among
+everyone present at the scheduled start removes that advantage, and with it two orders of
+magnitude of peak load:
 
-### Goals
-
-| # | Goal |
+| Approach | Write rate at T−0 for 1M visitors |
 |---|---|
-| G1 | Absorb an arbitrarily large arrival burst without dropping or misordering visitors |
-| G2 | Assign each visitor a unique, monotonically increasing queue position |
-| G3 | Admit visitors to the origin at an operator-controlled rate |
-| G4 | Prove admission cryptographically, so the origin can reject queue-jumpers |
-| G5 | Cost approximately nothing when no event is running |
-| G6 | Deploy into a *client's own* AWS account, commercial or GovCloud |
+| Live arrival order | 200,000–1,000,000/sec |
+| Pre-queue, randomized, assigned over 5 min | 3,333/sec |
 
-### Non-goals
+The second fits inside default AWS quotas. The first does not fit inside raised ones. This
+follows Queue-it's published design, which randomizes pre-queue visitors "like a raffle" to
+neutralize "any advantage to arriving early."
 
-- Physical-location queueing (restaurants, clinics) — different product entirely.
-- Being the origin's CDN or WAF. We integrate with those; we don't replace them.
-- Multi-tenant SaaS. See §9.
+Everything else follows from three further rules:
 
----
-
-## 2. Design principles
-
-1. **Gaps are free; duplicates are not.** A skipped queue position is invisible to
-   users. Two users holding position 40,001 is a correctness failure. Every design
-   decision follows from this asymmetry.
-2. **No compute in the ingest path.** The burst hits a service integration, not a
+1. **Gaps are free; duplicates are not.** A skipped position is invisible to users. Two
+   users holding position 40,001 is a correctness failure. This asymmetry permits the
+   cheapest correct counter implementation.
+2. **No compute in the ingest path.** The burst reaches a service integration, not a
    function. Cold starts and concurrency limits must not exist at the front door.
-3. **Near-zero cost at rest.** No always-on infrastructure; an idle waiting room should
-   bill pennies per month. **With one deliberate exception:** DynamoDB on-demand tables
-   scale from their previous peak, and an idle table has none, so tables are *pre-warmed*
-   (billed) ahead of a known event. Cheap at rest, paid before it matters — see §4.3b.
-4. **The client owns the data and the account.** We ship infrastructure-as-code, not a
-   hosted service.
-5. **Boring where it counts.** The counter is the product. It gets the least clever
-   implementation available that meets the throughput target.
-6. **Fail open, never closed.** If the waiting room is unavailable, visitors proceed to
-   the origin rather than being blocked. A waiting room that fails closed converts our
-   outage into the client's outage, which is worse than having no waiting room at all.
-   Queue-it's Direct Pass does exactly this: on service disruption, visitors "continue to
-   your site with a time-out cookie while the Connector retries connection in the
-   background." The authorizer's failure mode is configurable and defaults to open.
+3. **Fail open.** A waiting room that fails closed converts our outage into the client's
+   outage — worse than having no waiting room.
 
 ---
 
-## 3. Architecture
+## 2. Architecture
 
-### 3.0 Pre-queue: the scheduled-event path
-
-**This is the primary path for any event with a known start time**, which is nearly every
-real use case — ticket on-sales, product drops, registration windows.
-
-Early visitors are held on a **static countdown page served entirely from CloudFront
-cache** — no API Gateway, no DynamoDB, no SQS. When the timer reaches zero, the assembled
-participants are **randomized** and assigned queue positions as a scheduled batch, not by
-live arrival order.
-
-This follows Queue-it's published design, which describes randomizing pre-queue visitors
-"like a raffle" to neutralize "any advantage to arriving early."
-
-**The reason is load, not just fairness — and the arithmetic is decisive:**
-
-| Approach | Assignment load at T-0 |
-|---|---|
-| Live arrival order | 1M visitors over 1–5s = **200,000–1,000,000 writes/s** |
-| Pre-queue + batch assign over 5 min | **3,333 writes/s** |
-
-The second fits inside the *default* 40,000 WRU/s DynamoDB quota with room to spare. The
-first requires raising two quotas by 25× and 100× and still risks throttling.
-
-Assigning positions by arrival order makes arriving early an advantage, which guarantees
-that everyone arrives at once. **The thundering herd is manufactured by the fairness
-model, not imposed by the users.** Removing the incentive removes most of the load
-problem — and is *more* fair, since a fast connection stops conferring an advantage.
-
-The live-join path (§3.1) remains, but it serves walk-up arrivals after the event opens,
-not the scheduled peak.
-
-### 3.1 Request flow — joining the queue (live path)
+### 2.1 Scheduled event (primary path)
 
 ```
-                    ┌──────────────────────────────────────────┐
-                    │  AWS WAF + Bot Control + ASN match       │
-                    │  + Anti-DDoS rule group (COUNT by        │
-                    │    default — see §3.1a)                  │
-                    └────────────────────┬─────────────────────┘
-                                         │
-                    ┌────────────────────▼─────────────────────┐
-                    │  CloudFront                              │
-                    │  cache: /queue_num 24h (per request_id)  │
-                    │         /serving_num 5s (global)         │
-                    │         /public_key 24h                  │
-                    └────────────────────┬─────────────────────┘
-                                         │
-                    ┌────────────────────▼─────────────────────┐
-                    │  API Gateway REST API (regional)         │
-                    │  type: aws → SQS SendMessage             │
-                    │  request validator rejects bad bodies    │
-                    │  ← no Lambda in the burst path           │
-                    └────────────────────┬─────────────────────┘
-                                         │
-                    ┌────────────────────▼─────────────────────┐
-                    │  SQS standard queue  (+ DLQ)             │
-                    │  the shock absorber                      │
-                    └────────────────────┬─────────────────────┘
-                                         │ BatchSize 100 / window 1s
-                    ┌────────────────────▼─────────────────────┐
-                    │  assign_queue_num  (Rust, arm64)         │
-                    │  1× UpdateItem ADD :n → claims a range   │
-                    │  N× PutItem (idempotent per request_id)  │
-                    └────────────────────┬─────────────────────┘
-                                         │
-                    ┌────────────────────▼─────────────────────┐
-                    │  DynamoDB (on-demand)                    │
-                    │  Counters │ Positions │ Tokens           │
-                    └──────────────────────────────────────────┘
+  T−n           Visitor → CloudFront → static countdown page
+                (cached; zero origin requests per view)
+                        │
+                        │ register intent (once per visitor)
+                        ▼
+                  Pre-queue set in DynamoDB
+
+  T−0           EventBridge → assign_queue_num_batch (Rust)
+                  ├─ shuffle participant set with a recorded seed
+                  ├─ single UpdateItem ADD claims the whole range
+                  └─ paced BatchWriteItem into Positions
+                        │
+                        ▼
+  T+            Visitors poll /queue_num → position assigned
 ```
 
-### 3.1a Bot mitigation, and why Anti-DDoS ships in Count mode
-
-Three WAF layers, in increasing order of how much trouble they can cause:
-
-1. **Bot Control** — the bot-vs-human discrimination layer. Safe to run in Block.
-2. **ASN matching** (June 2025) — match on the Autonomous System Number of the source IP.
-   Scalper infrastructure concentrates in a small number of hosting ASNs, making this
-   cheap and effective for exactly this workload.
-3. **`AWSManagedRulesAntiDDoSRuleSet`** (June 2025) — detects, labels and challenges
-   requests suspected of participating in L7 DDoS. Adds a Challenge action alongside
-   Block/Count and needs 50 WCU.
-
-**The third ships in Count mode by default, deliberately.** It establishes a traffic
-baseline, and this workload has a pathological one: a waiting room's "normal" is zero
-traffic, and its legitimate peak is shaped exactly like a volumetric attack. AWS warns
-that baselines established during an attack take two to three times as long to settle.
-Running it in Block for a first on-sale risks challenging legitimate visitors at the
-worst possible moment.
-
-Promotion to Block is an explicit per-client decision after observing at least one real
-event. The operator runbook documents the COUNT-then-BLOCK discipline.
-
-**Cost note:** WAF is mandatory in this design, not optional, and it is billed per
-request inspected ($0.60/M) on top of Bot Control ($10/mo + $1/M Common, **$10/M
-Targeted**). Against the polling volume a waiting room generates, this is a first-order
-cost — frequently larger than the CloudFront bill itself. It is the main reason a
-CloudFront flat-rate plan, which bundles WAF and Bot Control, is usually cheaper than
-pay-as-you-go here (AUDIT-2026-09 §8).
-
-### 3.2 Request flow — being admitted
+### 2.2 Live join (walk-up arrivals after opening)
 
 ```
-  Operator / inlet strategy
-        │  increments serving_counter (rate control)
-        ▼
-  DynamoDB: serving_counter = 5,000
+  WAF (Bot Control + ASN match + Anti-DDoS in Count)
         │
-  Visitor polls /serving_num  ──► sees 5,000 ≥ own position 4,812
+  CloudFront   /queue_num 24h per request_id · /serving_num 5s global · /public_key 24h
         │
-  POST /generate_token ──► Rust Lambda signs RS256 JWT
+  API Gateway REST (regional)
+    request validator rejects malformed bodies
+    type: aws → SQS SendMessage          ← no Lambda in the burst path
         │
-  Visitor → origin with Bearer token
+  SQS standard + DLQ                      ← the shock absorber
+        │ BatchSize 100 / window 1s
+  assign_queue_num (Rust, arm64)
+    partition valid/invalid → ADD :valid_count → BatchWriteItem
         │
-  ┌─────▼──────────────────────────────────────┐
-  │ token_authorizer (Rust)                    │
-  │ verifies sig / exp / aud / iss             │
-  │ JWKS cached in-process (OnceCell)          │
-  └────────────────────────────────────────────┘
+  DynamoDB  Counters · Positions · Tokens   (on-demand, pre-warmed)
+```
+
+### 2.3 Admission
+
+```
+  Operator or inlet strategy increments serving_counter
+        │
+  Visitor polls /serving_num, sees serving ≥ own position
+        │
+  POST /generate_token → RS256 JWT
+        │
+  Origin request with Bearer token
+        │
+  token_authorizer (Rust) verifies sig/exp/aud/iss; JWKS cached in-process
+        │
+  Origin — private subnet behind CloudFront VPC origin (commercial regions)
 ```
 
 ---
 
-## 4. The counter (the critical design decision)
+## 3. Pre-queue
 
-### 4.1 Why not write sharding
+Satisfies F1.1–F1.5, C1, C2.
 
-The reflexive DynamoDB answer to a hot key is write sharding. **It does not apply
-here.** Sharded counters are *sum-only*: they answer "how many?" but cannot issue a
-unique ordered position. Reading shard 3 at 1,847 tells you nothing about what number
-to hand the next visitor, and two concurrent readers could compute the same total.
-Sharding destroys the global ordering that *is* the product.
+**Countdown page.** Static HTML and JavaScript served from CloudFront with a long TTL.
+Visitor count does not generate origin load (F1.2). The page polls a single globally-cached
+`/pre_queue_status` endpoint for the transition to open.
 
-The ~1,000 WCU/sec single-partition ceiling is therefore real and unavoidable for a
-true sequence. Adaptive capacity and split-for-heat cannot split a single key.
+**Registration.** A visitor arriving during the pre-queue registers a UUIDv7 into a
+pre-queue set. This is one write per visitor, spread across the entire pre-queue window
+(typically minutes to hours), not concentrated at T−0.
 
-### 4.2 Why an atomic counter is nonetheless correct and sufficient
+**Assignment at T−0.** An EventBridge schedule triggers a Rust function that:
 
-Per AWS's own guidance
-([Implement auto-increment with Amazon DynamoDB](https://aws.amazon.com/blogs/database/implement-auto-increment-with-amazon-dynamodb/)):
+1. Reads the participant set.
+2. Shuffles it using a seed recorded to the `Counters` item, making the result reproducible
+   and auditable (F1.5).
+3. Claims the full position range with one `UpdateItem ADD :n`.
+4. Writes positions with paced `BatchWriteItem`, rate-limited to the configured window
+   (F1.4).
 
-> There are no race conditions with this design because all writes to a single item in
-> DynamoDB are applied serially. This ensures that each counter value will never be
-> returned more than once.
+Because the write rate is scheduled rather than driven by arrivals, it is a parameter we
+choose rather than a burst we survive.
 
-`UpdateItem` + `ADD` + `ReturnValues: ALL_NEW` is a correct atomic sequence generator.
-No transactions, no OCC, no experimental validation required.
+**Fairness.** Randomization is the fairness model for scheduled events: everyone present at
+T−0 has equal probability of any position, regardless of connection speed or geography.
+First-come-first-served applies to live joins after opening (F2.1).
 
-### 4.3 Batch range allocation
+---
+
+## 4. Counter
+
+Satisfies F2.2, F2.3, C3.
+
+### 4.1 Atomic sequence, not sharding
+
+Write sharding is the reflexive answer to a hot DynamoDB key, and it does not apply.
+Sharded counters are sum-only: they answer "how many" but cannot issue a unique ordered
+position. Sharding destroys the global ordering that is the product.
+
+`UpdateItem` + `ADD` + `ReturnValues: ALL_NEW` is a correct sequence generator. AWS
+documents the guarantee: writes to a single item are applied serially, and each value is
+returned exactly once. No transactions, no optimistic concurrency control, no experiment
+needed.
+
+### 4.2 Batch range allocation
 
 One increment claims a whole batch's worth of positions:
 
 ```rust
-// one write per batch, not per visitor
-let n = records.len() as i64;
+let n = valid.len() as i64;
 let end = ddb.update_item()
     .update_expression("ADD queue_counter :n")
+    .expression_attribute_values(":n", N(n.to_string()))
     .return_values(ReturnValue::AllNew)
     .send().await?;
-let start = end - n + 1;          // this batch owns [start, end]
+let start = end - n + 1;              // this batch owns [start, end]
 ```
 
-The *counter* ceiling scales linearly with `BatchSize`. SQS standard queues support
-batches up to 10,000 (batches >10 require `MaximumBatchingWindowInSeconds ≥ 1`):
+Increment by the count of **valid** messages, never `records.len()` — otherwise a flood of
+malformed payloads consumes positions without producing queue members, a cheap
+denial-of-fairness attack (F2.6).
 
-| BatchSize | Window | Counter WCU/s | Counter ceiling |
-|---|---|---|---|
-| 10 | 0s | 1,000 | 10K/sec |
-| **100** | **1s** | **1,000** | **100K/sec** |
-| 1,000 | 1s | 1,000 | 1M/sec |
-| 5,000 | 1–2s | 1,000 | ~5M/sec (6 MB payload cap ≈ 10–12K records) |
+### 4.3 The real ceiling is `Positions`, not the counter
 
-The 1-second batching window adds ~1s to *joining* a queue in which users then wait
-minutes. It is imperceptible. Both values are Terraform variables.
-
-### 4.3a The counter is not the real ceiling — `Positions` is
-
-Batching amortizes the *counter* write. It does nothing for the position writes. Each
-batch performs **one** `UpdateItem` against `Counters` and **N** `PutItem`s against
-`Positions` — one per visitor, unavoidably.
-
-`Positions` is keyed on a UUIDv7 `request_id`, so it is evenly distributed across
-partitions and has no hot-key problem. But it is still bounded by the DynamoDB
-**per-table** on-demand quota:
+Batching amortizes the counter write. It does nothing for position writes, which are one
+per visitor.
 
 | Limit | Value | Adjustable |
 |---|---|---|
-| On-demand per-table write quota | 40,000 WRU/s | Yes — Service Quotas |
-| **Brand-new / long-idle table** | **~4,000 writes/s** | Via pre-warming (§4.3b) |
-| Single-partition write limit | 1,000 WCU/s | No — but irrelevant here (keys are distributed) |
+| DynamoDB per-table write, on-demand | 40,000 WRU/s | Yes — Service Quotas; explicitly not a maximum |
+| Cold or long-idle table | ~4,000 writes/s | Yes — pre-warming |
+| Single-partition write | 1,000 WCU/s | No — irrelevant; `request_id` keys are distributed |
+| Counter item | 1,000 WCU/s ÷ batch size | Not binding at batch ≥ 10 |
 
-**So the real ingest ceiling is ~40,000 joins/sec at default quotas**, regardless of
-`BatchSize`. Raising `BatchSize` above ~40 buys counter headroom that `Positions` cannot
-use. The quota increase must be requested *in advance* — it is a pre-event readiness item
-(§8) alongside the API Gateway RPS increase.
+So the live-join ceiling is ~40,000/sec at default quotas. `BatchSize` above ~40 buys
+counter headroom that `Positions` cannot use. Default `BatchSize` is 100 with a 1-second
+window, which costs one second on join in a queue where users then wait minutes.
 
-### 4.3b Cold-start capacity: pre-warm before every event
+### 4.4 Cold-start capacity
 
-On-demand capacity scales to roughly **double the previous peak**, and a new table starts
-at ~4,000 writes/sec. **A waiting room is idle by definition — it has no meaningful
-previous peak.** Left alone, a freshly deployed waiting room throttles at ~4,000
-joins/sec at exactly the moment an on-sale begins. This is the most likely way a first
-production deployment fails.
+On-demand tables serve ~4,000 writes/sec when new and grow to twice their previous peak. A
+waiting room is idle by definition and has no meaningful previous peak, so an unprepared
+deployment throttles at ~4,000/sec exactly when an on-sale starts.
 
-DynamoDB **warm throughput** (Nov 2024; GovCloud Jan 2025) addresses this directly:
+DynamoDB warm throughput fixes this: pre-warming sets the throughput a table can absorb
+instantaneously. Reading the value is free; pre-warming is billed. This is O1 — a
+contractual pre-event step, not an optimization.
 
-> Warm throughput value isn't a maximum limit on your table's capacity — rather, it's the
-> minimum throughput that your table is prepared to handle instantaneously. If you
-> pre-warm a table to support 100,000 write requests per second, your table will be ready
-> to handle that traffic immediately.
+### 4.5 Sequences versus statistics
 
-Reading the warm throughput value is free; pre-warming is billed. `warm_throughput_*` is
-therefore a Terraform variable on `Positions` and `Counters`, and **pre-warming is a
-billable line item in the pre-event readiness engagement** — a real per-event cost with a
-concrete failure it prevents.
-
-### 4.4 Gap tolerance
-
-An SDK retry after a 5xx, or a function dying mid-batch, can burn positions without
-issuing them. **This is acceptable and undetectable** — no user checks whether the queue
-skipped a number. The upstream Redis implementation has identical gap behavior
-(`INCR` then `put_item` is the same two-step), so this is not a regression.
-
-This tolerance is what unlocks the cheapest approach and, if ever needed, Hi/Lo leasing
-(§4.5). An inventory system could not make this trade.
-
-### 4.5 Escape hatches (documented, not built)
-
-- **Hi/Lo block leasing** — each execution environment leases N positions and serves
-  them from memory. DynamoDB sees one write per N visitors, fully decoupled from
-  ingest, with no batching-window latency. Cost: stranded blocks on environment death,
-  i.e. more gaps.
-- **Strided sequences** — N counters where counter *i* issues positions ≡ *i* (mod N).
-  Uniqueness preserved, ordering approximate across counters, ceiling × N. Unlike
-  sharding, reads do not scatter-gather.
-
-Neither is built in v1. Both are recorded so the ceiling question has a known answer.
-
-### 4.6 Sequences vs. statistics
-
-| Counter | Type | Sharding |
+| Counter | Kind | Sharding |
 |---|---|---|
-| `queue_counter` | sequence | **never** |
-| `serving_counter` | sequence | **never** |
-| `token_counter` | statistic | permitted |
-| `completed_counter` | statistic | permitted |
-| `abandoned_counter` | statistic | permitted |
-| `expired_queue_counter` | statistic | permitted |
+| `queue_counter`, `serving_counter` | sequence | never |
+| `token_counter`, `completed_counter`, `abandoned_counter`, `expired_queue_counter` | statistic | permitted if hot |
+
+### 4.6 Gap tolerance
+
+An SDK retry after a 5xx, or a function dying mid-batch, burns positions without issuing
+them. Nobody checks whether a queue skipped a number (F2.3). This tolerance is what permits
+the cheapest approach; an inventory system could not make the same trade.
 
 ---
 
-## 5. What we deliberately removed
+## 5. Ingest
 
-The upstream solution deploys **151 CloudFormation resources**. Twenty-six of them
-exist solely because ElastiCache Redis requires VPC attachment:
+Satisfies F2.4–F2.6, C5.
 
-```
-Lambdas total = 20,  in-VPC = 12
-VPC endpoints: sqs, dynamodb, secretsmanager, events, lambda
-VPC/Redis-coupled resources: 26 of 151
-```
+**Regional REST API with a direct SQS integration.** No Lambda in the burst path. SQS
+standard queues are documented as supporting a "nearly unlimited number of API calls per
+second," so ingest is not a constraint; every real limit is downstream.
 
-Redis held eight plain integers. DynamoDB, SQS, Secrets Manager, EventBridge and
-Lambda are all IAM-authenticated public-endpoint services — a function outside a VPC
-reaches them with no NAT and no endpoints. Removing Redis removes the entire subtree.
+**REST, not HTTP API.** HTTP APIs cost $1.00/M against REST's $3.50/M, but API Gateway only
+ever sees CloudFront cache misses — roughly three per visitor regardless of wait length.
+For a million-visitor event that is ~3M billable requests, so the saving is **$7.50**. HTTP
+APIs would cost request validation, API keys, and VTL response mapping, all REST-only. Not
+a trade worth making.
 
-| | Upstream | This design |
+**Client-supplied UUIDv7.** The client generates its own request identifier rather than
+receiving one minted by API Gateway. With a server-minted ID, a client retry produces a new
+ID and burns a second position; with a client-supplied one the retry carries the same value
+and is absorbed by the conditional write (F2.5). v7 over v4 for debuggability — join time is
+recoverable from the ID — and future sort-key headroom. The embedded timestamp is
+client-supplied and never trusted; `entry_time` is stamped server-side.
+
+Browser `crypto.randomUUID()` emits v4 only, so the reference client uses the `uuid`
+package.
+
+**Two validation layers.** A gateway request validator rejects malformed bodies
+synchronously with 400 (F2.4). The Lambda re-validates because schema validation cannot
+check UUIDv7 version bits, and because the increment-by-valid-count rule depends on it.
+
+**Recovery.** Invalid messages go to the DLQ via `ReportBatchItemFailures`. The client's
+subsequent `GET /queue_num` returns 404, which the client treats as "re-join with a fresh
+ID" (F4.4). This is also the recovery path for a genuinely lost message. API Gateway
+returning 200 means *accepted into the queue*, not *position assigned*; the 404 loop makes
+that safe.
+
+---
+
+## 6. Read path and caching
+
+Satisfies F3.1, C4.
+
+| Path | TTL | Cache key |
 |---|---|---|
-| Counters | ElastiCache `cache.r6g.large` MultiAZ | DynamoDB atomic counters |
+| `/queue_num` | 24h | `event_id` + `request_id` |
+| `/public_key` | 24h | `event_id` |
+| `/serving_num` | 5s | global |
+| `/queue_pos_expiry` | 5s | `event_id` + `request_id` |
+| `/pre_queue_status` | 5s | global |
+| `/assign_queue_num` | none | — |
+
+A position never changes once assigned, so it is cached per visitor for a day.
+`/serving_num` is the endpoint every waiter polls; a 5-second global cache collapses a
+million pollers into one origin fetch per interval (C4). Read hotspots are solved with
+cache, not sharding.
+
+**The client poll interval is the dominant cost variable in the whole system** — it
+multiplies CloudFront requests, WAF inspections, and Bot Control charges simultaneously.
+Default is 10 seconds, not the 5 the deprecated solution used.
+
+---
+
+## 7. Security and abuse mitigation
+
+Satisfies F3.3, F3.4, N7, O5.
+
+**Tokens.** RS256 JWT with claims `{sub, aud=event_id, iss, exp, token_use}`. The private
+key is generated at deploy time into Secrets Manager; the public JWKS is served and cached
+for 24 hours. The Rust authorizer holds the JWKS in a `OnceCell` rather than re-fetching.
+
+**WAF, three layers:**
+
+1. **Bot Control** — bot-versus-human discrimination. Safe in Block.
+2. **ASN matching** — scalper infrastructure concentrates in a small number of hosting
+   ASNs, making this cheap and effective here.
+3. **Anti-DDoS managed rule group** — ships in **Count mode by default** (O5). It learns a
+   traffic baseline, and a waiting room's legitimate peak is shaped exactly like a
+   volumetric attack. AWS documents that baselines formed during an attack take two to
+   three times longer to settle. Promotion to Block is a per-client decision after
+   observing one real event.
+
+**No public API key.** The deprecated solution's public API key ships in client-side
+JavaScript and is trivially extracted; it is a throttling handle, not a control. WAF
+rate-based rules do the job properly. API keys remain available on REST if a client wants a
+revocable handle for a partner integration.
+
+**Origin protection.** In commercial regions, CloudFront VPC origins place the origin in a
+private subnet with CloudFront as the sole ingress, making "nobody reaches the origin
+without a token" architecturally enforceable rather than policy-enforced.
+
+**WAF is a first-order cost, not a footnote.** It bills per request inspected on top of Bot
+Control's per-request fee, against polling volume — frequently exceeding the CloudFront
+bill. See §10.
+
+---
+
+## 8. Failure behaviour
+
+Satisfies F4.1–F4.5.
+
+**Fail open by default.** If the waiting room API is unreachable, the authorizer admits the
+visitor with a time-limited bypass cookie while the client retries in the background. This
+mirrors Queue-it's Direct Pass. Configurable to fail closed for clients who prefer it, with
+the tradeoff documented (F4.3).
+
+**Gateway throttling is expected, not exceptional.** API Gateway's account throttle is a
+token bucket: tokens refill at the RPS quota, the bucket holds at most 5,000. Steady-state
+capacity comes from the refill rate; the bucket absorbs instantaneous arrivals above it and
+sheds 429s when empty. The burst quota is not directly adjustable — AWS derives it from the
+RPS quota — so raising RPS is the only lever.
+
+This is a smoothing buffer, not a ceiling on event size. A 200,000-visitor burst against a
+50,000 RPS quota drains and refills within seconds. The requirement is that the client
+retries with jitter (F4.5); a client that fails closed on 429 turns a brief smoothing event
+into a visible outage.
+
+---
+
+## 9. Deployment
+
+Satisfies N2, N3, N4, N5.
+
+**Single-tenant, in the client's account.** Hosting other organizations' waiting rooms
+would make us a Cloud Service Provider requiring our own FedRAMP authorization
+($250K–$2M initial, 6–24 months, ~$500K/yr continuous monitoring). Deploying per-client
+means the client inherits AWS's existing authorization under their own ATO and we are a
+systems integrator writing Terraform. Blast radius is one client; the reusable asset is the
+module.
+
+CloudFront SaaS Manager is tooling for the multi-tenant architecture this rejects. It fits
+one narrow case — a single client running many branded domains — as a later variant.
+
+**What the deprecated solution deployed, and why we do not.** It used ElastiCache Redis for
+eight integer counters. Redis requires VPC attachment, so 12 of its 20 Lambdas ran in a VPC,
+which cost them five VPC endpoints, three subnets, a NAT gateway, an EIP, route tables, and
+flow logs — 26 of 151 resources existing solely to reach eight integers, plus roughly
+$330/month idle.
+
+DynamoDB, SQS, Secrets Manager, EventBridge and Lambda are IAM-authenticated public-endpoint
+services. Functions outside a VPC reach them with no NAT and no endpoints.
+
+| | Deprecated solution | This design |
+|---|---|---|
+| Counters | ElastiCache Redis, MultiAZ | DynamoDB atomic counters |
 | Networking | VPC, NAT, 5 endpoints, flow logs | none |
-| Resources | 151 | ~60–70 |
-| Idle cost | ~$300/mo Redis + ~$32/mo NAT | ~$0 |
-| Runtime | Python 3 + Chalice | Rust (`provided.al2023`, arm64) |
+| Resources | 151 | target ≤ 80 |
+| Idle cost | ~$330/mo | ~$0 plus pre-warming |
+| Runtime | Python 3 + Chalice | Rust, `provided.al2023`, arm64 |
 | IaC | CloudFormation | Terraform |
-| Ingest | REST API → SQS (`type: aws`) | REST API → SQS, client-supplied UUIDv7 (§8a) |
 
-**A VPC remains available as an opt-in Terraform variable** for clients whose ATO
-boundary mandates private-subnet compute and VPC endpoints regardless of IAM. That is
-a policy requirement, not an architectural one, and arguing SigV4 equivalence loses to
-a written control. The Lambda code is identical either way; only `vpc_config` and the
-endpoint resources become conditional.
-
----
-
-## 6. API surface
-
-Contract-compatible with upstream, so existing integrations port cleanly.
-
-### Public (CloudFront-fronted)
-
-| Method | Path | Cache | Purpose |
-|---|---|---|---|
-| POST | `/assign_queue_num` | none | Join the queue (client supplies UUIDv7 `request_id`; → SQS) |
-| GET | `/queue_num` | 24h per `request_id` | Read own position; **404 = re-join with a fresh ID** |
-| GET | `/serving_num` | 5s global | Read current serving position |
-| GET | `/waiting_num` | 5s global | Count still waiting |
-| POST | `/generate_token` | none | Exchange served position for JWT |
-| GET | `/public_key` | 24h | JWKS for token verification |
-| GET | `/queue_pos_expiry` | 5s | Seconds until position lapses |
-
-### Private (IAM / API key)
-
-| Method | Path | Purpose |
-|---|---|---|
-| POST | `/increment_serving_counter` | Admit N more visitors |
-| POST | `/update_session` | Mark session completed/abandoned |
-| POST | `/reset_initial_state` | Reset event |
-| GET | `/expired_tokens` | List expired tokens |
-| GET | `/num_active_tokens` | Active token count |
-
-`/serving_num` is the highest-volume read — every waiter polls it. CloudFront's 5s
-global cache collapses 100K pollers into one origin fetch per 5 seconds. Read hotspots
-are solved with cache, not shards.
-
----
-
-## 7. Data model
-
-**`Counters`** — PK `event_id`. One item holding all counters as numeric attributes.
-Atomic `ADD` per §4.
-
-**`Positions`** — PK `request_id` (client-supplied UUIDv7, validated in the Lambda).
-`{event_id, queue_position, entry_time, status}`. Written with
-`attribute_not_exists(request_id)` so SQS at-least-once redelivery *and* client retries
-are both idempotent. *(Upstream lacks this condition and can double-assign on
-redelivery.)* `entry_time` is stamped server-side and is authoritative — the UUIDv7
-timestamp is client-supplied and must never be trusted (§8a).
-
-**`Tokens`** — PK `request_id`. Issued JWT metadata, session status, TTL for automatic
-cleanup.
-
-All tables `PAY_PER_REQUEST`. Point-in-time recovery on by default.
-
----
-
-## 8. Real bottlenecks
-
-The counter is not the constraint after §4.3. In order:
-
-| # | Limit | Default | Adjustable |
-|---|---|---|---|
-| 1 | API Gateway account throttle (refill rate) | 10,000 RPS/region | Yes — Service Quotas, needs lead time |
-| 2 | API Gateway burst bucket | 5,000 requests | Not directly — derived from the RPS quota |
-| 3 | **DynamoDB `Positions` per-table write quota** | **40,000 WRU/s** | **Yes — Service Quotas (§4.3a)** |
-| 4 | **DynamoDB cold-start capacity** | **~4,000 writes/s** | **Yes — pre-warm (§4.3b)** |
-| 5 | Lambda concurrency | 1,000 | Yes |
-| 6 | SQS ESM poller ramp | +300/min → 1,250 max | Yes — Provisioned Mode (below) |
-| 7 | DynamoDB counter | ≥100K/sec at defaults | Via `BatchSize` — not binding |
-
-### Lambda Provisioned Mode for SQS ESM
-
-The default ESM ramp (+300 concurrent/minute) is too slow for a spike that arrives in
-under five seconds. Provisioned Mode (Nov 2025) scales **3× faster** (up to 1,000
-concurrent executions per minute) and supports **16× higher concurrency** (up to 20,000),
-configured as min (2–200) and max (2–2000) event pollers. Each poller handles up to
-1 MB/s, 10 concurrent invokes, or 10 SQS polling calls per second. Billed in Event Poller
-Units.
-
-**Constraint for the Terraform module:** provisioned mode cannot be combined with the
-maximum-concurrency setting — concurrency is controlled through poller count instead.
-
-It costs money at rest, so it is an opt-in variable defaulting to off, enabled as part of
-pre-event readiness.
-
-### How the throttle actually behaves
-
-API Gateway uses a token bucket. Tokens refill at the account RPS quota and the bucket
-holds at most 5,000. **Steady-state capacity is governed by the refill rate, not the
-bucket size.** The bucket only absorbs instantaneous submissions arriving faster than
-the refill rate can service; when it empties, clients receive `429 Too Many Requests`.
-
-The burst quota is
-[not directly adjustable](https://docs.aws.amazon.com/apigateway/latest/developerguide/limits.html) —
-"determined by the API Gateway service team based on the overall RPS quota for the
-account in the Region." Raising the RPS quota is the only lever that influences it.
-
-**This is a smoothing buffer, not a ceiling on event size.** A 200,000-visitor on-sale
-against a 50,000 RPS quota drains the bucket in the first instant and refills it within
-seconds; a small number of visitors see a 429 at t=0 and succeed on retry. The failure
-mode is a brief burst of retries, not a capped event.
-
-Two consequences, both of which the product must handle explicitly:
-
-1. **Client retry behavior matters as much as the quota.** The waiting-room page must
-   treat a 429 as expected and retry with jittered backoff rather than surfacing an
-   error. A client that fails closed converts a smoothing event into an outage. This is
-   a requirement on the reference implementation, not a nicety.
-2. **File the RPS increase early.** It is the only way to grow the burst bucket, and
-   Service Quotas requests above the default open a support case rather than
-   auto-approving.
-
-This is why **pre-event readiness is a first-class deliverable**, not an afterthought —
-quota increases filed with lead time, provisioned concurrency warmed, load test executed
-at target rate. It is also the work Queue-it's sales engineers perform for enterprise
-accounts, and therefore billable.
-
----
-
-## 8a. Ingest API flavor and request identity
-
-### Decision: REST API (regional), not HTTP API
-
-An earlier draft of this design specified an HTTP API for the public routes, on the
-grounds that HTTP APIs cost $1.00/M requests against REST's $3.50/M — a ~71% saving on
-the highest-volume endpoint. **That reasoning was wrong, because it priced the wrong
-volume.**
-
-API Gateway only ever sees CloudFront *cache misses*. `/queue_num` is cached for 24h per
-`request_id` and `/serving_num` is cached globally for 5s, so a visitor generates roughly
-three origin requests regardless of how long they wait or how often they poll:
-
-| | Requests | Cost |
-|---|---|---|
-| CloudFront | 243,000,000 | $182.25 |
-| API Gateway (cache misses only) | 3,001,440 | |
-| → REST API @ $3.50/M | | **$10.51** |
-| → HTTP API @ $1.00/M | | **$3.00** |
-
-*(1,000,000 visitors, 20-minute average wait, 5-second poll interval, 2-hour event.)*
-
-**The entire saving is $7.50 per million-visitor event.** CloudFront costs ~17× the API
-Gateway bill either way — and WAF, mandatory in this design and billed per inspected
-request, is larger still (AUDIT §8). The API flavor is not where the money is. The real
-cost lever is the client poll interval, which drives CloudFront, WAF and Bot Control
-charges together — moving from 5s to 10s polling saves $90 of CloudFront alone on the
-same event, plus proportional WAF and bot charges:
-
-```
-poll every  2s -> 600 polls/visitor -> CloudFront $452.25
-poll every  5s -> 240 polls/visitor -> CloudFront $182.25
-poll every 10s -> 120 polls/visitor -> CloudFront $ 92.25
-poll every 30s ->  40 polls/visitor -> CloudFront $ 32.25
-```
-
-For $7.50 an HTTP API would cost us **request validation** (REST-only), **API keys and
-usage plans** (REST-only), and **response body mapping via VTL** (REST-only) — and would
-require workarounds invented solely to route around those gaps. Asynchronous ingest
-already carries irreducible complexity (§8a below); adding avoidable complexity on top
-of it to save $7.50 is a bad trade.
-
-Use a **regional** REST API. CloudFront already fronts it; edge-optimized would stack a
-second CDN.
-
-*(HTTP APIs are available in GovCloud — only private integrations are restricted, which
-this design does not use — so region availability is not a factor either way.)*
-
-### The HTTP API constraints, recorded
-
-Kept for the record so the question is not relitigated. Porting the upstream
-`SQS-SendMessage` integration to an HTTP API hits four constraints:
-
-1. **Message attributes — supported.** `$context` variables are documented mapping
-   values; the bracket form is required inside a JSON string:
-   `{"apig_request_id": {"DataType": "String", "StringValue": "${context.requestId}"}}`
-2. **Response body transformation — not supported.** HTTP API response parameters accept
-   only `append|overwrite|remove:header.name` and `overwrite:statuscode`. No VTL, no body
-   mapping.
-3. **API keys — not supported.** Neither API keys nor usage plans exist on HTTP APIs.
-4. **Request validation — not supported.** Request validators
-   (`x-amazon-apigateway-request-validator`) are REST-only.
-
-Constraints 2 and 4 interlock: with no response body mapping, a server-generated
-fallback ID could never be returned to the client, so "generate one if the client didn't"
-is not an available behavior on an HTTP API.
-
-### Request identity: client-generated UUIDv7 (retained)
-
-The upstream REST integration mints the visitor's identity from `$context.requestId`,
-stamping it onto the SQS message and returning it in the response body. **We keep the
-REST API but do not keep this pattern**, because a client-supplied ID is better on its
-own merits:
-
-> With `$context.requestId`, a client retry mints a *fresh* ID and burns a second queue
-> position. With a client-generated ID, the retry carries the same value and is absorbed
-> by the `attribute_not_exists(request_id)` condition in §7.
-
-The browser generates an [RFC 9562](https://www.rfc-editor.org/rfc/rfc9562.html) UUIDv7
-and sends it in the request body.
-
-**Why v7 rather than v4** — for modest but real reasons. DynamoDB hashes the partition
-key, so v7's time ordering yields *no* locality benefit on `Positions` (and no
-hot-partition penalty either). The gains are debuggability — join time is recoverable
-from the ID during incident reconstruction — and headroom if a sort key or GSI is added
-later.
-
-**The embedded timestamp is not trustworthy.** It comes from the client's clock and is
-trivially spoofed. `entry_time` is stamped server-side in the Lambda and remains the
-sole source of truth for ordering and expiry. The v7 timestamp is a debugging
-convenience, never a data source.
-
-Note that browser-native `crypto.randomUUID()` emits v4 only; the reference client needs
-the `uuid` package (≥ v11 exports `uuidv7()`) or a short hand-rolled generator.
-
-### Handling a missing or malformed request ID
-
-On a REST API this gets **two** layers.
-
-**Gateway validation (first layer).** A request validator with a JSON Schema model
-rejects a malformed or missing `request_id` with a 400 before it ever reaches SQS —
-synchronously, so the client learns immediately.
-
-**Lambda validation (backstop).** Schema validation cannot enforce UUIDv7 version bits,
-and defense in depth is cheap here:
-
-```rust
-let (valid, invalid): (Vec<_>, Vec<_>) = records.iter()
-    .partition(|r| parse_uuid_v7(&r.body).is_ok());
-
-// increment by the VALID count only
-let end = ddb.update_item()
-    .update_expression("ADD queue_counter :n")
-    .expression_attribute_values(":n", N(valid.len().to_string()))
-    .return_values(ReturnValue::AllNew).send().await?;
-```
-
-**Incrementing by `records.len()` would be a bug with security consequences**: a flood of
-malformed payloads would consume queue positions without producing queue members — a
-cheap denial-of-fairness attack. Allocate only for messages that parse. Gateway
-validation makes this path rare; it does not make it unnecessary.
-
-Invalid messages are reported through `ReportBatchItemFailures` and land in the DLQ. The
-client's subsequent `GET /queue_num?request_id=…` returns **404**, which the waiting-room
-page treats as "generate a fresh ID and re-join." This is self-healing and doubles as the
-recovery path for a genuinely lost message.
-
-The residual asymmetry is inherent to asynchronous ingest: API Gateway returns 200 for a
-request that may never yield a position. The 200 means *accepted into the queue*, not
-*position assigned*. The 404-and-retry loop is what makes that safe, and it must be
-explicit in the client contract.
-
-### On the public API key
-
-The upstream public API key is not a security control — it ships in client-side
-JavaScript and is trivially extracted. It functions as a throttling handle, and WAF
-rate-based rules serve that purpose better.
-
-Because we are on a REST API, API keys and usage plans **remain available** as an
-optional extra (e.g. a client who wants a revocable handle for a partner integration).
-They are simply not the primary mechanism. WAF is.
-
-The **private** API is unaffected: it uses SigV4 and carries genuine authorization.
-
----
-
-## 9. Deployment model
-
-**Single-tenant, deployed into the client's AWS account. Not multi-tenant SaaS.**
-
-Hosting other organizations' waiting rooms in our own account would make us a Cloud
-Service Provider, requiring our own FedRAMP authorization: $250K–$2M initial,
-6–24 months, ~$500K/yr continuous monitoring, plus ~$50K per Significant Change
-Request. That is not viable for a small firm, and FedRAMP guidance pushes toward
-dedicated infrastructure anyway.
-
-Deploying per-client means the client inherits AWS's existing GovCloud authorization
-under their own ATO, and we are a systems integrator writing Terraform. Blast radius
-is one client. Each client pays their own AWS bill. The reusable asset is the module.
-
-### Protecting the origin with CloudFront VPC origins
-
-CloudFront **VPC origins** (Nov 2024) serve content from ALBs, NLBs, or EC2 instances in
-*private* subnets, making CloudFront the sole ingress and removing the need for a public
-IP on the origin.
-
-This matters more here than it does for a typical site. The waiting room's entire purpose
-is ensuring nobody reaches the origin without a token. VPC origins make that
-*architecturally* enforceable rather than merely policy-enforced — the origin is not
-reachable from the internet at all, so bypassing the queue is not a matter of guessing a
-URL. The token authorizer stops being the only line of defense.
-
-It is **not** available for the GovCloud variant — the supported-region list is 34
-commercial regions only, with neither `us-gov-west-1` nor `us-gov-east-1` present
-(verified; see AUDIT-2026-09 §9). Combined with CloudFront's own absence from GovCloud,
-that variant must protect the origin using an internal ALB with the token authorizer and
-security-group/IAM enforcement, with no managed CloudFront integration to lean on.
-
-Constraints for the commercial module: no Lambda@Edge origin triggers (forecloses an
-alternative authorizer design), no gRPC, inbound NACLs not evaluated (outbound must allow
-ephemeral TCP 1024–65535), and the VPC must have an internet gateway *present* even though
-it is not used for routing to the origin. VPC origins can be shared across accounts via
-AWS RAM, which helps if a client separates the waiting room from the protected
-application.
-
-### On CloudFront SaaS Manager (multi-tenant distributions)
-
-CloudFront SaaS Manager (April 2025) offers multi-tenant distributions with reusable
-templates, per-tenant parameters and ACM integration. **It does not apply to this
-deployment model** — it is tooling for exactly the multi-tenant architecture this section
-rejects. We deploy into the client's account, where a client has one domain and their own
-certificate.
-
-There is one narrower case where it genuinely fits: a *single* client running many
-concurrent branded events — a ticketing company with dozens of venue domains, a retailer
-with several brands. There, one client account holds many waiting-room front-ends and
-SaaS Manager removes real per-domain toil. That is a Phase 5+ variant for a specific
-customer profile, not a change to the core module. Note multi-tenant distributions
-support **only WAF V2 web ACLs**.
+A VPC remains available as an opt-in variable for clients whose ATO boundary mandates
+private-subnet compute regardless of IAM. That is policy, not architecture; the Lambda code
+is identical either way.
 
 ### GovCloud variant
 
-CloudFront, CloudFront Functions and Lambda@Edge **do not exist in GovCloud**. AWS's
-own public-sector guidance places CloudFront in a commercial region pointing at
-GovCloud origins. Two consequences:
+CloudFront, CloudFront Functions, Lambda@Edge, and CloudFront VPC origins are **all
+unavailable in GovCloud** — the VPC origins supported-region list covers 34 commercial
+regions and neither GovCloud region appears. AWS's own public-sector guidance places
+CloudFront in a commercial region pointing at GovCloud origins, which raises a data-boundary
+question for the client's Authorizing Official.
 
-1. Edge gating is unavailable inside the boundary; gate at ALB/origin instead.
-2. A commercial-region CloudFront fronting a GovCloud origin means request metadata
-   transits a non-GovCloud service — a conversation to have with the client's AO.
-
-The GovCloud module is therefore a genuinely different topology, shipped second and
-priced accordingly.
+Consequences: no edge gating, no managed origin protection, and no CDN cache collapse for
+`/serving_num` inside the boundary. Origin protection is built from primitives — internal
+ALB, token authorizer, security groups and IAM. This is a materially different topology, not
+a configuration flag, and is priced separately.
 
 ---
 
-## 10. Open questions
+## 10. Cost model
 
-1. ~~`SQS-SendMessage` HTTP API integration: confirm `$context.requestId` can be mapped
-   into `MessageAttributes`.~~ **Resolved — see §8a.** Investigated, then reversed: the
-   HTTP API saving is ~$7.50 per million-visitor event because API Gateway sees only
-   CloudFront cache misses. Staying on a regional REST API keeps request validation, API
-   keys and VTL. Client-generated UUIDv7 request IDs are retained on their own merits
-   (retry idempotency).
-2. JWKS rotation story — upstream effectively has none.
-3. Inlet strategy interface: port upstream's periodic/max-size Lambdas, or expose a
-   plain API and let clients drive it?
-4. Whether to port the OpenID adapter at all (618 LOC upstream, lowest value).
+Satisfies O6.
+
+Ordered by size for a million-visitor event at 10-second polling:
+
+| Component | Driver | Approximate |
+|---|---|---|
+| CloudFront requests | poll interval × visitors × wait | $92 |
+| WAF + Bot Control | same request volume | $87 + $123 (Common) or $1,230 (Targeted) |
+| DynamoDB pre-warming | target write rate | billed per event |
+| API Gateway | cache misses only, ~3/visitor | $10 |
+| SQS, Lambda, DynamoDB writes | joins | negligible |
+
+**Two decisions must be computed per client rather than assumed:**
+
+*Flat-rate versus pay-as-you-go.* Flat-rate plans (Free $0 / Pro $15 / Business $200 /
+Premium $1,000 per distribution per month) bundle CDN, WAF, DDoS protection, Bot Control,
+Route 53 and TLS. Pay-as-you-go buys those separately. The crossover is non-monotonic
+because WAF has a ~$23/month fixed floor plus a per-request component while plans have
+monthly allowances — flat-rate wins at small and large events, PAYG in the middle band.
+Bias toward flat-rate where the client needs a not-to-exceed number, since under PAYG a
+volumetric attack bills WAF and Bot Control per-request on attack traffic.
+
+*Bot Control Common versus Targeted.* Targeted costs ten times more per request and is
+designed for bots that mimic human behaviour, which is what scalpers do. At 123M requests
+the difference is $123 against $1,230 per event. There is no data yet on whether it catches
+materially more for this workload. Resolve by running Targeted in Count mode during a real
+event and measuring, not from the price sheet.
+
+---
+
+## 11. Sources
+
+| Claim | Source |
+|---|---|
+| DynamoDB per-table on-demand quota 40,000 RRU/WRU, adjustable, "not maximum limits" | [Quotas in DynamoDB](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/ServiceQuotas.html) |
+| No account-level throughput quota in on-demand mode | same |
+| New tables 4,000 writes/s, 12,000 reads/s; growth to 2× previous peak | [On-demand capacity mode](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/on-demand-capacity-mode.html) |
+| Single-partition 1,000 WCU/s | [Partition key design](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-partition-key-design.html) |
+| Warm throughput and pre-warming | [Pre-warming DynamoDB tables](https://aws.amazon.com/blogs/database/pre-warming-amazon-dynamodb-tables-with-warm-throughput/) |
+| Atomic counter serialization; each value returned once | [Implement auto-increment with DynamoDB](https://aws.amazon.com/blogs/database/implement-auto-increment-with-amazon-dynamodb/) |
+| Counter approaches and failure modes | [Implement resource counters with DynamoDB](https://aws.amazon.com/blogs/database/implement-resource-counters-with-amazon-dynamodb/) |
+| API Gateway 10,000 RPS, 5,000 burst not customer-adjustable | [API Gateway quotas](https://docs.aws.amazon.com/apigateway/latest/developerguide/limits.html) |
+| Request validators are REST-only | [Request validation](https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-method-request-validation.html) |
+| HTTP API response mapping limited to headers and status code | [HTTP API parameter mapping](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-parameter-mapping.html) |
+| SQS standard "nearly unlimited API calls per second, per action" | [SQS message quotas](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/quotas-messages.html) |
+| ESM BatchSize to 10,000; window ≥1s above 10; 6 MB payload; +300/min to 1,250 | [SQS event source mapping](https://docs.aws.amazon.com/lambda/latest/dg/services-sqs-configure.html) |
+| Provisioned Mode: 2–200/2–2000 pollers, 1,000 concurrent/min, 20,000 max | [Provisioned Mode for SQS ESM](https://aws.amazon.com/about-aws/whats-new/2025/11/aws-lambda-provisioned-mode-sqs-esm) |
+| Anti-DDoS rule group; baselines during attack take 2–3× longer | [Anti-DDoS managed rule group](https://docs.aws.amazon.com/waf/latest/developerguide/waf-anti-ddos-rg-using.html) |
+| WAF pricing: $5 ACL, $1 rule, $0.60/M; Bot Control $10/mo + $1/M or $10/M | [AWS WAF pricing](https://aws.amazon.com/waf/pricing) |
+| CloudFront flat-rate tiers and allowances | [CloudFront pricing](https://aws.amazon.com/cloudfront/pricing/) |
+| VPC origins; supported regions exclude GovCloud | [Restrict access with VPC origins](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-vpc-origins.html) |
+| CloudFront unavailable in GovCloud | [Setting up CloudFront with GovCloud resources](https://docs.aws.amazon.com/govcloud-us/latest/UserGuide/setting-up-cloudfront.html) |
+| Pre-queue randomization; redirect-and-token integration; Direct Pass fail-open | [How Queue-it Works](https://www.queue-it.com/developers/how-queue-it-works), [What's New August 2025](https://queue-it.com/blog/whats-new-august-2025/) |
+| FedRAMP cost and timeline | Published 3PAO and FedRAMP advisory pricing, cross-checked across sources |
+| Deprecated solution: 151 resources, 4,866 LOC, 26 VPC/Redis-coupled | Read directly from the archived repository |
+
+---
+
+## 12. Open questions
+
+1. Pre-queue randomization algorithm — must be verifiably fair and auditable from a
+   recorded seed.
+2. JWKS rotation. The deprecated solution has no rotation story.
+3. Bot Control Common versus Targeted (§10) — resolve by measurement.
+4. Inlet strategy interface: port the deprecated periodic and max-size Lambdas, or expose
+   the API and let clients drive it.
+5. Connector breadth. Queue-it ships 25+ platform connectors; we ship one authorizer.
+   Product scope decision.
+6. Whether to port the OpenID adapter at all — 618 LOC upstream, lowest value.

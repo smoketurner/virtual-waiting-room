@@ -1,192 +1,156 @@
 # Implementation Plan
 
-Companion to [`DESIGN.md`](./DESIGN.md). Sequenced to kill the riskiest unknowns first
-and to reach something demonstrable before something complete.
+Delivers [`REQUIREMENTS.md`](./REQUIREMENTS.md) per [`DESIGN.md`](./DESIGN.md).
+Requirement IDs in brackets.
 
-**Estimate: 6–8 weeks to a sellable commercial-region product.** GovCloud follows.
+**~7–9 weeks to a sellable commercial-region product.** GovCloud follows.
 
 ---
 
 ## Phase 0 — Spike (3–5 days)
 
-Purpose: prove the two assumptions the whole build rests on, in throwaway code.
-If either fails, the design changes before any real work is spent.
+Throwaway code. Measures what documentation cannot settle.
 
-- [ ] **REST API → SQS ingest.** Stand up the regional REST API with `type: aws` direct
-      SQS integration, a request validator on the body, and client-supplied UUIDv7
-      `request_id`. Confirm the ID survives to the Lambda and that a malformed body is
-      rejected with a 400 at the gateway. (API flavor settled in DESIGN §8a — the HTTP
-      API saving was $7.50 per million-visitor event and cost us validation, API keys
-      and VTL.)
-- [ ] **Atomic range allocation under concurrency.** Hammer one `Counters` item with
-      concurrent `UpdateItem ADD :n` / `ALL_NEW`. Assert: zero duplicate positions
-      across all allocated ranges. Measure gap rate under induced 5xx.
-- [ ] **Rust Lambda cold start**, `provided.al2023` on arm64, with an AWS SDK client.
-      Establishes whether provisioned concurrency is needed at all.
+- [ ] REST API `type: aws` → SQS with a request validator; confirm client UUIDv7 survives
+      to the Lambda and malformed bodies are rejected with 400 [F2.4]
+- [ ] Concurrent `UpdateItem ADD :n` / `ALL_NEW` against one item: assert zero duplicate
+      positions across allocated ranges; measure gap rate under induced 5xx [F2.2, F2.3]
+- [ ] Rust cold start on `provided.al2023` arm64 with an AWS SDK client — decides whether
+      provisioned concurrency is needed
 
-**Exit:** a scratch repo and a paragraph of findings. Nothing here is kept.
+**Exit:** findings written down. Nothing else kept.
 
 ---
 
-## Phase 1 — Core (3–4 weeks)
+## Phase 1 — Core (4–5 weeks)
 
-### 1a. Counter and ingest
-- [ ] `Counters` / `Positions` / `Tokens` tables, `PAY_PER_REQUEST`, PITR on,
-      `warm_throughput_*` and optional `max_throughput_*` as variables (DESIGN §4.3a/b)
-- [ ] `BatchSize` / `MaximumBatchingWindowInSeconds` as variables, default 100 / 1s
-- [ ] SQS ESM **Provisioned Mode** as an opt-in variable (default off) — note it is
-      mutually exclusive with the maximum-concurrency setting (DESIGN §8)
-- [ ] `assign_queue_num`: parse/validate client UUIDv7, partition valid from invalid,
-      **increment the counter by the valid count only** (DESIGN §8a — incrementing by
-      `records.len()` lets malformed payloads burn queue positions), batch range
-      allocation, `attribute_not_exists(request_id)` on write (fixes upstream's
-      redelivery double-assign)
-- [ ] DLQ + `ReportBatchItemFailures` partial-batch responses
+### 1a. Data and counter
+- [ ] `Counters`, `Positions`, `Tokens` — on-demand, PITR, `warm_throughput_*` and optional
+      `max_throughput_*` as variables [O1]
+- [ ] Batch range allocation; increment by **valid** count only [F2.2, F2.6]
+- [ ] `attribute_not_exists(request_id)` on position writes [F2.5]
 
-### 1b. Read path
-- [ ] `get_queue_num`, `get_serving_num`, `get_waiting_num`, `get_queue_position_expiry_time`
+### 1b. Pre-queue
+- [ ] Static countdown page, CDN-cached, zero origin calls per view [F1.1, F1.2]
+- [ ] Pre-queue registration (identity only, spread across the window) [C1]
+- [ ] `/pre_queue_status`, globally cached
+- [ ] EventBridge-triggered batch assignment: seeded shuffle, recorded seed, paced
+      `BatchWriteItem` within the configured window [F1.3, F1.4, F1.5, C2]
 
-### 1c. Tokens
-- [ ] RSA keypair generation at deploy time, private key in Secrets Manager
-- [ ] `generate_token` — RS256, claims `{sub, aud=event_id, iss, exp, token_use}`
-- [ ] `get_public_key` — JWKS endpoint
-- [ ] `token_authorizer` — verify sig/exp/aud/iss, JWKS in a `OnceCell`
-- [ ] **Decide JWKS rotation** (open question §10.2)
+### 1c. Live join
+- [ ] REST API → SQS integration, request validator, DLQ,
+      `ReportBatchItemFailures` [F2.1, F2.4, C5]
+- [ ] `BatchSize` / `MaximumBatchingWindowInSeconds` variables, default 100 / 1s
+- [ ] SQS ESM Provisioned Mode as an opt-in variable, default off — mutually exclusive with
+      the maximum-concurrency setting
 
-### 1d. Control plane
-- [ ] `increment_serving_counter`, `update_session`, `reset_initial_state`,
-      `get_list_expired_tokens`, `get_num_active_tokens`
-- [ ] Queue-position expiry sweeper (EventBridge scheduled)
+### 1d. Read path
+- [ ] `/queue_num`, `/serving_num`, `/waiting_num`, `/queue_pos_expiry` [F3.1]
 
-### 1e. Pre-queue (DESIGN §3.0 / DECISIONS D1)
-- [ ] Static countdown page, CloudFront-cached, zero backend calls
-- [ ] Pre-queue registration (lighter than a queue position — identity only)
-- [ ] Randomized batch assignment at T-0; must be verifiably fair and auditable
-- [ ] `/pre_queue_status` for the countdown page to poll (globally cached)
+### 1e. Tokens and authorizer
+- [ ] Deploy-time RSA keypair, private key in Secrets Manager
+- [ ] `/generate_token` RS256; `/public_key` JWKS [F3.3]
+- [ ] Rust authorizer: verify sig/exp/aud/iss, JWKS in `OnceCell` [F3.4]
+- [ ] **Fail-open with time-limited bypass cookie; configurable** [F4.1, F4.2, F4.3]
+- [ ] Decide JWKS rotation (open question 2)
 
-### 1f. Fail-open (DESIGN principle 6 / DECISIONS D2)
-- [ ] Authorizer failure mode configurable, **defaulting to open** with a time-limited
-      bypass cookie
-- [ ] Client-side retry in the background while bypassed
+### 1f. Control plane
+- [ ] `/increment_serving_counter`, `/update_session`, `/reset_initial_state`,
+      `/expired_tokens`, `/num_active_tokens` [F3.2, F3.6]
+- [ ] Scheduled position-expiry sweeper [F3.5]
 
-**Exit:** all endpoints answer correctly, pre-queue assigns fairly, and the authorizer fails open, against a locally-driven deployment.
+**Exit:** all endpoints correct; pre-queue assigns fairly and reproducibly; authorizer
+fails open.
 
 ---
 
+## Phase 2 — Terraform module (2 weeks)
+
+- [ ] `modules/core` — DynamoDB, SQS, Lambdas, IAM, regional REST API + validator [N5]
+- [ ] `modules/edge` — CloudFront, cache policies, WAF (Bot Control + ASN match + Anti-DDoS
+      in Count) [N7, O5]
+- [ ] `modules/authorizer` — origin authorizer plus optional CloudFront VPC origin
+- [ ] `var.enable_vpc` for ATO-constrained clients — design the seam now, do not retrofit
+- [ ] Flat-rate plan subscription as a variable [O6]
+- [ ] CloudWatch alarms — the useful subset, not all 35 from the deprecated solution
+- [ ] `examples/` and generated variable reference
+- [ ] Verify resource count ≤ 80 [N6] and idle monthly cost under $5 [N1]
+- [ ] Confirm no component runs outside the client's account [N3] and the endpoint
+      contract matches the deprecated solution [N8]
+
+**Exit:** `terraform apply` from a clean account to a working deployment [N2].
 
 ---
 
-## Phase 2 — Terraform module (1.5–2 weeks)
+## Phase 3 — Load validation (1.5 weeks)
 
-- [ ] `modules/core` — DynamoDB, SQS, Lambdas, IAM, regional REST API + request validator
-- [ ] `modules/edge` — CloudFront, cache policies (`/queue_num` 24h,
-      `/serving_num` 5s, `/public_key` 24h), WAF: Bot Control + ASN match + Anti-DDoS
-      rule group **in Count mode by default** (DESIGN §3.1a)
-- [ ] `modules/authorizer` — API Gateway authorizer for the client's protected origin,
-      plus optional **CloudFront VPC origin** so the origin has no public IP (DESIGN §9)
-- [ ] `var.enable_vpc` — conditional `vpc_config` + endpoints for ATO-constrained
-      clients (§5). Design the seam now; do not retrofit it.
-- [ ] CloudWatch alarms — port the useful subset of upstream's 35, not all of them
-- [ ] `examples/` — minimal deployment + protected-origin sample
-- [ ] `terraform-docs` generated variable/output reference
+The one place where being wrong is unrecoverable in production.
 
-**Exit:** `terraform apply` from clean account to working waiting room.
+- [ ] Repeatable load harness as a deliverable, not a test script [O3]
+- [ ] **Pre-queue path**: 1M participants, batch assignment within window, zero duplicates,
+      randomization shows no correlation with arrival time [F1.3, F1.4, C1, C2]
+- [ ] **Live-join path**: 10K/sec at default quotas and 40K/sec with increases filed; zero
+      duplicates at both; gap rate measured [F2.2, C3]
+- [ ] Raise quotas and pre-warm *before* testing above defaults, or the test measures
+      throttling rather than the design [O1, O2]
+- [ ] `/serving_num` origin RPS flat from 10K to 1M waiters [C4]
+- [ ] Fail-open verified: waiting room returning 5xx, origin still reachable [F4.1]
+- [ ] Spike arriving in <5s does not drop joins [C5]
 
----
-
-## Phase 3 — Load validation (1 week)
-
-Non-negotiable. Everything else is mechanical; queue-position correctness under
-concurrency is the entire product, and the failure mode only appears under exactly the
-traffic the client hired us to survive.
-
-- [ ] Repeatable load harness as a **first-class deliverable**, not a test script
-- [ ] Verify at 10K, 50K, 100K joins/sec on the **live-join path**: **zero duplicate
-      positions**, gap rate within tolerance, ordering preserved. **Note the `Positions`
-      table quota (~40,000 WRU/s default) is the real ceiling — file the increase and
-      pre-warm before testing above it, or the test measures DynamoDB throttling rather
-      than the design (DESIGN §4.3a/b).**
-- [ ] **Verify the pre-queue batch assignment separately** (DESIGN §3.0) — this is the
-      path a real scheduled on-sale uses, and it is a *scheduled* write rate we control
-      (~3,333/s for 1M over 5 min), not a burst. Assert fairness of the randomization and
-      zero duplicate positions across the whole assigned set.
-- [ ] Confirm `/serving_num` cache collapse — origin RPS must stay flat as waiters scale
-- [ ] Tune `BatchSize` against measured reality; publish the table
-- [ ] Cold-start / ramp behavior for a spike arriving in <5s
-
-**Exit:** a reproducible report. *Demonstrating 100K concurrent queue positions is
-itself the primary sales asset.*
+**Exit:** reproducible report. Demonstrating a million assigned positions is itself the
+primary sales asset.
 
 ---
 
 ## Phase 4 — Operational product (1 week)
 
-The part that makes this a service rather than a repo.
+What makes this a service rather than a repository.
 
-- [ ] **Pre-event readiness checklist** (§8) — API Gateway quota increase filed with
-      lead time, **DynamoDB per-table WRU quota increase filed (§4.3a)**, **tables
-      pre-warmed via warm throughput (§4.3b — billable line item)**, Lambda concurrency
-      raised, **SQS ESM Provisioned Mode enabled**, provisioned concurrency warmed, load
-      test at target rate, rollback plan. Billable deliverable.
-- [ ] Operator runbook: mid-event rate adjustment, reset, incident response,
-      **COUNT-then-BLOCK promotion discipline for the Anti-DDoS rule group (§3.1a)**
-- [ ] Waiting-room page reference implementation (position, ETA, auto-advance).
-      **Must treat HTTP 429 as expected and retry with jittered backoff** — API
-      Gateway's burst bucket will shed a few requests at t=0 of any large on-sale, and
-      a page that fails closed turns a smoothing event into an outage (DESIGN §8).
-      **Must treat a 404 from `/queue_num` as "re-join with a fresh UUIDv7"** — this is
-      the recovery path for a malformed or lost message (DESIGN §8a). Generates UUIDv7
-      via the `uuid` package; `crypto.randomUUID()` is v4-only.
+- [ ] **Pre-event readiness checklist** [O1, O2, O3] — API Gateway RPS increase filed,
+      DynamoDB per-table WRU increase filed, tables pre-warmed, Provisioned Mode enabled,
+      load test executed, rollback plan. Billable.
+- [ ] Operator runbook [O4, O5] — rate adjustment, reset, pause, incident response,
+      COUNT-then-BLOCK promotion, post-event flat-rate plan cancellation
+- [ ] Waiting-room reference client — countdown, position, ETA, auto-advance; **429 retry
+      with jitter** [F4.5]; **404 means re-join with a fresh UUIDv7** [F4.4]; UUIDv7 via the
+      `uuid` package
 - [ ] Client integration guide: CloudFront/ALB/CDN placement
-- [ ] Cost model per event size. **CloudFront request volume dominates** — it is ~17× the
-      API Gateway bill — and the client poll interval is the single largest lever
-      (DESIGN §8a). Model it explicitly rather than leaving it at the upstream 5s.
-      **CloudFront flat-rate vs pay-as-you-go (AUDIT §8)** — default to a flat-rate plan
-      sized to the client's event profile. PAYG must buy WAF ($5 ACL + $1/rule +
-      $0.60/M) and Bot Control ($10/mo + $1/M Common, $10/M Targeted) separately; the
-      flat-rate plan bundles them. Crossover depends on event size, poll interval and
-      Common vs Targeted, so compute per client — do not assume.
-- [ ] Per-event pre-warming cost model (DESIGN §4.3b) — this is billed, and it is the
-      difference between a working on-sale and a throttled one.
+- [ ] **Per-client cost model** [O6] — poll interval is the dominant variable; compute
+      flat-rate vs PAYG crossover and include pre-warming
 
 ---
 
-## Phase 5 — GovCloud variant (1–1.5 weeks)
+## Phase 5 — GovCloud variant (2 weeks)
 
-Ships second, priced separately.
+Ships second, priced separately. No CloudFront, no edge compute, no VPC origins.
 
-- [ ] ALB/origin gating to replace edge gating (no CloudFront in GovCloud, **and no VPC
-      origins either** — verified unavailable, AUDIT §9). Origin protection is internal
-      ALB + token authorizer + security groups/IAM, built from primitives.
-- [ ] Document the commercial-CloudFront-fronting-GovCloud-origin data-boundary
-      question for the client's AO
-- [ ] Validate deploy in a real GovCloud account — the artifact an agency buyer wants
-      to see before signing
+- [ ] Internal ALB gating with the token authorizer; origin access via security groups and
+      IAM [N4]
+- [ ] Replace CDN cache collapse for `/serving_num` — the read-scaling story differs
+      materially inside the boundary
+- [ ] Document the commercial-CloudFront-fronting-GovCloud-origin data-boundary question
+      for the client's AO
+- [ ] Validate deploy in a real GovCloud account
 
 ---
 
 ## Deferred
 
-- OpenID adapter (618 LOC upstream, lowest value — port only on demand)
-- Hi/Lo leasing and strided sequences (§4.5 — documented, unbuilt)
+- OpenID adapter (618 LOC upstream, lowest value)
+- Hi/Lo leasing and strided sequences — documented escape hatches, unbuilt
 - Multi-region / global tables
+- Additional platform connectors beyond the origin authorizer
+- CloudFront SaaS Manager variant for a single client with many branded domains
 
 ---
-
-## Sequencing rationale
-
-Phase 0 exists to confirm the ingest design end-to-end and to measure what desk research
-cannot. Phase 3 is protected because it is the one place where being wrong is
-unrecoverable in production. Phase 4 is what converts a
-GitHub repo into revenue — the code is the credential, the deployment and the
-pre-event operations are the product.
 
 ## Risks
 
 | Risk | Mitigation |
 |---|---|
-| Client poll interval drives cost more than any infra choice | Make it configurable; default 10s not 5s; model it in the Phase 4 cost model |
-| GovCloud variant is more work than estimated — no CloudFront, no VPC origins, origin protection built from primitives | Keep it Phase 5, priced separately; do not promise a GovCloud date until the commercial module ships |
-| Load test can't reach 100K/sec from one source | Distributed harness; budget for it in Phase 3 |
-| On-call burden — a failure during an on-sale is career-ending for the client | Price as incident-critical infrastructure, not a $150/mo care plan. Cap concurrent engagements. |
-| AWS ships a replacement | Unlikely — they just deprecated theirs and pointed at Marketplace |
+| Pre-queue randomization is disputed as unfair by a client's users | Recorded seed makes it auditable and reproducible [F1.5]; document the fairness argument up front |
+| Client poll interval drives cost more than any infrastructure choice | Configurable, default 10s, modelled per client [O6] |
+| Load harness cannot generate 1M participants from one source | Distributed harness; budget for it in Phase 3 |
+| GovCloud variant larger than estimated — no CloudFront, no VPC origins | Phase 5, priced separately; no date until commercial ships |
+| On-call burden — failure during an on-sale is career-ending for the client | Price as incident-critical infrastructure, not a care plan; cap concurrent engagements |
+| Connector breadth versus Queue-it's 25+ | Product scope decision; one authorizer covers CDN-fronted origins |
