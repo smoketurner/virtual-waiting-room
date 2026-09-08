@@ -27,10 +27,14 @@ Throwaway code. Measures what documentation cannot settle.
 ## Phase 1 — Core
 
 ### 1a. Data and counter
-- [ ] `Counters`, `Positions`, `Tokens` — on-demand, PITR, `warm_throughput_*` and optional
-      `max_throughput_*` as variables [O1]
-- [ ] Batch range allocation; increment by **valid** count only [F2.2, F2.6]
-- [ ] `attribute_not_exists(request_id)` on position writes [F2.5]
+- [ ] Four tables — `Counters`, `PreQueue`, `Positions`, `Tokens` — on-demand, PITR,
+      `warm_throughput_*` and optional `max_throughput_*` as variables (DESIGN §6.7) [O1]
+- [ ] `Counters` attributes: `queue_counter`, `serving_counter`, `max_expired_position`,
+      `arrivals#0..9`, `phase`, `phase_override`, `target_rate`, `shuffle_seed`,
+      `operator_message`
+- [ ] Batch range allocation via `UpdateItem ADD` / `ALL_NEW`; increment by **valid** count
+      only [F2.2, F2.6]
+- [ ] `PutItem` with `attribute_not_exists(request_id)` on every position write [F2.5]
 
 ### 1b. Event lifecycle and modes
 - [ ] Phase state machine: idle → pre-queue → active → post-event, plus maintenance
@@ -47,7 +51,8 @@ Throwaway code. Measures what documentation cannot settle.
 ### 1c. Pre-queue
 - [ ] Static countdown page, CDN-cached, zero origin calls per view [F1.1, F1.2]
 - [ ] Pre-queue registration (identity only, spread across the window) [C1]
-- [ ] `/status` carries phase, so the countdown page polls one globally-cached endpoint
+- [ ] `/status` carries phase, so the countdown page polls one endpoint (Min TTL 1 s,
+      no cookies forwarded — DESIGN §8)
 - [ ] EventBridge-triggered batch assignment (DESIGN §4.2): 256-bit seed to `Counters`,
       one `UpdateItem ADD`/`ALL_NEW` to claim the range, **parallel `Scan` projecting
       `request_id` only** (1 MB pages, ~286 pages at 1M, 50 segments), Fisher-Yates,
@@ -88,10 +93,12 @@ Throwaway code. Measures what documentation cannot settle.
 - [ ] Deferred bot enforcement: admit to pre-queue, block at randomization [F6.3]
 
 ### 1h. Operator surface
-- [ ] Live metrics: inflow, outflow, queue depth, admitted, no-show rate, expiry rate
+- [ ] Live metrics via EMF logs → CloudWatch: queue depth, admitted, no-show rate, expiry
+      rate. Inflow from the `AWS/CloudFront` `Requests` metric, not counted in our code
       [F5.1]
 - [ ] Brandable waiting page — client supplies assets, no module fork [F5.2]
-- [ ] Operator message published into the cached status payload [F5.3]
+- [ ] Operator message as a `Counters` attribute, delivered in the existing `/status`
+      payload — one `UpdateItem`, zero additional requests [F5.3]
 - [ ] Position and estimated wait derived from measured admission rate [F5.4]
 - [ ] Every operator action available via API; no console dependency [F5.5]
 
@@ -120,7 +127,9 @@ event; authorizer fails open.
       cookies must not be forwarded on polled behaviours or request collapsing is
       disabled** and C4 fails (DESIGN §8). WAF: Bot Control + ASN match + Anti-DDoS in
       Count. [N7, O5, C4]
-- [ ] `modules/authorizer` — origin authorizer plus optional CloudFront VPC origin
+- [ ] `modules/authorizer` — origin authorizer plus optional CloudFront VPC origin.
+      Note VPC origins require an internet gateway present but unused, forbid Lambda@Edge
+      origin triggers, and are unavailable in GovCloud (DESIGN §12)
 - [ ] `var.enable_vpc` for ATO-constrained clients — design the seam now, do not retrofit
 - [ ] Flat-rate plan subscription as a variable [O6]
 - [ ] CloudWatch alarms and a shipped dashboard — the metrics an operator acts on, not
@@ -154,7 +163,8 @@ The one place where being wrong is unrecoverable in production.
 - [ ] **No-show compensation**: with an injected 30% no-show rate and a 500/min target,
       measured origin arrivals converge on 500/min [F3.8]
 - [ ] **Standby activation**: inflow crossing the threshold queues new visitors without
-      operator action; unprotected paths stay unqueued [F0.2, F0.4]
+      operator action within the ~125 s worst case; unprotected paths stay unqueued
+      [F0.4, F0.6]
 - [ ] Spike arriving in <5s does not drop joins [C5]
 
 **Exit:** reproducible report. Demonstrating a million assigned positions is itself the

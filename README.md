@@ -39,12 +39,14 @@ rate, plus standby across the rest of the site for visitors who hit the homepage
 ```
   WAF ──► CloudFront ──► API Gateway ──► SQS ──► Lambda ──► DynamoDB
    │          │              (direct integration, no compute in the burst path)
-   │          └─ /status cached 5s globally: one poll serves every waiter
+   │          └─ /status: Min TTL 1s, no cookies forwarded — CloudFront collapses
+   │             simultaneous misses into one origin fetch, so origin load is
+   │             independent of how many people are waiting
    └─ Bot Control · ASN matching · Anti-DDoS
 ```
 
-Admission is a signed token, validated once at the edge and exchanged for a session, so
-the origin never calls the waiting room on the hot path.
+Admission is a signed token, validated once and exchanged for a session cookie, so the
+origin never calls the waiting room on the hot path.
 
 ## Design highlights
 

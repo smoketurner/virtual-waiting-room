@@ -41,40 +41,59 @@ Three further constraints shape the rest of the design:
 ### 2.1 Scheduled event (primary path)
 
 ```
-  T−n           Visitor → CloudFront → static countdown page
-                (cached; zero origin requests per view)
-                        │
-                        │ register intent (once per visitor)
-                        ▼
-                  Pre-queue set in DynamoDB
+  T−n   Visitor → CloudFront → static countdown page (S3, cached)
+                                    │
+                                    │ POST /join — one PreQueue item per visitor,
+                                    │ spread across the pre-queue window
+                                    ▼
+                              DynamoDB PreQueue
 
-  T−0           EventBridge → assign_positions_batch (Rust)
-                  ├─ shuffle participant set with a recorded seed
-                  ├─ single UpdateItem ADD claims the whole range
-                  └─ PutItem per position, conditional, rate-limited
-                        │
-                        ▼
-  T+            Visitors poll /queue_num → position assigned
+  T−0   EventBridge Scheduler → assign_positions (Rust, arm64)
+          1. write 256-bit seed to Counters
+          2. UpdateItem ADD queue_counter :n / ALL_NEW  → claims range [start, end]
+          3. parallel Scan PreQueue, ProjectionExpression: request_id only
+             (1 MB pages, ~286 pages at 1M, 50 segments)
+          4. Fisher-Yates over the ID array, then per position:
+             PutItem ConditionExpression: attribute_not_exists(request_id)
+             rate-limited to the configured window (default 5 min = 3,333 writes/s)
+                                    │
+                                    ▼
+  T+    Visitors poll /status and /queue_num → position assigned
 ```
+
+Detail in §4. The order matters: the seed is recorded before any position is assigned, so
+the mapping is auditable (F1.5).
 
 ### 2.2 Live join (walk-up arrivals after opening)
 
 ```
-  WAF (Bot Control + ASN match + Anti-DDoS in Count)
+  WAF          Bot Control · ASN match · Anti-DDoS (Count mode by default, §3.1a)
         │
-  CloudFront   /status 5s global · /queue_num 24h per request_id · /public_key 24h
+  CloudFront   polled behaviour: Min TTL 1 s, no cookies forwarded
+               (request collapsing depends on both — §8)
         │
-  API Gateway REST (regional)
-    request validator rejects malformed bodies
-    type: aws → SQS SendMessage          ← no Lambda in the burst path
+  API Gateway  REST, regional
+               request validator (JSON Schema) → 400 on malformed body
+               type: aws → SQS SendMessage        ← no Lambda in the burst path
         │
-  SQS standard + DLQ                       (absorbs arrival burst)
-        │ BatchSize 100 / window 1s
+  SQS          standard queue + DLQ (maxReceiveCount 5)
+               at-least-once; duplicates absorbed by the conditional write
+        │      ESM: BatchSize 100, MaximumBatchingWindowInSeconds 1,
+        │      FunctionResponseTypes: [ReportBatchItemFailures]
+        ▼
   assign_position (Rust, arm64)
-    partition valid/invalid → ADD :valid_count → conditional PutItem per record
+        1. partition records into valid / invalid (UUIDv7 parse)
+        2. UpdateItem ADD queue_counter :valid_count / ALL_NEW
+        3. PutItem ConditionExpression: attribute_not_exists(request_id)
+        4. return batchItemFailures for invalid or failed records
         │
-  DynamoDB  Counters · Positions · Tokens   (on-demand, pre-warmed)
+        ▼
+  DynamoDB     Counters · PreQueue · Positions · Tokens
+               on-demand, PITR, pre-warmed before the event (§6.4)
 ```
+
+Detail in §7. The counter is incremented by the count of **valid** records, never
+`records.len()` (F2.6).
 
 ### 2.3 Admission and session
 
@@ -83,22 +102,34 @@ session cookie proves the token was already validated on an earlier request. Que
 the same split.
 
 ```
-  Outflow controller increments serving_counter
-    target rate adjusted for measured no-show rate      ← closed loop, §5
+  Outflow controller (EventBridge Scheduler, every 10 s)
+        1. sum arrivals#0..9 and released count
+        2. no_show_rate = 1 − (arrivals / released)
+        3. release = target_rate / (1 − smoothed_no_show_rate), bounded
+        4. UpdateItem serving_counter
+        5. expire positions past expires_at, advance max_expired_position
         │
-  Visitor polls /status, sees serving ≥ own position
+        ▼
+  Visitor polls /status → serving_counter ≥ own position
         │
-  POST /generate_token → single-use admission token, short expiry
+  POST /generate_token → admission token (short expiry, single use)
         │
-  Origin request carrying the token
+  Origin request carrying the token on the URL
         │
-  authorizer (Rust, at CloudFront or the origin)
-    ├─ session cookie present and valid?  → continue
-    ├─ admission token present and valid? → mint session cookie, strip token, continue
-    └─ neither, and request is protected? → 302 to the waiting room
+        ▼
+  authorizer (Rust — CloudFront VPC origin, or at the client origin)
+     ├─ valid session cookie?        → forward to origin
+     ├─ valid admission token?       → set session cookie, strip token from URL,
+     │                                 ADD arrivals#(hash % 10), forward
+     ├─ request not protected?       → forward
+     ├─ waiting room unreachable?    → forward with bypass cookie (fail open, §11)
+     └─ otherwise                    → 302 to the waiting room
         │
-  Origin — private subnet behind a CloudFront VPC origin (commercial regions)
+        ▼
+  Client origin — private subnet, reachable only via the CloudFront VPC origin
 ```
+
+Detail in §5 (controller), §9 (credentials), §11 (fail open).
 
 **The session is required for correctness, not performance.** The admission token is
 carried as a URL query parameter. The URL changes on the visitor's next navigation, so
@@ -121,7 +152,7 @@ run at the edge and add only the cost of a signature verification per request.
 
 ## 3. Event lifecycle and operating modes
 
-Satisfies F0.1–F0.8.
+Satisfies F0.1, F0.2, F0.3, F0.4, F0.5, F0.6, F0.7, F0.8.
 
 ### 3.1 Phases
 
@@ -228,7 +259,7 @@ you configure, only then will the online queue activate." Their FAQ frames the c
 
 ## 4. Pre-queue
 
-Satisfies F1.1–F1.5, C1, C2.
+Satisfies F1.1, F1.2, F1.3, F1.4, F1.5, C1, C2.
 
 ### 4.1 Registration
 
@@ -341,7 +372,7 @@ from getting an unfair advantage."
 
 ## 5. Outflow control
 
-Satisfies F3.2, F3.8, F3.10.
+Satisfies F3.2, F3.8, F3.9, F3.10.
 
 The operator declares a capacity — say 500 arrivals per minute — and the system releases
 visitors at that rate. Naively this is "increment `serving_counter` by 500 each minute."
@@ -353,8 +384,7 @@ capacity the client is paying to use, and everyone still waiting waits longer th
 necessary. Queue-it's architect identifies no-shows as a primary difficulty in outflow
 control.
 
-The fix is a closed loop. `/update_session` already reports completions and abandonments;
-those figures feed back into the release rate:
+The fix is a closed loop over measured arrivals:
 
 ```
 observed_arrival_rate = arrivals in the last interval
@@ -366,8 +396,8 @@ The no-show rate is smoothed across intervals to avoid oscillation, and the corr
 bounded so a transient measurement error cannot release a damaging burst.
 
 **How it runs.** An EventBridge Scheduler rule invokes the controller Lambda every 10
-seconds. It reads the release and arrival counters, computes the correction, and writes the
-new `serving_counter` with one `UpdateItem`.
+seconds. It sums the arrival shards, reads the released count, computes the correction, and
+writes the new `serving_counter` with one `UpdateItem`.
 
 **Counting arrivals.** The authorizer increments an arrival counter when it converts an
 admission token into a session. This is one write per admitted visitor. If the operator sets
@@ -446,9 +476,13 @@ per visitor.
 | Single-partition write | 1,000 WCU/s | No — irrelevant; `request_id` keys are distributed |
 | Counter item | 1,000 WCU/s ÷ batch size | Not binding at batch ≥ 10 |
 
-So the live-join ceiling is ~40,000/sec at default quotas. `BatchSize` above ~40 buys
-counter headroom that `Positions` cannot use. Default `BatchSize` is 100 with a 1-second
-window, which costs one second on join in a queue where users then wait minutes.
+So the live-join ceiling is ~40,000/s at default quotas. `BatchSize` above ~40 buys counter
+headroom that `Positions` cannot use. Default `BatchSize` is 100 with a 1-second window,
+adding one second to a join in a queue where the visitor then waits minutes.
+
+The same `Positions` quota bounds pre-queue assignment (§4.4), where the write rate is
+chosen rather than imposed. That is the difference between the two paths: live join must
+absorb whatever arrives, pre-queue assignment is scheduled.
 
 ### 6.4 Cold-start capacity
 
@@ -602,7 +636,7 @@ API Gateway returning 200 means *accepted into the queue*, not *position assigne
 
 ## 8. API surface and caching
 
-Satisfies F3.1, F5.5, C4.
+Satisfies F3.1, F5.5, N8, C4.
 
 ### Public
 
@@ -667,7 +701,7 @@ and Bot Control charges together (§13).
 | `/admin/reset` | Reset event state |
 | `/admin/rules` | Update protection rules |
 | `/metrics` | Event metrics as JSON for the client's own tooling |
-| `/update_session` | Report completion or abandonment; feeds the outflow controller |
+| `/update_session` | Report session completion or abandonment; updates statistics counters |
 
 Every operator action is here, and the scheduled paths call the same Lambdas. There is no
 capability available through a console that is unavailable through the API.
@@ -676,7 +710,7 @@ capability available through a console that is unavailable through the API.
 
 ## 9. Security and abuse mitigation
 
-Satisfies F3.3, F3.4, N7, O5.
+Satisfies F3.3, F3.4, F3.5, F3.6, F3.7, F6.1, F6.2, F6.3, N7, O5.
 
 **Credentials.** Two artifacts, signed with the same key over **different inputs** so
 neither can be replayed as the other (F3.6):
@@ -733,23 +767,23 @@ wants a revocable handle for a partner integration.
 private subnet with CloudFront as the sole ingress, making "nobody reaches the origin
 without a token" architecturally enforceable rather than policy-enforced.
 
-**WAF is a first-order cost, not a footnote.** It bills per request inspected on top of Bot
-Control's per-request fee, against polling volume — frequently exceeding the CloudFront
-bill. See §10.
+**WAF cost scales with polling volume.** It bills $0.60 per million requests inspected on
+top of Bot Control's per-request fee, against the same request count CloudFront serves.
+At 1M visitors polling every 10 s for 20 minutes it exceeds the CloudFront bill (§13).
 
 ---
 
 ## 10. Operator surface
 
-Satisfies F5.1–F5.5.
+Satisfies F5.1, F5.2, F5.3, F5.4, F5.5, O4.
 
 Queue-it sells traffic intelligence and custom themes as separate products. Both are
 required to operate an event.
 
 | Capability | AWS mechanism |
 |---|---|
-| Live metrics | Lambdas emit EMF-formatted logs; CloudWatch derives inflow, outflow, queue depth, admitted, no-show rate, expiry rate without a separate metrics pipeline. A dashboard ships with the module. |
-| Metrics for the client's own tooling | `/metrics`, a cached JSON endpoint reading the same `Counters` item. |
+| Live metrics | Lambdas emit EMF-formatted logs; CloudWatch derives queue depth, admitted, no-show rate and expiry rate without a separate metrics pipeline. Inflow comes from the `AWS/CloudFront` `Requests` metric (§3.4). A dashboard ships with the module. |
+| Metrics for the client's own tooling | `GET /metrics` on the admin API (SigV4), reading the `Counters` item. Not public and not cached. |
 | Branding | Client HTML, CSS and assets in S3 behind CloudFront. The module ships a reference theme; the client overrides bucket contents. No fork required. |
 | Operator messaging | A string attribute on the `Counters` item, published through the admin API, delivered in the existing `/status` payload. Zero additional requests. |
 | Position and estimated wait | `/queue_num` returns position; the client computes wait from the measured admission rate in `/status`. Recomputed as the operator changes the rate. |
@@ -770,7 +804,7 @@ requires one. Clients drive it from their own tooling or Terraform.
 
 ## 11. Failure behaviour
 
-Satisfies F4.1–F4.5.
+Satisfies F4.1, F4.2, F4.3, F4.4, F4.5.
 
 **Fail open by default.** If the waiting room API is unreachable, the authorizer admits the
 visitor with a time-limited bypass cookie while the client retries in the background. This
@@ -792,7 +826,7 @@ into a visible outage.
 
 ## 12. Deployment
 
-Satisfies N2, N3, N4, N5.
+Satisfies N1, N2, N3, N4, N5, N6.
 
 **Single-tenant, in the client's account.** Hosting other organizations' waiting rooms
 would make us a Cloud Service Provider requiring our own FedRAMP authorization
@@ -836,7 +870,7 @@ a configuration flag, and is priced separately.
 
 ## 13. Cost model
 
-Satisfies O6.
+Satisfies O2, O3, O6.
 
 Ordered by size for a million-visitor event at 10-second polling:
 
@@ -890,7 +924,7 @@ event and measuring, not from the price sheet.
 | CloudFront unavailable in GovCloud | [Setting up CloudFront with GovCloud resources](https://docs.aws.amazon.com/govcloud-us/latest/UserGuide/setting-up-cloudfront.html) |
 | Pre-queue randomization; redirect-and-token integration; Direct Pass fail-open; connector taxonomy and security tradeoffs | [How Queue-it Works](https://www.queue-it.com/developers/how-queue-it-works), [What's New August 2025](https://queue-it.com/blog/whats-new-august-2025/) |
 | Distributed FIFO, open-window outflow control, no-show compensation, DynamoDB backbone at "a couple hundred thousand TPS", Safety Net, simultaneous scheduled + standby configuration | [Virtual Waiting Room System Design, Smooth Scaling ep. 17](https://queue-it.com/smooth-scaling-podcast/ep017-virtual-waiting-room-architecture/) — Mojtaba Sarooghi, Distinguished Product Architect, Queue-it |
-| Two-credential model: single-use URL token validated once, then a separately-signed per-event session cookie; sliding vs fixed session validity; triggers matched on URL, headers, cookies, user agent; local validation with no backend round-trip | [Queue-it's architecture: the queue token, the cookie, and safety-net mode](https://blog.crawlex.net/blog/queue-it-architecture/) — teardown of Queue-it's open-source connector implementations |
+| Two-credential model: single-use URL token validated once, then a separately-signed per-event session cookie; sliding vs fixed session validity; triggers matched on URL, headers, cookies, user agent; local validation with no backend round-trip | [Queue-it's architecture: the admission token, the cookie, and safety-net mode](https://blog.crawlex.net/blog/queue-it-architecture/) — teardown of Queue-it's open-source connector implementations |
 | Queue Token SDK: client-signed identifier gating queue entry; members-only ticketing use case | [Queue-it Connectors](https://queue-it.com/developers/connectors/) |
 | Hype Event Protection: blocking bots at sale start rather than on arrival; 225,000 bots excluded from an invite-only drop | [Queue-it bad bot protection](https://www.queue-it.com/bad-bot-protection) |
 | Safety Net activation on configured inflow threshold; "Always Visible" vs "Visible at Peak"; randomization for scheduled and FIFO for safety-net | [Queue-it virtual waiting room](https://queue-it.com/virtual-waiting-room) |

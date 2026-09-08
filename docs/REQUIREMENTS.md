@@ -9,9 +9,9 @@ criterion. `MUST` = mandatory; `SHOULD` = strong default, overridable per client
 
 ### 1.1 Event lifecycle
 
-Queue-it runs every waiting room through four phases. We adopt the same model: it is where
-operators communicate with visitors, and the phases that look like "nothing is happening"
-are the ones that carry the most operational value.
+Queue-it runs every waiting room through four phases. This adopts the same model. Three of
+the four phases serve static operator-authored pages; only `active` runs the queueing
+machinery.
 
 | ID | Requirement | Acceptance |
 |---|---|---|
@@ -33,10 +33,10 @@ fair model when a spike is unplanned and nobody was waiting.
 
 | ID | Requirement | Acceptance |
 |---|---|---|
-| F1.1 | The system MUST support events with a scheduled start time, holding visitors who arrive before it on a countdown page. | Visitors arriving at T−10min see a countdown, not a queue position. |
+| F1.1 | During the pre-queue phase, visitors MUST be held on a countdown page rather than assigned a position. | A visitor arriving at T−10min sees a countdown; no `Positions` item is written. |
 | F1.2 | The pre-queue page MUST be servable entirely from CDN cache, making zero calls to API Gateway, DynamoDB, or SQS per view. | Origin request count during the pre-queue phase is independent of visitor count. |
 | F1.3 | At T−0 the system MUST assign queue positions to pre-queue participants in **randomized** order. | Across repeated trials, arrival timestamp shows no correlation with assigned position. |
-| F1.4 | Position assignment for pre-queue participants MUST complete within an operator-configured window. | 1,000,000 positions assigned within 5 minutes. |
+| F1.4 | Position assignment for pre-queue participants MUST complete within an operator-configured window. | 1,000,000 positions assigned within the configured window, default 5 minutes. |
 | F1.5 | The randomization MUST be auditable after the fact. | A stored seed plus the participant set reproduces the exact assignment. |
 
 ### 1.3 Queue join (live arrivals)
@@ -63,7 +63,7 @@ fair model when a spike is unplanned and nobody was waiting.
 | F3.7 | Session lifetime MUST support both a sliding window (extended on activity) and a hard cap from issue time. | Both modes configurable per event; hard cap does not extend regardless of activity. |
 | F3.8 | Admission rate control MUST compensate for **no-shows** — admitted visitors who never arrive at the origin. | With a 30% no-show rate and a target of 500/min, actual origin arrivals converge on 500/min, not 350. |
 | F3.9 | Queue positions MUST expire if unused within an operator-configured period. | Position expires; the serving counter advances past it. |
-| F3.10 | Sessions MUST be markable as completed or abandoned. | Counters update; the figures feed F3.8. |
+| F3.10 | Sessions MUST be markable as completed or abandoned. | `POST /update_session` updates the completion and abandonment counters. |
 
 ### 1.5 Failure behaviour
 
@@ -77,13 +77,12 @@ fair model when a spike is unplanned and nobody was waiting.
 
 ### 1.6 Operator experience
 
-A waiting room that cannot be observed and adjusted mid-event is not usable in production.
-Queue-it sells traffic intelligence and branded themes as products; both are table stakes
-rather than extras.
+An event that cannot be observed and adjusted while running cannot be operated. Queue-it
+sells traffic intelligence and custom themes as separate products.
 
 | ID | Requirement | Acceptance |
 |---|---|---|
-| F5.1 | The operator MUST see live event metrics: inflow, outflow, queue depth, admitted, no-show rate, expiry rate. | Metrics visible within one polling interval of reality. |
+| F5.1 | The operator MUST see live event metrics: inflow, outflow, queue depth, admitted, no-show rate, expiry rate. | Metrics visible in CloudWatch within one 60 s metric period. |
 | F5.2 | The waiting room page MUST be brandable by the client without forking the module. | Client supplies template assets; no code change required. |
 | F5.3 | The operator MUST be able to publish a message to waiting visitors during an event. | Message appears on the waiting page within the cache TTL. |
 | F5.4 | Waiting visitors MUST see their position and an estimated wait time. | Both displayed and updated as the queue advances. |
@@ -97,23 +96,22 @@ rather than extras.
 | F6.2 | The identifier MUST be signed by the client, not by the waiting room. | The waiting room verifies a signature over data it never stores. |
 | F6.3 | Bot-blocking decisions SHOULD be enforceable at event start rather than during the pre-queue. | An operator can choose to admit suspected bots to the pre-queue and block them at randomization. |
 
-**Why F6.3.** Queue-it's Hype Event Protection blocks bots at sale start, after genuine
-visitors have secured positions, specifically so operators do not reveal detection early and
-give bots time to retool and rejoin. This is an operational posture, not a feature — it
-costs nothing to support and materially changes outcomes.
+**Why F6.3.** Blocking a detected bot on arrival reveals the detection while there is still
+time to modify the client and rejoin. Queue-it's Hype Event Protection defers the block to
+sale start, "after genuine visitors have secured their spots."
 
 
 ---
 
 ## 2. Capacity
 
-Stated as requirements on the deployed system, not on AWS defaults. Every figure below is
-achievable only with the pre-event preparation in §4.
+Stated as requirements on the deployed system, not on AWS defaults. Every figure below
+requires the pre-event preparation in §4: quota increases filed and tables pre-warmed.
 
 | ID | Requirement | Acceptance |
 |---|---|---|
 | C1 | The pre-queue MUST support at least 1,000,000 concurrent participants. | Load test sustains 1M countdown-page holders. |
-| C2 | Batch position assignment MUST sustain ≥ 4,000 writes/sec. | 1M positions in ≤ 5 min, zero throttling. |
+| C2 | Batch position assignment MUST sustain the write rate implied by the configured window. | 1M positions in 5 minutes = 3,333 writes/s sustained, zero throttling, zero duplicates. |
 | C3 | The live-join path MUST sustain ≥ 10,000 joins/sec at default quotas, and ≥ 40,000/sec with quota increases filed. | Load test at both levels; zero duplicates at each. |
 | C4 | Polling load MUST be independent of visitor count at the origin. | Origin RPS for `/status` stays flat as waiters scale from 10K to 1M. |
 | C5 | The system MUST handle a spike arriving in under 5 seconds without dropping joins. | Joins are durably enqueued even when compute has not yet scaled. |
@@ -137,8 +135,8 @@ achievable only with the pre-event preparation in §4.
 
 ## 4. Operational
 
-These are contractual deliverables, not implementation details. They are the difference
-between a working on-sale and a throttled one.
+Contractual deliverables. Without these the capacity requirements in §2 are not met: an
+unprepared on-demand table throttles at ~4,000 writes/s regardless of what the code does.
 
 | ID | Requirement | Acceptance |
 |---|---|---|
