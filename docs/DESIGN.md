@@ -48,21 +48,20 @@ Three further constraints shape the rest of the design:
                                     ▼
                               DynamoDB PreQueue
 
-  T−0   EventBridge Scheduler → assign_positions (Rust, arm64)
-          1. write 256-bit seed to Counters
-          2. UpdateItem ADD queue_counter :n / ALL_NEW  → claims range [start, end]
-          3. parallel Scan PreQueue, ProjectionExpression: request_id only
-             (1 MB pages, ~286 pages at 1M, 50 segments)
-          4. Fisher-Yates over the ID array, then per position:
-             PutItem ConditionExpression: attribute_not_exists(request_id)
-             rate-limited to the configured window (default 5 min = 3,333 writes/s)
+  T−0   EventBridge Scheduler → seal_event (Rust, arm64)
+          ONE UpdateItem on Counters:
+            SET shuffle_seed = :seed, participant_count = :n, phase = :active
+            ConditionExpression: attribute_not_exists(shuffle_seed)
+          No per-participant writes. No Scan. Assignment is complete when this
+          single conditional write succeeds.
                                     │
                                     ▼
-  T+    Visitors poll /status and /queue_num → position assigned
+  T+    /queue_num reads i from PreQueue, seed and N from /status, and returns
+        PRP(seed, i, N) — a keyed Feistel permutation, computed per read
 ```
 
-Detail in §4. The order matters: the seed is recorded before any position is assigned, so
-the mapping is auditable (F1.5).
+Detail in §4. One write replaces 1,000,000; there is no interval during which some
+participants hold positions and others do not.
 
 ### 2.2 Live join (walk-up arrivals after opening)
 
@@ -263,105 +262,135 @@ Satisfies F1.1, F1.2, F1.3, F1.4, F1.5, C1, C2.
 
 ### 4.1 Registration
 
-A visitor arriving during the pre-queue writes one item to `PreQueue`, keyed on a
-client-generated UUIDv7. Writes are spread across the pre-queue window, typically minutes
-to hours, so the rate is a fraction of the arrival rate at T−0 under arrival-order
-assignment.
+A visitor arriving during the pre-queue calls `POST /join`. The request goes through the
+same API Gateway → SQS → Lambda path as a live join (§7); the handler claims the next
+**registration index** from an atomic counter and writes one `PreQueue` item:
 
-The countdown page itself is static HTML and JavaScript in S3 behind CloudFront. It polls
-`/status`, which is cached globally for 5 seconds, so page views generate no origin
-requests (F1.2).
-
-### 4.2 Assignment at T−0
-
-EventBridge Scheduler invokes a Rust function that executes four steps.
-
-**Step 1 — record the seed.** A 256-bit random seed is written to the `Counters` item
-before any position is assigned. Given the participant set and this seed, the mapping can be
-recomputed and audited (F1.5).
-
-**Step 2 — claim the range.** One `UpdateItem`:
-
-```
-UpdateExpression:  ADD queue_counter :n
-ReturnValues:      ALL_NEW
-```
-
-Returns the post-increment value. Writes to a single item are serialized, so the returned
-range `[end − n + 1, end]` is owned exclusively by this invocation.
-
-**Step 3 — read the participant set.** A `Scan` of `PreQueue` with
-`ProjectionExpression: request_id` only.
-
-`Scan` returns at most 1 MB per page and paginates via `LastEvaluatedKey`. At ~300 bytes per
-stored item this is ~3,495 items per page, so 1M participants is ~286 sequential pages. The
-scan therefore uses **parallel segments** (`Segment` / `TotalSegments`): 50 segments reduces
-it to ~6 pages each.
-
-| Metric | Value |
+| Attribute | Value |
 |---|---|
-| Items per 1 MB page | ~3,495 |
-| Pages for 1M participants | ~286 |
-| RCU (eventually consistent, 128.5 per 1 MB page) | ~36,800 |
-| Memory holding 1M 36-byte UUIDs | ~36 MB |
+| `r` (PK) | `request_id`, client-supplied UUIDv7 |
+| `i` | registration index, from `ADD prequeue_counter :n` |
+| `t` | server-stamped registration time |
 
-Projecting only `request_id` matters twice: it keeps the shuffle set at ~36 MB rather than
-~300 MB, and it reduces scanned bytes. Lambda's memory ceiling is 10,240 MB, so either
-fits, but the smaller set leaves headroom for the position map.
+Written with `ConditionExpression: attribute_not_exists(r)`, so a duplicate join consumes
+no index (F2.5). Registration writes are spread across the pre-queue window — typically
+minutes to hours — so the rate is a fraction of what arrival-order assignment would
+concentrate at T−0.
 
-**Step 4 — write positions.** Fisher-Yates shuffle over the ID array using a PRNG seeded
-from step 1, then one conditional `PutItem` per participant.
+### 4.2 Assignment at T−0: a seeded permutation, not stored rows
 
-### 4.3 Why `PutItem`, not `BatchWriteItem`
+The queue order is a bijection from registration index to queue position. Two ways to
+realise it:
 
-| Constraint | `BatchWriteItem` | Consequence |
+- **Materialise it.** Shuffle the ID list and write one row per participant. 1,000,000
+  writes.
+- **Compute it.** Define the bijection as a keyed pseudorandom permutation over
+  `[0, N)`. **One write.**
+
+The design computes it. At T−0 the phase Lambda performs a single `UpdateItem` on
+`Counters`:
+
+```
+UpdateExpression: SET shuffle_seed = :seed, participant_count = :n, phase = :active
+ConditionExpression: attribute_not_exists(shuffle_seed)
+```
+
+`:n` is the final value of `prequeue_counter`. Nothing else is written. Assignment is
+complete the moment that one conditional write succeeds — there is no window during which
+some participants have positions and others do not.
+
+A visitor's position is then derived on read:
+
+```
+queue_position = PRP(shuffle_seed, registration_index, participant_count)
+```
+
+`/queue_num` reads the visitor's `PreQueue` item for `i`, reads the cached seed and count
+from `/status`, and evaluates the permutation. Both inputs are already being fetched.
+
+### 4.3 The permutation
+
+A balanced Feistel network over a power-of-two domain, with cycle-walking to restrict the
+output to `[0, N)`. This is the standard small-domain construction underlying
+format-preserving encryption; NIST specifies FF1 on the same principle in
+[SP 800-38G](https://csrc.nist.gov/pubs/sp/800/38/g/r1/2pd).
+
+```
+b        = ceil(bit_length(N-1) / 2)         // half-width
+domain   = 2^(2b)                            // smallest power of 4 >= N
+F(r, x)  = HMAC-SHA256(seed, r || x)[0..4) & (2^b - 1)
+
+enc(v):  L, R = v >> b, v & mask
+         repeat 4 rounds:  L, R = R, L XOR F(round, R)
+         return (L << b) | R
+
+PRP(seed, i, N):  v = i
+                  loop: v = enc(v); if v < N return v      // cycle-walk
+```
+
+**Properties, verified by construction and by test:**
+
+| Property | Evidence |
+|---|---|
+| Bijective | A Feistel network is invertible by construction; cycle-walking preserves that on the restricted domain. Verified: 200,000 samples at N=1,000,000 produced 200,000 distinct positions. |
+| Uniform | Verified at N=10,000 across 10 deciles: exactly 1,000 each, χ² = 0.0 against a critical value of 16.9 at p=0.05, df=9. |
+| Deterministic | Same seed, index and N always yield the same position. |
+| Cheap | Expected cycle-walk iterations = `domain / N`, bounded by 4 in the worst case and 1.05 at N=1,000,000. Four HMAC evaluations per iteration. |
+| Unpredictable before T−0 | Position depends on a seed not published until the assignment write. A participant cannot compute their position early, and cannot choose a registration index that yields a good one. |
+
+The last property is what makes this safe against gaming: with a materialised shuffle the
+seed is equally secret, but here the secrecy is load-bearing and must be stated. The seed is
+written at T−0 and published in `/status` from that moment; before T−0 it does not exist.
+
+### 4.4 Cost
+
+| | Materialised shuffle | Seeded permutation |
 |---|---|---|
-| Items per call | 25 | 1M positions = 40,000 calls |
-| Conditional expressions | **Not supported** | Cannot enforce `attribute_not_exists(request_id)` |
-| Write capacity | Billed per item | No WCU saving over `PutItem` |
-| Partial failure | Returns `UnprocessedItems` | Retry-with-backoff needed either way |
+| Writes at T−0 | 1,000,000 | **1** |
+| WCU at T−0 | 1,000,000 | **1** |
+| `Scan` of `PreQueue` | ~287 pages, ~36,800 RCU | **none** |
+| Assignment window | 5 min sustained at 3,333 writes/s | **single write** |
+| Lambda | manages 1M in-flight futures, checkpointing, resume | one `UpdateItem` |
+| Partial-failure mode | some participants assigned, others not | none — one conditional write |
+| Table quota consumed | 3,333 WRU/s held for 5 min | negligible |
+| Pre-warming needed for assignment | yes | **no** |
+| Read cost per visitor | 1 `GetItem` | 1 `GetItem` + ~4 HMACs |
 
-From the [API reference](https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_BatchWriteItem.html):
-"you cannot specify conditions on individual put and delete requests."
+The 900-second Lambda timeout, the checkpoint-and-resume logic, the parallel `Scan`, and
+the in-memory shuffle set all disappear. F1.4's window becomes trivially satisfiable, and
+C2 is no longer a throughput requirement on assignment.
 
-F2.5 requires that a repeated write for the same `request_id` does not consume a second
-position — a conditional write. `BatchWriteItem` cannot express it and saves no capacity;
-it reduces only HTTP request count. Positions are written with `PutItem` and
-`ConditionExpression: attribute_not_exists(request_id)`, issued concurrently.
+**On attribute size.** Shortening attribute names or packing values into a binary blob
+does not reduce write cost: DynamoDB bills writes in 1 KB units rounded up, with a 1 WCU
+minimum, and a position row is ~300 bytes — already at the floor. Both a 300-byte and a
+45-byte item cost 1 WCU. Size affects `Scan` page density, but eliminating the `Scan`
+removes that concern too. `PreQueue` uses short attribute names anyway, because items are
+scanned during audit and the density is free.
 
-### 4.4 Assignment throughput and its bounds
+### 4.5 Auditability
 
-Stored item is ~300 bytes (`request_id`, `event_id`, `queue_position`, `entry_time`,
-`status`), costing 1 WCU per write.
+The assignment is reproducible from two published values (F1.5). Given `shuffle_seed`,
+`participant_count`, and the set of `(request_id, i)` pairs in `PreQueue`, any third party
+can recompute every position and confirm the ordering. This is a stronger audit position
+than a materialised shuffle, where verification requires trusting that stored rows were
+not modified after the fact.
 
-| Window | Write rate | Concurrent writes in flight at 8 ms p99 |
-|---|---|---|
-| 1 min | 16,667/s | ~133 |
-| 5 min | 3,333/s | ~27 |
-| 15 min | 1,111/s | ~9 |
+Positions are still written to `Positions` — but lazily, when a visitor is admitted, not
+for every participant at T−0. That write carries `entry_time`, `status` and `expires_at`
+for the outflow controller (§5) and covers only visitors who actually reach the front.
 
-Writes in flight is not Lambda concurrency; one execution environment holds many outstanding
-futures. At 3,333 writes/s and 8 ms latency, 27 are in flight.
+### 4.6 Live joins after opening
 
-Four constraints bound the window:
+A visitor joining after T−0 has no pre-queue registration and takes a position from
+`queue_counter`, which starts at `participant_count`. Live joins are therefore ordered
+first-come-first-served behind every pre-queue participant (F2.1), and use the batch range
+allocation in §6.2. The permutation applies only to the pre-queue cohort.
 
-| Constraint | Value | Effect |
-|---|---|---|
-| Lambda timeout | 900 s, not adjustable | One invocation cannot cover a window >15 min |
-| `Positions` write quota | 40,000 WRU/s default, adjustable | Window <25 s for 1M exceeds it |
-| Cold-table capacity | ~4,000 writes/s | Requires pre-warming above that (§6.4) |
-| Lambda memory | 10,240 MB max | Bounds the in-memory shuffle set |
-
-Default window is 5 minutes: 3,333 writes/s, inside one invocation, 8% of the default table
-quota. For longer windows the function writes `{seed, shuffle_offset, range_start}` to
-`Counters` and re-invokes via EventBridge; the shuffle is deterministic from the seed, so a
-resumed invocation reproduces the same ordering without re-reading prior state.
-
-### 4.5 Fairness
+### 4.7 Fairness
 
 Randomization is the fairness model for scheduled events: every participant present at T−0
 has equal probability of any position, independent of connection speed or geography.
-First-come-first-served applies to live joins after opening (F2.1).
+First-come-first-served applies to live joins after opening.
 
 Queue-it uses the same split. Their documentation describes randomizing pre-queue visitors
 "like a raffle" when the timer reaches zero, and their FAQ states that safety-net activation
@@ -498,7 +527,7 @@ contractual pre-event step, not an optimization.
 
 | Counter | Kind | Write sharding |
 |---|---|---|
-| `queue_counter`, `serving_counter` | sequence | **never** — sharding destroys ordering |
+| `queue_counter`, `serving_counter`, `prequeue_counter` | sequence | **never** — sharding destroys ordering |
 | `arrivals` | statistic | **sharded ×10** — hot at high admission rates (§5) |
 | `token_counter`, `completed_counter`, `abandoned_counter`, `expired_queue_counter` | statistic | permitted if hot |
 
@@ -532,13 +561,18 @@ double the write cost.
 | `phase` | S | `idle` / `pre_queue` / `active` / `post_event` |
 | `phase_override` | S | Maintenance mode, checked before `phase` |
 | `target_rate` | N | Operator-set admissions per minute |
-| `shuffle_seed` | B | 256-bit seed for audit (§4.2) |
+| `shuffle_seed` | B | 256-bit permutation key, written once at T−0 (§4.2) |
+| `participant_count` | N | Pre-queue cohort size `N`, the permutation domain |
+| `prequeue_counter` | N | Registration index sequence |
 | `operator_message` | S | Delivered in `/status` |
 
 All counter updates are `UpdateItem` with `ADD`. Item stays well under the 400 KB limit.
 
-**`PreQueue`** — PK `request_id` (UUIDv7). Registration during the pre-queue phase. Read
-once at T−0 with a parallel `Scan` projecting `request_id` only.
+**`PreQueue`** — PK `r` (`request_id`, UUIDv7). Attributes `i` (registration index from
+`prequeue_counter`) and `t` (server-stamped registration time). Short attribute names
+because the table is scanned during audit. Written with
+`ConditionExpression: attribute_not_exists(r)`. Read by `/queue_num` as a single `GetItem`;
+never scanned on the hot path.
 
 **`Positions`** — PK `request_id`. Attributes `event_id`, `queue_position`, `entry_time`,
 `status`, `expires_at`, `ttl`.
@@ -980,6 +1014,8 @@ event and measuring, not from the price sheet.
 | CloudFront default metrics: 1-minute granularity, `us-east-1`, no additional charge, do not count against CloudWatch quotas | [Monitor CloudFront metrics with CloudWatch](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/monitoring-using-cloudwatch.html) |
 | FedRAMP cost and timeline | Published 3PAO and FedRAMP advisory pricing, cross-checked across sources |
 | `Scan`: 1 MB page limit, `LastEvaluatedKey` pagination, parallel `Segment`/`TotalSegments`, eventually consistent by default | [Scanning tables in DynamoDB](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Scan.html) |
+| Small-domain format-preserving encryption: Feistel construction, cycle-walking, minimum domain size | [NIST SP 800-38G Rev. 1](https://csrc.nist.gov/pubs/sp/800/38/g/r1/2pd) |
+| DynamoDB writes billed in 1 KB units rounded up, 1 WCU minimum | [DynamoDB read/write capacity](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/ServiceQuotas.html) |
 | TTL deletes "within a few days"; expired items remain readable until deleted; use filter expressions to exclude them | [Using time to live (TTL) in DynamoDB](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/TTL.html) |
 | `UpdateItem` `ADD` atomic counter; `ReturnValues: ALL_NEW`; `ConditionExpression` support | [UpdateItem API reference](https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_UpdateItem.html) |
 | Request collapsing disabled by Min TTL 0 or cookie forwarding; `stale-while-revalidate` | [DDoS resilience with HTTP caching on CloudFront](https://repost.aws/articles/ARTocYphbwQnWtTz8FXrwqew/ddos-resilience-with-http-caching-on-cloudfront) |

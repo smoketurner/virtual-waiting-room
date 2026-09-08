@@ -35,9 +35,9 @@ fair model when a spike is unplanned and nobody was waiting.
 |---|---|---|
 | F1.1 | During the pre-queue phase, visitors MUST be held on a countdown page rather than assigned a position. | A visitor arriving at T−10min sees a countdown; no `Positions` item is written. |
 | F1.2 | The pre-queue page MUST be servable entirely from CDN cache, making zero calls to API Gateway, DynamoDB, or SQS per view. | Origin request count during the pre-queue phase is independent of visitor count. |
-| F1.3 | At T−0 the system MUST assign queue positions to pre-queue participants in **randomized** order. | Across repeated trials, arrival timestamp shows no correlation with assigned position. |
-| F1.4 | Position assignment for pre-queue participants MUST complete within an operator-configured window. | 1,000,000 positions assigned within the configured window, default 5 minutes. |
-| F1.5 | The randomization MUST be auditable after the fact. | A stored seed plus the participant set reproduces the exact assignment. |
+| F1.3 | At T−0 the system MUST assign queue positions to pre-queue participants in **randomized** order, and the ordering MUST NOT be predictable before that moment. | Assigned position shows no correlation with registration time; positions are uniformly distributed; the permutation key does not exist before T−0. |
+| F1.4 | Position assignment for pre-queue participants MUST complete promptly at the scheduled start. | 1,000,000 participants assigned in one write; elapsed time independent of cohort size. |
+| F1.5 | The randomization MUST be auditable after the fact. | A third party given the published seed, participant count, and registration indices recomputes every position and reproduces the ordering exactly. |
 
 ### 1.3 Queue join (live arrivals)
 
@@ -111,7 +111,7 @@ requires the pre-event preparation in §4: quota increases filed and tables pre-
 | ID | Requirement | Acceptance |
 |---|---|---|
 | C1 | The pre-queue MUST support at least 1,000,000 concurrent participants. | Load test sustains 1M countdown-page holders. |
-| C2 | Batch position assignment MUST sustain the write rate implied by the configured window. | 1M positions in 5 minutes = 3,333 writes/s sustained, zero throttling, zero duplicates. |
+| C2 | Position assignment for the pre-queue cohort MUST be atomic — no interval in which some participants hold positions and others do not. | Assignment completes in a single conditional write; a reader either sees the pre-queue unassigned or sees every participant assigned. |
 | C3 | The live-join path MUST sustain ≥ 10,000 joins/sec at default quotas, and ≥ 40,000/sec with quota increases filed. | Load test at both levels; zero duplicates at each. |
 | C4 | Polling load MUST be independent of visitor count at the origin. | Origin RPS for `/status` stays flat as waiters scale from 10K to 1M. |
 | C5 | The system MUST handle a spike arriving in under 5 seconds without dropping joins. | Joins are durably enqueued even when compute has not yet scaled. |

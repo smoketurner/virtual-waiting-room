@@ -51,9 +51,12 @@ origin never calls the waiting room on the hot path.
 ## Design highlights
 
 - **The burst is removed, not absorbed.** Assigning positions by arrival order makes
-  arriving early an advantage, so everyone arrives at once. Randomizing among everyone
-  present at the start drops peak write load from ~1,000,000/sec to ~3,300/sec — inside
-  default AWS quotas.
+  arriving early an advantage, so everyone arrives at once. Holding early arrivals on a
+  countdown page and randomizing them at the start removes that incentive.
+- **Randomization is one database write.** The queue order is a seeded pseudorandom
+  permutation computed on read, not a million stored rows. Assignment for a million-person
+  cohort is a single conditional write, so there is no window where some people have
+  positions and others do not.
 - **No compute in the ingest path.** API Gateway writes straight to SQS. The burst never
   touches a function, so there are no cold starts and no concurrency ceiling at the door.
 - **Closed-loop admission.** Some admitted visitors never arrive. The controller measures

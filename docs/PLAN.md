@@ -53,13 +53,15 @@ Throwaway code. Measures what documentation cannot settle.
 - [ ] Pre-queue registration (identity only, spread across the window) [C1]
 - [ ] `/status` carries phase, so the countdown page polls one endpoint (Min TTL 1 s,
       no cookies forwarded — DESIGN §8)
-- [ ] EventBridge-triggered batch assignment (DESIGN §4.2): 256-bit seed to `Counters`,
-      one `UpdateItem ADD`/`ALL_NEW` to claim the range, **parallel `Scan` projecting
-      `request_id` only** (1 MB pages, ~286 pages at 1M, 50 segments), Fisher-Yates,
-      then `PutItem` with `attribute_not_exists(request_id)` per position — **not
-      `BatchWriteItem`, which cannot express conditions**. Checkpoint
-      `{seed, offset, range_start}` and re-invoke beyond the 900 s Lambda timeout.
-      [F1.3, F1.4, F1.5, C2]
+- [ ] Registration writes `PreQueue {r, i, t}` with `attribute_not_exists(r)`; `i` from
+      `ADD prequeue_counter` [F2.5]
+- [ ] **Seeded permutation, not a materialised shuffle** (DESIGN §4.2–4.4). At T−0, one
+      `UpdateItem` on `Counters` setting `shuffle_seed`, `participant_count` and `phase`,
+      guarded by `attribute_not_exists(shuffle_seed)`. **No per-participant writes, no
+      `Scan`.** Position derived on read as `PRP(seed, i, N)`. [F1.3, F1.4, F1.5, C2]
+- [ ] PRP implementation: 4-round balanced Feistel, `HMAC-SHA256(seed, round || x)` as the
+      round function, cycle-walking into `[0, N)`. Property tests: bijectivity over the
+      full domain at N ≤ 10⁶, uniformity by chi-square, determinism across processes
 
 ### 1d. Live join
 - [ ] REST API `AWS` integration → SQS `SendMessage`, request validator with JSON Schema,
@@ -152,12 +154,15 @@ event; authorizer fails open.
 The one place where being wrong is unrecoverable in production.
 
 - [ ] Repeatable load harness as a deliverable, not a test script [O3]
-- [ ] **Pre-queue path**: 1M participants, batch assignment within window, zero duplicates,
-      randomization shows no correlation with arrival time [F1.3, F1.4, C1, C2]
+- [ ] **Pre-queue path**: 1M registrations, then assignment as a single write. Assert
+      bijectivity across the full cohort (every position in `[0, N)` issued exactly once),
+      no correlation between registration time and assigned position, and that the seed is
+      absent before T−0 [F1.3, F1.4, C1, C2]
 - [ ] **Live-join path**: 10K/sec at default quotas and 40K/sec with increases filed; zero
       duplicates at both; gap rate measured [F2.2, C3]
-- [ ] Raise quotas and pre-warm *before* testing above defaults, or the test measures
-      throttling rather than the design [O1, O2]
+- [ ] Raise quotas and pre-warm *before* testing the live-join path above defaults, or the
+      test measures throttling rather than the design. Pre-queue assignment needs neither,
+      since it is one write [O1, O2]
 - [ ] `/status` origin RPS flat from 10K to 1M waiters — **this validates request
       collapsing**, so assert origin fetches ≈ elapsed/TTL and not a function of waiter
       count [C4]
