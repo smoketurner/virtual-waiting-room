@@ -23,6 +23,10 @@ pub struct Dashboard {
     /// human "last changed by X at T" line for the audit trail.
     pub admission_paused: bool,
     pub last_action_line: String,
+    /// Signed-in operator email for the top nav (set by the handler, not from
+    /// control state). Not part of the JSON state view.
+    #[serde(skip)]
+    pub operator_email: String,
     /// Per-render CSP nonce for the inline poller script. Not part of the JSON
     /// state view (the poller endpoint reuses this struct).
     #[serde(skip)]
@@ -52,6 +56,7 @@ impl Dashboard {
                 _ => "—".to_owned(),
             },
             csp_nonce: String::new(),
+            operator_email: String::new(),
         }
     }
 }

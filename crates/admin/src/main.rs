@@ -343,12 +343,13 @@ async fn logout(State(state): State<Shared>, headers: HeaderMap) -> Response {
 
 /// Renders the dashboard from current control state. Unauthenticated -> login.
 async fn dashboard(State(state): State<Shared>, headers: HeaderMap) -> Response {
-    if authed(&state, &headers).await.is_none() {
+    let Some(session) = authed(&state, &headers).await else {
         return Redirect::to("/admin/login").into_response();
-    }
+    };
     match state.store_load().await {
         Ok(Some(mut view)) => {
             view.csp_nonce = admin::security::nonce();
+            view.operator_email = session.email;
             match view.render() {
                 Ok(html) => {
                     let mut response = Html(html).into_response();

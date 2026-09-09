@@ -1,9 +1,14 @@
-/* Admin dashboard layout. Colors, spacing, radii, and fonts all reference the
- * Cloudscape design tokens in tokens.css (loaded first). No component library,
- * no JS — the operator actions are plain form POSTs. */
+/* Admin dashboard — hand-authored Cloudscape UX patterns (ADR-0014: tokens, not
+ * the React component library). Colors, spacing, radii, and fonts reference the
+ * Cloudscape design tokens in tokens.css. No component library, no framework —
+ * the operator actions are plain form POSTs; only the live poller needs JS. */
 
 :root {
   color-scheme: light;
+}
+
+* {
+  box-sizing: border-box;
 }
 
 body {
@@ -12,62 +17,223 @@ body {
   color: var(--color-text-body-default);
   background: var(--color-background-layout-main);
   margin: 0;
+  padding: 0;
+}
+
+/* --- Top navigation (Cloudscape TopNavigation pattern) --------------------- */
+
+.top-nav {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: var(--color-background-container-content);
+  border-bottom: var(--border-width-field) solid var(--color-border-divider-default);
+  padding: var(--space-scaled-s) var(--space-scaled-l);
+}
+
+.top-nav .brand {
+  font-size: var(--font-size-heading-s);
+  font-weight: var(--font-weight-heading-m);
+  color: var(--color-text-heading-default);
+}
+
+.top-nav .who {
+  font-size: var(--font-size-body-s);
+  color: var(--color-text-body-secondary);
+}
+
+/* --- Content header (Cloudscape Header pattern) ---------------------------- */
+
+.content {
+  max-width: 72rem;
+  margin: 0 auto;
   padding: var(--space-scaled-l);
 }
 
-h1 {
+.page-header {
+  margin-bottom: var(--space-scaled-l);
+}
+
+.page-header h1 {
   font-size: var(--font-size-heading-xl);
-  margin: 0 0 var(--space-scaled-m);
+  font-weight: var(--font-weight-heading-xl);
+  color: var(--color-text-heading-default);
+  margin: 0;
 }
 
-h2 {
-  font-size: var(--font-size-heading-m);
-  margin: var(--space-scaled-l) 0 var(--space-scaled-s);
+.page-header .desc {
+  color: var(--color-text-heading-secondary);
+  margin: var(--space-scaled-xxs) 0 0;
 }
 
-.card {
+/* --- Layout grid (Cloudscape ColumnLayout / Grid) -------------------------- */
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr));
+  gap: var(--space-scaled-l);
+  align-items: start;
+}
+
+.span-2 {
+  grid-column: 1 / -1;
+}
+
+/* --- Container (Cloudscape Container with a Header) ------------------------- */
+
+.container {
   background: var(--color-background-container-content);
   border: var(--border-width-field) solid var(--color-border-divider-default);
+  border-top: var(--border-width-container-top, 2px) solid var(--color-border-container-top);
   border-radius: var(--border-radius-container);
-  padding: var(--space-scaled-l);
-  margin-bottom: var(--space-scaled-m);
-  max-width: 40rem;
+  overflow: hidden;
 }
 
-.kv {
-  display: flex;
-  gap: var(--space-scaled-s);
-  padding: var(--space-scaled-xxs) 0;
+.container > .container-header {
+  background: var(--color-background-container-header);
+  border-bottom: var(--border-width-field) solid var(--color-border-divider-default);
+  padding: var(--space-scaled-m) var(--space-scaled-l);
 }
 
-.kv dt {
-  color: var(--color-text-body-secondary);
-  min-width: 12rem;
-}
-
-.kv dd {
-  margin: 0;
+.container > .container-header h2 {
+  font-size: var(--font-size-heading-m);
   font-weight: var(--font-weight-heading-m);
+  color: var(--color-text-heading-default);
+  margin: 0;
 }
 
-.phase {
-  display: inline-block;
+.container > .container-header .sub {
+  font-size: var(--font-size-body-s);
+  color: var(--color-text-body-secondary);
+  margin: var(--space-scaled-xxs) 0 0;
+}
+
+.container > .container-body {
+  padding: var(--space-scaled-l);
+}
+
+.container.emphasis {
+  border-top-color: var(--color-text-status-error);
+}
+
+/* --- KPI tiles (Cloudscape "big number" pattern) --------------------------- */
+
+.kpis {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+  gap: var(--space-scaled-m);
+}
+
+.kpi {
+  padding: var(--space-scaled-s) 0;
+}
+
+.kpi .label {
+  font-size: var(--font-size-body-s);
+  color: var(--color-text-body-secondary);
+  margin-bottom: var(--space-scaled-xxs);
+}
+
+.kpi .value {
+  font-size: var(--font-size-heading-l);
+  font-weight: var(--font-weight-heading-l);
+  color: var(--color-text-heading-default);
+}
+
+/* --- Key-value pairs (Cloudscape KeyValuePairs) ---------------------------- */
+
+.kv-pairs {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+  gap: var(--space-scaled-m);
+  margin: 0;
+}
+
+.kv-pairs .kv-key {
+  font-size: var(--font-size-body-s);
+  color: var(--color-text-body-secondary);
+}
+
+.kv-pairs .kv-val {
+  font-weight: var(--font-weight-heading-s);
+  margin: var(--space-scaled-xxxs) 0 0;
+}
+
+/* --- Status indicators (Cloudscape StatusIndicator / Badge) ---------------- */
+
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-scaled-xxs);
   padding: var(--space-scaled-xxs) var(--space-scaled-s);
   border-radius: var(--border-radius-badge);
+  font-size: var(--font-size-body-s);
+  font-weight: var(--font-weight-heading-s);
+}
+
+.status::before {
+  content: "";
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.status-active,
+.status-success {
+  background: var(--color-background-status-success);
+  color: var(--color-text-status-success);
+}
+
+.status-idle,
+.status-inactive {
+  background: var(--color-background-cell-shaded);
+  color: var(--color-text-status-inactive);
+}
+
+.status-pre_queue,
+.status-info {
   background: var(--color-background-status-info);
   color: var(--color-text-status-info);
 }
 
-form {
-  margin: var(--space-scaled-s) 0;
-  display: flex;
-  gap: var(--space-scaled-s);
-  align-items: center;
-  flex-wrap: wrap;
+.status-post_event,
+.status-warning {
+  background: var(--color-background-status-warning);
+  color: var(--color-text-status-warning);
 }
 
-label {
+.status-maintenance,
+.status-error {
+  background: var(--color-background-status-error);
+  color: var(--color-text-status-error);
+}
+
+/* --- Forms (Cloudscape FormField + SpaceBetween) --------------------------- */
+
+.form-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-scaled-xxs);
+  margin-bottom: var(--space-scaled-m);
+}
+
+.form-field label {
+  font-size: var(--font-size-body-s);
+  font-weight: var(--font-weight-heading-s);
+  color: var(--color-text-body-default);
+}
+
+.form-field .help {
+  font-size: var(--font-size-body-s);
   color: var(--color-text-body-secondary);
+}
+
+.form-row {
+  display: flex;
+  gap: var(--space-scaled-s);
+  align-items: flex-end;
+  flex-wrap: wrap;
 }
 
 input,
@@ -76,25 +242,72 @@ select {
   padding: var(--space-scaled-xxs) var(--space-scaled-s);
   border: var(--border-width-field) solid var(--color-border-input-default);
   border-radius: var(--border-radius-input);
+  background: var(--color-background-input-default);
+  color: var(--color-text-body-default);
+  min-height: 2rem;
 }
+
+/* --- Buttons (Cloudscape Button variants) ---------------------------------- */
 
 button {
   font: inherit;
+  font-weight: var(--font-weight-button);
   cursor: pointer;
-  padding: var(--space-scaled-xxs) var(--space-scaled-m);
+  padding: var(--space-scaled-xxs) var(--space-scaled-l);
+  min-height: 2rem;
   border-radius: var(--border-radius-button);
   border: var(--border-width-button) solid var(--color-border-button-primary-default);
   background: var(--color-background-button-primary-default);
   color: var(--color-text-button-primary-default);
 }
 
-button.danger {
+button:hover {
+  background: var(--color-background-button-primary-hover);
+}
+
+/* "normal" variant — secondary actions */
+button.normal {
   background: var(--color-background-button-normal-default);
   color: var(--color-text-button-normal-default);
   border-color: var(--color-border-button-normal-default);
 }
 
+button.normal:hover {
+  background: var(--color-background-button-normal-hover);
+}
+
+/* emergency / stop — the andon cord */
+button.danger {
+  background: var(--color-background-button-primary-default);
+  color: var(--color-text-button-primary-default);
+  border-color: var(--color-text-status-error);
+  background: var(--color-text-status-error);
+}
+
+button.big {
+  min-height: 2.75rem;
+  font-size: var(--font-size-heading-s);
+  padding: var(--space-scaled-s) var(--space-scaled-xl);
+}
+
+/* --- Utility --------------------------------------------------------------- */
+
 .deferred {
   color: var(--color-text-status-inactive);
   font-style: italic;
+}
+
+.audit-line {
+  font-size: var(--font-size-body-s);
+  color: var(--color-text-body-secondary);
+  margin-top: var(--space-scaled-s);
+}
+
+.banner {
+  padding: var(--space-scaled-s) var(--space-scaled-l);
+  border-radius: var(--border-radius-item);
+  margin-bottom: var(--space-scaled-m);
+  background: var(--color-background-status-warning);
+  color: var(--color-text-status-warning);
+  font-weight: var(--font-weight-heading-s);
 }
