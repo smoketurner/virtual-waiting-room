@@ -32,6 +32,7 @@ use openidconnect::{
 };
 use rust_embed::RustEmbed;
 use serde::Deserialize;
+use tower::Layer as _;
 
 /// Name of the opaque session cookie.
 const SESSION_COOKIE: &str = "vwr_admin_session";
@@ -128,6 +129,12 @@ async fn main() -> Result<(), Error> {
         .route("/update_session", post(deferred))
         .route("/static/{*path}", get(static_asset))
         .with_state(state);
+
+    // Trim a trailing slash before routing so /admin/ resolves to the /admin
+    // route (and /admin/phase/ to /admin/phase, etc.) — the same handler, not a
+    // redirect. API Gateway collapses /admin/ onto the admin Lambda but forwards
+    // the trailing slash; without this the axum router would 404 on it.
+    let app = tower_http::normalize_path::NormalizePathLayer::trim_trailing_slash().layer(app);
 
     lambda_http::run(app).await
 }
