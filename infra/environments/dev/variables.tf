@@ -105,3 +105,9 @@ variable "oidc_redirect_uri" {
   type        = string
   default     = ""
 }
+
+variable "oidc_allowed_emails" {
+  description = "Comma-separated allowlist of operator emails permitted admin access. Empty = deny all (fail closed)."
+  type        = string
+  default     = ""
+}

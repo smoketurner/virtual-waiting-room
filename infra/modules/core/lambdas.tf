@@ -131,6 +131,9 @@ resource "aws_lambda_function" "admin" {
       OIDC_CLIENT_ID           = var.oidc_client_id
       OIDC_REDIRECT_URI        = var.oidc_redirect_uri
       OIDC_CLIENT_SECRET_PARAM = aws_ssm_parameter.oidc_client_secret.name
+      # Comma-separated allowlist of operator emails permitted to log in. Empty
+      # = deny all (the admin Lambda fails closed).
+      OIDC_ALLOWED_EMAILS = var.oidc_allowed_emails
     }
   }
 

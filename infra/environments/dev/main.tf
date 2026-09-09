@@ -25,9 +25,10 @@ module "core" {
   seal_start_time               = var.seal_start_time
 
   # Admin OIDC login (ADR-0016). Secret is an SSM SecureString written out of band.
-  oidc_issuer       = var.oidc_issuer
-  oidc_client_id    = var.oidc_client_id
-  oidc_redirect_uri = var.oidc_redirect_uri
+  oidc_issuer         = var.oidc_issuer
+  oidc_client_id      = var.oidc_client_id
+  oidc_redirect_uri   = var.oidc_redirect_uri
+  oidc_allowed_emails = var.oidc_allowed_emails
 }
 
 # edge (CloudFront). Created once a client origin is supplied - the origin is the

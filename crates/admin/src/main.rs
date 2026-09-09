@@ -35,6 +35,9 @@ use serde::Deserialize;
 
 /// Name of the opaque session cookie.
 const SESSION_COOKIE: &str = "vwr_admin_session";
+/// Name of the short-lived cookie binding a login to the browser that started
+/// it: holds the CSRF state, checked against the callback's `state` param.
+const STATE_COOKIE: &str = "vwr_admin_login_state";
 
 /// Static assets (CSS) embedded into the binary at build time.
 #[derive(RustEmbed)]
@@ -47,6 +50,9 @@ struct AppState {
     oidc: OidcClient,
     http: reqwest::Client,
     event_id: String,
+    /// Emails permitted to hold an admin session. Empty = deny all (fail closed
+    /// for a control plane): an OIDC identity not on this list is rejected.
+    allowed_emails: Vec<String>,
 }
 
 type Shared = Arc<AppState>;
@@ -99,6 +105,14 @@ async fn main() -> Result<(), Error> {
         oidc,
         http,
         event_id: std::env::var("EVENT_ID")?,
+        // Comma-separated allowlist; entries trimmed and lowercased. Empty (unset)
+        // = deny all — the operator must configure who may log in.
+        allowed_emails: std::env::var("OIDC_ALLOWED_EMAILS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect(),
     });
 
     let app = Router::new()
@@ -120,13 +134,18 @@ async fn main() -> Result<(), Error> {
 
 // --- Auth helpers -------------------------------------------------------------
 
-/// Extracts the session id from the request cookie header, if present.
-fn session_id_from(headers: &HeaderMap) -> Option<String> {
+/// Reads a named cookie's value from the request cookie header, if present.
+fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     let raw = headers.get(header::COOKIE)?.to_str().ok()?;
     cookie::Cookie::split_parse(raw)
         .filter_map(Result::ok)
-        .find(|c| c.name() == SESSION_COOKIE)
+        .find(|c| c.name() == name)
         .map(|c| c.value().to_string())
+}
+
+/// Extracts the session id from the request cookie header, if present.
+fn session_id_from(headers: &HeaderMap) -> Option<String> {
+    cookie_value(headers, SESSION_COOKIE)
 }
 
 /// Returns the authenticated session, or `None` if the request is unauthenticated.
@@ -160,7 +179,21 @@ async fn login(State(state): State<Shared>) -> Response {
     if let Err(e) = state.sessions.put_pending(csrf.secret(), &pending).await {
         return server_error(&e.to_string());
     }
-    Redirect::to(auth_url.as_str()).into_response()
+    // Bind this login to the browser that started it: a short-lived cookie
+    // holding the CSRF state, required to match the callback's state param. A
+    // state stolen from elsewhere cannot complete a login without this cookie.
+    let state_cookie = format!(
+        "{STATE_COOKIE}={}; Path=/admin; HttpOnly; Secure; SameSite=Lax; Max-Age=600",
+        csrf.secret()
+    );
+    (
+        StatusCode::SEE_OTHER,
+        [
+            (header::SET_COOKIE, state_cookie),
+            (header::LOCATION, auth_url.to_string()),
+        ],
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -171,7 +204,19 @@ struct CallbackParams {
 
 /// OIDC redirect target: exchange the code, verify the ID token, create a
 /// session, set the cookie, redirect to the dashboard.
-async fn callback(State(state): State<Shared>, Query(params): Query<CallbackParams>) -> Response {
+async fn callback(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Query(params): Query<CallbackParams>,
+) -> Response {
+    // Browser binding: the callback must carry the login-state cookie set at
+    // /admin/login, and it must equal the returned state. Rejects a state
+    // replayed from a different browser.
+    match cookie_value(&headers, STATE_COOKIE) {
+        Some(bound) if bound == params.state => {}
+        _ => return (StatusCode::BAD_REQUEST, "login state mismatch").into_response(),
+    }
+
     let Some(pending) = state
         .sessions
         .take_pending(&params.state)
@@ -214,6 +259,13 @@ async fn callback(State(state): State<Shared>, Query(params): Query<CallbackPara
         .map(|e| e.as_str().to_string())
         .unwrap_or_default();
 
+    // Operator allowlist: only configured emails may hold an admin session.
+    // Empty allowlist = deny all (fail closed).
+    if !state.allowed_emails.contains(&email.to_ascii_lowercase()) {
+        tracing::warn!(subject = %subject, "admin login denied: email not in allowlist");
+        return (StatusCode::FORBIDDEN, "not authorized for admin access").into_response();
+    }
+
     let session_id = match state
         .sessions
         .create_session(&AdminSession { subject, email })
@@ -226,14 +278,24 @@ async fn callback(State(state): State<Shared>, Query(params): Query<CallbackPara
     let cookie = format!(
         "{SESSION_COOKIE}={session_id}; Path=/admin; HttpOnly; Secure; SameSite=Lax; Max-Age=28800"
     );
-    (
-        StatusCode::SEE_OTHER,
-        [
-            (header::SET_COOKIE, cookie),
-            (header::LOCATION, "/admin".to_string()),
-        ],
-    )
-        .into_response()
+    // Clear the one-shot login-state cookie now that it has been consumed.
+    let clear_state =
+        format!("{STATE_COOKIE}=; Path=/admin; HttpOnly; Secure; SameSite=Lax; Max-Age=0");
+    // Two Set-Cookie headers: append rather than a header array (which would
+    // insert-overwrite the first).
+    let mut response = (StatusCode::SEE_OTHER, [(header::LOCATION, "/admin")]).into_response();
+    let set_cookie = |v: String| {
+        v.parse()
+            .map_err(|e| tracing::error!(error = %e, "invalid Set-Cookie value"))
+            .ok()
+    };
+    if let Some(c) = set_cookie(cookie) {
+        response.headers_mut().append(header::SET_COOKIE, c);
+    }
+    if let Some(c) = set_cookie(clear_state) {
+        response.headers_mut().append(header::SET_COOKIE, c);
+    }
+    response
 }
 
 /// Clears the session and its cookie.

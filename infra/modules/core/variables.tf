@@ -116,6 +116,12 @@ variable "oidc_redirect_uri" {
   default     = ""
 }
 
+variable "oidc_allowed_emails" {
+  description = "Comma-separated allowlist of operator emails permitted to hold an admin session. Empty = deny all (the admin Lambda fails closed)."
+  type        = string
+  default     = ""
+}
+
 variable "assign_position_reserved_concurrency" {
   description = "Reserved concurrency on the assign_position function. Mandatory for event isolation (ADR-0008): without it a runaway event starves the others. -1 leaves it unreserved (single-event dev only)."
   type        = number
