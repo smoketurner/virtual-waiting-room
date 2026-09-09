@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["wr-permutation"]
+members = ["wr-permutation", "wr-domain"]
 
 [workspace.package]
 edition = "2024"
@@ -10,12 +10,23 @@ repository = "https://github.com/smoketurner/virtual-waiting-room"
 
 [workspace.dependencies]
 wr-permutation = { path = "wr-permutation" }
+wr-domain = { path = "wr-domain" }
 
 # Exact version pins only, default features disabled on everything; each member
 # crate opts into exactly the features it uses (conventions.md).
 
 # Crypto — aws-lc-rs is the sole crypto/HMAC backend across the tree (tech.md).
 aws-lc-rs = { version = "=1.18.1", default-features = false }
+
+# AWS SDK — defaults off so no second crypto stack / legacy connector is pulled
+# in; the DynamoDB AttributeValue type is used to build item maps and reads.
+aws-sdk-dynamodb = { version = "=1.124.0", default-features = false }
+
+# Serialization
+serde = { version = "=1.0.229", default-features = false }
+serde_json = { version = "=1.0.151", default-features = false }
+# Typed DynamoDB AttributeValue de/serialization for item shapes.
+serde_dynamo = { version = "=4.3.0", default-features = false }
 
 # Errors and logging
 thiserror = { version = "=2.0.20", default-features = false }
