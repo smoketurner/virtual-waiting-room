@@ -26,13 +26,13 @@ resource "aws_lambda_function" "api_placeholder" {
   function_name = "${var.name_prefix}-api-placeholder"
   role          = aws_iam_role.api_placeholder.arn
   runtime       = "provided.al2023"
-  architectures = ["arm64"]
+  architectures = [local.lambda_runtime_arch]
   handler       = "bootstrap"
   timeout       = 10
   memory_size   = 256
 
-  filename         = local.lambda_zip
-  source_code_hash = local.using_placeholder ? data.archive_file.placeholder[0].output_base64sha256 : filebase64sha256(var.lambda_artifact_path)
+  filename         = data.archive_file.placeholder[0].output_path
+  source_code_hash = data.archive_file.placeholder[0].output_base64sha256
 
   tags = var.tags
 }
@@ -144,7 +144,9 @@ resource "aws_api_gateway_integration" "endpoint" {
   http_method             = aws_api_gateway_method.endpoint[each.key].http_method
   type                    = "AWS_PROXY"
   integration_http_method = "POST"
-  uri                     = aws_lambda_function.api_placeholder.invoke_arn
+  # The read Lambda backs the two public read endpoints; every other endpoint is
+  # still fronted by the shared placeholder until its crate lands.
+  uri = contains(["status", "queue_num"], each.key) ? aws_lambda_function.read.invoke_arn : aws_lambda_function.api_placeholder.invoke_arn
 }
 
 # --- Stage + deployment -------------------------------------------------------

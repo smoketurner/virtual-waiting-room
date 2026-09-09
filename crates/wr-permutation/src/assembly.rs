@@ -73,6 +73,18 @@ impl SealedOffsets {
         })
     }
 
+    /// Reconstructs a sealed index space from the prefix offsets and cohort
+    /// size already published for an event, without re-reading the shard
+    /// counts. The read path uses this to resolve positions from the values a
+    /// reader already fetched.
+    #[must_use]
+    pub fn from_parts(offsets: [u64; SHARDS], participant_count: u64) -> Self {
+        Self {
+            offsets,
+            participant_count,
+        }
+    }
+
     /// The cohort size `N` — the number of registration indices issued across
     /// all shards, and the domain size for [`crate::prp`].
     #[must_use]
