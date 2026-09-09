@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["wr-permutation", "wr-domain", "assign_position", "seal_event", "read"]
+members = ["wr-permutation", "wr-domain", "assign_position", "seal_event", "read", "admin"]
 
 [workspace.package]
 edition = "2024"
@@ -30,6 +30,13 @@ aws-sdk-dynamodb = { version = "=1.124.0", default-features = false }
 
 # Async runtime.
 tokio = { version = "=1.53.1", default-features = false }
+
+# Admin UI: Axum server-rendered HTML Lambda (tech.md Option A). askama is
+# compile-time templates; tower/tower-http provide middleware.
+axum = { version = "=0.8.9", default-features = false }
+tower = { version = "=0.5.3", default-features = false }
+tower-http = { version = "=0.7.1", default-features = false }
+askama = { version = "=0.16.1", default-features = false }
 
 # Serialization
 serde = { version = "=1.0.229", default-features = false }

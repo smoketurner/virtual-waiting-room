@@ -1,0 +1,103 @@
+//! The askama template binding for the operator dashboard. Compile-time
+//! templates render server-side HTML; no runtime templating, no JS required for
+//! the core actions (each is a plain `<form method="post">`).
+
+use askama::Template;
+
+use crate::ControlState;
+
+/// The dashboard view. Optional fields render as an em dash when absent so the
+/// operator sees "not set" rather than a blank.
+#[derive(Template)]
+#[template(path = "dashboard.html")]
+pub struct Dashboard {
+    pub event_id: String,
+    pub phase: String,
+    pub serving_counter: u64,
+    pub queue_counter: u64,
+    pub participant_count: String,
+    pub target_rate: String,
+    pub message: String,
+}
+
+impl Dashboard {
+    /// Builds the view from control state, formatting optionals for display.
+    #[must_use]
+    pub fn from_state(state: &ControlState) -> Self {
+        let dash = |s: Option<String>| s.unwrap_or_else(|| "—".to_owned());
+        Self {
+            event_id: state.event_id.clone(),
+            phase: format!("{:?}", state.phase).to_lowercase(),
+            serving_counter: state.serving_counter,
+            queue_counter: state.queue_counter,
+            participant_count: dash(state.participant_count.map(|n| n.to_string())),
+            target_rate: dash(state.target_rate.map(|n| n.to_string())),
+            message: dash(state.message.clone()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
+
+    use askama::Template;
+    use wr_domain::Phase;
+
+    use super::*;
+
+    fn state() -> ControlState {
+        ControlState {
+            event_id: "launch".to_owned(),
+            phase: Phase::Active,
+            serving_counter: 42,
+            queue_counter: 1000,
+            participant_count: Some(1000),
+            target_rate: Some(500),
+            message: Some("Doors open at noon".to_owned()),
+        }
+    }
+
+    #[test]
+    fn renders_current_state() {
+        let html = Dashboard::from_state(&state()).render().unwrap();
+        assert!(html.contains("launch"));
+        assert!(html.contains(">active<"));
+        assert!(html.contains("Doors open at noon"));
+        assert!(html.contains("500"));
+    }
+
+    #[test]
+    fn core_actions_are_plain_form_posts_no_js() {
+        let html = Dashboard::from_state(&state()).render().unwrap();
+        // Every operator action is a POST form to its /admin route — works with
+        // JavaScript disabled.
+        for action in [
+            "action=\"/admin/phase\"",
+            "action=\"/admin/rate\"",
+            "action=\"/admin/message\"",
+            "action=\"/admin/reset\"",
+        ] {
+            assert!(html.contains(action), "missing form {action}");
+        }
+        assert!(html.contains("method=\"post\""));
+        // No client-side scripting in the core path.
+        assert!(!html.to_lowercase().contains("<script"));
+    }
+
+    #[test]
+    fn absent_optionals_render_as_dash() {
+        let mut s = state();
+        s.participant_count = None;
+        s.target_rate = None;
+        s.message = None;
+        let html = Dashboard::from_state(&s).render().unwrap();
+        assert!(html.contains("—"));
+    }
+
+    #[test]
+    fn deferred_features_are_labeled_not_faked() {
+        let html = Dashboard::from_state(&state()).render().unwrap();
+        assert!(html.contains("Not yet available"));
+    }
+}

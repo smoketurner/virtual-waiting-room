@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Waiting Room Admin — {{ event_id }}</title>
+<style>
+:root { color-scheme: light; }
+body {
+  font-family: var(--font-family-base);
+  font-size: var(--font-size-body-m);
+  color: var(--color-text-body-default);
+  background: var(--color-background-layout-main);
+  margin: 0;
+  padding: var(--space-scaled-l);
+}
+h1 { font-size: var(--font-size-heading-xl); margin: 0 0 var(--space-scaled-m); }
+h2 { font-size: var(--font-size-heading-m); margin: var(--space-scaled-l) 0 var(--space-scaled-s); }
+.card {
+  background: var(--color-background-container-content);
+  border: var(--border-width-field) solid var(--color-border-divider-default);
+  border-radius: var(--border-radius-container);
+  padding: var(--space-scaled-l);
+  margin-bottom: var(--space-scaled-m);
+  max-width: 40rem;
+}
+.kv { display: flex; gap: var(--space-scaled-s); padding: var(--space-scaled-xxs) 0; }
+.kv dt { color: var(--color-text-body-secondary); min-width: 12rem; }
+.kv dd { margin: 0; font-weight: var(--font-weight-heading-m); }
+.phase { display: inline-block; padding: var(--space-scaled-xxs) var(--space-scaled-s); border-radius: var(--border-radius-badge); background: var(--color-background-status-info); color: var(--color-text-status-info); }
+form { margin: var(--space-scaled-s) 0; display: flex; gap: var(--space-scaled-s); align-items: center; flex-wrap: wrap; }
+label { color: var(--color-text-body-secondary); }
+input, select {
+  font: inherit;
+  padding: var(--space-scaled-xxs) var(--space-scaled-s);
+  border: var(--border-width-field) solid var(--color-border-input-default);
+  border-radius: var(--border-radius-input);
+}
+button {
+  font: inherit;
+  cursor: pointer;
+  padding: var(--space-scaled-xxs) var(--space-scaled-m);
+  border-radius: var(--border-radius-button);
+  border: var(--border-width-button) solid var(--color-border-button-primary-default);
+  background: var(--color-background-button-primary-default);
+  color: var(--color-text-button-primary-default);
+}
+button.danger { background: var(--color-background-button-normal-default); color: var(--color-text-button-normal-default); border-color: var(--color-border-button-normal-default); }
+.deferred { color: var(--color-text-status-inactive); font-style: italic; }
+</style>
+</head>
+<body>
+<h1>Virtual Waiting Room — {{ event_id }}</h1>
+
+<div class="card">
+  <h2>Current state</h2>
+  <dl class="kv"><dt>Phase</dt><dd><span class="phase">{{ phase }}</span></dd></dl>
+  <dl class="kv"><dt>Serving position</dt><dd>{{ serving_counter }}</dd></dl>
+  <dl class="kv"><dt>Queue counter</dt><dd>{{ queue_counter }}</dd></dl>
+  <dl class="kv"><dt>Participant count</dt><dd>{{ participant_count }}</dd></dl>
+  <dl class="kv"><dt>Target rate</dt><dd>{{ target_rate }}</dd></dl>
+  <dl class="kv"><dt>Message</dt><dd>{{ message }}</dd></dl>
+</div>
+
+<div class="card">
+  <h2>Phase</h2>
+  <form method="post" action="/admin/phase">
+    <label for="phase">Transition to</label>
+    <select id="phase" name="phase">
+      <option value="idle">idle</option>
+      <option value="pre_queue">pre_queue</option>
+      <option value="active">active</option>
+      <option value="post_event">post_event</option>
+    </select>
+    <button type="submit">Set phase</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>Admission rate</h2>
+  <form method="post" action="/admin/rate">
+    <label for="rate">Target rate (per second)</label>
+    <input id="rate" name="rate" type="number" min="1" required>
+    <button type="submit">Set rate</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>Broadcast message</h2>
+  <form method="post" action="/admin/message">
+    <label for="message">Message</label>
+    <input id="message" name="message" type="text">
+    <button type="submit">Set message</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>Maintenance</h2>
+  <form method="post" action="/admin/reset">
+    <button class="danger" type="submit">Force maintenance mode</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>Protection rules · sessions</h2>
+  <p class="deferred">Not yet available — the authorizer and session plane ship after the MVP.</p>
+</div>
+</body>
+</html>
