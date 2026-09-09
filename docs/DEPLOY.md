@@ -108,7 +108,7 @@ API URL, table names, seal function, and event id from `terraform output` and
 never touches Terraform state, so it needs nothing but credentials:
 
 ```bash
-AWS_PROFILE=dev-admin ./scripts/smoke-test.sh
+AWS_PROFILE=dev-admin ./scripts/smoke_test.py
 ```
 
 ## Tear down

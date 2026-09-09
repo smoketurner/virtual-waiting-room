@@ -51,3 +51,6 @@ infra/modules/core/.artifacts/
 
 # Lambda bootstraps staged by `make build` (passed to Terraform by path)
 /.artifacts/
+
+# Python bytecode cache (scripts/smoke_test.py)
+__pycache__/
