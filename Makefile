@@ -65,13 +65,12 @@ help: ## Show this help.
 		| awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
 
 build: ## Compile the three Lambdas and stage their bootstraps under .artifacts/.
-	cargo lambda build --release --target $(LAMBDA_TARGET) \
-		-p assign_position -p seal_event -p read \
-		--manifest-path $(CRATES_DIR)/Cargo.toml
 	@mkdir -p $(ARTIFACTS)
-	@cp $(CRATES_DIR)/target/lambda/assign_position/bootstrap $(ASSIGN_ARTIFACT)
-	@cp $(CRATES_DIR)/target/lambda/seal_event/bootstrap      $(SEAL_ARTIFACT)
-	@cp $(CRATES_DIR)/target/lambda/read/bootstrap            $(READ_ARTIFACT)
+	@for crate in assign_position seal_event read; do \
+		cargo lambda build --release --target $(LAMBDA_TARGET) \
+			-p $$crate --manifest-path $(CRATES_DIR)/Cargo.toml; \
+		cp $(CRATES_DIR)/target/lambda/$$crate/bootstrap $(ARTIFACTS)/$$crate-bootstrap; \
+	done
 	@echo "staged: $(ASSIGN_ARTIFACT) $(SEAL_ARTIFACT) $(READ_ARTIFACT)"
 
 init: ## terraform init (safe, idempotent).
