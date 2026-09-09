@@ -16,6 +16,7 @@
 #   EVENT_ID    The single event id this deployment serves (default: default).
 #   SEAL_START  One-time UTC seal time, EventBridge at() value. Empty = manual.
 #   REGION      AWS region (default: us-east-1).
+#   PROFILE     Named AWS profile to authenticate with. Empty = default chain.
 
 SHELL       := /usr/bin/env bash
 .SHELLFLAGS := -eu -o pipefail -c
@@ -29,6 +30,7 @@ ARCH        ?= x86_64
 EVENT_ID    ?= default
 SEAL_START  ?=
 REGION      ?= us-east-1
+PROFILE     ?=
 
 # cargo-lambda's --target flag wants the Rust triple for the chosen arch.
 ifeq ($(ARCH),arm64)
@@ -43,7 +45,10 @@ READ_ARTIFACT   := $(ARTIFACTS)/read-bootstrap
 
 # Vars threaded into every plan/apply so the real functions deploy (empty paths
 # leave the vendored placeholders and disable the join event source mapping).
+# aws_profile is empty by default, which uses the default credential chain.
 TF_VARS := \
+	-var "region=$(REGION)" \
+	-var "aws_profile=$(PROFILE)" \
 	-var "event_id=$(EVENT_ID)" \
 	-var "lambda_architecture=$(ARCH)" \
 	-var "seal_start_time=$(SEAL_START)" \

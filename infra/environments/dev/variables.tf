@@ -4,6 +4,12 @@ variable "region" {
   default     = "us-east-1"
 }
 
+variable "aws_profile" {
+  description = "Named AWS profile from the shared config to authenticate with. Empty uses the default credential chain (environment, SSO session, instance role)."
+  type        = string
+  default     = ""
+}
+
 variable "name_prefix" {
   description = "Prefix for every resource name in this deployment. Isolates a second deployment in the same account."
   type        = string
