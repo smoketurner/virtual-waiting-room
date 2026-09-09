@@ -10,6 +10,7 @@ terraform {
 
   # S3 remote state.
   backend "s3" {
+    profile      = "dev-admin"
     bucket       = "terraform-state-952961969614-us-east-1-an"
     key          = "virtual-waiting-room/dev/terraform.tfstate"
     region       = "us-east-1"
