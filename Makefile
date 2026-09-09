@@ -18,8 +18,6 @@
 #   SEAL_START  One-time UTC seal time, EventBridge at() value. Empty = manual.
 #   REGION      AWS region (default: us-east-1).
 #   PROFILE     Named AWS profile to authenticate with. Empty = default chain.
-#   STATE_BUCKET  S3 bucket for remote state, passed to `init` the first time
-#                 (Terraform caches it in .terraform/ after that).
 
 SHELL       := /usr/bin/env bash
 .SHELLFLAGS := -eu -o pipefail -c
@@ -77,9 +75,8 @@ build: ## Cross-compile the three Lambdas to zips under .artifacts/<crate>/.
 	done
 	@echo "built: $(ASSIGN_ARTIFACT) $(SEAL_ARTIFACT) $(READ_ARTIFACT)"
 
-init: ## terraform init (safe, idempotent). Pass STATE_BUCKET=<s3-bucket>.
-	terraform -chdir=$(ENV_DIR) init -input=false \
-		$(if $(STATE_BUCKET),-backend-config="bucket=$(STATE_BUCKET)",)
+init: ## terraform init (safe, idempotent).
+	terraform -chdir=$(ENV_DIR) init -input=false
 
 plan: init ## terraform plan (uses staged artifacts if built, else placeholders).
 	terraform -chdir=$(ENV_DIR) plan -input=false $(TF_VARS)
