@@ -47,6 +47,8 @@ placeholder never consumes the queue.
 - **cargo-lambda** (`cargo install cargo-lambda`) and **zig** — the release
   build was verified with cargo-lambda 1.9.2 and Terraform 1.16.1.
 - **Terraform** ≥ 1.16.
+- **uv** — runs the smoke test; its PEP 723 inline metadata declares `boto3`,
+  so `uv run` provisions an ephemeral virtualenv (no manual venv or pip).
 - **AWS credentials** in the environment with rights to create the stack
   (Lambda, DynamoDB, SQS, API Gateway, IAM, EventBridge Scheduler). Sign in
   with `aws sso login` or `aws configure`; the CLI picks the credentials up
@@ -105,10 +107,11 @@ make apply EVENT_ID=launch SEAL_START=2026-09-10T18:00:00
 table names. To exercise the deployed stack end to end — register, seal, and
 verify no two visitors get the same position — run the smoke test. It reads the
 API URL, table names, seal function, and event id from `terraform output` and
-never touches Terraform state, so it needs nothing but credentials:
+never touches Terraform state, so it needs nothing but credentials. `uv`
+provisions boto3 from the script's inline metadata on first run:
 
 ```bash
-AWS_PROFILE=dev-admin ./scripts/smoke_test.py
+AWS_PROFILE=dev-admin uv run scripts/smoke_test.py
 ```
 
 ## Tear down

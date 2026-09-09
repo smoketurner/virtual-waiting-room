@@ -1,4 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.9"
+# dependencies = ["boto3==1.43.90"]
+# ///
 """Virtual Waiting Room MVP smoke test.
 
 Drives the scheduled-pre-queue and live-join happy paths against a deployed dev
@@ -10,13 +14,17 @@ The script reads the API URL, table names, seal function, and event id from
 first. It exercises the app only (writes PreQueue rows, invokes seal, polls the
 API).
 
+Self-contained via uv: the PEP 723 block above declares boto3, so `uv run`
+creates an ephemeral virtualenv and installs it — no manual venv or pip step.
+
 Prerequisites:
   - AWS credentials in the environment (aws sso login / aws configure), with
     rights to read/write the stack's DynamoDB tables and invoke its Lambdas.
-  - terraform on PATH; boto3 installed.
+  - terraform and uv on PATH.
 
 Usage:
-  AWS_PROFILE=dev-admin ./scripts/smoke_test.py
+  AWS_PROFILE=dev-admin uv run scripts/smoke_test.py
+  # or, since the shebang runs uv, just: AWS_PROFILE=dev-admin ./scripts/smoke_test.py
 """
 
 from __future__ import annotations
