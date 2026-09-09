@@ -62,29 +62,62 @@ say "3. Pre-queue registration: write PreQueue rows for a small cohort"
 # smoke test seeds PreQueue rows and the shard counter directly, mirroring what
 # a POST /join during the pre-queue phase would write: shard s = hash % 10,
 # local index l from ADD prequeue_counter#s.
-declare -A SHARD_COUNT
+#
+# Shard assignment and per-shard counts are computed in one Python pass (real
+# dicts) rather than a bash associative array, so this runs on bash 3.2 (macOS).
+COHORT=12
+ASSIGN="$(python3 - "$COHORT" <<'PY'
+import os, sys, time
+
+def uuid_v7():
+    ts = int(time.time() * 1000)
+    b = bytearray(ts.to_bytes(6, "big") + os.urandom(10))
+    b[6] = (b[6] & 0x0F) | 0x70
+    b[8] = (b[8] & 0x3F) | 0x80
+    h = b.hex()
+    return f"{h[0:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
+
+def fnv1a(s):
+    h = 0xcbf29ce484222325
+    for c in s.encode():
+        h ^= c
+        h = (h * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
+    return h
+
+n = int(sys.argv[1])
+counts = {}
+rows = []
+for _ in range(n):
+    rid = uuid_v7()
+    s = fnv1a(rid) % 10
+    l = counts.get(s, 0)
+    counts[s] = l + 1
+    rows.append(f"row {rid} {s} {l}")
+for s in sorted(counts):
+    rows.append(f"count {s} {counts[s]}")
+print("\n".join(rows))
+PY
+)"
+
 IDS=()
-for _ in $(seq 1 12); do
-  RID="$(uuid_v7)"; IDS+=("$RID")
-  S=$(python3 -c "
-h=0xcbf29ce484222325
-for b in b'$RID':
-    h ^= b; h = (h * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
-print(h % 10)")
-  L=${SHARD_COUNT[$S]:-0}
-  SHARD_COUNT[$S]=$((L + 1))
-  aws dynamodb put-item --region "$REGION" --table-name "$PREQUEUE" \
-    --item "{\"r\":{\"S\":\"$RID\"},\"s\":{\"N\":\"$S\"},\"l\":{\"N\":\"$L\"},\"t\":{\"S\":\"$(date -u +%FT%TZ)\"}}" \
-    --condition-expression "attribute_not_exists(r)"
-done
-# Reflect the per-shard counts on the Counters item (what the striped counter holds).
-for S in "${!SHARD_COUNT[@]}"; do
-  aws dynamodb update-item --region "$REGION" --table-name "$COUNTERS" \
-    --key "{\"event_id\":{\"S\":\"$EVENT_ID\"}}" \
-    --update-expression "SET #c = :v" \
-    --expression-attribute-names "{\"#c\":\"prequeue_counter#$S\"}" \
-    --expression-attribute-values "{\":v\":{\"N\":\"${SHARD_COUNT[$S]}\"}}" >/dev/null
-done
+NOW="$(date -u +%FT%TZ)"
+while read -r kind a b c; do
+  if [ "$kind" = "row" ]; then
+    RID="$a"; S="$b"; L="$c"
+    IDS+=("$RID")
+    aws dynamodb put-item --region "$REGION" --table-name "$PREQUEUE" \
+      --item "{\"r\":{\"S\":\"$RID\"},\"s\":{\"N\":\"$S\"},\"l\":{\"N\":\"$L\"},\"t\":{\"S\":\"$NOW\"}}" \
+      --condition-expression "attribute_not_exists(r)"
+  else
+    # kind=count: reflect the per-shard total on the Counters item.
+    S="$a"; TOTAL="$b"
+    aws dynamodb update-item --region "$REGION" --table-name "$COUNTERS" \
+      --key "{\"event_id\":{\"S\":\"$EVENT_ID\"}}" \
+      --update-expression "SET #c = :v" \
+      --expression-attribute-names "{\"#c\":\"prequeue_counter#$S\"}" \
+      --expression-attribute-values "{\":v\":{\"N\":\"$TOTAL\"}}" >/dev/null
+  fi
+done <<<"$ASSIGN"
 echo "registered ${#IDS[@]} pre-queue visitors"
 
 say "4. Seal the event (invoke seal_event) and confirm phase=active via /status"
@@ -93,7 +126,7 @@ aws lambda invoke --region "$REGION" --function-name "$SEAL_FN" \
 sleep 2
 STATUS="$(curl -fsS "$API_URL/v1/status")"
 echo "$STATUS"
-echo "$STATUS" | python3 -c 'import sys,json;d=json.load(sys.stdin);assert d["phase"]=="active",d;assert d.get("participant_count")==12,d;print("status OK: active, N=12")'
+echo "$STATUS" | COHORT="$COHORT" python3 -c 'import os,sys,json;d=json.load(sys.stdin);n=int(os.environ["COHORT"]);assert d["phase"]=="active",d;assert d.get("participant_count")==n,d;print(f"status OK: active, N={n}")'
 
 say "5. Resolve every pre-queue position via /queue_num; assert all distinct"
 python3 - "$API_URL" "${IDS[@]}" <<'PY'
