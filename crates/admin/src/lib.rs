@@ -45,6 +45,24 @@ pub trait Store {
         event_id: &str,
         message: &str,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// Sets the andon-cord admission-pause flag (ADR-0017). `target_rate` is
+    /// untouched, so resuming restores the operator's configured rate.
+    fn set_paused(
+        &self,
+        event_id: &str,
+        paused: bool,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// Records the last mutating action for the audit trail (ADR-0017): the
+    /// action name, the acting operator, and an RFC3339 timestamp.
+    fn record_action(
+        &self,
+        event_id: &str,
+        action: &str,
+        actor: &str,
+        at: &str,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
 }
 
 /// The operator-facing control state rendered on the dashboard.
@@ -57,7 +75,20 @@ pub struct ControlState {
     pub participant_count: Option<u64>,
     pub target_rate: Option<u32>,
     pub message: Option<String>,
+    /// Andon cord (ADR-0017): when true the controller admits nobody while the
+    /// queue and positions stay intact. Preserves `target_rate` across a pause.
+    pub admission_paused: bool,
+    /// Audit (ADR-0017): the last mutating action, who performed it (OIDC email),
+    /// and when (RFC3339). Surfaced as "last changed by X at T".
+    pub last_action: Option<String>,
+    pub last_action_by: Option<String>,
+    pub last_action_at: Option<String>,
 }
+
+/// The upper sanity bound on the admission target rate (ADR-0017 §4): a
+/// per-second admission ceiling that stops a fat-fingered runaway value from
+/// being written. Chosen well above any realistic origin capacity.
+pub const MAX_ADMISSION_RATE: u32 = 100_000;
 
 /// A store failure or a lost transition race.
 #[derive(Debug, thiserror::Error)]
@@ -82,6 +113,9 @@ pub enum ActionError {
     /// The rate value could not be parsed as a positive integer.
     #[error("invalid rate")]
     InvalidRate,
+    /// The rate exceeds the admission ceiling (ADR-0017 §4).
+    #[error("rate exceeds the maximum of {max}")]
+    RateTooHigh { max: u32 },
     /// The event does not exist.
     #[error("event not found")]
     NotFound,
@@ -169,7 +203,8 @@ pub async fn apply_reset<S: Store>(store: &S, event_id: &str) -> Result<(), Appl
 ///
 /// # Errors
 ///
-/// [`ActionError::InvalidRate`] if `rate` is not a positive integer; store
+/// [`ActionError::InvalidRate`] if `rate` is not a positive integer;
+/// [`ActionError::RateTooHigh`] if it exceeds [`MAX_ADMISSION_RATE`]; store
 /// errors otherwise.
 pub async fn apply_rate<S: Store>(
     store: &S,
@@ -180,8 +215,41 @@ pub async fn apply_rate<S: Store>(
     if rate == 0 {
         return Err(ActionError::InvalidRate.into());
     }
+    if rate > MAX_ADMISSION_RATE {
+        return Err(ActionError::RateTooHigh {
+            max: MAX_ADMISSION_RATE,
+        }
+        .into());
+    }
     store.set_rate(event_id, rate).await?;
     Ok(rate)
+}
+
+/// Pauses admission (andon cord, ADR-0017): the controller admits nobody while
+/// the queue stays intact. Reversible via [`apply_resume`].
+///
+/// # Errors
+///
+/// [`ApplyError`] if the event is missing or the store write fails.
+pub async fn apply_pause<S: Store>(store: &S, event_id: &str) -> Result<(), ApplyError> {
+    if store.load(event_id).await?.is_none() {
+        return Err(ActionError::NotFound.into());
+    }
+    store.set_paused(event_id, true).await?;
+    Ok(())
+}
+
+/// Resumes admission after a pause, restoring the configured `target_rate`.
+///
+/// # Errors
+///
+/// [`ApplyError`] if the event is missing or the store write fails.
+pub async fn apply_resume<S: Store>(store: &S, event_id: &str) -> Result<(), ApplyError> {
+    if store.load(event_id).await?.is_none() {
+        return Err(ActionError::NotFound.into());
+    }
+    store.set_paused(event_id, false).await?;
+    Ok(())
 }
 
 /// Sets the operator broadcast message.
@@ -219,6 +287,7 @@ mod tests {
         phase: Mutex<Phase>,
         rate: Mutex<Option<u32>>,
         message: Mutex<Option<String>>,
+        paused: Mutex<bool>,
         missing: bool,
         /// When set, the next `set_phase` reports a lost race.
         conflict: bool,
@@ -230,6 +299,7 @@ mod tests {
                 phase: Mutex::new(Phase::Idle),
                 rate: Mutex::new(None),
                 message: Mutex::new(None),
+                paused: Mutex::new(false),
                 missing: false,
                 conflict: false,
             }
@@ -261,6 +331,10 @@ mod tests {
                     participant_count: None,
                     target_rate: *self.rate.lock().unwrap(),
                     message: self.message.lock().unwrap().clone(),
+                    admission_paused: *self.paused.lock().unwrap(),
+                    last_action: None,
+                    last_action_by: None,
+                    last_action_at: None,
                 }))
             };
             std::future::ready(result)
@@ -296,6 +370,25 @@ mod tests {
             message: &str,
         ) -> impl Future<Output = Result<(), StoreError>> + Send {
             *self.message.lock().unwrap() = Some(message.to_owned());
+            std::future::ready(Ok(()))
+        }
+
+        fn set_paused(
+            &self,
+            _event_id: &str,
+            paused: bool,
+        ) -> impl Future<Output = Result<(), StoreError>> + Send {
+            *self.paused.lock().unwrap() = paused;
+            std::future::ready(Ok(()))
+        }
+
+        fn record_action(
+            &self,
+            _event_id: &str,
+            _action: &str,
+            _actor: &str,
+            _at: &str,
+        ) -> impl Future<Output = Result<(), StoreError>> + Send {
             std::future::ready(Ok(()))
         }
     }
@@ -409,5 +502,46 @@ mod tests {
         );
         apply_message(&store, "evt", "").await.unwrap();
         assert_eq!(store.message.lock().unwrap().as_deref(), Some(""));
+    }
+
+    #[tokio::test]
+    async fn rate_zero_and_over_ceiling_are_rejected() {
+        let store = FakeStore::with_phase(Phase::Active);
+        assert!(matches!(
+            apply_rate(&store, "evt", "0").await,
+            Err(ApplyError::Action(ActionError::InvalidRate))
+        ));
+        let over = (u64::from(MAX_ADMISSION_RATE) + 1).to_string();
+        assert!(matches!(
+            apply_rate(&store, "evt", &over).await,
+            Err(ApplyError::Action(ActionError::RateTooHigh { .. }))
+        ));
+        // The ceiling itself is accepted.
+        assert!(
+            apply_rate(&store, "evt", &MAX_ADMISSION_RATE.to_string())
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn pause_and_resume_toggle_the_flag() {
+        let store = FakeStore::with_phase(Phase::Active);
+        apply_pause(&store, "evt").await.unwrap();
+        assert!(*store.paused.lock().unwrap());
+        apply_resume(&store, "evt").await.unwrap();
+        assert!(!*store.paused.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn pause_on_missing_event_is_not_found() {
+        let store = FakeStore {
+            missing: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            apply_pause(&store, "evt").await,
+            Err(ApplyError::Action(ActionError::NotFound))
+        ));
     }
 }

@@ -72,6 +72,9 @@ impl Store for DynamoStore {
                 .map(String::as_str),
         );
 
+        let str_attr =
+            |key: &str| -> Option<String> { item.get(key).and_then(|v| v.as_s().ok()).cloned() };
+
         Ok(Some(ControlState {
             event_id: event_id.to_owned(),
             phase,
@@ -80,6 +83,14 @@ impl Store for DynamoStore {
             participant_count: num("participant_count"),
             target_rate: num("target_rate").and_then(|n| u32::try_from(n).ok()),
             message: item.get("message").and_then(|v| v.as_s().ok()).cloned(),
+            admission_paused: item
+                .get("admission_paused")
+                .and_then(|v| v.as_bool().ok())
+                .copied()
+                .unwrap_or(false),
+            last_action: str_attr("last_action"),
+            last_action_by: str_attr("last_action_by"),
+            last_action_at: str_attr("last_action_at"),
         }))
     }
 
@@ -133,6 +144,40 @@ impl Store for DynamoStore {
             .send()
             .await
             .map_err(|e| StoreError::Backend(format!("update_item(message): {e}")))?;
+        Ok(())
+    }
+
+    async fn set_paused(&self, event_id: &str, paused: bool) -> Result<(), StoreError> {
+        self.client
+            .update_item()
+            .table_name(&self.counters_table)
+            .key("event_id", AttributeValue::S(event_id.to_owned()))
+            .update_expression("SET admission_paused = :p")
+            .expression_attribute_values(":p", AttributeValue::Bool(paused))
+            .send()
+            .await
+            .map_err(|e| StoreError::Backend(format!("update_item(paused): {e}")))?;
+        Ok(())
+    }
+
+    async fn record_action(
+        &self,
+        event_id: &str,
+        action: &str,
+        actor: &str,
+        at: &str,
+    ) -> Result<(), StoreError> {
+        self.client
+            .update_item()
+            .table_name(&self.counters_table)
+            .key("event_id", AttributeValue::S(event_id.to_owned()))
+            .update_expression("SET last_action = :a, last_action_by = :b, last_action_at = :t")
+            .expression_attribute_values(":a", AttributeValue::S(action.to_owned()))
+            .expression_attribute_values(":b", AttributeValue::S(actor.to_owned()))
+            .expression_attribute_values(":t", AttributeValue::S(at.to_owned()))
+            .send()
+            .await
+            .map_err(|e| StoreError::Backend(format!("update_item(audit): {e}")))?;
         Ok(())
     }
 }

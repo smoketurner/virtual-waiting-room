@@ -16,7 +16,9 @@ use admin::dynamo::DynamoStore;
 use admin::oidc::{self, OidcClient, OidcConfig};
 use admin::sessions::{AdminSession, PendingLogin, SessionStore};
 use admin::templates::Dashboard;
-use admin::{ApplyError, apply_message, apply_phase, apply_rate, apply_reset};
+use admin::{
+    ApplyError, apply_message, apply_pause, apply_phase, apply_rate, apply_reset, apply_resume,
+};
 use askama::Template;
 use axum::Form;
 use axum::Router;
@@ -126,6 +128,8 @@ async fn main() -> Result<(), Error> {
         .route("/admin/rate", post(set_rate))
         .route("/admin/message", post(set_message))
         .route("/admin/reset", post(reset))
+        .route("/admin/pause", post(pause))
+        .route("/admin/resume", post(resume))
         .route("/admin/rules", post(deferred))
         .route("/update_session", post(deferred))
         .route("/static/{*path}", get(static_asset))
@@ -382,14 +386,14 @@ async fn set_phase(
     headers: HeaderMap,
     Form(form): Form<PhaseForm>,
 ) -> Response {
-    if authed(&state, &headers).await.is_none() {
+    let Some(session) = authed(&state, &headers).await else {
         return Redirect::to("/admin/login").into_response();
-    }
-    finish(
-        apply_phase(&state.store, &state.event_id, &form.phase)
-            .await
-            .map(|_| ()),
-    )
+    };
+    let result = apply_phase(&state.store, &state.event_id, &form.phase)
+        .await
+        .map(|_| ());
+    state.audit(&result, "set_phase", &session.email).await;
+    finish(result)
 }
 
 #[derive(Deserialize)]
@@ -402,14 +406,14 @@ async fn set_rate(
     headers: HeaderMap,
     Form(form): Form<RateForm>,
 ) -> Response {
-    if authed(&state, &headers).await.is_none() {
+    let Some(session) = authed(&state, &headers).await else {
         return Redirect::to("/admin/login").into_response();
-    }
-    finish(
-        apply_rate(&state.store, &state.event_id, &form.rate)
-            .await
-            .map(|_| ()),
-    )
+    };
+    let result = apply_rate(&state.store, &state.event_id, &form.rate)
+        .await
+        .map(|_| ());
+    state.audit(&result, "set_rate", &session.email).await;
+    finish(result)
 }
 
 #[derive(Deserialize)]
@@ -422,17 +426,47 @@ async fn set_message(
     headers: HeaderMap,
     Form(form): Form<MessageForm>,
 ) -> Response {
-    if authed(&state, &headers).await.is_none() {
+    let Some(session) = authed(&state, &headers).await else {
         return Redirect::to("/admin/login").into_response();
-    }
-    finish(apply_message(&state.store, &state.event_id, &form.message).await)
+    };
+    let result = apply_message(&state.store, &state.event_id, &form.message).await;
+    state.audit(&result, "set_message", &session.email).await;
+    finish(result)
 }
 
 async fn reset(State(state): State<Shared>, headers: HeaderMap) -> Response {
-    if authed(&state, &headers).await.is_none() {
+    let Some(session) = authed(&state, &headers).await else {
         return Redirect::to("/admin/login").into_response();
-    }
-    finish(apply_reset(&state.store, &state.event_id).await)
+    };
+    let result = apply_reset(&state.store, &state.event_id).await;
+    state
+        .audit(&result, "force_maintenance", &session.email)
+        .await;
+    finish(result)
+}
+
+/// Andon cord: pause admission (ADR-0017). Reversible, no confirmation.
+async fn pause(State(state): State<Shared>, headers: HeaderMap) -> Response {
+    let Some(session) = authed(&state, &headers).await else {
+        return Redirect::to("/admin/login").into_response();
+    };
+    let result = apply_pause(&state.store, &state.event_id).await;
+    state
+        .audit(&result, "pause_admission", &session.email)
+        .await;
+    finish(result)
+}
+
+/// Resume admission after a pause.
+async fn resume(State(state): State<Shared>, headers: HeaderMap) -> Response {
+    let Some(session) = authed(&state, &headers).await else {
+        return Redirect::to("/admin/login").into_response();
+    };
+    let result = apply_resume(&state.store, &state.event_id).await;
+    state
+        .audit(&result, "resume_admission", &session.email)
+        .await;
+    finish(result)
 }
 
 /// A route whose backing plane (authorizer / sessions) is not in the MVP.
@@ -461,6 +495,26 @@ async fn static_asset(Path(path): Path<String>) -> Response {
 }
 
 impl AppState {
+    /// Records a successful mutating action to the audit trail (ADR-0017),
+    /// best-effort: an audit-write failure is logged but never fails the action
+    /// the operator already performed. No-op when the action itself failed.
+    async fn audit(&self, result: &Result<(), ApplyError>, action: &str, actor: &str) {
+        use admin::Store;
+        if result.is_err() {
+            return;
+        }
+        let at = aws_smithy_types::DateTime::from(std::time::SystemTime::now())
+            .fmt(aws_smithy_types::date_time::Format::DateTime)
+            .unwrap_or_default();
+        if let Err(e) = self
+            .store
+            .record_action(&self.event_id, action, actor, &at)
+            .await
+        {
+            tracing::warn!(error = %e, action, "audit record failed");
+        }
+    }
+
     /// Loads control state and maps it to the dashboard view.
     async fn store_load(&self) -> Result<Option<Dashboard>, String> {
         use admin::Store;

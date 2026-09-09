@@ -12,6 +12,7 @@ dependencies = [
  "aws-lc-rs",
  "aws-sdk-dynamodb",
  "aws-sdk-ssm",
+ "aws-smithy-types",
  "axum",
  "cookie",
  "jsonwebtoken",

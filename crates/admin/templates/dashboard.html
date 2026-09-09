@@ -13,6 +13,22 @@
   <dl class="kv"><dt>Participant count</dt><dd id="s-participant_count">{{ participant_count }}</dd></dl>
   <dl class="kv"><dt>Target rate</dt><dd id="s-target_rate">{{ target_rate }}</dd></dl>
   <dl class="kv"><dt>Message</dt><dd id="s-message">{{ message }}</dd></dl>
+  <dl class="kv"><dt>Admission</dt><dd id="s-admission">{% if admission_paused %}PAUSED{% else %}admitting{% endif %}</dd></dl>
+  <dl class="kv"><dt>Last change</dt><dd>{{ last_action_line }}</dd></dl>
+</div>
+
+<div class="card">
+  <h2>Emergency — andon cord</h2>
+  {% if admission_paused %}
+  <p class="deferred">Admission is PAUSED — the queue keeps forming; no one is admitted.</p>
+  <form method="post" action="/admin/resume">
+    <button type="submit">Resume admission</button>
+  </form>
+  {% else %}
+  <form method="post" action="/admin/pause">
+    <button class="danger" type="submit">Pause admission</button>
+  </form>
+  {% endif %}
 </div>
 
 <div class="card">
@@ -49,7 +65,7 @@
 
 <div class="card">
   <h2>Maintenance</h2>
-  <form method="post" action="/admin/reset">
+  <form method="post" action="/admin/reset" data-confirm="Force maintenance mode? This halts the event for everyone.">
     <button class="danger" type="submit">Force maintenance mode</button>
   </form>
 </div>
@@ -65,6 +81,15 @@
    matches the script-src nonce in the Content-Security-Policy header. #}
 <script nonce="{{ csp_nonce }}">
   (function () {
+    // Confirmation guard on destructive actions (ADR-0017 §5). Progressive
+    // enhancement: with JS off the forms still submit — the guard is a
+    // stressed-mis-click safeguard, not an auth gate.
+    document.querySelectorAll("form[data-confirm]").forEach(function (f) {
+      f.addEventListener("submit", function (e) {
+        if (!window.confirm(f.getAttribute("data-confirm"))) { e.preventDefault(); }
+      });
+    });
+    // Live-stats poller.
     var fields = ["phase", "serving_counter", "queue_counter", "participant_count", "target_rate", "message"];
     function refresh() {
       fetch("/admin/state", { headers: { "Accept": "application/json" }, credentials: "same-origin" })
@@ -74,6 +99,8 @@
             var el = document.getElementById("s-" + f);
             if (el && s[f] !== undefined && s[f] !== null) { el.textContent = String(s[f]); }
           });
+          var adm = document.getElementById("s-admission");
+          if (adm && s.admission_paused !== undefined) { adm.textContent = s.admission_paused ? "PAUSED" : "admitting"; }
         })
         .catch(function () { /* transient; try again next tick */ });
     }

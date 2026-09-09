@@ -19,6 +19,10 @@ pub struct Dashboard {
     pub participant_count: String,
     pub target_rate: String,
     pub message: String,
+    /// Andon cord (ADR-0017): whether admission is currently paused, and a
+    /// human "last changed by X at T" line for the audit trail.
+    pub admission_paused: bool,
+    pub last_action_line: String,
     /// Per-render CSP nonce for the inline poller script. Not part of the JSON
     /// state view (the poller endpoint reuses this struct).
     #[serde(skip)]
@@ -38,6 +42,15 @@ impl Dashboard {
             participant_count: dash(state.participant_count.map(|n| n.to_string())),
             target_rate: dash(state.target_rate.map(|n| n.to_string())),
             message: dash(state.message.clone()),
+            admission_paused: state.admission_paused,
+            last_action_line: match (
+                &state.last_action,
+                &state.last_action_by,
+                &state.last_action_at,
+            ) {
+                (Some(a), Some(by), Some(at)) => format!("{a} by {by} at {at}"),
+                _ => "—".to_owned(),
+            },
             csp_nonce: String::new(),
         }
     }
@@ -61,6 +74,10 @@ mod tests {
             participant_count: Some(1000),
             target_rate: Some(500),
             message: Some("Doors open at noon".to_owned()),
+            admission_paused: false,
+            last_action: Some("set_rate".to_owned()),
+            last_action_by: Some("op@example.com".to_owned()),
+            last_action_at: Some("2026-09-09T22:00:00Z".to_owned()),
         }
     }
 
