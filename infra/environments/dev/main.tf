@@ -13,6 +13,15 @@ module "core" {
   env                         = var.env
   warm_throughput_write_units = var.warm_throughput_write_units
   warm_throughput_read_units  = var.warm_throughput_read_units
+
+  # Rust Lambda artifacts. Empty = vendored placeholder; set these to the built
+  # bootstrap zips to deploy the real functions and enable the join ESM.
+  assign_position_artifact_path = var.assign_position_artifact_path
+  seal_event_artifact_path      = var.seal_event_artifact_path
+  read_artifact_path            = var.read_artifact_path
+  lambda_architecture           = var.lambda_architecture
+  event_id                      = var.event_id
+  seal_start_time               = var.seal_start_time
 }
 
 # edge (CloudFront). Created once a client origin is supplied - the origin is the

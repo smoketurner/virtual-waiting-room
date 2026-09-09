@@ -39,8 +39,18 @@ output "join_queue_arn" {
 }
 
 output "assign_position_function_name" {
-  description = "Name of the assign_position Lambda (placeholder until the Rust artifact is supplied)."
+  description = "Name of the assign_position Lambda (placeholder until its artifact is supplied)."
   value       = aws_lambda_function.assign_position.function_name
+}
+
+output "seal_event_function_name" {
+  description = "Name of the seal_event Lambda. Invoke it manually or via the seal schedule to open the event."
+  value       = aws_lambda_function.seal_event.function_name
+}
+
+output "read_function_name" {
+  description = "Name of the read Lambda backing /v1/status and /v1/queue_num."
+  value       = aws_lambda_function.read.function_name
 }
 
 output "rest_api_id" {
@@ -58,7 +68,7 @@ output "api_gateway_domain_name" {
   value       = "${aws_api_gateway_rest_api.this.id}.execute-api.${data.aws_region.current.region}.amazonaws.com"
 }
 
-output "using_placeholder_lambda" {
-  description = "True when the assign_position function is the vendored placeholder and the SQS event-source mapping is disabled."
-  value       = local.using_placeholder
+output "join_esm_enabled" {
+  description = "True when a real assign_position artifact is deployed and the SQS event-source mapping is live; false while it is the placeholder."
+  value       = !local.assign_position_is_placeholder
 }

@@ -193,13 +193,13 @@ resource "aws_lambda_function" "assign_position" {
   function_name = local.assign_position_name
   role          = aws_iam_role.assign_position.arn
   runtime       = "provided.al2023"
-  architectures = ["arm64"]
+  architectures = [local.lambda_runtime_arch]
   handler       = "bootstrap"
   timeout       = 30
   memory_size   = 256
 
-  filename         = local.lambda_zip
-  source_code_hash = local.using_placeholder ? data.archive_file.placeholder[0].output_base64sha256 : filebase64sha256(var.lambda_artifact_path)
+  filename         = local.assign_position_zip
+  source_code_hash = local.assign_position_hash
 
   reserved_concurrent_executions = var.assign_position_reserved_concurrency
 
@@ -213,14 +213,14 @@ resource "aws_lambda_function" "assign_position" {
   tags = var.tags
 }
 
-# Event-source mapping. Created DISABLED while the placeholder is in use so no
-# live join batch is consumed by a non-functional handler; enable it once the
-# real artifact is deployed. BatchSize 100 / batching window 1s (DESIGN §5.3),
+# Event-source mapping. Enabled only when a real assign_position artifact is
+# deployed; with the placeholder it stays disabled so no live join batch is
+# consumed by a non-functional handler. BatchSize 100 / batching window 1s,
 # ReportBatchItemFailures so only failed record IDs return to the queue.
 resource "aws_lambda_event_source_mapping" "join" {
   event_source_arn                   = aws_sqs_queue.join.arn
   function_name                      = aws_lambda_function.assign_position.arn
-  enabled                            = !local.using_placeholder
+  enabled                            = !local.assign_position_is_placeholder
   batch_size                         = 100
   maximum_batching_window_in_seconds = 1
   function_response_types            = ["ReportBatchItemFailures"]
