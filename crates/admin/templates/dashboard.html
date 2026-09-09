@@ -10,7 +10,7 @@
 
 <main class="content">
   <div class="page-header">
-    <h1>Event · {{ event_id }}</h1>
+    <h1>Event <span class="event">{{ event_id }}</span></h1>
     <p class="desc">Operator control plane. Actions take effect immediately.</p>
   </div>
 
@@ -19,20 +19,19 @@
   {% endif %}
 
   <div class="grid">
-    <!-- Current state: KPI tiles + status + key-value pairs -->
-    <section class="container span-2">
-      <div class="container-header">
+    <!-- Current state -->
+    <section class="card span-2">
+      <div class="card-header">
         <h2>Current state</h2>
         <p class="sub">Live — refreshes automatically.</p>
       </div>
-      <div class="container-body">
+      <div class="card-body">
         <div class="kpis">
           <div class="kpi"><div class="label">Serving position</div><div class="value" id="s-serving_counter">{{ serving_counter }}</div></div>
           <div class="kpi"><div class="label">Queue counter</div><div class="value" id="s-queue_counter">{{ queue_counter }}</div></div>
           <div class="kpi"><div class="label">Participants</div><div class="value" id="s-participant_count">{{ participant_count }}</div></div>
           <div class="kpi"><div class="label">Target rate /s</div><div class="value" id="s-target_rate">{{ target_rate }}</div></div>
         </div>
-        <hr style="border:none;border-top:var(--border-width-field) solid var(--color-border-divider-secondary);margin:var(--space-scaled-m) 0;">
         <dl class="kv-pairs">
           <div>
             <dt class="kv-key">Phase</dt>
@@ -52,12 +51,12 @@
     </section>
 
     <!-- Emergency / andon cord -->
-    <section class="container emphasis">
-      <div class="container-header">
+    <section class="card emergency">
+      <div class="card-header">
         <h2>Emergency</h2>
         <p class="sub">Andon cord — pull to stop the line.</p>
       </div>
-      <div class="container-body">
+      <div class="card-body">
         {% if admission_paused %}
         <p class="deferred">Admission is paused.</p>
         <form method="post" action="/admin/resume">
@@ -67,19 +66,19 @@
         <form method="post" action="/admin/pause">
           <button class="danger big" type="submit">Pause admission</button>
         </form>
-        <p class="help" style="margin-top:var(--space-scaled-s);color:var(--color-text-body-secondary);">Holds new admissions; the queue and positions are preserved.</p>
+        <p class="help" style="margin-top:12px;color:var(--text-dim);">Holds new admissions; the queue and positions are preserved.</p>
         {% endif %}
-        <hr style="border:none;border-top:var(--border-width-field) solid var(--color-border-divider-secondary);margin:var(--space-scaled-m) 0;">
+        <hr class="divider">
         <form method="post" action="/admin/reset" data-confirm="Force maintenance mode? This halts the event for everyone.">
           <button class="danger" type="submit">Force maintenance</button>
         </form>
       </div>
     </section>
 
-    <!-- Phase control -->
-    <section class="container">
-      <div class="container-header"><h2>Phase</h2></div>
-      <div class="container-body">
+    <!-- Phase -->
+    <section class="card">
+      <div class="card-header"><h2>Phase</h2></div>
+      <div class="card-body">
         <form method="post" action="/admin/phase">
           <div class="form-field">
             <label for="phase">Transition to</label>
@@ -96,9 +95,9 @@
     </section>
 
     <!-- Admission rate -->
-    <section class="container">
-      <div class="container-header"><h2>Admission rate</h2></div>
-      <div class="container-body">
+    <section class="card">
+      <div class="card-header"><h2>Admission rate</h2></div>
+      <div class="card-body">
         <form method="post" action="/admin/rate">
           <div class="form-field">
             <label for="rate">Target rate (visitors per second)</label>
@@ -111,9 +110,9 @@
     </section>
 
     <!-- Broadcast message -->
-    <section class="container">
-      <div class="container-header"><h2>Broadcast message</h2></div>
-      <div class="container-body">
+    <section class="card">
+      <div class="card-header"><h2>Broadcast message</h2></div>
+      <div class="card-body">
         <form method="post" action="/admin/message">
           <div class="form-field">
             <label for="message">Message shown to waiting visitors</label>
@@ -126,9 +125,9 @@
     </section>
 
     <!-- Deferred plane -->
-    <section class="container">
-      <div class="container-header"><h2>Protection rules · sessions</h2></div>
-      <div class="container-body">
+    <section class="card">
+      <div class="card-header"><h2>Protection rules · sessions</h2></div>
+      <div class="card-body">
         <p class="deferred">Not yet available — the authorizer and session plane ship after the MVP.</p>
       </div>
     </section>

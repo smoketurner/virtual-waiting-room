@@ -1,10 +1,54 @@
-/* Admin dashboard — hand-authored Cloudscape UX patterns (ADR-0014: tokens, not
- * the React component library). Colors, spacing, radii, and fonts reference the
- * Cloudscape design tokens in tokens.css. No component library, no framework —
- * the operator actions are plain form POSTs; only the live poller needs JS. */
+/* Admin console — a plain-CSS port of the Vouch design language
+ * (crates/vouch-server/styles/input.css + tailwind.config.js). The operator
+ * authenticates through Vouch (ADR-0016), so the admin plane matches Vouch:
+ * dark, flat, black + green. Palette, fonts, and component classes are ported
+ * 1:1 from Vouch's Tailwind theme to plain CSS — no build step, no bundler
+ * (ADR-0018). Server-rendered; only the live poller needs JS. */
+
+/* Self-hosted fonts (vendored woff2, served from /static/fonts) — matches
+ * Vouch's @font-face exactly, so the type is identical and the CSP needs no
+ * external font-src. */
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url('/static/fonts/inter-latin.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 400 500;
+  font-display: swap;
+  src: url('/static/fonts/jetbrains-mono-latin.woff2') format('woff2');
+}
 
 :root {
-  color-scheme: light;
+  color-scheme: dark;
+
+  /* Vouch palette (tailwind.config.js theme.extend.colors.vouch) */
+  --vouch-bg: #0a0a0a;
+  --vouch-surface: #141414;
+  --vouch-raised: #1e1e1e;
+  --vouch-border: #2a2a2a;
+  --vouch-subtle: #333333;
+  --vouch-accent: #3ecf8e;
+  --vouch-accent-hover: #5edba5;
+  --vouch-success: #2ea043;
+  --vouch-success-bg: #0d2818;
+  --vouch-error: #d73a49;
+  --vouch-error-bg: #2d1214;
+  --vouch-warning: #d29922;
+  --vouch-warning-bg: #2d2208;
+
+  --gray-200: #e5e7eb;
+  --gray-300: #d1d5db;
+  --gray-400: #9ca3af;
+  --gray-500: #6b7280;
+
+  --font-sans: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'JetBrains Mono', 'SF Mono', Monaco, Consolas, monospace;
 }
 
 * {
@@ -12,66 +56,92 @@
 }
 
 body {
-  font-family: var(--font-family-base);
-  font-size: var(--font-size-body-m);
-  color: var(--color-text-body-default);
-  background: var(--color-background-layout-main);
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--gray-300);
+  background: var(--vouch-bg);
   margin: 0;
   padding: 0;
+  -webkit-font-smoothing: antialiased;
 }
 
-/* --- Top navigation (Cloudscape TopNavigation pattern) --------------------- */
+/* --- Top navigation ------------------------------------------------------- */
 
 .top-nav {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  background: var(--color-background-container-content);
-  border-bottom: var(--border-width-field) solid var(--color-border-divider-default);
-  padding: var(--space-scaled-s) var(--space-scaled-l);
+  height: 64px;
+  padding: 0 24px;
+  background: var(--vouch-surface);
+  border-bottom: 1px solid var(--vouch-border);
+  position: sticky;
+  top: 0;
+  z-index: 10;
 }
 
 .top-nav .brand {
-  font-size: var(--font-size-heading-s);
-  font-weight: var(--font-weight-heading-m);
-  color: var(--color-text-heading-default);
+  font-weight: 600;
+  color: #fff;
+  letter-spacing: -0.01em;
+}
+
+.top-nav .brand::before {
+  content: "";
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--vouch-accent);
+  margin-right: 8px;
+  vertical-align: middle;
 }
 
 .top-nav .who {
-  font-size: var(--font-size-body-s);
-  color: var(--color-text-body-secondary);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--gray-400);
 }
 
-/* --- Content header (Cloudscape Header pattern) ---------------------------- */
+/* --- Content + header ----------------------------------------------------- */
 
 .content {
-  max-width: 72rem;
+  max-width: 1100px;
   margin: 0 auto;
-  padding: var(--space-scaled-l);
+  padding: 32px 24px 64px;
 }
 
 .page-header {
-  margin-bottom: var(--space-scaled-l);
+  margin-bottom: 32px;
 }
 
 .page-header h1 {
-  font-size: var(--font-size-heading-xl);
-  font-weight: var(--font-weight-heading-xl);
-  color: var(--color-text-heading-default);
+  font-size: 28px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: #fff;
   margin: 0;
 }
 
-.page-header .desc {
-  color: var(--color-text-heading-secondary);
-  margin: var(--space-scaled-xxs) 0 0;
+.page-header h1 .event {
+  font-family: var(--font-mono);
+  color: var(--vouch-accent);
+  font-weight: 500;
 }
 
-/* --- Layout grid (Cloudscape ColumnLayout / Grid) -------------------------- */
+.page-header .desc {
+  color: var(--gray-400);
+  margin: 6px 0 0;
+  font-size: 14px;
+}
+
+/* --- Grid + cards (Vouch .card: bg-surface border rounded-lg p-8) ---------- */
 
 .grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr));
-  gap: var(--space-scaled-l);
+  gap: 16px;
   align-items: start;
 }
 
@@ -79,235 +149,277 @@ body {
   grid-column: 1 / -1;
 }
 
-/* --- Container (Cloudscape Container with a Header) ------------------------- */
-
-.container {
-  background: var(--color-background-container-content);
-  border: var(--border-width-field) solid var(--color-border-divider-default);
-  border-top: var(--border-width-container-top, 2px) solid var(--color-border-container-top);
-  border-radius: var(--border-radius-container);
+.card {
+  background: var(--vouch-surface);
+  border: 1px solid var(--vouch-border);
+  border-radius: 8px;
   overflow: hidden;
 }
 
-.container > .container-header {
-  background: var(--color-background-container-header);
-  border-bottom: var(--border-width-field) solid var(--color-border-divider-default);
-  padding: var(--space-scaled-m) var(--space-scaled-l);
+.card > .card-header {
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--vouch-border);
 }
 
-.container > .container-header h2 {
-  font-size: var(--font-size-heading-m);
-  font-weight: var(--font-weight-heading-m);
-  color: var(--color-text-heading-default);
+.card > .card-header h2 {
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--gray-400);
   margin: 0;
 }
 
-.container > .container-header .sub {
-  font-size: var(--font-size-body-s);
-  color: var(--color-text-body-secondary);
-  margin: var(--space-scaled-xxs) 0 0;
+.card > .card-header .sub {
+  font-size: 13px;
+  color: var(--gray-500);
+  margin: 4px 0 0;
 }
 
-.container > .container-body {
-  padding: var(--space-scaled-l);
+.card > .card-body {
+  padding: 20px;
 }
 
-.container.emphasis {
-  border-top-color: var(--color-text-status-error);
+/* Emergency container — the andon cord, error-tinted */
+.card.emergency {
+  border-color: var(--vouch-error);
 }
 
-/* --- KPI tiles (Cloudscape "big number" pattern) --------------------------- */
+.card.emergency > .card-header {
+  background: var(--vouch-error-bg);
+  border-bottom-color: var(--vouch-error);
+}
+
+.card.emergency > .card-header h2 {
+  color: var(--vouch-error);
+}
+
+/* --- KPI stat tiles ------------------------------------------------------- */
 
 .kpis {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
-  gap: var(--space-scaled-m);
+  grid-template-columns: repeat(auto-fit, minmax(8rem, 1fr));
+  gap: 1px;
+  background: var(--vouch-border);
+  border-radius: 8px;
+  overflow: hidden;
 }
 
 .kpi {
-  padding: var(--space-scaled-s) 0;
+  background: var(--vouch-raised);
+  padding: 18px 20px;
 }
 
 .kpi .label {
-  font-size: var(--font-size-body-s);
-  color: var(--color-text-body-secondary);
-  margin-bottom: var(--space-scaled-xxs);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--gray-500);
+  margin-bottom: 6px;
 }
 
 .kpi .value {
-  font-size: var(--font-size-heading-l);
-  font-weight: var(--font-weight-heading-l);
-  color: var(--color-text-heading-default);
+  font-family: var(--font-mono);
+  font-size: 30px;
+  font-weight: 500;
+  color: #fff;
+  line-height: 1;
 }
 
-/* --- Key-value pairs (Cloudscape KeyValuePairs) ---------------------------- */
+/* --- Key-value pairs ------------------------------------------------------ */
 
 .kv-pairs {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
-  gap: var(--space-scaled-m);
-  margin: 0;
+  grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+  gap: 20px;
+  margin: 20px 0 0;
 }
 
 .kv-pairs .kv-key {
-  font-size: var(--font-size-body-s);
-  color: var(--color-text-body-secondary);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--gray-500);
 }
 
 .kv-pairs .kv-val {
-  font-weight: var(--font-weight-heading-s);
-  margin: var(--space-scaled-xxxs) 0 0;
+  margin: 6px 0 0;
+  color: var(--gray-200);
 }
 
-/* --- Status indicators (Cloudscape StatusIndicator / Badge) ---------------- */
+/* --- Badges (Vouch .badge / .badge-success / .badge-warning) --------------- */
 
 .status {
   display: inline-flex;
   align-items: center;
-  gap: var(--space-scaled-xxs);
-  padding: var(--space-scaled-xxs) var(--space-scaled-s);
-  border-radius: var(--border-radius-badge);
-  font-size: var(--font-size-body-s);
-  font-weight: var(--font-weight-heading-s);
+  gap: 7px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 500;
+  border: 1px solid var(--vouch-subtle);
+  background: var(--vouch-raised);
+  color: var(--gray-400);
 }
 
 .status::before {
   content: "";
-  width: 0.5rem;
-  height: 0.5rem;
+  width: 7px;
+  height: 7px;
   border-radius: 50%;
   background: currentColor;
 }
 
 .status-active,
 .status-success {
-  background: var(--color-background-status-success);
-  color: var(--color-text-status-success);
+  color: var(--vouch-accent);
+  border-color: rgba(62, 207, 142, 0.3);
+  background: var(--vouch-success-bg);
 }
 
 .status-idle,
 .status-inactive {
-  background: var(--color-background-cell-shaded);
-  color: var(--color-text-status-inactive);
+  color: var(--gray-500);
 }
 
 .status-pre_queue,
-.status-info {
-  background: var(--color-background-status-info);
-  color: var(--color-text-status-info);
+.status-warning {
+  color: var(--vouch-warning);
+  border-color: rgba(210, 153, 34, 0.3);
+  background: var(--vouch-warning-bg);
 }
 
-.status-post_event,
-.status-warning {
-  background: var(--color-background-status-warning);
-  color: var(--color-text-status-warning);
+.status-post_event {
+  color: var(--gray-400);
 }
 
 .status-maintenance,
 .status-error {
-  background: var(--color-background-status-error);
-  color: var(--color-text-status-error);
+  color: var(--vouch-error);
+  border-color: rgba(215, 58, 73, 0.4);
+  background: var(--vouch-error-bg);
 }
 
-/* --- Forms (Cloudscape FormField + SpaceBetween) --------------------------- */
+/* --- Forms (Vouch .input-field) ------------------------------------------- */
 
 .form-field {
   display: flex;
   flex-direction: column;
-  gap: var(--space-scaled-xxs);
-  margin-bottom: var(--space-scaled-m);
+  gap: 6px;
+  margin-bottom: 16px;
 }
 
 .form-field label {
-  font-size: var(--font-size-body-s);
-  font-weight: var(--font-weight-heading-s);
-  color: var(--color-text-body-default);
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--gray-200);
 }
 
 .form-field .help {
-  font-size: var(--font-size-body-s);
-  color: var(--color-text-body-secondary);
-}
-
-.form-row {
-  display: flex;
-  gap: var(--space-scaled-s);
-  align-items: flex-end;
-  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--gray-500);
 }
 
 input,
 select {
   font: inherit;
-  padding: var(--space-scaled-xxs) var(--space-scaled-s);
-  border: var(--border-width-field) solid var(--color-border-input-default);
-  border-radius: var(--border-radius-input);
-  background: var(--color-background-input-default);
-  color: var(--color-text-body-default);
-  min-height: 2rem;
+  font-size: 14px;
+  padding: 10px 14px;
+  border: 1px solid var(--gray-500);
+  border-radius: 6px;
+  background: var(--vouch-raised);
+  color: var(--gray-200);
+  width: 100%;
 }
 
-/* --- Buttons (Cloudscape Button variants) ---------------------------------- */
+input::placeholder {
+  color: var(--gray-400);
+}
+
+input:focus,
+select:focus {
+  outline: none;
+  border-color: var(--vouch-accent);
+}
+
+/* --- Buttons (Vouch .btn-primary / .btn-secondary / .btn-danger) ----------- */
 
 button {
   font: inherit;
-  font-weight: var(--font-weight-button);
+  font-size: 14px;
+  font-weight: 500;
   cursor: pointer;
-  padding: var(--space-scaled-xxs) var(--space-scaled-l);
-  min-height: 2rem;
-  border-radius: var(--border-radius-button);
-  border: var(--border-width-button) solid var(--color-border-button-primary-default);
-  background: var(--color-background-button-primary-default);
-  color: var(--color-text-button-primary-default);
+  padding: 12px 24px;
+  border-radius: 6px;
+  border: 1px solid var(--vouch-accent);
+  background: var(--vouch-accent);
+  color: #0a0a0a;
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
 }
 
 button:hover {
-  background: var(--color-background-button-primary-hover);
+  background: var(--vouch-accent-hover);
+  border-color: var(--vouch-accent-hover);
 }
 
-/* "normal" variant — secondary actions */
+/* .btn-secondary */
 button.normal {
-  background: var(--color-background-button-normal-default);
-  color: var(--color-text-button-normal-default);
-  border-color: var(--color-border-button-normal-default);
+  background: transparent;
+  color: var(--gray-300);
+  border-color: var(--vouch-border);
 }
 
 button.normal:hover {
-  background: var(--color-background-button-normal-hover);
+  background: var(--vouch-raised);
+  border-color: var(--vouch-border);
 }
 
-/* emergency / stop — the andon cord */
+/* .btn-danger */
 button.danger {
-  background: var(--color-background-button-primary-default);
-  color: var(--color-text-button-primary-default);
-  border-color: var(--color-text-status-error);
-  background: var(--color-text-status-error);
+  background: var(--vouch-error);
+  border-color: var(--vouch-error);
+  color: #fff;
+}
+
+button.danger:hover {
+  opacity: 0.9;
+  background: var(--vouch-error);
 }
 
 button.big {
-  min-height: 2.75rem;
-  font-size: var(--font-size-heading-s);
-  padding: var(--space-scaled-s) var(--space-scaled-xl);
+  width: 100%;
+  padding: 14px;
+  font-size: 15px;
 }
 
-/* --- Utility --------------------------------------------------------------- */
+/* --- Utility -------------------------------------------------------------- */
+
+.divider {
+  border: none;
+  border-top: 1px solid var(--vouch-border);
+  margin: 16px 0;
+}
 
 .deferred {
-  color: var(--color-text-status-inactive);
+  color: var(--gray-500);
   font-style: italic;
 }
 
 .audit-line {
-  font-size: var(--font-size-body-s);
-  color: var(--color-text-body-secondary);
-  margin-top: var(--space-scaled-s);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--gray-500);
+  margin-top: 16px;
 }
 
+/* Vouch .alert-error (left-accent bar) */
 .banner {
-  padding: var(--space-scaled-s) var(--space-scaled-l);
-  border-radius: var(--border-radius-item);
-  margin-bottom: var(--space-scaled-m);
-  background: var(--color-background-status-warning);
-  color: var(--color-text-status-warning);
-  font-weight: var(--font-weight-heading-s);
+  padding: 12px 16px;
+  border-left: 4px solid var(--vouch-error);
+  border-radius: 0 8px 8px 0;
+  margin-bottom: 24px;
+  background: var(--vouch-error-bg);
+  color: var(--gray-300);
+  font-weight: 500;
 }
