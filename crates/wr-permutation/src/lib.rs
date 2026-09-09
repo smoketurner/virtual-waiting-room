@@ -25,6 +25,10 @@
 //! - One round is `L, R = R, L XOR F(round, R)`; recombine `(L << b) | R`.
 //! - Cycle-walk: re-apply `enc` until the result is `< N`.
 
+mod assembly;
+
+pub use assembly::{Assignment, SHARDS, SealError, SealedOffsets, shard_for};
+
 use aws_lc_rs::hmac;
 
 /// The 256-bit `shuffle_seed` used as the HMAC-SHA256 key.
