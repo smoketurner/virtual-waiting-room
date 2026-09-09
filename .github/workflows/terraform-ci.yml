@@ -1,0 +1,32 @@
+name: Terraform CI
+
+on:
+  push:
+    branches: [main]
+    paths: ["infra/**", ".github/workflows/terraform-ci.yml"]
+  pull_request:
+    paths: ["infra/**", ".github/workflows/terraform-ci.yml"]
+
+permissions: {}
+
+jobs:
+  fmt-and-validate:
+    name: fmt and validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: "1.16.1"
+          terraform_wrapper: false
+      # Canonical formatting across the whole infra tree.
+      - run: terraform -chdir=infra fmt -check -recursive
+      # validate needs the providers installed, but no backend and no AWS
+      # credentials: -backend=false keeps init offline, and validate never
+      # calls AWS.
+      - run: terraform -chdir=infra/environments/dev init -backend=false -input=false
+      - run: terraform -chdir=infra/environments/dev validate
