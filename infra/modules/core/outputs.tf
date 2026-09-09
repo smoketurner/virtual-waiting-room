@@ -53,6 +53,11 @@ output "read_function_name" {
   value       = aws_lambda_function.read.function_name
 }
 
+output "event_id" {
+  description = "The single event id this deployment serves. The read Lambda scopes /status and /queue_num to it."
+  value       = var.event_id
+}
+
 output "rest_api_id" {
   description = "ID of the regional REST API."
   value       = aws_api_gateway_rest_api.this.id
