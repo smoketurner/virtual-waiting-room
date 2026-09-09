@@ -47,17 +47,13 @@ SEAL_ARTIFACT   := $(ARTIFACTS)/seal_event/bootstrap/bootstrap.zip
 READ_ARTIFACT   := $(ARTIFACTS)/read/bootstrap/bootstrap.zip
 ADMIN_ARTIFACT  := $(ARTIFACTS)/admin/bootstrap/bootstrap.zip
 
-# Only the artifact paths are passed as -var: they are computed from the build
-# (empty via $(wildcard) when a zip is absent, so `plan` falls back to the
-# vendored placeholder Lambda before `build`). Everything else — region,
-# aws_profile, event_id, lambda_architecture, seal_start_time — is read from
-# infra/environments/dev/terraform.tfvars, which is authoritative. A command-line
-# -var would override tfvars, so those are deliberately NOT passed here.
-TF_VARS := \
-	-var "assign_position_artifact_path=$(wildcard $(ASSIGN_ARTIFACT))" \
-	-var "seal_event_artifact_path=$(wildcard $(SEAL_ARTIFACT))" \
-	-var "read_artifact_path=$(wildcard $(READ_ARTIFACT))" \
-	-var "admin_artifact_path=$(wildcard $(ADMIN_ARTIFACT))"
+# All Terraform config — region, aws_profile, event_id, lambda_architecture,
+# seal_start_time, and the four *_artifact_path values — lives in
+# infra/environments/dev/terraform.tfvars, which Terraform auto-loads from the
+# -chdir root and is the single source of truth. This Makefile passes no -var:
+# a command-line -var would override the file. See example.tfvars for the shape;
+# the artifact paths are the deterministic build outputs
+# (.artifacts/<crate>/bootstrap/bootstrap.zip), empty/unset -> placeholder Lambda.
 
 .PHONY: help build init plan apply destroy fmt validate clean
 
@@ -76,14 +72,14 @@ build: ## Cross-compile the three Lambdas to zips under .artifacts/<crate>/.
 init: ## terraform init (safe, idempotent).
 	terraform -chdir=$(ENV_DIR) init -input=false
 
-plan: init ## terraform plan (uses staged artifacts if built, else placeholders).
-	terraform -chdir=$(ENV_DIR) plan -input=false $(TF_VARS)
+plan: init ## terraform plan (config + artifact paths from terraform.tfvars).
+	terraform -chdir=$(ENV_DIR) plan -input=false
 
 apply: build init ## Build the Lambdas then terraform apply (needs AWS credentials).
-	terraform -chdir=$(ENV_DIR) apply -input=false $(TF_VARS)
+	terraform -chdir=$(ENV_DIR) apply -input=false
 
 destroy: init ## Tear the stack down (Terraform prompts for confirmation).
-	terraform -chdir=$(ENV_DIR) destroy $(TF_VARS)
+	terraform -chdir=$(ENV_DIR) destroy
 
 fmt: ## terraform fmt across the infra tree.
 	terraform -chdir=$(ROOT)/infra fmt -recursive
