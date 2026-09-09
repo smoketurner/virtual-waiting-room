@@ -91,6 +91,52 @@ resource "aws_lambda_permission" "read_apigw" {
   source_arn    = "${aws_api_gateway_rest_api.this.execution_arn}/*/*"
 }
 
+# --- admin (SigV4 control plane) ----------------------------------------------
+
+resource "aws_iam_role" "admin" {
+  name               = "${local.admin_name}-role"
+  assume_role_policy = data.aws_iam_policy_document.lambda_assume_role.json
+  tags               = var.tags
+}
+
+resource "aws_iam_role_policy" "admin" {
+  name   = "${local.admin_name}-policy"
+  role   = aws_iam_role.admin.id
+  policy = data.aws_iam_policy_document.admin.json
+}
+
+resource "aws_lambda_function" "admin" {
+  function_name = local.admin_name
+  role          = aws_iam_role.admin.arn
+  runtime       = "provided.al2023"
+  architectures = [local.lambda_runtime_arch]
+  handler       = "bootstrap"
+  timeout       = 10
+  memory_size   = 256
+
+  filename         = local.admin_zip
+  source_code_hash = local.admin_hash
+
+  environment {
+    variables = {
+      COUNTERS_TABLE = aws_dynamodb_table.counters.name
+      EVENT_ID       = var.event_id
+    }
+  }
+
+  tags = var.tags
+}
+
+# API Gateway invokes the admin Lambda for the SigV4 /admin, /metrics, and
+# /update_session routes.
+resource "aws_lambda_permission" "admin_apigw" {
+  statement_id  = "AllowAPIGatewayInvokeAdmin"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.admin.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_api_gateway_rest_api.this.execution_arn}/*/*"
+}
+
 # --- seal schedule (EventBridge Scheduler) ------------------------------------
 # One-time trigger at the event start. Disabled by default (no start time set);
 # the operator sets seal_start_time and flips it on ahead of the event. The

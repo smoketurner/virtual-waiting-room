@@ -149,6 +149,32 @@ data "aws_iam_policy_document" "read" {
   }
 }
 
+# Execution-role permissions for the admin control plane: read and conditionally
+# update the Counters item (phase / rate / message), plus logs. It never touches
+# PreQueue or Positions.
+data "aws_iam_policy_document" "admin" {
+  statement {
+    sid    = "ReadAndWriteCounters"
+    effect = "Allow"
+    actions = [
+      "dynamodb:GetItem",
+      "dynamodb:UpdateItem",
+    ]
+    resources = [aws_dynamodb_table.counters.arn]
+  }
+
+  statement {
+    sid    = "Logs"
+    effect = "Allow"
+    actions = [
+      "logs:CreateLogGroup",
+      "logs:CreateLogStream",
+      "logs:PutLogEvents",
+    ]
+    resources = ["arn:${data.aws_partition.current.partition}:logs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/${local.admin_name}*"]
+  }
+}
+
 # Trust policy for the EventBridge Scheduler role that invokes the seal Lambda.
 data "aws_iam_policy_document" "scheduler_assume_role" {
   statement {

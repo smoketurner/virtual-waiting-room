@@ -46,6 +46,7 @@ endif
 ASSIGN_ARTIFACT := $(ARTIFACTS)/assign_position/bootstrap/bootstrap.zip
 SEAL_ARTIFACT   := $(ARTIFACTS)/seal_event/bootstrap/bootstrap.zip
 READ_ARTIFACT   := $(ARTIFACTS)/read/bootstrap/bootstrap.zip
+ADMIN_ARTIFACT  := $(ARTIFACTS)/admin/bootstrap/bootstrap.zip
 
 # An artifact path is passed to Terraform only when its zip is actually built
 # ($(wildcard) is empty when absent). A missing zip falls back to the vendored
@@ -59,7 +60,8 @@ TF_VARS := \
 	-var "seal_start_time=$(SEAL_START)" \
 	-var "assign_position_artifact_path=$(wildcard $(ASSIGN_ARTIFACT))" \
 	-var "seal_event_artifact_path=$(wildcard $(SEAL_ARTIFACT))" \
-	-var "read_artifact_path=$(wildcard $(READ_ARTIFACT))"
+	-var "read_artifact_path=$(wildcard $(READ_ARTIFACT))" \
+	-var "admin_artifact_path=$(wildcard $(ADMIN_ARTIFACT))"
 
 .PHONY: help build init plan apply destroy fmt validate clean
 
@@ -68,12 +70,12 @@ help: ## Show this help.
 		| awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
 
 build: ## Cross-compile the three Lambdas to zips under .artifacts/<crate>/.
-	@for crate in assign_position seal_event read; do \
+	@for crate in assign_position seal_event read admin; do \
 		cargo lambda build --release $(ARCH_FLAG) --output-format zip \
 			--lambda-dir $(ARTIFACTS)/$$crate \
 			-p $$crate --manifest-path $(CRATES_DIR)/Cargo.toml; \
 	done
-	@echo "built: $(ASSIGN_ARTIFACT) $(SEAL_ARTIFACT) $(READ_ARTIFACT)"
+	@echo "built: $(ASSIGN_ARTIFACT) $(SEAL_ARTIFACT) $(READ_ARTIFACT) $(ADMIN_ARTIFACT)"
 
 init: ## terraform init (safe, idempotent).
 	terraform -chdir=$(ENV_DIR) init -input=false

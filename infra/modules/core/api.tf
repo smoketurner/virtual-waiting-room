@@ -153,9 +153,13 @@ resource "aws_api_gateway_integration" "endpoint" {
   http_method             = aws_api_gateway_method.endpoint[each.key].http_method
   type                    = "AWS_PROXY"
   integration_http_method = "POST"
-  # The read Lambda backs the two public read endpoints; every other endpoint is
-  # still fronted by the shared placeholder until its crate lands.
-  uri = contains(["status", "queue_num"], each.key) ? aws_lambda_function.read.invoke_arn : aws_lambda_function.api_placeholder.invoke_arn
+  # Route each endpoint to its backing Lambda: the read Lambda for the two
+  # public read endpoints, the admin Lambda for the SigV4 control plane (when
+  # its artifact is deployed), and the shared placeholder for everything else
+  # until its crate lands.
+  uri = contains(["status", "queue_num"], each.key) ? aws_lambda_function.read.invoke_arn : (
+    each.value.auth == "AWS_IAM" && !local.admin_is_placeholder ? aws_lambda_function.admin.invoke_arn : aws_lambda_function.api_placeholder.invoke_arn
+  )
 }
 
 # --- Stage + deployment -------------------------------------------------------
@@ -179,6 +183,9 @@ resource "aws_api_gateway_deployment" "this" {
       # change never triggers a new deployment and the stage serves stale config.
       [for k in sort(keys(local.api_endpoints)) : aws_api_gateway_method.endpoint[k].request_validator_id],
       [for k in sort(keys(local.api_endpoints)) : jsonencode(aws_api_gateway_method.endpoint[k].request_parameters)],
+      # Integration URIs change in place when an endpoint is retargeted from the
+      # placeholder to a real Lambda; hash them so that forces a redeployment.
+      [for k in sort(keys(local.api_endpoints)) : aws_api_gateway_integration.endpoint[k].uri],
     ]))
   }
 

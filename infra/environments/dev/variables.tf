@@ -62,6 +62,12 @@ variable "read_artifact_path" {
   default     = ""
 }
 
+variable "admin_artifact_path" {
+  description = "Path to the built admin bootstrap binary."
+  type        = string
+  default     = ""
+}
+
 variable "lambda_architecture" {
   description = "Lambda CPU architecture for every function: arm64 or x86_64. Must match the built artifacts."
   type        = string

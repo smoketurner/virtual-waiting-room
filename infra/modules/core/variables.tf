@@ -65,6 +65,12 @@ variable "read_artifact_path" {
   default     = ""
 }
 
+variable "admin_artifact_path" {
+  description = "Path to the admin Lambda bootstrap zip (SigV4 /admin control plane). Empty = vendored placeholder."
+  type        = string
+  default     = ""
+}
+
 variable "lambda_architecture" {
   description = "Lambda CPU architecture for every function: arm64 (design default) or x86_64. Must match the built artifacts."
   type        = string

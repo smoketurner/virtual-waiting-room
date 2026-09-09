@@ -17,7 +17,7 @@ path = "src/lib.rs"
 [dependencies]
 wr-domain = { workspace = true }
 lambda_http = { workspace = true, features = ["apigw_rest"] }
-axum = { workspace = true, features = ["http1", "query", "tokio"] }
+axum = { workspace = true, features = ["http1", "query", "form", "tokio"] }
 tower = { workspace = true }
 askama = { workspace = true, features = ["std", "derive"] }
 aws-config = { workspace = true, features = ["behavior-version-latest"] }

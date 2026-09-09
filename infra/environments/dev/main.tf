@@ -19,6 +19,7 @@ module "core" {
   assign_position_artifact_path = var.assign_position_artifact_path
   seal_event_artifact_path      = var.seal_event_artifact_path
   read_artifact_path            = var.read_artifact_path
+  admin_artifact_path           = var.admin_artifact_path
   lambda_architecture           = var.lambda_architecture
   event_id                      = var.event_id
   seal_start_time               = var.seal_start_time
