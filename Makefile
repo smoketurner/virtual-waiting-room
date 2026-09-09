@@ -11,13 +11,14 @@
 #   make apply                 # terraform apply (real deploy — needs AWS creds)
 #   make destroy               # tear the stack down (prompts to confirm)
 #
-# Common overrides (make apply ARCH=arm64 EVENT_ID=launch SEAL_START=2026-09-10T18:00:00):
-#   ARCH        Lambda CPU architecture: x86_64 (default) or arm64. Must match
-#               the built artifacts.
-#   EVENT_ID    The single event id this deployment serves (default: default).
-#   SEAL_START  One-time UTC seal time, EventBridge at() value. Empty = manual.
-#   REGION      AWS region (default: us-east-1).
-#   PROFILE     Named AWS profile to authenticate with. Empty = default chain.
+# Deployment config (region, aws_profile, event_id, lambda_architecture,
+# seal_start_time) lives in infra/environments/dev/terraform.tfvars and is
+# authoritative — this Makefile does not pass those as -var (which would override
+# the file). Only the built artifact paths are passed.
+#
+# The one build-time override (make build ARCH=arm64):
+#   ARCH        cargo-lambda build target: x86_64 (default) or arm64. Keep this
+#               in sync with lambda_architecture in terraform.tfvars.
 
 SHELL       := /usr/bin/env bash
 .SHELLFLAGS := -eu -o pipefail -c
@@ -28,12 +29,10 @@ CRATES_DIR  := $(ROOT)/crates
 ARTIFACTS   := $(ROOT)/.artifacts
 
 ARCH        ?= x86_64
-EVENT_ID    ?= default
-SEAL_START  ?=
-REGION      ?= us-east-1
-PROFILE     ?= dev-admin
 
 # cargo-lambda cross-compiles for x86_64 by default; --arm64 selects Graviton.
+# ARCH only selects the BUILD target here; the Lambda's lambda_architecture is
+# set in terraform.tfvars and must be kept in sync with what you build.
 ifeq ($(ARCH),arm64)
 ARCH_FLAG := --arm64
 else
@@ -48,20 +47,13 @@ SEAL_ARTIFACT   := $(ARTIFACTS)/seal_event/bootstrap/bootstrap.zip
 READ_ARTIFACT   := $(ARTIFACTS)/read/bootstrap/bootstrap.zip
 ADMIN_ARTIFACT  := $(ARTIFACTS)/admin/bootstrap/bootstrap.zip
 
-# An artifact path is passed to Terraform only when its zip is actually built
-# ($(wildcard) is empty when absent). A missing zip falls back to the vendored
-# placeholder Lambda, so `plan` works before `build`. Run `make build` first to
-# deploy the real functions.
-TF_VARS := \
-	-var "region=$(REGION)" \
-	-var "aws_profile=$(PROFILE)" \
-	-var "event_id=$(EVENT_ID)" \
-	-var "lambda_architecture=$(ARCH)" \
-	-var "seal_start_time=$(SEAL_START)" \
-	-var "assign_position_artifact_path=$(wildcard $(ASSIGN_ARTIFACT))" \
-	-var "seal_event_artifact_path=$(wildcard $(SEAL_ARTIFACT))" \
-	-var "read_artifact_path=$(wildcard $(READ_ARTIFACT))" \
-	-var "admin_artifact_path=$(wildcard $(ADMIN_ARTIFACT))"
+# All Terraform config — region, aws_profile, event_id, lambda_architecture,
+# seal_start_time, and the four *_artifact_path values — lives in
+# infra/environments/dev/terraform.tfvars, which Terraform auto-loads from the
+# -chdir root and is the single source of truth. This Makefile passes no -var:
+# a command-line -var would override the file. See example.tfvars for the shape;
+# the artifact paths are the deterministic build outputs
+# (.artifacts/<crate>/bootstrap/bootstrap.zip), empty/unset -> placeholder Lambda.
 
 .PHONY: help build init plan apply destroy fmt validate clean
 
@@ -80,14 +72,14 @@ build: ## Cross-compile the three Lambdas to zips under .artifacts/<crate>/.
 init: ## terraform init (safe, idempotent).
 	terraform -chdir=$(ENV_DIR) init -input=false
 
-plan: init ## terraform plan (uses staged artifacts if built, else placeholders).
-	terraform -chdir=$(ENV_DIR) plan -input=false $(TF_VARS)
+plan: init ## terraform plan (config + artifact paths from terraform.tfvars).
+	terraform -chdir=$(ENV_DIR) plan -input=false
 
 apply: build init ## Build the Lambdas then terraform apply (needs AWS credentials).
-	terraform -chdir=$(ENV_DIR) apply -input=false $(TF_VARS)
+	terraform -chdir=$(ENV_DIR) apply -input=false
 
 destroy: init ## Tear the stack down (Terraform prompts for confirmation).
-	terraform -chdir=$(ENV_DIR) destroy $(TF_VARS)
+	terraform -chdir=$(ENV_DIR) destroy
 
 fmt: ## terraform fmt across the infra tree.
 	terraform -chdir=$(ROOT)/infra fmt -recursive
