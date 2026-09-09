@@ -1,0 +1,33 @@
+[package]
+name = "read"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "bootstrap"
+path = "src/main.rs"
+
+[lib]
+name = "read"
+path = "src/lib.rs"
+
+[dependencies]
+wr-domain = { workspace = true }
+lambda_http = { workspace = true, features = ["apigw_rest", "tracing"] }
+lambda_runtime = { workspace = true }
+aws-config = { workspace = true, features = ["behavior-version-latest"] }
+aws-sdk-dynamodb = { workspace = true, features = ["default-https-client", "rt-tokio"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["std"] }
+serde_dynamo = { workspace = true, features = ["aws-sdk-dynamodb+1"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+thiserror = { workspace = true }
+tracing = { workspace = true, default-features = true }
+tracing-subscriber = { workspace = true, features = ["fmt", "env-filter", "json"] }
+anyhow = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true

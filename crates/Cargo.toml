@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["wr-permutation", "wr-domain", "assign_position"]
+members = ["wr-permutation", "wr-domain", "assign_position", "seal_event", "read"]
 
 [workspace.package]
 edition = "2024"
@@ -20,6 +20,7 @@ aws-lc-rs = { version = "=1.18.1", default-features = false }
 
 # Lambda runtime and typed event shapes.
 lambda_runtime = { version = "=1.4.0", default-features = false }
+lambda_http = { version = "=1.3.1", default-features = false }
 aws_lambda_events = { version = "=1.2.0", default-features = false }
 
 # AWS SDK — defaults off so no second crypto stack / legacy connector is pulled
