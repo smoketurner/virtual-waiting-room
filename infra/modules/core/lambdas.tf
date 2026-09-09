@@ -72,9 +72,10 @@ resource "aws_lambda_function" "read" {
 
   environment {
     variables = {
-      COUNTERS_TABLE = aws_dynamodb_table.counters.name
-      PREQUEUE_TABLE = aws_dynamodb_table.prequeue.name
-      EVENT_ID       = var.event_id
+      COUNTERS_TABLE  = aws_dynamodb_table.counters.name
+      PREQUEUE_TABLE  = aws_dynamodb_table.prequeue.name
+      POSITIONS_TABLE = aws_dynamodb_table.positions.name
+      EVENT_ID        = var.event_id
     }
   }
 
