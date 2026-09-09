@@ -80,6 +80,7 @@ Pass these on the `make` command line; each has a default.
 | `EVENT_ID`   | `default`   | The single event id this deployment serves.                             |
 | `SEAL_START` | *(empty)*   | One-time UTC seal time as an EventBridge `at()` value, e.g. `2026-09-10T18:00:00`. Empty = seal invoked manually. |
 | `REGION`     | `us-east-1` | AWS region.                                                             |
+| `PROFILE`    | *(empty)*   | Named AWS profile to authenticate with (sets the provider's `profile`). Empty uses the default credential chain — environment, active SSO session, or instance role. |
 
 > **Architecture must match.** `ARCH` defaults to `x86_64` because that is what
 > the standard host toolchain builds. To ship `arm64` you need the
