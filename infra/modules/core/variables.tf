@@ -42,10 +42,48 @@ variable "warm_throughput_read_units" {
   }
 }
 
-# --- Live-join Lambda (DESIGN §2.2, §5.3, §6) ---------------------------------
+# --- Lambda artifacts (DESIGN §2.2, §5.3, §6) ---------------------------------
+# Each function is a Rust bootstrap zip. An empty path falls back to the vendored
+# placeholder so the plane can be created before the crates are built. The join
+# event-source mapping stays DISABLED whenever assign_position is a placeholder.
 
-variable "lambda_artifact_path" {
-  description = "Path to the assign_position Lambda bootstrap zip (provided.al2023, arm64). Defaults to the vendored placeholder that returns success and drops the batch; replaced by the Rust build artifact."
+variable "assign_position_artifact_path" {
+  description = "Path to the assign_position Lambda bootstrap zip. Empty = vendored placeholder (join ESM stays disabled)."
+  type        = string
+  default     = ""
+}
+
+variable "seal_event_artifact_path" {
+  description = "Path to the seal_event Lambda bootstrap zip. Empty = vendored placeholder."
+  type        = string
+  default     = ""
+}
+
+variable "read_artifact_path" {
+  description = "Path to the read Lambda bootstrap zip (serves /v1/status and /v1/queue_num). Empty = vendored placeholder."
+  type        = string
+  default     = ""
+}
+
+variable "lambda_architecture" {
+  description = "Lambda CPU architecture for every function: arm64 (design default) or x86_64. Must match the built artifacts."
+  type        = string
+  default     = "arm64"
+
+  validation {
+    condition     = contains(["arm64", "x86_64"], var.lambda_architecture)
+    error_message = "lambda_architecture must be arm64 or x86_64."
+  }
+}
+
+variable "event_id" {
+  description = "The single event id this MVP deployment serves. The read Lambda scopes /status and /queue_num to it."
+  type        = string
+  default     = "default"
+}
+
+variable "seal_start_time" {
+  description = "One-time UTC start time for the seal, as an EventBridge at() value without the 'at(' wrapper, e.g. \"2026-09-10T18:00:00\". Empty = no schedule created (seal invoked manually)."
   type        = string
   default     = ""
 }

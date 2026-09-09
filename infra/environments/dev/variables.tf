@@ -33,3 +33,43 @@ variable "client_origin_domain_name" {
   type        = string
   default     = ""
 }
+
+# --- Rust Lambda artifacts ----------------------------------------------------
+# Point these at the built bootstrap binaries to deploy the real functions.
+# Empty leaves each as the vendored placeholder (and the join ESM disabled).
+
+variable "assign_position_artifact_path" {
+  description = "Path to the built assign_position bootstrap binary."
+  type        = string
+  default     = ""
+}
+
+variable "seal_event_artifact_path" {
+  description = "Path to the built seal_event bootstrap binary."
+  type        = string
+  default     = ""
+}
+
+variable "read_artifact_path" {
+  description = "Path to the built read bootstrap binary."
+  type        = string
+  default     = ""
+}
+
+variable "lambda_architecture" {
+  description = "Lambda CPU architecture for every function: arm64 or x86_64. Must match the built artifacts."
+  type        = string
+  default     = "arm64"
+}
+
+variable "event_id" {
+  description = "The single event id this MVP deployment serves."
+  type        = string
+  default     = "default"
+}
+
+variable "seal_start_time" {
+  description = "One-time UTC seal time as an EventBridge at() value, e.g. \"2026-09-10T18:00:00\". Empty = seal invoked manually."
+  type        = string
+  default     = ""
+}
