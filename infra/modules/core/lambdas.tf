@@ -120,10 +120,17 @@ resource "aws_lambda_function" "admin" {
   environment {
     variables = {
       COUNTERS_TABLE = aws_dynamodb_table.counters.name
+      TOKENS_TABLE   = aws_dynamodb_table.tokens.name
       EVENT_ID       = var.event_id
       # API Gateway prefixes the path with the stage (e.g. /dev/admin); this
       # makes the Rust runtime strip it so the Axum routes match unprefixed.
       AWS_LAMBDA_HTTP_IGNORE_STAGE_IN_PATH = "true"
+      # OIDC admin login (ADR-0016). The client secret is read from the SSM
+      # SecureString named here; the rest are non-secret config.
+      OIDC_ISSUER              = var.oidc_issuer
+      OIDC_CLIENT_ID           = var.oidc_client_id
+      OIDC_REDIRECT_URI        = var.oidc_redirect_uri
+      OIDC_CLIENT_SECRET_PARAM = aws_ssm_parameter.oidc_client_secret.name
     }
   }
 

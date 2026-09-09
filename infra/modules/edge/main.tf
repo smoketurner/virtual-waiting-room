@@ -210,6 +210,24 @@ resource "aws_cloudfront_distribution" "this" {
     }
   }
 
+  # Admin control plane: /admin, /admin/*, /static/* (ADR-0016). Uncached, all
+  # methods, forward everything except Host so the OIDC session cookie + callback
+  # query reach the admin Lambda. Access is gated by the admin Lambda's OIDC
+  # session, not at the edge.
+  dynamic "ordered_cache_behavior" {
+    for_each = toset(local.admin_paths)
+    content {
+      path_pattern             = ordered_cache_behavior.value
+      target_origin_id         = local.api_origin_id
+      viewer_protocol_policy   = "redirect-to-https"
+      allowed_methods          = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
+      cached_methods           = ["GET", "HEAD"]
+      cache_policy_id          = local.caching_disabled_policy_id
+      origin_request_policy_id = local.all_viewer_except_host_policy_id
+      compress                 = true
+    }
+  }
+
   restrictions {
     geo_restriction {
       restriction_type = "none"

@@ -72,22 +72,35 @@ locals {
     # Public write under /v1 (F3.3) - single-use admission token.
     generate_token = { parent = "v1", path_part = "generate_token", method = "POST", auth = "NONE" }
 
-    # Admin control plane (SigV4), unversioned. UI GET + per-action POSTs.
-    admin          = { parent = "root", path_part = "admin", method = "GET", auth = "AWS_IAM" }
-    metrics        = { parent = "root", path_part = "metrics", method = "GET", auth = "AWS_IAM" }
-    update_session = { parent = "root", path_part = "update_session", method = "POST", auth = "AWS_IAM" }
-    admin_phase    = { parent = "admin", path_part = "phase", method = "POST", auth = "AWS_IAM" }
-    admin_rate     = { parent = "admin", path_part = "rate", method = "POST", auth = "AWS_IAM" }
-    admin_message  = { parent = "admin", path_part = "message", method = "POST", auth = "AWS_IAM" }
-    admin_reset    = { parent = "admin", path_part = "reset", method = "POST", auth = "AWS_IAM" }
-    admin_rules    = { parent = "admin", path_part = "rules", method = "POST", auth = "AWS_IAM" }
-    admin_metrics  = { parent = "admin", path_part = "metrics", method = "GET", auth = "AWS_IAM" }
+    # Admin control plane, unversioned. Auth is NONE at API Gateway because the
+    # admin Lambda enforces access via an OIDC login session (ADR-0016); the
+    # login/callback/logout routes run the flow, the rest are session-gated.
+    admin          = { parent = "root", path_part = "admin", method = "GET", auth = "NONE" }
+    metrics        = { parent = "root", path_part = "metrics", method = "GET", auth = "NONE" }
+    update_session = { parent = "root", path_part = "update_session", method = "POST", auth = "NONE" }
+    admin_login    = { parent = "admin", path_part = "login", method = "GET", auth = "NONE" }
+    admin_callback = { parent = "admin", path_part = "callback", method = "GET", auth = "NONE" }
+    admin_logout   = { parent = "admin", path_part = "logout", method = "GET", auth = "NONE" }
+    admin_phase    = { parent = "admin", path_part = "phase", method = "POST", auth = "NONE" }
+    admin_rate     = { parent = "admin", path_part = "rate", method = "POST", auth = "NONE" }
+    admin_message  = { parent = "admin", path_part = "message", method = "POST", auth = "NONE" }
+    admin_reset    = { parent = "admin", path_part = "reset", method = "POST", auth = "NONE" }
+    admin_rules    = { parent = "admin", path_part = "rules", method = "POST", auth = "NONE" }
+    admin_metrics  = { parent = "admin", path_part = "metrics", method = "GET", auth = "NONE" }
   }
 
   # Split by parent so each container resource is created before its children.
   v1_endpoints    = { for k, v in local.api_endpoints : k => v if v.parent == "v1" }
   root_endpoints  = { for k, v in local.api_endpoints : k => v if v.parent == "root" }
   admin_endpoints = { for k, v in local.api_endpoints : k => v if v.parent == "admin" }
+
+  # Admin endpoints route to the admin Lambda regardless of auth type. Includes
+  # the root-level admin surface (/admin, /metrics, /update_session) plus every
+  # /admin/* child.
+  is_admin_endpoint = {
+    for k, v in local.api_endpoints : k =>
+    v.parent == "admin" || contains(["admin", "metrics", "update_session"], k)
+  }
 }
 
 # --- Resources (paths) --------------------------------------------------------
@@ -185,11 +198,12 @@ resource "aws_api_gateway_integration" "endpoint" {
   type                    = "AWS_PROXY"
   integration_http_method = "POST"
   # Route each endpoint to its backing Lambda: the read Lambda for the two
-  # public read endpoints, the admin Lambda for the SigV4 control plane (when
-  # its artifact is deployed), and the shared placeholder for everything else
-  # until its crate lands.
+  # public read endpoints, the admin Lambda for the OIDC-gated control plane
+  # (when its artifact is deployed), and the shared placeholder for everything
+  # else until its crate lands. Admin routing keys on the endpoint being an admin
+  # one, not on its auth type (auth is NONE — the Lambda enforces the session).
   uri = contains(["status", "queue_num"], each.key) ? aws_lambda_function.read.invoke_arn : (
-    each.value.auth == "AWS_IAM" && !local.admin_is_placeholder ? aws_lambda_function.admin.invoke_arn : aws_lambda_function.api_placeholder.invoke_arn
+    local.is_admin_endpoint[each.key] && !local.admin_is_placeholder ? aws_lambda_function.admin.invoke_arn : aws_lambda_function.api_placeholder.invoke_arn
   )
 }
 

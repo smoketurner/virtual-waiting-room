@@ -94,6 +94,28 @@ variable "seal_start_time" {
   default     = ""
 }
 
+# --- Admin OIDC login (ADR-0016) ----------------------------------------------
+# The client secret is NOT a variable — it is an SSM SecureString written out of
+# band. These are the non-secret OIDC config the admin Lambda needs.
+
+variable "oidc_issuer" {
+  description = "OIDC issuer / discovery base URL for admin login (ADR-0016), e.g. https://us.vouch.sh."
+  type        = string
+  default     = "https://us.vouch.sh"
+}
+
+variable "oidc_client_id" {
+  description = "OAuth2 client id for the admin OIDC application. Empty in dev until an application is registered with the provider."
+  type        = string
+  default     = ""
+}
+
+variable "oidc_redirect_uri" {
+  description = "OIDC callback URL registered with the provider — the CloudFront (or API) URL of /admin/callback, e.g. https://d123.cloudfront.net/admin/callback."
+  type        = string
+  default     = ""
+}
+
 variable "assign_position_reserved_concurrency" {
   description = "Reserved concurrency on the assign_position function. Mandatory for event isolation (ADR-0008): without it a runaway event starves the others. -1 leaves it unreserved (single-event dev only)."
   type        = number

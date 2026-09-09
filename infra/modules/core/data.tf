@@ -164,6 +164,24 @@ data "aws_iam_policy_document" "admin" {
   }
 
   statement {
+    sid    = "AdminSessions"
+    effect = "Allow"
+    actions = [
+      "dynamodb:GetItem",
+      "dynamodb:PutItem",
+      "dynamodb:DeleteItem",
+    ]
+    resources = [aws_dynamodb_table.tokens.arn]
+  }
+
+  statement {
+    sid       = "ReadOidcClientSecret"
+    effect    = "Allow"
+    actions   = ["ssm:GetParameter"]
+    resources = [aws_ssm_parameter.oidc_client_secret.arn]
+  }
+
+  statement {
     sid    = "Logs"
     effect = "Allow"
     actions = [

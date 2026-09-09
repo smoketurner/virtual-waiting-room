@@ -85,3 +85,23 @@ variable "seal_start_time" {
   type        = string
   default     = ""
 }
+
+# --- Admin OIDC login (ADR-0016) ----------------------------------------------
+
+variable "oidc_issuer" {
+  description = "OIDC issuer / discovery base URL for admin login (Vouch by default)."
+  type        = string
+  default     = "https://us.vouch.sh"
+}
+
+variable "oidc_client_id" {
+  description = "OAuth2 client id for the admin OIDC application. Empty until registered with the provider."
+  type        = string
+  default     = ""
+}
+
+variable "oidc_redirect_uri" {
+  description = "OIDC callback URL registered with the provider — the CloudFront URL of /admin/callback."
+  type        = string
+  default     = ""
+}
