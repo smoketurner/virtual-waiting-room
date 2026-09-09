@@ -7,42 +7,17 @@ data "aws_region" "current" {}
 
 data "aws_partition" "current" {}
 
-# Placeholder Lambda artifact. When var.lambda_artifact_path is empty, Terraform
-# zips the vendored placeholder bootstrap so the compute plane can be created
-# before the Rust crate is built. Replaced by pointing the variable at the real
-# build artifact.
 # Placeholder Lambda artifact. Always built: the token-minting and admin API
-# endpoints in api.tf are still fronted by it until those crates land. Each real
-# function points at its own archive below instead.
+# endpoints in api.tf are still fronted by it until those crates land, and each
+# real function falls back to it when its artifact path is empty. The vendored
+# source is a raw bootstrap binary, so Terraform zips it here; the real function
+# artifacts are already zips produced by `cargo lambda build --output-format
+# zip`, referenced directly (see locals), so they need no archive_file.
 data "archive_file" "placeholder" {
   count       = 1
   type        = "zip"
   source_file = "${path.module}/placeholder-lambda/bootstrap"
   output_path = "${path.module}/placeholder-lambda/placeholder.zip"
-}
-
-# Real function artifacts, zipped from the built Rust bootstrap. Each exists only
-# when its path variable is set; otherwise the function falls back to the
-# placeholder (see locals).
-data "archive_file" "assign_position" {
-  count       = var.assign_position_artifact_path == "" ? 0 : 1
-  type        = "zip"
-  source_file = var.assign_position_artifact_path
-  output_path = "${path.module}/.artifacts/assign_position.zip"
-}
-
-data "archive_file" "seal_event" {
-  count       = var.seal_event_artifact_path == "" ? 0 : 1
-  type        = "zip"
-  source_file = var.seal_event_artifact_path
-  output_path = "${path.module}/.artifacts/seal_event.zip"
-}
-
-data "archive_file" "read" {
-  count       = var.read_artifact_path == "" ? 0 : 1
-  type        = "zip"
-  source_file = var.read_artifact_path
-  output_path = "${path.module}/.artifacts/read.zip"
 }
 
 # Trust policy for the assign_position Lambda execution role.

@@ -1,18 +1,19 @@
 # Virtual Waiting Room — deploy convenience targets.
 #
-# The Terraform root is infra/environments/dev. The three Rust Lambdas each
-# compile to a binary named `bootstrap`, so `build` stages them under
-# $(ARTIFACTS) with distinct names, and plan/apply pass those paths as vars.
+# The Terraform root is infra/environments/dev. `build` cross-compiles the three
+# Rust Lambdas with cargo-lambda, which writes a ready-to-deploy zip per function
+# at $(ARTIFACTS)/<crate>/bootstrap.zip; plan/apply pass those zip paths as vars
+# and Terraform deploys them directly (no re-zip).
 #
 # Usage:
-#   make build                 # compile + stage the three bootstraps
+#   make build                 # cross-compile the three functions to zips
 #   make plan                  # terraform plan with the built artifacts
 #   make apply                 # terraform apply (real deploy — needs AWS creds)
 #   make destroy               # tear the stack down (prompts to confirm)
 #
 # Common overrides (make apply ARCH=arm64 EVENT_ID=launch SEAL_START=2026-09-10T18:00:00):
 #   ARCH        Lambda CPU architecture: x86_64 (default) or arm64. Must match
-#               the built artifacts — the host toolchain here builds x86_64.
+#               the built artifacts.
 #   EVENT_ID    The single event id this deployment serves (default: default).
 #   SEAL_START  One-time UTC seal time, EventBridge at() value. Empty = manual.
 #   REGION      AWS region (default: us-east-1).
@@ -32,22 +33,23 @@ SEAL_START  ?=
 REGION      ?= us-east-1
 PROFILE     ?= dev-admin
 
-# cargo-lambda's --target flag wants the Rust triple for the chosen arch.
+# cargo-lambda cross-compiles for x86_64 by default; --arm64 selects Graviton.
 ifeq ($(ARCH),arm64)
-LAMBDA_TARGET := aarch64-unknown-linux-gnu
+ARCH_FLAG := --arm64
 else
-LAMBDA_TARGET := x86_64-unknown-linux-gnu
+ARCH_FLAG :=
 endif
 
-ASSIGN_ARTIFACT := $(ARTIFACTS)/assign_position-bootstrap
-SEAL_ARTIFACT   := $(ARTIFACTS)/seal_event-bootstrap
-READ_ARTIFACT   := $(ARTIFACTS)/read-bootstrap
+# cargo lambda build --output-format zip --lambda-dir $(ARTIFACTS) writes a
+# ready-to-deploy zip per function at $(ARTIFACTS)/<crate>/bootstrap.zip.
+ASSIGN_ARTIFACT := $(ARTIFACTS)/assign_position/bootstrap.zip
+SEAL_ARTIFACT   := $(ARTIFACTS)/seal_event/bootstrap.zip
+READ_ARTIFACT   := $(ARTIFACTS)/read/bootstrap.zip
 
-# An artifact path is passed to Terraform only when the bootstrap binary is
-# actually staged ($(wildcard) is empty when the file is absent). A missing
-# binary therefore falls back to the vendored placeholder instead of failing
-# the archive_file data source, so `plan` works before `build`. Run `make
-# build` first to deploy the real functions.
+# An artifact path is passed to Terraform only when its zip is actually built
+# ($(wildcard) is empty when absent). A missing zip falls back to the vendored
+# placeholder Lambda, so `plan` works before `build`. Run `make build` first to
+# deploy the real functions.
 TF_VARS := \
 	-var "region=$(REGION)" \
 	-var "aws_profile=$(PROFILE)" \
@@ -64,15 +66,12 @@ help: ## Show this help.
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
 		| awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
 
-build: ## Compile the three Lambdas and stage their bootstraps under .artifacts/.
-	cargo lambda build --release --target $(LAMBDA_TARGET) \
+build: ## Cross-compile the three Lambdas to zips under .artifacts/<crate>/.
+	cargo lambda build --release $(ARCH_FLAG) --output-format zip \
+		--lambda-dir $(ARTIFACTS) \
 		-p assign_position -p seal_event -p read \
 		--manifest-path $(CRATES_DIR)/Cargo.toml
-	@mkdir -p $(ARTIFACTS)
-	@cp $(CRATES_DIR)/target/lambda/assign_position/bootstrap $(ASSIGN_ARTIFACT)
-	@cp $(CRATES_DIR)/target/lambda/seal_event/bootstrap      $(SEAL_ARTIFACT)
-	@cp $(CRATES_DIR)/target/lambda/read/bootstrap            $(READ_ARTIFACT)
-	@echo "staged: $(ASSIGN_ARTIFACT) $(SEAL_ARTIFACT) $(READ_ARTIFACT)"
+	@echo "built: $(ASSIGN_ARTIFACT) $(SEAL_ARTIFACT) $(READ_ARTIFACT)"
 
 init: ## terraform init (safe, idempotent).
 	terraform -chdir=$(ENV_DIR) init -input=false
