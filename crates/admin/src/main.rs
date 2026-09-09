@@ -16,12 +16,19 @@ use admin::{ApplyError, apply_message, apply_phase, apply_rate, apply_reset};
 use askama::Template;
 use axum::Form;
 use axum::Router;
-use axum::extract::State;
-use axum::http::StatusCode;
+use axum::extract::{Path, State};
+use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use lambda_http::Error;
+use rust_embed::RustEmbed;
 use serde::Deserialize;
+
+/// Static assets (CSS) embedded into the binary at build time, so the Lambda
+/// serves them with no filesystem dependency.
+#[derive(RustEmbed)]
+#[folder = "static/"]
+struct StaticAssets;
 
 struct AppState {
     store: DynamoStore,
@@ -58,6 +65,7 @@ async fn main() -> Result<(), Error> {
         .route("/admin/reset", post(reset))
         .route("/admin/rules", post(deferred))
         .route("/update_session", post(deferred))
+        .route("/static/{*path}", get(static_asset))
         .with_state(state);
 
     lambda_http::run(app).await
@@ -121,6 +129,22 @@ async fn deferred() -> Response {
         "Not yet available — the authorizer and session plane ship after the MVP.",
     )
         .into_response()
+}
+
+/// Serves an embedded static asset (`/static/<path>`) with a guessed
+/// content-type. Unknown paths 404.
+async fn static_asset(Path(path): Path<String>) -> Response {
+    match StaticAssets::get(&path) {
+        Some(file) => {
+            let mime = mime_guess::from_path(&path).first_or_octet_stream();
+            (
+                [(header::CONTENT_TYPE, mime.as_ref().to_owned())],
+                file.data.into_owned(),
+            )
+                .into_response()
+        }
+        None => (StatusCode::NOT_FOUND, "not found").into_response(),
+    }
 }
 
 impl AppState {

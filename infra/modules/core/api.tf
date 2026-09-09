@@ -116,6 +116,37 @@ resource "aws_api_gateway_resource" "admin_child" {
   path_part   = each.value.path_part
 }
 
+# Static assets (CSS) for the admin UI, served by the admin Lambda from its
+# embedded files. Public (no SigV4): a browser <link> cannot sign the request
+# and the stylesheets carry no secrets. Greedy {proxy+} under /static.
+resource "aws_api_gateway_resource" "static" {
+  rest_api_id = aws_api_gateway_rest_api.this.id
+  parent_id   = aws_api_gateway_rest_api.this.root_resource_id
+  path_part   = "static"
+}
+
+resource "aws_api_gateway_resource" "static_proxy" {
+  rest_api_id = aws_api_gateway_rest_api.this.id
+  parent_id   = aws_api_gateway_resource.static.id
+  path_part   = "{proxy+}"
+}
+
+resource "aws_api_gateway_method" "static_get" {
+  rest_api_id   = aws_api_gateway_rest_api.this.id
+  resource_id   = aws_api_gateway_resource.static_proxy.id
+  http_method   = "GET"
+  authorization = "NONE"
+}
+
+resource "aws_api_gateway_integration" "static" {
+  rest_api_id             = aws_api_gateway_rest_api.this.id
+  resource_id             = aws_api_gateway_resource.static_proxy.id
+  http_method             = aws_api_gateway_method.static_get.http_method
+  type                    = "AWS_PROXY"
+  integration_http_method = "POST"
+  uri                     = local.admin_is_placeholder ? aws_lambda_function.api_placeholder.invoke_arn : aws_lambda_function.admin.invoke_arn
+}
+
 locals {
   # Resolve each endpoint to its resource id, regardless of parent.
   endpoint_resource_id = merge(
@@ -186,6 +217,10 @@ resource "aws_api_gateway_deployment" "this" {
       # Integration URIs change in place when an endpoint is retargeted from the
       # placeholder to a real Lambda; hash them so that forces a redeployment.
       [for k in sort(keys(local.api_endpoints)) : aws_api_gateway_integration.endpoint[k].uri],
+      # Static-asset route (admin CSS).
+      aws_api_gateway_resource.static_proxy.id,
+      aws_api_gateway_method.static_get.id,
+      aws_api_gateway_integration.static.uri,
     ]))
   }
 
@@ -196,6 +231,7 @@ resource "aws_api_gateway_deployment" "this" {
   depends_on = [
     aws_api_gateway_integration.join_sqs,
     aws_api_gateway_integration.endpoint,
+    aws_api_gateway_integration.static,
   ]
 }
 

@@ -19,7 +19,9 @@ wr-domain = { workspace = true }
 lambda_http = { workspace = true, features = ["apigw_rest"] }
 axum = { workspace = true, features = ["http1", "query", "form", "tokio"] }
 tower = { workspace = true }
-askama = { workspace = true, features = ["std", "derive"] }
+askama = { workspace = true, features = ["std", "derive", "config"] }
+rust-embed = { workspace = true }
+mime_guess = { workspace = true }
 aws-config = { workspace = true, features = ["behavior-version-latest"] }
 aws-sdk-dynamodb = { workspace = true, features = ["default-https-client", "rt-tokio"] }
 serde = { workspace = true, features = ["derive"] }
