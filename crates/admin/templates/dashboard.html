@@ -3,106 +3,167 @@
 {% block title %}Waiting Room Admin — {{ event_id }}{% endblock %}
 
 {% block content %}
-<h1>Virtual Waiting Room — {{ event_id }}</h1>
+<header class="top-nav">
+  <span class="brand">Virtual Waiting Room</span>
+  <span class="who">{{ operator_email }}</span>
+</header>
 
-<div class="card">
-  <h2>Current state</h2>
-  <dl class="kv"><dt>Phase</dt><dd><span class="phase" id="s-phase">{{ phase }}</span></dd></dl>
-  <dl class="kv"><dt>Serving position</dt><dd id="s-serving_counter">{{ serving_counter }}</dd></dl>
-  <dl class="kv"><dt>Queue counter</dt><dd id="s-queue_counter">{{ queue_counter }}</dd></dl>
-  <dl class="kv"><dt>Participant count</dt><dd id="s-participant_count">{{ participant_count }}</dd></dl>
-  <dl class="kv"><dt>Target rate</dt><dd id="s-target_rate">{{ target_rate }}</dd></dl>
-  <dl class="kv"><dt>Message</dt><dd id="s-message">{{ message }}</dd></dl>
-  <dl class="kv"><dt>Admission</dt><dd id="s-admission">{% if admission_paused %}PAUSED{% else %}admitting{% endif %}</dd></dl>
-  <dl class="kv"><dt>Last change</dt><dd>{{ last_action_line }}</dd></dl>
-</div>
+<main class="content">
+  <div class="page-header">
+    <h1>Event · {{ event_id }}</h1>
+    <p class="desc">Operator control plane. Actions take effect immediately.</p>
+  </div>
 
-<div class="card">
-  <h2>Emergency — andon cord</h2>
   {% if admission_paused %}
-  <p class="deferred">Admission is PAUSED — the queue keeps forming; no one is admitted.</p>
-  <form method="post" action="/admin/resume">
-    <button type="submit">Resume admission</button>
-  </form>
-  {% else %}
-  <form method="post" action="/admin/pause">
-    <button class="danger" type="submit">Pause admission</button>
-  </form>
+  <div class="banner" id="pause-banner">Admission is PAUSED — the queue keeps forming; no one is admitted.</div>
   {% endif %}
-</div>
 
-<div class="card">
-  <h2>Phase</h2>
-  <form method="post" action="/admin/phase">
-    <label for="phase">Transition to</label>
-    <select id="phase" name="phase">
-      <option value="idle">idle</option>
-      <option value="pre_queue">pre_queue</option>
-      <option value="active">active</option>
-      <option value="post_event">post_event</option>
-    </select>
-    <button type="submit">Set phase</button>
-  </form>
-</div>
+  <div class="grid">
+    <!-- Current state: KPI tiles + status + key-value pairs -->
+    <section class="container span-2">
+      <div class="container-header">
+        <h2>Current state</h2>
+        <p class="sub">Live — refreshes automatically.</p>
+      </div>
+      <div class="container-body">
+        <div class="kpis">
+          <div class="kpi"><div class="label">Serving position</div><div class="value" id="s-serving_counter">{{ serving_counter }}</div></div>
+          <div class="kpi"><div class="label">Queue counter</div><div class="value" id="s-queue_counter">{{ queue_counter }}</div></div>
+          <div class="kpi"><div class="label">Participants</div><div class="value" id="s-participant_count">{{ participant_count }}</div></div>
+          <div class="kpi"><div class="label">Target rate /s</div><div class="value" id="s-target_rate">{{ target_rate }}</div></div>
+        </div>
+        <hr style="border:none;border-top:var(--border-width-field) solid var(--color-border-divider-secondary);margin:var(--space-scaled-m) 0;">
+        <dl class="kv-pairs">
+          <div>
+            <dt class="kv-key">Phase</dt>
+            <dd class="kv-val"><span class="status status-{{ phase }}" id="s-phase-badge">{{ phase }}</span></dd>
+          </div>
+          <div>
+            <dt class="kv-key">Admission</dt>
+            <dd class="kv-val" id="s-admission-badge">{% if admission_paused %}<span class="status status-error">paused</span>{% else %}<span class="status status-success">admitting</span>{% endif %}</dd>
+          </div>
+          <div>
+            <dt class="kv-key">Broadcast message</dt>
+            <dd class="kv-val" id="s-message">{{ message }}</dd>
+          </div>
+        </dl>
+        <p class="audit-line">Last change: {{ last_action_line }}</p>
+      </div>
+    </section>
 
-<div class="card">
-  <h2>Admission rate</h2>
-  <form method="post" action="/admin/rate">
-    <label for="rate">Target rate (per second)</label>
-    <input id="rate" name="rate" type="number" min="1" required>
-    <button type="submit">Set rate</button>
-  </form>
-</div>
+    <!-- Emergency / andon cord -->
+    <section class="container emphasis">
+      <div class="container-header">
+        <h2>Emergency</h2>
+        <p class="sub">Andon cord — pull to stop the line.</p>
+      </div>
+      <div class="container-body">
+        {% if admission_paused %}
+        <p class="deferred">Admission is paused.</p>
+        <form method="post" action="/admin/resume">
+          <button class="normal big" type="submit">Resume admission</button>
+        </form>
+        {% else %}
+        <form method="post" action="/admin/pause">
+          <button class="danger big" type="submit">Pause admission</button>
+        </form>
+        <p class="help" style="margin-top:var(--space-scaled-s);color:var(--color-text-body-secondary);">Holds new admissions; the queue and positions are preserved.</p>
+        {% endif %}
+        <hr style="border:none;border-top:var(--border-width-field) solid var(--color-border-divider-secondary);margin:var(--space-scaled-m) 0;">
+        <form method="post" action="/admin/reset" data-confirm="Force maintenance mode? This halts the event for everyone.">
+          <button class="danger" type="submit">Force maintenance</button>
+        </form>
+      </div>
+    </section>
 
-<div class="card">
-  <h2>Broadcast message</h2>
-  <form method="post" action="/admin/message">
-    <label for="message">Message</label>
-    <input id="message" name="message" type="text">
-    <button type="submit">Set message</button>
-  </form>
-</div>
+    <!-- Phase control -->
+    <section class="container">
+      <div class="container-header"><h2>Phase</h2></div>
+      <div class="container-body">
+        <form method="post" action="/admin/phase">
+          <div class="form-field">
+            <label for="phase">Transition to</label>
+            <select id="phase" name="phase">
+              <option value="idle">idle</option>
+              <option value="pre_queue">pre_queue</option>
+              <option value="active">active</option>
+              <option value="post_event">post_event</option>
+            </select>
+          </div>
+          <button type="submit">Set phase</button>
+        </form>
+      </div>
+    </section>
 
-<div class="card">
-  <h2>Maintenance</h2>
-  <form method="post" action="/admin/reset" data-confirm="Force maintenance mode? This halts the event for everyone.">
-    <button class="danger" type="submit">Force maintenance mode</button>
-  </form>
-</div>
+    <!-- Admission rate -->
+    <section class="container">
+      <div class="container-header"><h2>Admission rate</h2></div>
+      <div class="container-body">
+        <form method="post" action="/admin/rate">
+          <div class="form-field">
+            <label for="rate">Target rate (visitors per second)</label>
+            <input id="rate" name="rate" type="number" min="1" required>
+            <span class="help">Positive integer, up to the deployment ceiling.</span>
+          </div>
+          <button type="submit">Set rate</button>
+        </form>
+      </div>
+    </section>
 
-<div class="card">
-  <h2>Protection rules · sessions</h2>
-  <p class="deferred">Not yet available — the authorizer and session plane ship after the MVP.</p>
-</div>
+    <!-- Broadcast message -->
+    <section class="container">
+      <div class="container-header"><h2>Broadcast message</h2></div>
+      <div class="container-body">
+        <form method="post" action="/admin/message">
+          <div class="form-field">
+            <label for="message">Message shown to waiting visitors</label>
+            <input id="message" name="message" type="text">
+            <span class="help">Leave empty to clear.</span>
+          </div>
+          <button type="submit">Set message</button>
+        </form>
+      </div>
+    </section>
 
-{# Progressive enhancement: poll /admin/state and patch the current-state values
-   in place. The operator actions above are plain form POSTs and work with this
-   script disabled; only the live refresh needs JS. The nonce is per-response and
-   matches the script-src nonce in the Content-Security-Policy header. #}
+    <!-- Deferred plane -->
+    <section class="container">
+      <div class="container-header"><h2>Protection rules · sessions</h2></div>
+      <div class="container-body">
+        <p class="deferred">Not yet available — the authorizer and session plane ship after the MVP.</p>
+      </div>
+    </section>
+  </div>
+</main>
+
+{# Progressive enhancement: confirm guard on destructive forms + live-stats
+   poller. Operator actions are plain form POSTs that work with this disabled;
+   only the confirm and the live refresh need JS. Nonce matches the CSP. #}
 <script nonce="{{ csp_nonce }}">
   (function () {
-    // Confirmation guard on destructive actions (ADR-0017 §5). Progressive
-    // enhancement: with JS off the forms still submit — the guard is a
-    // stressed-mis-click safeguard, not an auth gate.
     document.querySelectorAll("form[data-confirm]").forEach(function (f) {
       f.addEventListener("submit", function (e) {
         if (!window.confirm(f.getAttribute("data-confirm"))) { e.preventDefault(); }
       });
     });
-    // Live-stats poller.
-    var fields = ["phase", "serving_counter", "queue_counter", "participant_count", "target_rate", "message"];
+    var nums = ["serving_counter", "queue_counter", "participant_count", "target_rate", "message"];
     function refresh() {
       fetch("/admin/state", { headers: { "Accept": "application/json" }, credentials: "same-origin" })
         .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
         .then(function (s) {
-          fields.forEach(function (f) {
+          nums.forEach(function (f) {
             var el = document.getElementById("s-" + f);
             if (el && s[f] !== undefined && s[f] !== null) { el.textContent = String(s[f]); }
           });
-          var adm = document.getElementById("s-admission");
-          if (adm && s.admission_paused !== undefined) { adm.textContent = s.admission_paused ? "PAUSED" : "admitting"; }
+          var pb = document.getElementById("s-phase-badge");
+          if (pb && s.phase) { pb.textContent = s.phase; pb.className = "status status-" + s.phase; }
+          var ab = document.getElementById("s-admission-badge");
+          if (ab && s.admission_paused !== undefined) {
+            ab.innerHTML = s.admission_paused
+              ? '<span class="status status-error">paused</span>'
+              : '<span class="status status-success">admitting</span>';
+          }
         })
-        .catch(function () { /* transient; try again next tick */ });
+        .catch(function () { /* transient; retry next tick */ });
     }
     setInterval(refresh, 2000);
   })();
