@@ -118,6 +118,7 @@ async fn main() -> Result<(), Error> {
 
     let app = Router::new()
         .route("/admin", get(dashboard))
+        .route("/admin/state", get(state_json))
         .route("/admin/login", get(login))
         .route("/admin/callback", get(callback))
         .route("/admin/logout", get(logout))
@@ -128,7 +129,12 @@ async fn main() -> Result<(), Error> {
         .route("/admin/rules", post(deferred))
         .route("/update_session", post(deferred))
         .route("/static/{*path}", get(static_asset))
-        .with_state(state);
+        .with_state(state)
+        // Security-headers middleware: apply the hardening + no-cache headers to
+        // every response. The dashboard handler sets its own nonce'd CSP first;
+        // apply_hardening leaves an existing CSP intact, so this adds the policy
+        // only where a handler did not (everything but the dashboard).
+        .layer(axum::middleware::map_response(harden_response));
 
     // Trim a trailing slash before routing so /admin/ resolves to the /admin
     // route (and /admin/phase/ to /admin/phase, etc.) — the same handler, not a
@@ -137,6 +143,14 @@ async fn main() -> Result<(), Error> {
     let app = tower_http::normalize_path::NormalizePathLayer::trim_trailing_slash().layer(app);
 
     lambda_http::run(app).await
+}
+
+/// Response middleware: stamp the hardening + no-cache headers on every response
+/// (empty nonce — a handler that needs an inline script sets its own nonce'd CSP,
+/// which `apply_hardening` preserves).
+async fn harden_response(mut response: Response) -> Response {
+    admin::security::apply_hardening(response.headers_mut(), "");
+    response
 }
 
 // --- Auth helpers -------------------------------------------------------------
@@ -329,10 +343,30 @@ async fn dashboard(State(state): State<Shared>, headers: HeaderMap) -> Response 
         return Redirect::to("/admin/login").into_response();
     }
     match state.store_load().await {
-        Ok(Some(view)) => match view.render() {
-            Ok(html) => Html(html).into_response(),
-            Err(e) => server_error(&format!("render: {e}")),
-        },
+        Ok(Some(mut view)) => {
+            view.csp_nonce = admin::security::nonce();
+            match view.render() {
+                Ok(html) => {
+                    let mut response = Html(html).into_response();
+                    admin::security::apply_hardening(response.headers_mut(), &view.csp_nonce);
+                    response
+                }
+                Err(e) => server_error(&format!("render: {e}")),
+            }
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, "event not found").into_response(),
+        Err(e) => server_error(&e),
+    }
+}
+
+/// Current control state as JSON for the dashboard's poller. Session-gated like
+/// the dashboard; returns the same view the HTML renders.
+async fn state_json(State(state): State<Shared>, headers: HeaderMap) -> Response {
+    if authed(&state, &headers).await.is_none() {
+        return (StatusCode::UNAUTHORIZED, "not authenticated").into_response();
+    }
+    match state.store_load().await {
+        Ok(Some(view)) => axum::Json(view).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, "event not found").into_response(),
         Err(e) => server_error(&e),
     }
