@@ -73,33 +73,27 @@ locals {
     generate_token = { parent = "v1", path_part = "generate_token", method = "POST", auth = "NONE" }
 
     # Admin control plane, unversioned. Auth is NONE at API Gateway because the
-    # admin Lambda enforces access via an OIDC login session (ADR-0016); the
-    # login/callback/logout routes run the flow, the rest are session-gated.
+    # admin Lambda enforces access via an OIDC login session (ADR-0016).
+    #
+    # /admin (the dashboard GET) is explicit because a {proxy+} resource does not
+    # match the bare parent path. Every /admin/* action (login, callback, logout,
+    # phase, rate, message, reset, rules, metrics) is served by the
+    # /admin/{proxy+} greedy resource below → the same admin Lambda, whose axum
+    # router does the real routing. /metrics and /update_session are top-level
+    # paths (outside /admin/*) that also front the admin Lambda.
     admin          = { parent = "root", path_part = "admin", method = "GET", auth = "NONE" }
     metrics        = { parent = "root", path_part = "metrics", method = "GET", auth = "NONE" }
     update_session = { parent = "root", path_part = "update_session", method = "POST", auth = "NONE" }
-    admin_login    = { parent = "admin", path_part = "login", method = "GET", auth = "NONE" }
-    admin_callback = { parent = "admin", path_part = "callback", method = "GET", auth = "NONE" }
-    admin_logout   = { parent = "admin", path_part = "logout", method = "GET", auth = "NONE" }
-    admin_phase    = { parent = "admin", path_part = "phase", method = "POST", auth = "NONE" }
-    admin_rate     = { parent = "admin", path_part = "rate", method = "POST", auth = "NONE" }
-    admin_message  = { parent = "admin", path_part = "message", method = "POST", auth = "NONE" }
-    admin_reset    = { parent = "admin", path_part = "reset", method = "POST", auth = "NONE" }
-    admin_rules    = { parent = "admin", path_part = "rules", method = "POST", auth = "NONE" }
-    admin_metrics  = { parent = "admin", path_part = "metrics", method = "GET", auth = "NONE" }
   }
 
   # Split by parent so each container resource is created before its children.
-  v1_endpoints    = { for k, v in local.api_endpoints : k => v if v.parent == "v1" }
-  root_endpoints  = { for k, v in local.api_endpoints : k => v if v.parent == "root" }
-  admin_endpoints = { for k, v in local.api_endpoints : k => v if v.parent == "admin" }
+  v1_endpoints   = { for k, v in local.api_endpoints : k => v if v.parent == "v1" }
+  root_endpoints = { for k, v in local.api_endpoints : k => v if v.parent == "root" }
 
-  # Admin endpoints route to the admin Lambda regardless of auth type. Includes
-  # the root-level admin surface (/admin, /metrics, /update_session) plus every
-  # /admin/* child.
+  # Endpoints that front the admin Lambda (all top-level here; the /admin/*
+  # children are handled by the greedy proxy, not this map).
   is_admin_endpoint = {
-    for k, v in local.api_endpoints : k =>
-    v.parent == "admin" || contains(["admin", "metrics", "update_session"], k)
+    for k, v in local.api_endpoints : k => contains(["admin", "metrics", "update_session"], k)
   }
 }
 
@@ -121,12 +115,31 @@ resource "aws_api_gateway_resource" "root" {
   path_part   = each.value.path_part
 }
 
-resource "aws_api_gateway_resource" "admin_child" {
-  for_each = local.admin_endpoints
-
+# Every /admin/* action (login, callback, logout, phase, rate, message, reset,
+# rules, metrics) is a greedy proxy to the admin Lambda; its axum router does the
+# routing. ANY covers the GET login flow and the POST actions in one resource.
+# The bare /admin path is the explicit "admin" endpoint above ({proxy+} does not
+# match the parent). Auth is NONE — the Lambda enforces the OIDC session.
+resource "aws_api_gateway_resource" "admin_proxy" {
   rest_api_id = aws_api_gateway_rest_api.this.id
   parent_id   = aws_api_gateway_resource.root["admin"].id
-  path_part   = each.value.path_part
+  path_part   = "{proxy+}"
+}
+
+resource "aws_api_gateway_method" "admin_proxy" {
+  rest_api_id   = aws_api_gateway_rest_api.this.id
+  resource_id   = aws_api_gateway_resource.admin_proxy.id
+  http_method   = "ANY"
+  authorization = "NONE"
+}
+
+resource "aws_api_gateway_integration" "admin_proxy" {
+  rest_api_id             = aws_api_gateway_rest_api.this.id
+  resource_id             = aws_api_gateway_resource.admin_proxy.id
+  http_method             = aws_api_gateway_method.admin_proxy.http_method
+  type                    = "AWS_PROXY"
+  integration_http_method = "POST"
+  uri                     = local.admin_is_placeholder ? aws_lambda_function.api_placeholder.invoke_arn : aws_lambda_function.admin.invoke_arn
 }
 
 # Static assets (CSS) for the admin UI, served by the admin Lambda from its
@@ -165,7 +178,6 @@ locals {
   endpoint_resource_id = merge(
     { for k, v in local.v1_endpoints : k => aws_api_gateway_resource.v1_child[k].id },
     { for k, v in local.root_endpoints : k => aws_api_gateway_resource.root[k].id },
-    { for k, v in local.admin_endpoints : k => aws_api_gateway_resource.admin_child[k].id },
   )
 }
 
@@ -235,6 +247,10 @@ resource "aws_api_gateway_deployment" "this" {
       aws_api_gateway_resource.static_proxy.id,
       aws_api_gateway_method.static_get.id,
       aws_api_gateway_integration.static.uri,
+      # Admin greedy proxy (/admin/*).
+      aws_api_gateway_resource.admin_proxy.id,
+      aws_api_gateway_method.admin_proxy.id,
+      aws_api_gateway_integration.admin_proxy.uri,
     ]))
   }
 
@@ -246,6 +262,7 @@ resource "aws_api_gateway_deployment" "this" {
     aws_api_gateway_integration.join_sqs,
     aws_api_gateway_integration.endpoint,
     aws_api_gateway_integration.static,
+    aws_api_gateway_integration.admin_proxy,
   ]
 }
 
