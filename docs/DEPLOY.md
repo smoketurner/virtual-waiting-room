@@ -55,6 +55,13 @@ placeholder never consumes the queue.
   (Lambda, DynamoDB, SQS, API Gateway, IAM, EventBridge Scheduler). Sign in
   with `aws sso login` or `aws configure`; the CLI picks the credentials up
   from the environment.
+- **Remote state backend (one-time).** State lives in S3. The bucket name
+  embeds the AWS account id, so it is supplied at init rather than committed.
+  Pass it via `STATE_BUCKET` on the first `make` invocation (Terraform caches
+  it in `.terraform/` after that):
+  ```bash
+  make init STATE_BUCKET=terraform-state-<account>-<region>-<suffix>
+  ```
 
 ## Make targets
 
