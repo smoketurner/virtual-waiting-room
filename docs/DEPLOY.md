@@ -104,23 +104,11 @@ make apply EVENT_ID=launch SEAL_START=2026-09-10T18:00:00
 `make apply` prints the stack outputs, including the API invoke URL and the
 table names. To exercise the deployed stack end to end — register, seal, and
 verify no two visitors get the same position — run the smoke test. It reads the
-API URL, table names, seal function, and event id from `terraform output`, so
-against an already-applied stack it needs nothing but credentials:
+API URL, table names, seal function, and event id from `terraform output` and
+never touches Terraform state, so it needs nothing but credentials:
 
 ```bash
 AWS_PROFILE=dev-admin ./scripts/smoke-test.sh
-```
-
-To deploy first and then test in one shot, set `DEPLOY=1` and point at the
-built zips:
-
-```bash
-DEPLOY=1 \
-ASSIGN_ARTIFACT=$PWD/.artifacts/assign_position/bootstrap.zip \
-SEAL_ARTIFACT=$PWD/.artifacts/seal_event/bootstrap.zip \
-READ_ARTIFACT=$PWD/.artifacts/read/bootstrap.zip \
-LAMBDA_ARCH=x86_64 \
-./scripts/smoke-test.sh
 ```
 
 ## Tear down

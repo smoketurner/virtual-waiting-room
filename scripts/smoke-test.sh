@@ -11,17 +11,11 @@
 #     rights to read/write the stack's DynamoDB tables and invoke its Lambdas.
 #   - terraform, aws, curl, python3 on PATH.
 #   - The stack already deployed (make apply). The script reads the API URL,
-#     table names, seal function, and event id from `terraform output`.
+#     table names, seal function, and event id from `terraform output` and never
+#     touches Terraform state — deploy with `make apply` first.
 #
-# Usage (against an already-deployed stack):
+# Usage:
 #   AWS_PROFILE=dev-admin ./scripts/smoke-test.sh
-#
-# To deploy first, then test, set DEPLOY=1 and point at the built zips:
-#   DEPLOY=1 \
-#   ASSIGN_ARTIFACT=$PWD/.artifacts/assign_position/bootstrap.zip \
-#   SEAL_ARTIFACT=$PWD/.artifacts/seal_event/bootstrap.zip \
-#   READ_ARTIFACT=$PWD/.artifacts/read/bootstrap.zip \
-#   LAMBDA_ARCH=x86_64 EVENT_ID=smoke ./scripts/smoke-test.sh
 set -euo pipefail
 
 ENV_DIR="$(cd "$(dirname "$0")/../infra/environments/dev" && pwd)"
@@ -45,23 +39,9 @@ print(f"{h[0:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}")
 PY
 }
 
+say "1. Read the deployed stack from terraform outputs"
 cd "$ENV_DIR"
 terraform init -input=false >/dev/null
-
-# Optional self-deploy. Default is to test the already-applied stack; set
-# DEPLOY=1 to apply first (needs the built zip paths and arch).
-if [ "${DEPLOY:-0}" = "1" ]; then
-  EVENT_ID="${EVENT_ID:-smoke-$(date +%s)}"
-  say "1. Deploy the dev stack (event_id=$EVENT_ID, arch=${LAMBDA_ARCH:-x86_64})"
-  terraform apply -input=false -auto-approve \
-    -var "event_id=$EVENT_ID" \
-    -var "lambda_architecture=${LAMBDA_ARCH:-x86_64}" \
-    -var "assign_position_artifact_path=$ASSIGN_ARTIFACT" \
-    -var "seal_event_artifact_path=$SEAL_ARTIFACT" \
-    -var "read_artifact_path=$READ_ARTIFACT"
-fi
-
-say "1. Read the deployed stack from terraform outputs"
 API_URL="$(terraform output -raw api_invoke_url)"
 EVENT_ID="$(terraform output -raw event_id)"
 COUNTERS="$(terraform output -json table_names | python3 -c 'import sys,json;print(json.load(sys.stdin)["counters"])')"
