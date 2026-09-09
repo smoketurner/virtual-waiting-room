@@ -91,6 +91,65 @@ resource "aws_lambda_permission" "read_apigw" {
   source_arn    = "${aws_api_gateway_rest_api.this.execution_arn}/*/*"
 }
 
+# --- admin (SigV4 control plane) ----------------------------------------------
+
+resource "aws_iam_role" "admin" {
+  name               = "${local.admin_name}-role"
+  assume_role_policy = data.aws_iam_policy_document.lambda_assume_role.json
+  tags               = var.tags
+}
+
+resource "aws_iam_role_policy" "admin" {
+  name   = "${local.admin_name}-policy"
+  role   = aws_iam_role.admin.id
+  policy = data.aws_iam_policy_document.admin.json
+}
+
+resource "aws_lambda_function" "admin" {
+  function_name = local.admin_name
+  role          = aws_iam_role.admin.arn
+  runtime       = "provided.al2023"
+  architectures = [local.lambda_runtime_arch]
+  handler       = "bootstrap"
+  timeout       = 10
+  memory_size   = 256
+
+  filename         = local.admin_zip
+  source_code_hash = local.admin_hash
+
+  environment {
+    variables = {
+      COUNTERS_TABLE = aws_dynamodb_table.counters.name
+      TOKENS_TABLE   = aws_dynamodb_table.tokens.name
+      EVENT_ID       = var.event_id
+      # API Gateway prefixes the path with the stage (e.g. /dev/admin); this
+      # makes the Rust runtime strip it so the Axum routes match unprefixed.
+      AWS_LAMBDA_HTTP_IGNORE_STAGE_IN_PATH = "true"
+      # OIDC admin login (ADR-0016). The client secret is read from the SSM
+      # SecureString named here; the rest are non-secret config.
+      OIDC_ISSUER              = var.oidc_issuer
+      OIDC_CLIENT_ID           = var.oidc_client_id
+      OIDC_REDIRECT_URI        = var.oidc_redirect_uri
+      OIDC_CLIENT_SECRET_PARAM = aws_ssm_parameter.oidc_client_secret.name
+      # Comma-separated allowlist of operator emails permitted to log in. Empty
+      # = deny all (the admin Lambda fails closed).
+      OIDC_ALLOWED_EMAILS = var.oidc_allowed_emails
+    }
+  }
+
+  tags = var.tags
+}
+
+# API Gateway invokes the admin Lambda for the SigV4 /admin, /metrics, and
+# /update_session routes.
+resource "aws_lambda_permission" "admin_apigw" {
+  statement_id  = "AllowAPIGatewayInvokeAdmin"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.admin.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_api_gateway_rest_api.this.execution_arn}/*/*"
+}
+
 # --- seal schedule (EventBridge Scheduler) ------------------------------------
 # One-time trigger at the event start. Disabled by default (no start time set);
 # the operator sets seal_start_time and flips it on ahead of the event. The

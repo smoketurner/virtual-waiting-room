@@ -62,6 +62,12 @@ variable "read_artifact_path" {
   default     = ""
 }
 
+variable "admin_artifact_path" {
+  description = "Path to the built admin bootstrap binary."
+  type        = string
+  default     = ""
+}
+
 variable "lambda_architecture" {
   description = "Lambda CPU architecture for every function: arm64 or x86_64. Must match the built artifacts."
   type        = string
@@ -76,6 +82,32 @@ variable "event_id" {
 
 variable "seal_start_time" {
   description = "One-time UTC seal time as an EventBridge at() value, e.g. \"2026-09-10T18:00:00\". Empty = seal invoked manually."
+  type        = string
+  default     = ""
+}
+
+# --- Admin OIDC login (ADR-0016) ----------------------------------------------
+
+variable "oidc_issuer" {
+  description = "OIDC issuer / discovery base URL for admin login (Vouch by default)."
+  type        = string
+  default     = "https://us.vouch.sh"
+}
+
+variable "oidc_client_id" {
+  description = "OAuth2 client id for the admin OIDC application. Empty until registered with the provider."
+  type        = string
+  default     = ""
+}
+
+variable "oidc_redirect_uri" {
+  description = "OIDC callback URL registered with the provider — the CloudFront URL of /admin/callback."
+  type        = string
+  default     = ""
+}
+
+variable "oidc_allowed_emails" {
+  description = "Comma-separated allowlist of operator emails permitted admin access. Empty = deny all (fail closed)."
   type        = string
   default     = ""
 }

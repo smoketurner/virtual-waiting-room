@@ -65,6 +65,12 @@ variable "read_artifact_path" {
   default     = ""
 }
 
+variable "admin_artifact_path" {
+  description = "Path to the admin Lambda bootstrap zip (SigV4 /admin control plane). Empty = vendored placeholder."
+  type        = string
+  default     = ""
+}
+
 variable "lambda_architecture" {
   description = "Lambda CPU architecture for every function: arm64 (design default) or x86_64. Must match the built artifacts."
   type        = string
@@ -84,6 +90,34 @@ variable "event_id" {
 
 variable "seal_start_time" {
   description = "One-time UTC start time for the seal, as an EventBridge at() value without the 'at(' wrapper, e.g. \"2026-09-10T18:00:00\". Empty = no schedule created (seal invoked manually)."
+  type        = string
+  default     = ""
+}
+
+# --- Admin OIDC login (ADR-0016) ----------------------------------------------
+# The client secret is NOT a variable — it is an SSM SecureString written out of
+# band. These are the non-secret OIDC config the admin Lambda needs.
+
+variable "oidc_issuer" {
+  description = "OIDC issuer / discovery base URL for admin login (ADR-0016), e.g. https://us.vouch.sh."
+  type        = string
+  default     = "https://us.vouch.sh"
+}
+
+variable "oidc_client_id" {
+  description = "OAuth2 client id for the admin OIDC application. Empty in dev until an application is registered with the provider."
+  type        = string
+  default     = ""
+}
+
+variable "oidc_redirect_uri" {
+  description = "OIDC callback URL registered with the provider — the CloudFront (or API) URL of /admin/callback, e.g. https://d123.cloudfront.net/admin/callback."
+  type        = string
+  default     = ""
+}
+
+variable "oidc_allowed_emails" {
+  description = "Comma-separated allowlist of operator emails permitted to hold an admin session. Empty = deny all (the admin Lambda fails closed)."
   type        = string
   default     = ""
 }

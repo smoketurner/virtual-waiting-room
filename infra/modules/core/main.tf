@@ -152,6 +152,23 @@ resource "aws_ssm_parameter" "signing_key" {
   tags = var.tags
 }
 
+# OIDC client secret for the admin login flow (ADR-0016). Same pattern as the
+# signing key: an encrypted SecureString created with a placeholder, whose value
+# is written OUT OF BAND (never in the repo or state). The admin Lambda reads it
+# by name (ssm:GetParameter with decryption) at Init.
+resource "aws_ssm_parameter" "oidc_client_secret" {
+  name        = "/${var.name_prefix}/oidc-client-secret"
+  description = "Virtual Waiting Room admin OIDC client secret (read by the admin Lambda)."
+  type        = "SecureString"
+  value       = "PLACEHOLDER-overwrite-out-of-band" # nosemgrep: not a real secret
+
+  lifecycle {
+    ignore_changes = [value]
+  }
+
+  tags = var.tags
+}
+
 # --- SQS (ingest buffer, DESIGN §6, §11) --------------------------------------
 # One join queue + DLQ per deployment. maxReceiveCount 5 -> DLQ. Visibility
 # timeout follows the design formula: 6 x function_timeout + batching window.

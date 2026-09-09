@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+
+{% block title %}Waiting Room Admin — {{ event_id }}{% endblock %}
+
+{% block content %}
+<h1>Virtual Waiting Room — {{ event_id }}</h1>
+
+<div class="card">
+  <h2>Current state</h2>
+  <dl class="kv"><dt>Phase</dt><dd><span class="phase">{{ phase }}</span></dd></dl>
+  <dl class="kv"><dt>Serving position</dt><dd>{{ serving_counter }}</dd></dl>
+  <dl class="kv"><dt>Queue counter</dt><dd>{{ queue_counter }}</dd></dl>
+  <dl class="kv"><dt>Participant count</dt><dd>{{ participant_count }}</dd></dl>
+  <dl class="kv"><dt>Target rate</dt><dd>{{ target_rate }}</dd></dl>
+  <dl class="kv"><dt>Message</dt><dd>{{ message }}</dd></dl>
+</div>
+
+<div class="card">
+  <h2>Phase</h2>
+  <form method="post" action="/admin/phase">
+    <label for="phase">Transition to</label>
+    <select id="phase" name="phase">
+      <option value="idle">idle</option>
+      <option value="pre_queue">pre_queue</option>
+      <option value="active">active</option>
+      <option value="post_event">post_event</option>
+    </select>
+    <button type="submit">Set phase</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>Admission rate</h2>
+  <form method="post" action="/admin/rate">
+    <label for="rate">Target rate (per second)</label>
+    <input id="rate" name="rate" type="number" min="1" required>
+    <button type="submit">Set rate</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>Broadcast message</h2>
+  <form method="post" action="/admin/message">
+    <label for="message">Message</label>
+    <input id="message" name="message" type="text">
+    <button type="submit">Set message</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>Maintenance</h2>
+  <form method="post" action="/admin/reset">
+    <button class="danger" type="submit">Force maintenance mode</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>Protection rules · sessions</h2>
+  <p class="deferred">Not yet available — the authorizer and session plane ship after the MVP.</p>
+</div>
+{% endblock %}

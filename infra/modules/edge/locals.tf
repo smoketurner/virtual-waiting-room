@@ -20,6 +20,17 @@ locals {
   # Uncached write behaviour path patterns: ingest and token minting.
   write_paths = ["/v1/join", "/v1/generate_token"]
 
+  # Admin control plane (ADR-0016): the operator dashboard + OIDC login, plus its
+  # static assets. Served by the admin Lambda; uncached, all methods, forward
+  # everything to the origin. Auth is the admin Lambda's OIDC session, not the edge.
+  admin_paths = ["/admin", "/admin/*", "/static/*"]
+
+  # AWS-managed origin request policy "AllViewerExceptHostHeader" — forwards
+  # query string, cookies, and viewer headers except Host (API Gateway rejects a
+  # forwarded CloudFront Host). Required so the session cookie + OIDC callback
+  # query reach the admin Lambda.
+  all_viewer_except_host_policy_id = "b689b0a8-53d0-40ab-baf2-68738e2966ac"
+
   # Polled default TTL tracks the min TTL: /status carries phase and serving
   # position, so it must stay fresh. Not a separate knob - min TTL is the one
   # load-bearing value (ADR-0013).
