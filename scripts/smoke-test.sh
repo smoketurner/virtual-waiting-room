@@ -10,18 +10,17 @@
 #   - AWS credentials in the environment (aws sso login / aws configure), with
 #     rights to deploy the stack and read/write its DynamoDB tables and Lambdas.
 #   - terraform, aws, curl, python3 on PATH.
-#   - The three Lambda bootstrap binaries built (see BUILD below) and their
-#     paths exported (ASSIGN_ARTIFACT / SEAL_ARTIFACT / READ_ARTIFACT).
+#   - The three Lambda zips built (see BUILD below) and their paths exported
+#     (ASSIGN_ARTIFACT / SEAL_ARTIFACT / READ_ARTIFACT).
 #
-# BUILD (from crates/):
-#   cargo lambda build --release -p assign_position -p seal_event -p read
-#   # then copy each target/lambda/bootstrap/bootstrap out per crate, since all
-#   # three bins are named 'bootstrap' (see the staging loop in Stage 4).
+# BUILD (from the repo root):
+#   make build            # cargo lambda build --output-format zip, per function
+#   # produces .artifacts/<crate>/bootstrap.zip for each of the three functions.
 #
 # Usage:
-#   ASSIGN_ARTIFACT=/abs/assign_position-bootstrap \
-#   SEAL_ARTIFACT=/abs/seal_event-bootstrap \
-#   READ_ARTIFACT=/abs/read-bootstrap \
+#   ASSIGN_ARTIFACT=/abs/.artifacts/assign_position/bootstrap.zip \
+#   SEAL_ARTIFACT=/abs/.artifacts/seal_event/bootstrap.zip \
+#   READ_ARTIFACT=/abs/.artifacts/read/bootstrap.zip \
 #   ./scripts/smoke-test.sh
 set -euo pipefail
 

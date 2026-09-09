@@ -19,21 +19,19 @@ locals {
   warm_throughput_enabled = var.warm_throughput_write_units > 0 || var.warm_throughput_read_units > 0
 
   # Per-function artifact resolution. An empty path falls back to the vendored
-  # placeholder zip; a real path is zipped by its own archive_file. The join
-  # event-source mapping is enabled only when assign_position is real.
+  # placeholder zip; a real path is a cargo-lambda zip referenced directly. The
+  # join event-source mapping is enabled only when assign_position is real.
   assign_position_is_placeholder = var.assign_position_artifact_path == ""
   seal_event_is_placeholder      = var.seal_event_artifact_path == ""
   read_is_placeholder            = var.read_artifact_path == ""
 
-  assign_position_zip = local.assign_position_is_placeholder ? data.archive_file.placeholder[0].output_path : data.archive_file.assign_position[0].output_path
-  seal_event_zip      = local.seal_event_is_placeholder ? data.archive_file.placeholder[0].output_path : data.archive_file.seal_event[0].output_path
-  read_zip            = local.read_is_placeholder ? data.archive_file.placeholder[0].output_path : data.archive_file.read[0].output_path
+  assign_position_zip = local.assign_position_is_placeholder ? data.archive_file.placeholder[0].output_path : var.assign_position_artifact_path
+  seal_event_zip      = local.seal_event_is_placeholder ? data.archive_file.placeholder[0].output_path : var.seal_event_artifact_path
+  read_zip            = local.read_is_placeholder ? data.archive_file.placeholder[0].output_path : var.read_artifact_path
 
-  assign_position_hash = local.assign_position_is_placeholder ? data.archive_file.placeholder[0].output_base64sha256 : data.archive_file.assign_position[0].output_base64sha256
-  seal_event_hash      = local.seal_event_is_placeholder ? data.archive_file.placeholder[0].output_base64sha256 : data.archive_file.seal_event[0].output_base64sha256
-  read_hash            = local.read_is_placeholder ? data.archive_file.placeholder[0].output_base64sha256 : data.archive_file.read[0].output_base64sha256
+  assign_position_hash = local.assign_position_is_placeholder ? data.archive_file.placeholder[0].output_base64sha256 : filebase64sha256(var.assign_position_artifact_path)
+  seal_event_hash      = local.seal_event_is_placeholder ? data.archive_file.placeholder[0].output_base64sha256 : filebase64sha256(var.seal_event_artifact_path)
+  read_hash            = local.read_is_placeholder ? data.archive_file.placeholder[0].output_base64sha256 : filebase64sha256(var.read_artifact_path)
 
-  # The placeholder zip is always built: the token/admin API endpoints in api.tf
-  # are still fronted by it until those crates land.
   lambda_runtime_arch = var.lambda_architecture
 }

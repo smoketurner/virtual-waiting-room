@@ -9,28 +9,27 @@ and a first-deploy walkthrough.
 
 The three Rust functions (`assign_position`, `seal_event`, `read`) are
 **`provided.al2023` custom-runtime** Lambdas — plain zipped binaries, not
-container images. There are no Dockerfiles by design. Three distinct steps take
+container images. There are no Dockerfiles by design. Two distinct steps take
 source to a running function:
 
-1. **Build** — `cargo lambda build --release` cross-compiles each crate to a
-   static Linux binary named `bootstrap`. This runs *outside* Terraform (via
-   `make build`), so a plan stays hermetic — it never triggers a compile. The
-   cross-link uses `zig`; no Docker is involved.
+1. **Build + package** — `cargo lambda build --release --output-format zip`
+   cross-compiles each crate to a static Linux binary named `bootstrap` and
+   packages it into a ready-to-deploy zip, one per function at
+   `.artifacts/<crate>/bootstrap.zip` (`make build`). cargo-lambda namespaces
+   each function into its own directory, so the shared `bootstrap` name never
+   collides. This runs *outside* Terraform, so a plan stays hermetic — it never
+   triggers a compile. The cross-link uses `zig`; no Docker is involved.
 
-2. **Package** — Terraform's `archive_file` data sources (in
-   `infra/modules/core/data.tf`) zip each `bootstrap` into
-   `infra/modules/core/.artifacts/<fn>.zip` at plan time. Pure Terraform, no
-   build side effects.
-
-3. **Deploy** — each `aws_lambda_function` uploads its zip with
-   `runtime = "provided.al2023"`, `handler = "bootstrap"`,
-   `architectures = [var.lambda_architecture]`, and `source_code_hash` set to
-   the zip's SHA-256 so a rebuilt binary redeploys automatically.
+2. **Deploy** — each `aws_lambda_function` uploads its zip directly (`filename`
+   points at the cargo-lambda zip) with `runtime = "provided.al2023"`,
+   `handler = "bootstrap"`, `architectures = [var.lambda_architecture]`, and
+   `source_code_hash = filebase64sha256(<zip>)` so a rebuilt zip redeploys
+   automatically. No Terraform re-zip step.
 
 The seam between build and deploy is a **path variable per function**
 (`assign_position_artifact_path`, `seal_event_artifact_path`,
-`read_artifact_path`). You build the binary out-of-band, point the variable at
-it, and Terraform packages and deploys it.
+`read_artifact_path`). You build the zips out-of-band, point the variables at
+them, and Terraform deploys them directly.
 
 ### The placeholder fallback
 
