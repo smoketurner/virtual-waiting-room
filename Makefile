@@ -30,7 +30,7 @@ ARCH        ?= x86_64
 EVENT_ID    ?= default
 SEAL_START  ?=
 REGION      ?= us-east-1
-PROFILE     ?=
+PROFILE     ?= dev-admin
 
 # cargo-lambda's --target flag wants the Rust triple for the chosen arch.
 ifeq ($(ARCH),arm64)
