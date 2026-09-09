@@ -11,6 +11,7 @@ struct Ctx {
     client: Client,
     counters_table: String,
     prequeue_table: String,
+    positions_table: String,
     event_id: String,
 }
 
@@ -28,6 +29,7 @@ async fn main() -> Result<(), Error> {
         client: Client::new(&config),
         counters_table: std::env::var("COUNTERS_TABLE")?,
         prequeue_table: std::env::var("PREQUEUE_TABLE")?,
+        positions_table: std::env::var("POSITIONS_TABLE")?,
         event_id: std::env::var("EVENT_ID")?,
     };
 
@@ -63,7 +65,15 @@ async fn handle_queue_num(ctx: &Ctx, req: &Request) -> Result<Response<Body>, Er
     };
 
     let Some(row) = load_prequeue(ctx, request_id).await? else {
-        return json(404, &serde_json::json!({ "error": "not registered" }));
+        // No pre-queue row: this may be a live joiner, whose position lives in
+        // the Positions table (written by assign_position), not the pre-queue.
+        return match load_position(ctx, request_id).await? {
+            Some(position) => json(
+                200,
+                &serde_json::json!({ "position": position, "live_join": true }),
+            ),
+            None => json(404, &serde_json::json!({ "error": "not registered" })),
+        };
     };
 
     match queue_num(&counters, &row) {
@@ -103,6 +113,24 @@ async fn load_prequeue(ctx: &Ctx, request_id: &str) -> Result<Option<PreQueueIte
         Some(item) => Ok(Some(serde_dynamo::from_item(item.clone())?)),
         None => Ok(None),
     }
+}
+
+/// Fetches a live joiner's position from the Positions table. The position is
+/// stored in `entry_time` (written by `assign_position`). Returns `None` when the
+/// request id has no Positions row.
+async fn load_position(ctx: &Ctx, request_id: &str) -> Result<Option<u64>, Error> {
+    let out = ctx
+        .client
+        .get_item()
+        .table_name(&ctx.positions_table)
+        .key("request_id", AttributeValue::S(request_id.to_owned()))
+        .send()
+        .await?;
+    Ok(out
+        .item()
+        .and_then(|item| item.get("entry_time"))
+        .and_then(|v| v.as_s().ok())
+        .and_then(|s| s.parse::<u64>().ok()))
 }
 
 /// Reads the flat `Counters` item, assembling the `prequeue_counter#0..9`

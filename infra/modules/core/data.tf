@@ -133,6 +133,7 @@ data "aws_iam_policy_document" "read" {
     resources = [
       aws_dynamodb_table.counters.arn,
       aws_dynamodb_table.prequeue.arn,
+      aws_dynamodb_table.positions.arn,
     ]
   }
 
