@@ -174,7 +174,8 @@ async fn login(State(state): State<Shared>) -> Response {
             CsrfToken::new_random,
             Nonce::new_random,
         )
-        .add_scope(Scope::new("openid".to_string()))
+        // openidconnect adds the required `openid` scope automatically; only
+        // the extra `email` scope is requested here.
         .add_scope(Scope::new("email".to_string()))
         .set_pkce_challenge(pkce_challenge)
         .url();
