@@ -1,0 +1,53 @@
+[workspace]
+resolver = "3"
+members = ["wr-permutation"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.98.0"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/smoketurner/virtual-waiting-room"
+
+[workspace.dependencies]
+wr-permutation = { path = "wr-permutation" }
+
+# Exact version pins only, default features disabled on everything; each member
+# crate opts into exactly the features it uses (conventions.md).
+
+# Crypto — aws-lc-rs is the sole crypto/HMAC backend across the tree (tech.md).
+aws-lc-rs = { version = "=1.18.1", default-features = false }
+
+# Errors and logging
+thiserror = { version = "=2.0.20", default-features = false }
+
+# Dev
+proptest = { version = "=1.11.0", default-features = false }
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Panic prevention
+unwrap_used = "deny"
+expect_used = "warn"
+panic = "deny"
+panic_in_result_fn = "deny"
+unimplemented = "deny"
+# No cheating
+allow_attributes = "deny"
+# Code hygiene
+dbg_macro = "deny"
+todo = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+# Safety
+await_holding_lock = "deny"
+large_futures = "deny"
+exit = "deny"
+mem_forget = "deny"
+# Pedantic relaxations (too noisy)
+module_name_repetitions = "allow"
+similar_names = "allow"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
