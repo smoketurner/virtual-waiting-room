@@ -4,8 +4,10 @@ A virtual waiting room for AWS. Absorbs traffic spikes that would otherwise take
 your site — ticket on-sales, product drops, registration windows — and meters visitors
 into your origin at a rate it can survive.
 
-**Status: design phase.** No runnable code yet.
+**Status: MVP.** The scheduled pre-queue and live-join happy paths are implemented and
+deployable — see [`docs/DEPLOY.md`](./docs/DEPLOY.md).
 
+- [`docs/DEPLOY.md`](./docs/DEPLOY.md) — build → package → deploy, and the `make` targets
 - [`docs/REQUIREMENTS.md`](./docs/REQUIREMENTS.md) — numbered, testable requirements
 - [`docs/DESIGN.md`](./docs/DESIGN.md) — how the system works, with sourced constraints
 - [`docs/adr/`](./docs/adr/) — architecture decision records: why it works that way
