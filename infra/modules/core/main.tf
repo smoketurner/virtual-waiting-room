@@ -278,6 +278,17 @@ resource "aws_api_gateway_request_validator" "body" {
   validate_request_parameters = false
 }
 
+# Presence check for required query-string parameters on the GET read endpoints.
+# REST API validators only assert presence (no regex); format (e.g. UUIDv7) is
+# still enforced in the handler. A missing param is rejected at the edge with a
+# 400, so no Lambda is invoked for it.
+resource "aws_api_gateway_request_validator" "params" {
+  name                        = "validate-params"
+  rest_api_id                 = aws_api_gateway_rest_api.this.id
+  validate_request_body       = false
+  validate_request_parameters = true
+}
+
 resource "aws_api_gateway_resource" "join" {
   rest_api_id = aws_api_gateway_rest_api.this.id
   parent_id   = aws_api_gateway_resource.v1.id # path-versioned: /v1/join
