@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["wr-permutation", "wr-domain"]
+members = ["wr-permutation", "wr-domain", "assign_position"]
 
 [workspace.package]
 edition = "2024"
@@ -18,9 +18,17 @@ wr-domain = { path = "wr-domain" }
 # Crypto — aws-lc-rs is the sole crypto/HMAC backend across the tree (tech.md).
 aws-lc-rs = { version = "=1.18.1", default-features = false }
 
+# Lambda runtime and typed event shapes.
+lambda_runtime = { version = "=1.4.0", default-features = false }
+aws_lambda_events = { version = "=1.2.0", default-features = false }
+
 # AWS SDK — defaults off so no second crypto stack / legacy connector is pulled
 # in; the DynamoDB AttributeValue type is used to build item maps and reads.
+aws-config = { version = "=1.12.0", default-features = false }
 aws-sdk-dynamodb = { version = "=1.124.0", default-features = false }
+
+# Async runtime.
+tokio = { version = "=1.53.1", default-features = false }
 
 # Serialization
 serde = { version = "=1.0.229", default-features = false }
@@ -30,6 +38,9 @@ serde_dynamo = { version = "=4.3.0", default-features = false }
 
 # Errors and logging
 thiserror = { version = "=2.0.20", default-features = false }
+anyhow = { version = "=1.0.104", default-features = false }
+tracing = { version = "=0.1.44", default-features = false }
+tracing-subscriber = { version = "=0.3.23", default-features = false }
 
 # Dev
 proptest = { version = "=1.11.0", default-features = false }
