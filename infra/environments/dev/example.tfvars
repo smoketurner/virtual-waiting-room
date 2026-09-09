@@ -7,8 +7,8 @@
 region              = "us-east-1"
 aws_profile         = "dev-admin" # "" = default credential chain
 event_id            = "smoke"
-lambda_architecture = "arm64"     # must match `make build ARCH=...`
-seal_start_time     = ""          # EventBridge at() value; "" = manual seal
+lambda_architecture = "arm64" # must match `make build ARCH=...`
+seal_start_time     = ""      # EventBridge at() value; "" = manual seal
 
 # --- Built Lambda artifacts ---------------------------------------------------
 # Deterministic build outputs, relative to this directory. Leave empty ("") to
