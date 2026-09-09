@@ -40,11 +40,12 @@ else
 ARCH_FLAG :=
 endif
 
-# cargo lambda build --output-format zip --lambda-dir $(ARTIFACTS) writes a
-# ready-to-deploy zip per function at $(ARTIFACTS)/<crate>/bootstrap.zip.
-ASSIGN_ARTIFACT := $(ARTIFACTS)/assign_position/bootstrap.zip
-SEAL_ARTIFACT   := $(ARTIFACTS)/seal_event/bootstrap.zip
-READ_ARTIFACT   := $(ARTIFACTS)/read/bootstrap.zip
+# Each crate is built separately (all three bins are named `bootstrap`, so a
+# single --output-format zip invocation would collide them under one dir). Each
+# per-crate build writes $(ARTIFACTS)/<crate>/bootstrap/bootstrap.zip.
+ASSIGN_ARTIFACT := $(ARTIFACTS)/assign_position/bootstrap/bootstrap.zip
+SEAL_ARTIFACT   := $(ARTIFACTS)/seal_event/bootstrap/bootstrap.zip
+READ_ARTIFACT   := $(ARTIFACTS)/read/bootstrap/bootstrap.zip
 
 # An artifact path is passed to Terraform only when its zip is actually built
 # ($(wildcard) is empty when absent). A missing zip falls back to the vendored
@@ -67,10 +68,11 @@ help: ## Show this help.
 		| awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
 
 build: ## Cross-compile the three Lambdas to zips under .artifacts/<crate>/.
-	cargo lambda build --release $(ARCH_FLAG) --output-format zip \
-		--lambda-dir $(ARTIFACTS) \
-		-p assign_position -p seal_event -p read \
-		--manifest-path $(CRATES_DIR)/Cargo.toml
+	@for crate in assign_position seal_event read; do \
+		cargo lambda build --release $(ARCH_FLAG) --output-format zip \
+			--lambda-dir $(ARTIFACTS)/$$crate \
+			-p $$crate --manifest-path $(CRATES_DIR)/Cargo.toml; \
+	done
 	@echo "built: $(ASSIGN_ARTIFACT) $(SEAL_ARTIFACT) $(READ_ARTIFACT)"
 
 init: ## terraform init (safe, idempotent).
