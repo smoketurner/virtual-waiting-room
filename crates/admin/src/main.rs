@@ -183,7 +183,7 @@ async fn login(State(state): State<Shared>) -> Response {
     // holding the CSRF state, required to match the callback's state param. A
     // state stolen from elsewhere cannot complete a login without this cookie.
     let state_cookie = format!(
-        "{STATE_COOKIE}={}; Path=/admin; HttpOnly; Secure; SameSite=Lax; Max-Age=600",
+        "{STATE_COOKIE}={}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=600",
         csrf.secret()
     );
     (
@@ -276,11 +276,10 @@ async fn callback(
     };
 
     let cookie = format!(
-        "{SESSION_COOKIE}={session_id}; Path=/admin; HttpOnly; Secure; SameSite=Lax; Max-Age=28800"
+        "{SESSION_COOKIE}={session_id}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=28800"
     );
     // Clear the one-shot login-state cookie now that it has been consumed.
-    let clear_state =
-        format!("{STATE_COOKIE}=; Path=/admin; HttpOnly; Secure; SameSite=Lax; Max-Age=0");
+    let clear_state = format!("{STATE_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0");
     // Two Set-Cookie headers: append rather than a header array (which would
     // insert-overwrite the first).
     let mut response = (StatusCode::SEE_OTHER, [(header::LOCATION, "/admin")]).into_response();
@@ -303,8 +302,7 @@ async fn logout(State(state): State<Shared>, headers: HeaderMap) -> Response {
     if let Some(id) = session_id_from(&headers) {
         let _ = state.sessions.delete_session(&id).await;
     }
-    let cleared =
-        format!("{SESSION_COOKIE}=; Path=/admin; HttpOnly; Secure; SameSite=Lax; Max-Age=0");
+    let cleared = format!("{SESSION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0");
     (
         StatusCode::SEE_OTHER,
         [
