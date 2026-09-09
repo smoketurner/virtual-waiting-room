@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.9"
-# dependencies = ["boto3==1.43.90"]
+# dependencies = ["boto3[crt]==1.43.90"]
 # ///
 """Virtual Waiting Room MVP smoke test.
 
