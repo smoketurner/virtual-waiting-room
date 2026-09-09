@@ -65,8 +65,8 @@ locals {
   api_endpoints = {
     # Public read under /v1 (DESIGN §8, F3.1) - /status is the one polled payload.
     status           = { parent = "v1", path_part = "status", method = "GET", auth = "NONE" }
-    queue_num        = { parent = "v1", path_part = "queue_num", method = "GET", auth = "NONE" }
-    queue_pos_expiry = { parent = "v1", path_part = "queue_pos_expiry", method = "GET", auth = "NONE" }
+    queue_num        = { parent = "v1", path_part = "queue_num", method = "GET", auth = "NONE", required_query = ["request_id"] }
+    queue_pos_expiry = { parent = "v1", path_part = "queue_pos_expiry", method = "GET", auth = "NONE", required_query = ["request_id"] }
     public_key       = { parent = "v1", path_part = "public_key", method = "GET", auth = "NONE" }
 
     # Public write under /v1 (F3.3) - single-use admission token.
@@ -134,6 +134,15 @@ resource "aws_api_gateway_method" "endpoint" {
   resource_id   = local.endpoint_resource_id[each.key]
   http_method   = each.value.method
   authorization = each.value.auth
+
+  # Endpoints that declare required_query get edge presence validation: each
+  # named query-string parameter is marked required and the params validator is
+  # attached, so a missing parameter is rejected with a 400 before any Lambda.
+  request_validator_id = length(lookup(each.value, "required_query", [])) > 0 ? aws_api_gateway_request_validator.params.id : null
+  request_parameters = {
+    for p in lookup(each.value, "required_query", []) :
+    "method.request.querystring.${p}" => true
+  }
 }
 
 resource "aws_api_gateway_integration" "endpoint" {
@@ -165,6 +174,11 @@ resource "aws_api_gateway_deployment" "this" {
       [for k in sort(keys(local.api_endpoints)) : local.endpoint_resource_id[k]],
       [for k in sort(keys(local.api_endpoints)) : aws_api_gateway_method.endpoint[k].id],
       [for k in sort(keys(local.api_endpoints)) : aws_api_gateway_integration.endpoint[k].id],
+      # Method ids are stable across in-place updates, so also hash the mutable
+      # method config (validator + required params); otherwise a validation
+      # change never triggers a new deployment and the stage serves stale config.
+      [for k in sort(keys(local.api_endpoints)) : aws_api_gateway_method.endpoint[k].request_validator_id],
+      [for k in sort(keys(local.api_endpoints)) : jsonencode(aws_api_gateway_method.endpoint[k].request_parameters)],
     ]))
   }
 
