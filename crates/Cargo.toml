@@ -9,8 +9,8 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/smoketurner/virtual-waiting-room"
 
 [workspace.dependencies]
-wr-permutation = { path = "wr-permutation" }
-wr-domain = { path = "wr-domain" }
+wr-permutation = { path = "wr-permutation", version = "=0.1.0" }
+wr-domain = { path = "wr-domain", version = "=0.1.0" }
 
 # Exact version pins only, default features disabled on everything; each member
 # crate opts into exactly the features it uses (conventions.md).
