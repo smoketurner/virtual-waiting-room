@@ -2,6 +2,12 @@
 //! `SigV4` (`AWS_IAM`) admin routes, served through API Gateway via `lambda_http`.
 //! API Gateway rejects unsigned requests before this runs, so the handlers
 //! trust that reaching them means the caller was IAM-authorized.
+//!
+//! API Gateway prefixes the request path with the stage (e.g. `/dev/admin`).
+//! `AWS_LAMBDA_HTTP_IGNORE_STAGE_IN_PATH=true` (set on the function in Terraform)
+//! makes the runtime strip the stage before axum routes, so routes are declared
+//! unprefixed.
+
 use std::sync::Arc;
 
 use admin::dynamo::DynamoStore;

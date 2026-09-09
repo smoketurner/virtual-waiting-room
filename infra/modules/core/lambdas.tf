@@ -121,6 +121,9 @@ resource "aws_lambda_function" "admin" {
     variables = {
       COUNTERS_TABLE = aws_dynamodb_table.counters.name
       EVENT_ID       = var.event_id
+      # API Gateway prefixes the path with the stage (e.g. /dev/admin); this
+      # makes the Rust runtime strip it so the Axum routes match unprefixed.
+      AWS_LAMBDA_HTTP_IGNORE_STAGE_IN_PATH = "true"
     }
   }
 
