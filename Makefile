@@ -43,18 +43,20 @@ ASSIGN_ARTIFACT := $(ARTIFACTS)/assign_position-bootstrap
 SEAL_ARTIFACT   := $(ARTIFACTS)/seal_event-bootstrap
 READ_ARTIFACT   := $(ARTIFACTS)/read-bootstrap
 
-# Vars threaded into every plan/apply so the real functions deploy (empty paths
-# leave the vendored placeholders and disable the join event source mapping).
-# aws_profile is empty by default, which uses the default credential chain.
+# An artifact path is passed to Terraform only when the bootstrap binary is
+# actually staged ($(wildcard) is empty when the file is absent). A missing
+# binary therefore falls back to the vendored placeholder instead of failing
+# the archive_file data source, so `plan` works before `build`. Run `make
+# build` first to deploy the real functions.
 TF_VARS := \
 	-var "region=$(REGION)" \
 	-var "aws_profile=$(PROFILE)" \
 	-var "event_id=$(EVENT_ID)" \
 	-var "lambda_architecture=$(ARCH)" \
 	-var "seal_start_time=$(SEAL_START)" \
-	-var "assign_position_artifact_path=$(ASSIGN_ARTIFACT)" \
-	-var "seal_event_artifact_path=$(SEAL_ARTIFACT)" \
-	-var "read_artifact_path=$(READ_ARTIFACT)"
+	-var "assign_position_artifact_path=$(wildcard $(ASSIGN_ARTIFACT))" \
+	-var "seal_event_artifact_path=$(wildcard $(SEAL_ARTIFACT))" \
+	-var "read_artifact_path=$(wildcard $(READ_ARTIFACT))"
 
 .PHONY: help build init plan apply destroy fmt validate clean
 
@@ -75,10 +77,10 @@ build: ## Compile the three Lambdas and stage their bootstraps under .artifacts/
 init: ## terraform init (safe, idempotent).
 	terraform -chdir=$(ENV_DIR) init -input=false
 
-plan: init ## terraform plan against the built artifacts.
+plan: init ## terraform plan (uses staged artifacts if built, else placeholders).
 	terraform -chdir=$(ENV_DIR) plan -input=false $(TF_VARS)
 
-apply: init ## terraform apply — real deploy (needs AWS credentials).
+apply: build init ## Build the Lambdas then terraform apply (needs AWS credentials).
 	terraform -chdir=$(ENV_DIR) apply -input=false $(TF_VARS)
 
 destroy: init ## Tear the stack down (Terraform prompts for confirmation).
