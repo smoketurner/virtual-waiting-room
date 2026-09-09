@@ -1,0 +1,10 @@
+#!/bin/sh
+# Placeholder assign_position handler for the provided.al2023 runtime.
+#
+# This is scaffolding only: it is NOT a working handler. It exists so the Lambda
+# function, its IAM role, and the SQS event-source mapping can be created and
+# planned before the Rust crate (crates/assign_position) is built. Point
+# var.lambda_artifact_path at the real build artifact to replace it; until then
+# the event-source mapping should be left disabled so no live batches are lost.
+echo "vwr placeholder bootstrap - not a functional handler" >&2
+exit 1
