@@ -8,6 +8,8 @@ use std::future::Future;
 use wr_domain::Phase;
 
 pub mod dynamo;
+pub mod oidc;
+pub mod sessions;
 pub mod templates;
 
 /// The persistence port the admin actions drive. Reading the current `Counters`

@@ -3,6 +3,16 @@ all-features = true
 
 [advisories]
 yanked = "deny"
+ignore = [
+  # RUSTSEC-2023-0071 — Marvin timing sidechannel in the `rsa` crate, pulled in
+  # transitively by `openidconnect` for RS256 ID-token verification. The attack
+  # requires an attacker to observe decryption/signing timing with a private key.
+  # The admin Lambda only VERIFIES the OIDC provider's ID-token signature with a
+  # public key from the provider's JWKS — it holds no RSA private key and performs
+  # no RSA decryption — so the vulnerable code path is not exercised. No fixed
+  # `rsa` release exists yet; revisit when one ships or openidconnect drops it.
+  { id = "RUSTSEC-2023-0071", reason = "verify-only OIDC path; no RSA private key held (ADR-0016)" },
+]
 
 [licenses]
 allow = [

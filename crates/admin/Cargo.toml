@@ -24,6 +24,18 @@ rust-embed = { workspace = true }
 mime_guess = { workspace = true }
 aws-config = { workspace = true, features = ["behavior-version-latest"] }
 aws-sdk-dynamodb = { workspace = true, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-ssm = { workspace = true, features = ["default-https-client", "rt-tokio"] }
+# OIDC admin login (ADR-0016). openidconnect provides only the reqwest transport
+# (its rustls-tls default forces reqwest's ring provider, forbidden by tech.md).
+# reqwest uses the no-provider webpki-roots rustls feature — no ring — and the
+# admin binary installs rustls's aws-lc-rs CryptoProvider at startup.
+# jsonwebtoken verifies JWKS signatures via pure-Rust rust_crypto (no ring, no PEM).
+openidconnect = { workspace = true }
+jsonwebtoken = { workspace = true, features = ["aws_lc_rs"] }
+reqwest = { workspace = true, features = ["json", "rustls-tls-webpki-roots-no-provider", "http2"] }
+rustls = { workspace = true, features = ["aws_lc_rs", "std", "tls12"] }
+aws-lc-rs = { workspace = true, features = ["aws-lc-sys"] }
+cookie = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

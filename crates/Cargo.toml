@@ -41,6 +41,22 @@ askama = { version = "=0.16.1", default-features = false }
 rust-embed = { version = "=8.12.0", default-features = false }
 mime_guess = { version = "=2.0.5", default-features = false }
 
+# Admin OIDC login (ADR-0016): Authorization Code + PKCE, session + PKCE state in
+# DynamoDB. openidconnect re-exports the oauth2 5 / reqwest 0.12 types its
+# request_async signature expects, so reqwest is pinned to 0.12 to typecheck.
+# openidconnect's default rustls-tls forces reqwest's ring-backed provider, which
+# tech.md forbids — so defaults are OFF and only the reqwest transport is enabled;
+# the admin crate selects reqwest's no-provider rustls and installs the aws-lc-rs
+# CryptoProvider at startup. jsonwebtoken verifies JWKS signatures via the
+# aws_lc_rs backend (single crypto stack, no ring).
+openidconnect = { version = "=4.0.1", default-features = false, features = ["reqwest"] }
+jsonwebtoken = { version = "=11.0.0", default-features = false }
+reqwest = { version = "=0.12.28", default-features = false }
+rustls = { version = "=0.23.44", default-features = false }
+cookie = { version = "=0.18.2", default-features = false }
+# Read the OIDC client secret from an encrypted SSM SecureString (ADR-0016).
+aws-sdk-ssm = { version = "=1.122.0", default-features = false }
+
 # Serialization
 serde = { version = "=1.0.229", default-features = false }
 serde_json = { version = "=1.0.151", default-features = false }
