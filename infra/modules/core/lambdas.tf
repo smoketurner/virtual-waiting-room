@@ -35,6 +35,12 @@ resource "aws_lambda_function" "seal_event" {
   filename         = local.seal_event_zip
   source_code_hash = local.seal_event_hash
 
+  environment {
+    variables = {
+      COUNTERS_TABLE = aws_dynamodb_table.counters.name
+    }
+  }
+
   tags = var.tags
 }
 

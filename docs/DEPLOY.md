@@ -15,10 +15,12 @@ source to a running function:
 1. **Build + package** — `cargo lambda build --release --output-format zip`
    cross-compiles each crate to a static Linux binary named `bootstrap` and
    packages it into a ready-to-deploy zip, one per function at
-   `.artifacts/<crate>/bootstrap.zip` (`make build`). cargo-lambda namespaces
-   each function into its own directory, so the shared `bootstrap` name never
-   collides. This runs *outside* Terraform, so a plan stays hermetic — it never
-   triggers a compile. The cross-link uses `zig`; no Docker is involved.
+   `.artifacts/<crate>/bootstrap/bootstrap.zip` (`make build`). Each crate is
+   built separately: all three bins are named `bootstrap` (required by
+   `provided.al2023`), so a single `--output-format zip` invocation would
+   collide them — the per-crate `--lambda-dir` keeps them apart. This runs
+   *outside* Terraform, so a plan stays hermetic — it never triggers a compile.
+   The cross-link uses `zig`; no Docker is involved.
 
 2. **Deploy** — each `aws_lambda_function` uploads its zip directly (`filename`
    points at the cargo-lambda zip) with `runtime = "provided.al2023"`,
