@@ -8,12 +8,9 @@ terraform {
     }
   }
 
-  # S3 remote state. Partial config: the non-sensitive settings live here, but
-  # the bucket name (which embeds the AWS account id) is supplied at init so no
-  # account identifier is committed:
-  #   terraform init -backend-config="bucket=terraform-state-<account>-<region>-<suffix>"
-  # `make init` / `make plan` / `make apply` pass it via the STATE_BUCKET var.
+  # S3 remote state.
   backend "s3" {
+    bucket       = "terraform-state-952961969614-us-east-1-an"
     key          = "virtual-waiting-room/dev/terraform.tfstate"
     region       = "us-east-1"
     encrypt      = true
