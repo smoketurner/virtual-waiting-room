@@ -1,29 +1,25 @@
-//! Pre-queue index-space assembly (ADR-0015, design §4.1–4.2).
+//! Pre-queue index-space assembly.
 //!
-//! Registration stripes `prequeue_counter` across `K = 10` shards: each
-//! `POST /join` picks shard `s = hash(request_id) % 10`, claims a **local
-//! index** `l` via `ADD prequeue_counter#s :1` / `ALL_NEW`, and stores
-//! `PreQueue {r, s, l, t}` — never a global index.
-//!
-//! At T−0 the seal reads the 10 shard counts, computes prefix offsets
-//! `offset[s] = Σ counts[0..s)` and cohort size `N = Σ counts`, and stores
-//! them alongside the seed in one conditional write. A visitor's global
-//! registration index is reconstructed on read as `i = offset[s] + l`.
+//! Registration stripes the pre-queue counter across `K = 10` shards: each
+//! join picks a shard `s = hash(request_id) % 10`, claims a local index `l` by
+//! atomically incrementing that shard's counter, and stores `(request_id, s,
+//! l)` — never a global index. Sealing the cohort reads the 10 shard counts,
+//! computes prefix offsets `offset[s] = Σ counts[0..s)` and cohort size `N = Σ
+//! counts`. A visitor's global registration index is reconstructed on read as
+//! `i = offset[s] + l`.
 //!
 //! Because the shards partition the cohort and the offsets are a prefix sum,
 //! the set of global indices is exactly the contiguous range `[0, N)` — the
-//! domain the permutation ([`crate::prp`]) runs over. `N` counts indices
-//! *issued*, not participants confirmed: an index whose `PreQueue` write failed
-//! after the counter incremented is a burned slot that maps to a position no
-//! one claims (the gaps-permitted property, F2.3).
+//! domain [`crate::prp`] permutes. `N` counts indices *issued*, not rows
+//! written: an index whose row write failed after the counter incremented is a
+//! burned slot that maps to a position no one claims, which is permitted (a
+//! served position that admits nobody).
 
-/// Number of pre-queue counter shards. Fixed at 10 for every deployment
-/// (ADR-0015), matching the `arrivals` shard count.
+/// Number of pre-queue counter shards; fixed at 10 for every deployment.
 pub const SHARDS: usize = 10;
 
 /// The sealed pre-queue index space: per-shard prefix offsets and the cohort
-/// size `N`, computed once at T−0 from the shard counts and thereafter
-/// published in `/status`.
+/// size `N`, computed once from the shard counts when the cohort is sealed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SealedOffsets {
     offsets: [u64; SHARDS],
@@ -33,14 +29,12 @@ pub struct SealedOffsets {
 /// The outcome of reconstructing a visitor's global registration index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Assignment {
-    /// The visitor registered before the seal counted their shard: their global
-    /// index `i` is in `[0, N)` and `PRP` derives the pre-queue position.
+    /// The global index `i` is in `[0, N)`; [`crate::prp`] derives the
+    /// pre-queue position from it.
     PreQueue { index: u64 },
-    /// The visitor's local index was claimed after the seal counted their shard
-    /// (a straggler racing the seal), so the reconstructed `i >= N` falls
-    /// outside the permutation domain. `/queue_num` serves a live-join position
-    /// behind the whole pre-queue cohort instead of evaluating `PRP` out of
-    /// range (design §4.2, ADR-0015 failure mode).
+    /// The reconstructed `i >= N` falls outside the permutation domain — a
+    /// local index claimed after the cohort was sealed. The caller assigns a
+    /// live-join position instead of permuting an out-of-domain index.
     LiveJoin,
 }
 
@@ -48,15 +42,15 @@ pub enum Assignment {
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SealError {
     /// A shard count plus the running total would exceed `u64`. Unreachable in
-    /// practice (the cohort target is ~`10^6`), but summed explicitly rather
-    /// than wrapped.
+    /// practice (cohort sizes are ~`10^6`), but summed explicitly rather than
+    /// wrapped.
     #[error("pre-queue cohort size overflows u64")]
     Overflow,
 }
 
 impl SealedOffsets {
-    /// Seals the index space from the 10 shard counts read at T−0: computes the
-    /// prefix offsets and `N = Σ counts`.
+    /// Seals the index space from the 10 shard counts: computes the prefix
+    /// offsets and `N = Σ counts`.
     ///
     /// # Errors
     ///
@@ -96,11 +90,11 @@ impl SealedOffsets {
     /// index)`.
     ///
     /// Returns [`Assignment::PreQueue`] with the global index `i = offset[s] +
-    /// l` when `i < N`, and [`Assignment::LiveJoin`] when `i >= N` (a straggler
-    /// that raced the seal — never evaluate `PRP` out of domain).
+    /// l` when `i < N`, and [`Assignment::LiveJoin`] when `i >= N` (a local
+    /// index claimed after the cohort was sealed).
     ///
-    /// A `shard` outside `[0, SHARDS)` is a straggler by definition (no offset
-    /// was sealed for it), so it degrades to a live join rather than panicking.
+    /// A `shard` outside `[0, SHARDS)` has no sealed offset, so it also
+    /// degrades to a live join rather than panicking.
     #[must_use]
     pub fn assign(&self, shard: usize, local_index: u64) -> Assignment {
         let Some(&offset) = self.offsets.get(shard) else {
@@ -116,13 +110,11 @@ impl SealedOffsets {
 /// Selects the registration shard for a request id: `hash(request_id) % 10`.
 ///
 /// Hashing (not round-robin) means a retried join lands on the same shard, so
-/// the `attribute_not_exists(r)` conditional rejects the duplicate and consumes
-/// no index — idempotency (F2.5) is preserved. The hash need not be
-/// cryptographic; it need only spread `UUIDv7` ids uniformly mod 10.
+/// the same request id claims no second index. The hash need not be
+/// cryptographic; it need only spread request ids uniformly mod 10.
 #[must_use]
 pub fn shard_for(request_id: &[u8]) -> usize {
-    // FNV-1a over the id bytes, reduced mod SHARDS. Deterministic and
-    // dependency-free; UUIDv7 ids are uniform mod 10 under it.
+    // FNV-1a over the id bytes, reduced mod SHARDS.
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for &byte in request_id {
         hash ^= u64::from(byte);
@@ -206,10 +198,9 @@ mod tests {
         assert_eq!(shard_for(id), shard_for(id));
     }
 
-    /// The whole point of the assembly: for any per-shard counts, reconstructing
-    /// every issued (shard, local index) yields exactly the contiguous range
-    /// [0, N) — no gap, no duplicate — which is the domain the permutation
-    /// requires (ADR-0015).
+    /// For any per-shard counts, reconstructing every issued (shard, local
+    /// index) yields exactly the contiguous range [0, N) — no gap, no
+    /// duplicate — which is the domain the permutation requires.
     #[test]
     fn assembled_index_space_is_contiguous() {
         let counts = [3u64, 0, 5, 1, 0, 7, 2, 0, 0, 4];
@@ -253,12 +244,10 @@ mod tests {
             prop_assert_eq!(seen, expected);
         }
 
-        /// Burned slot (ADR-0015, F2.3): with an injected registration-write
-        /// failure (counter incremented, PreQueue row absent), the assembled
-        /// index space is still contiguous [0, N) where N = Σ shard counts, PRP
-        /// remains bijective over [0, N), and a burned index resolves to a valid
-        /// position that maps to no PreQueue row — no duplicate, no panic, no
-        /// gap in the permutation.
+        /// Burned slot: with an injected registration-write failure (counter
+        /// incremented, row absent), N = Σ shard counts is unchanged, PRP stays
+        /// bijective over [0, N), and the burned index still resolves to a valid
+        /// position that no row claims — no duplicate, no panic, no gap.
         #[test]
         fn prop_burned_slot_leaves_permutation_intact(
             counts in prop::array::uniform10(0u64..80),
@@ -273,7 +262,7 @@ mod tests {
             // N counts indices issued, unaffected by which rows survived.
             prop_assert_eq!(n, counts.iter().sum::<u64>());
 
-            // Pick one issued index to "burn" (its PreQueue write failed).
+            // Pick one issued index to "burn" (its row write failed).
             let burned = burn_pick % n;
 
             // PRP is a bijection over [0, N): every index, burned or not, maps to
@@ -286,17 +275,15 @@ mod tests {
             }
             prop_assert_eq!(u64::try_from(positions.len()).unwrap(), n);
 
-            // The burned index still resolves to a valid position; the serving
-            // counter advancing past it simply admits nobody (no row to serve).
+            // The burned index still resolves to a valid position; a reader
+            // advancing past it simply admits nobody (no row to serve).
             let burned_position = prp(&seed, burned, n);
             prop_assert!(burned_position < n);
         }
 
-        /// Straggler racing the seal (ADR-0015): a (shard, local) whose
-        /// reconstructed global index i = offset[s] + l >= N returns a live-join
-        /// assignment, and any i < N returns pre-queue — PRP is never called out
-        /// of domain. Uses the last shard, where l >= counts[9] is exactly the
-        /// i >= N boundary.
+        /// A (shard, local) whose reconstructed global index i = offset[s] + l
+        /// >= N returns a live join, and any i < N returns pre-queue. Uses the
+        /// last shard, where l >= counts[9] is exactly the i >= N boundary.
         #[test]
         fn prop_straggler_past_total_is_live_join(
             counts in prop::array::uniform10(1u64..80),
@@ -304,8 +291,8 @@ mod tests {
         ) {
             let sealed = seal_ok(counts);
             let last = SHARDS - 1;
-            // On the last shard, offset[last] + counts[last] == N, so local index
-            // counts[last] + k reconstructs to i = N + k >= N.
+            // On the last shard, offset[last] + counts[last] == N, so a local
+            // index counts[last] + k reconstructs to i = N + k >= N.
             let straggler_local = counts[last] + overshoot;
             prop_assert_eq!(sealed.assign(last, straggler_local), Assignment::LiveJoin);
             // And the last valid index (l = counts[last] - 1) is pre-queue.

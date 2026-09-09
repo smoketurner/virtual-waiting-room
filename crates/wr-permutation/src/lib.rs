@@ -1,24 +1,23 @@
-//! Seeded pseudorandom permutation over `[0, N)` for pre-queue position
-//! assignment (ADR-0002, design §4.3).
+//! Seeded pseudorandom permutation over `[0, N)`.
 //!
-//! Queue order is a bijection from registration index to queue position,
-//! derived on read from a single stored seed rather than a materialised
-//! shuffle. The construction is a 4-round balanced Feistel network over the
-//! smallest power-of-four domain `>= N`, with `HMAC-SHA256(seed, round || x)`
-//! as the round function and cycle-walking to restrict the output to `[0, N)`.
+//! Maps a registration index to a queue position as a bijection derived on
+//! read from a single stored seed, rather than storing the shuffled mapping.
+//! The construction is a 4-round balanced Feistel network over the smallest
+//! power-of-four domain `>= N`, with `HMAC-SHA256(seed, round || x)` as the
+//! round function and cycle-walking to restrict the output to `[0, N)` — the
+//! small-domain format-preserving-encryption construction of NIST SP 800-38G
+//! (FF1), <https://doi.org/10.6028/NIST.SP.800-38G>.
 //!
-//! # Frozen wire encoding (audit contract)
+//! # Wire encoding
 //!
-//! The permutation is part of the audit contract: a third party recomputes
-//! every position byte-for-byte from `(seed, i, N)`. The encoding below is
-//! frozen — any deviation produces different positions and breaks
-//! auditability. All multi-byte integers are big-endian.
+//! The exact byte encoding is fixed so a third party can recompute every
+//! position from `(seed, i, N)`; any deviation produces different positions.
+//! All multi-byte integers are big-endian.
 //!
 //! - `b = ceil(bit_length(N - 1) / 2)`; `domain = 2^(2b)`; `mask = 2^b - 1`.
 //!   Both halves are exactly `b` bits. `N = 1` is a degenerate identity.
 //! - Exactly 4 rounds, `round in {0, 1, 2, 3}` ascending.
-//! - HMAC key is the 256-bit `shuffle_seed`, used verbatim — never part of the
-//!   message.
+//! - HMAC key is the 256-bit seed, used verbatim — never part of the message.
 //! - Message `r || x` is 5 bytes: `r` the round as 1 byte (`0x00`–`0x03`),
 //!   `x` the right half as a 4-byte big-endian `u32`.
 //! - `F(r, x) = be_u32(HMAC-SHA256(seed, r || x)[0..4]) & mask`.
@@ -31,34 +30,29 @@ pub use assembly::{Assignment, SHARDS, SealError, SealedOffsets, shard_for};
 
 use aws_lc_rs::hmac;
 
-/// The 256-bit `shuffle_seed` used as the HMAC-SHA256 key.
+/// The 256-bit seed used as the HMAC-SHA256 key.
 ///
 /// A newtype over the raw key bytes so a seed is never confused with an
 /// arbitrary byte slice at a call site.
 #[derive(Clone, Copy)]
 pub struct Seed(pub [u8; 32]);
 
-/// Number of Feistel rounds. Frozen at 4 by the audit contract.
+/// Number of Feistel rounds; fixed at 4 by the wire encoding.
 const ROUNDS: u8 = 4;
 
 /// Computes the queue position for a registration index under a seeded
 /// permutation over `[0, N)`.
 ///
-/// `i` is the global registration index (`offset[s] + l`); `n` is the cohort
-/// size `participant_count`. Returns a position in `[0, N)`.
+/// `i` is the global registration index; `n` is the cohort size. Returns a
+/// position in `[0, N)`.
 ///
-/// # Panics / preconditions
-///
-/// The caller must ensure `i < n` — a valid registration index is always
-/// strictly inside the cohort. A join that raced the T−0 seal can yield
-/// `i >= n`; the read path (`/queue_num`) detects that and returns a live-join
-/// position instead of calling this function out of domain (design §4.2). This
-/// function itself does not evaluate the permutation for `i >= n`: it returns
-/// `i` unchanged, since the domain is only defined over `[0, N)`.
+/// The permutation is only defined over `[0, N)`, so `i >= n` is returned
+/// unchanged rather than evaluated — the caller passes such an index only when
+/// it should fall back to a non-permuted position, never to permute it.
 #[must_use]
 pub fn prp(seed: &Seed, i: u64, n: u64) -> u64 {
     // Degenerate cohorts: the permutation over 0 or 1 elements is the identity,
-    // and no rounds run (b would be 0). Also guards the out-of-domain contract.
+    // and no rounds run (b would be 0). Also handles the out-of-domain i >= n.
     if n <= 1 || i >= n {
         return i;
     }
@@ -139,8 +133,8 @@ mod tests {
 
     #[test]
     fn out_of_domain_index_returns_unchanged() {
-        // A straggler that raced the seal (i >= n) must never evaluate the
-        // permutation out of domain; prp returns i unchanged (design §4.2).
+        // An index at or beyond the cohort size is outside the permutation
+        // domain and must be returned unchanged, never evaluated.
         let seed = seed_from(0x22);
         assert_eq!(prp(&seed, 100, 50), 100);
         assert_eq!(prp(&seed, 50, 50), 50);
@@ -170,8 +164,7 @@ mod tests {
 
     #[test]
     fn deterministic_across_calls() {
-        // Same (seed, i, n) always yields the same position — the property the
-        // audit contract rests on.
+        // Same (seed, i, n) always yields the same position.
         let seed = seed_from(0x55);
         for i in 0..500u64 {
             assert_eq!(prp(&seed, i, 500), prp(&seed, i, 500));
@@ -188,9 +181,9 @@ mod tests {
     }
 
     #[test]
-    fn seed_before_t0_is_load_bearing() {
-        // The seed determines position; without it a participant cannot compute
-        // their own position. Sanity: index 0 does not trivially map to 0.
+    fn seed_scrambles_the_identity() {
+        // The seed determines the mapping: the permutation is not the identity,
+        // so a position cannot be known without the seed.
         let seed = seed_from(0x77);
         let images: Vec<u64> = images(&seed, 10_000);
         assert!(
