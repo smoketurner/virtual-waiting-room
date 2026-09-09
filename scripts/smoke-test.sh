@@ -8,24 +8,16 @@
 #
 # Prerequisites:
 #   - AWS credentials in the environment (aws sso login / aws configure), with
-#     rights to deploy the stack and read/write its DynamoDB tables and Lambdas.
+#     rights to read/write the stack's DynamoDB tables and invoke its Lambdas.
 #   - terraform, aws, curl, python3 on PATH.
-#   - The three Lambda zips built (see BUILD below) and their paths exported
-#     (ASSIGN_ARTIFACT / SEAL_ARTIFACT / READ_ARTIFACT).
-#
-# BUILD (from the repo root):
-#   make build            # cargo lambda build --output-format zip, per function
-#   # produces .artifacts/<crate>/bootstrap.zip for each of the three functions.
+#   - The stack already deployed (make apply). The script reads the API URL,
+#     table names, seal function, and event id from `terraform output` and never
+#     touches Terraform state — deploy with `make apply` first.
 #
 # Usage:
-#   ASSIGN_ARTIFACT=/abs/.artifacts/assign_position/bootstrap.zip \
-#   SEAL_ARTIFACT=/abs/.artifacts/seal_event/bootstrap.zip \
-#   READ_ARTIFACT=/abs/.artifacts/read/bootstrap.zip \
-#   ./scripts/smoke-test.sh
+#   AWS_PROFILE=dev-admin ./scripts/smoke-test.sh
 set -euo pipefail
 
-EVENT_ID="${EVENT_ID:-smoke-$(date +%s)}"
-ARCH="${LAMBDA_ARCH:-x86_64}"
 ENV_DIR="$(cd "$(dirname "$0")/../infra/environments/dev" && pwd)"
 REGION="${AWS_REGION:-us-east-1}"
 
@@ -47,21 +39,16 @@ print(f"{h[0:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}")
 PY
 }
 
-say "1. Deploy the dev stack (event_id=$EVENT_ID, arch=$ARCH)"
+say "1. Read the deployed stack from terraform outputs"
 cd "$ENV_DIR"
 terraform init -input=false >/dev/null
-terraform apply -input=false -auto-approve \
-  -var "event_id=$EVENT_ID" \
-  -var "lambda_architecture=$ARCH" \
-  -var "assign_position_artifact_path=$ASSIGN_ARTIFACT" \
-  -var "seal_event_artifact_path=$SEAL_ARTIFACT" \
-  -var "read_artifact_path=$READ_ARTIFACT"
-
 API_URL="$(terraform output -raw api_invoke_url)"
+EVENT_ID="$(terraform output -raw event_id)"
 COUNTERS="$(terraform output -json table_names | python3 -c 'import sys,json;print(json.load(sys.stdin)["counters"])')"
 PREQUEUE="$(terraform output -json table_names | python3 -c 'import sys,json;print(json.load(sys.stdin)["prequeue"])')"
+POSITIONS="$(terraform output -json table_names | python3 -c 'import sys,json;print(json.load(sys.stdin)["positions"])')"
 SEAL_FN="$(terraform output -raw seal_event_function_name)"
-echo "API: $API_URL"
+echo "API: $API_URL  event_id: $EVENT_ID"
 
 say "2. Seed the signing key out-of-band (SSM SecureString placeholder -> real)"
 aws ssm put-parameter --region "$REGION" \
@@ -131,7 +118,7 @@ curl -fsS -X POST "$API_URL/v1/join" \
 echo "posted live join $LIVE_RID; waiting for assign_position to drain the batch"
 for _ in $(seq 1 15); do
   ROW="$(aws dynamodb get-item --region "$REGION" \
-    --table-name "$(terraform output -json table_names | python3 -c 'import sys,json;print(json.load(sys.stdin)["positions"])')" \
+    --table-name "$POSITIONS" \
     --key "{\"request_id\":{\"S\":\"$LIVE_RID\"}}" 2>/dev/null || true)"
   [ -n "$ROW" ] && echo "$ROW" | grep -q request_id && { echo "live-join Positions row written"; break; }
   sleep 2
