@@ -48,3 +48,6 @@ infra/modules/core/placeholder-lambda/placeholder.zip
 # Terraform-generated real Lambda artifact zips (archive_file rebuilds them from
 # the built bootstrap binaries, which are passed in by path, not committed)
 infra/modules/core/.artifacts/
+
+# Lambda bootstraps staged by `make build` (passed to Terraform by path)
+/.artifacts/
