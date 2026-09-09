@@ -57,6 +57,7 @@ pub fn apply_hardening(headers: &mut HeaderMap, nonce: &str) {
          script-src 'nonce-{nonce}'; \
          connect-src 'self'; \
          img-src 'self' data:; \
+         font-src 'self'; \
          form-action 'self'; \
          base-uri 'none'; \
          frame-ancestors 'none'; \

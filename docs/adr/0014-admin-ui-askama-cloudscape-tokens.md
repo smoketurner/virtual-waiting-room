@@ -1,6 +1,9 @@
 # ADR-0014: Render the admin UI with askama and Cloudscape design tokens
 
-**Status:** Accepted
+**Status:** Accepted — the askama, server-rendered, React-free architecture stands.
+The **Cloudscape design-token** styling is **superseded by ADR-0018** (the Vouch
+design language). Everything below about *how* the UI is rendered still holds; only
+the visual token source changed.
 
 ## Context
 
