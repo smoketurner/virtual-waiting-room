@@ -7,8 +7,9 @@ use askama::Template;
 use crate::ControlState;
 
 /// The dashboard view. Optional fields render as an em dash when absent so the
-/// operator sees "not set" rather than a blank.
-#[derive(Template)]
+/// operator sees "not set" rather than a blank. Also serialized as JSON by the
+/// `/admin/state` poller endpoint.
+#[derive(Template, serde::Serialize)]
 #[template(path = "dashboard.html")]
 pub struct Dashboard {
     pub event_id: String,
@@ -18,6 +19,10 @@ pub struct Dashboard {
     pub participant_count: String,
     pub target_rate: String,
     pub message: String,
+    /// Per-render CSP nonce for the inline poller script. Not part of the JSON
+    /// state view (the poller endpoint reuses this struct).
+    #[serde(skip)]
+    pub csp_nonce: String,
 }
 
 impl Dashboard {
@@ -33,6 +38,7 @@ impl Dashboard {
             participant_count: dash(state.participant_count.map(|n| n.to_string())),
             target_rate: dash(state.target_rate.map(|n| n.to_string())),
             message: dash(state.message.clone()),
+            csp_nonce: String::new(),
         }
     }
 }
@@ -81,8 +87,15 @@ mod tests {
             assert!(html.contains(action), "missing form {action}");
         }
         assert!(html.contains("method=\"post\""));
-        // No client-side scripting in the core path.
-        assert!(!html.to_lowercase().contains("<script"));
+        // The only script is the additive, nonce-guarded live-stats poller — it
+        // enhances the read-only view and drives none of the operator actions.
+        assert_eq!(
+            html.matches("<script").count(),
+            1,
+            "exactly one script (the poller) expected"
+        );
+        assert!(html.contains("<script nonce="));
+        assert!(html.contains("/admin/state"));
     }
 
     #[test]

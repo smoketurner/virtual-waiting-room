@@ -7,12 +7,12 @@
 
 <div class="card">
   <h2>Current state</h2>
-  <dl class="kv"><dt>Phase</dt><dd><span class="phase">{{ phase }}</span></dd></dl>
-  <dl class="kv"><dt>Serving position</dt><dd>{{ serving_counter }}</dd></dl>
-  <dl class="kv"><dt>Queue counter</dt><dd>{{ queue_counter }}</dd></dl>
-  <dl class="kv"><dt>Participant count</dt><dd>{{ participant_count }}</dd></dl>
-  <dl class="kv"><dt>Target rate</dt><dd>{{ target_rate }}</dd></dl>
-  <dl class="kv"><dt>Message</dt><dd>{{ message }}</dd></dl>
+  <dl class="kv"><dt>Phase</dt><dd><span class="phase" id="s-phase">{{ phase }}</span></dd></dl>
+  <dl class="kv"><dt>Serving position</dt><dd id="s-serving_counter">{{ serving_counter }}</dd></dl>
+  <dl class="kv"><dt>Queue counter</dt><dd id="s-queue_counter">{{ queue_counter }}</dd></dl>
+  <dl class="kv"><dt>Participant count</dt><dd id="s-participant_count">{{ participant_count }}</dd></dl>
+  <dl class="kv"><dt>Target rate</dt><dd id="s-target_rate">{{ target_rate }}</dd></dl>
+  <dl class="kv"><dt>Message</dt><dd id="s-message">{{ message }}</dd></dl>
 </div>
 
 <div class="card">
@@ -58,4 +58,26 @@
   <h2>Protection rules · sessions</h2>
   <p class="deferred">Not yet available — the authorizer and session plane ship after the MVP.</p>
 </div>
+
+{# Progressive enhancement: poll /admin/state and patch the current-state values
+   in place. The operator actions above are plain form POSTs and work with this
+   script disabled; only the live refresh needs JS. The nonce is per-response and
+   matches the script-src nonce in the Content-Security-Policy header. #}
+<script nonce="{{ csp_nonce }}">
+  (function () {
+    var fields = ["phase", "serving_counter", "queue_counter", "participant_count", "target_rate", "message"];
+    function refresh() {
+      fetch("/admin/state", { headers: { "Accept": "application/json" }, credentials: "same-origin" })
+        .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
+        .then(function (s) {
+          fields.forEach(function (f) {
+            var el = document.getElementById("s-" + f);
+            if (el && s[f] !== undefined && s[f] !== null) { el.textContent = String(s[f]); }
+          });
+        })
+        .catch(function () { /* transient; try again next tick */ });
+    }
+    setInterval(refresh, 2000);
+  })();
+</script>
 {% endblock %}

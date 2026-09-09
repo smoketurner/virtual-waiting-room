@@ -9,6 +9,7 @@ use wr_domain::Phase;
 
 pub mod dynamo;
 pub mod oidc;
+pub mod security;
 pub mod sessions;
 pub mod templates;
 
