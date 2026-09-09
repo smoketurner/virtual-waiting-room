@@ -11,13 +11,14 @@
 #   make apply                 # terraform apply (real deploy — needs AWS creds)
 #   make destroy               # tear the stack down (prompts to confirm)
 #
-# Common overrides (make apply ARCH=arm64 EVENT_ID=launch SEAL_START=2026-09-10T18:00:00):
-#   ARCH        Lambda CPU architecture: x86_64 (default) or arm64. Must match
-#               the built artifacts.
-#   EVENT_ID    The single event id this deployment serves (default: default).
-#   SEAL_START  One-time UTC seal time, EventBridge at() value. Empty = manual.
-#   REGION      AWS region (default: us-east-1).
-#   PROFILE     Named AWS profile to authenticate with. Empty = default chain.
+# Deployment config (region, aws_profile, event_id, lambda_architecture,
+# seal_start_time) lives in infra/environments/dev/terraform.tfvars and is
+# authoritative — this Makefile does not pass those as -var (which would override
+# the file). Only the built artifact paths are passed.
+#
+# The one build-time override (make build ARCH=arm64):
+#   ARCH        cargo-lambda build target: x86_64 (default) or arm64. Keep this
+#               in sync with lambda_architecture in terraform.tfvars.
 
 SHELL       := /usr/bin/env bash
 .SHELLFLAGS := -eu -o pipefail -c
@@ -28,12 +29,10 @@ CRATES_DIR  := $(ROOT)/crates
 ARTIFACTS   := $(ROOT)/.artifacts
 
 ARCH        ?= x86_64
-EVENT_ID    ?= default
-SEAL_START  ?=
-REGION      ?= us-east-1
-PROFILE     ?= dev-admin
 
 # cargo-lambda cross-compiles for x86_64 by default; --arm64 selects Graviton.
+# ARCH only selects the BUILD target here; the Lambda's lambda_architecture is
+# set in terraform.tfvars and must be kept in sync with what you build.
 ifeq ($(ARCH),arm64)
 ARCH_FLAG := --arm64
 else
@@ -48,16 +47,13 @@ SEAL_ARTIFACT   := $(ARTIFACTS)/seal_event/bootstrap/bootstrap.zip
 READ_ARTIFACT   := $(ARTIFACTS)/read/bootstrap/bootstrap.zip
 ADMIN_ARTIFACT  := $(ARTIFACTS)/admin/bootstrap/bootstrap.zip
 
-# An artifact path is passed to Terraform only when its zip is actually built
-# ($(wildcard) is empty when absent). A missing zip falls back to the vendored
-# placeholder Lambda, so `plan` works before `build`. Run `make build` first to
-# deploy the real functions.
+# Only the artifact paths are passed as -var: they are computed from the build
+# (empty via $(wildcard) when a zip is absent, so `plan` falls back to the
+# vendored placeholder Lambda before `build`). Everything else — region,
+# aws_profile, event_id, lambda_architecture, seal_start_time — is read from
+# infra/environments/dev/terraform.tfvars, which is authoritative. A command-line
+# -var would override tfvars, so those are deliberately NOT passed here.
 TF_VARS := \
-	-var "region=$(REGION)" \
-	-var "aws_profile=$(PROFILE)" \
-	-var "event_id=$(EVENT_ID)" \
-	-var "lambda_architecture=$(ARCH)" \
-	-var "seal_start_time=$(SEAL_START)" \
 	-var "assign_position_artifact_path=$(wildcard $(ASSIGN_ARTIFACT))" \
 	-var "seal_event_artifact_path=$(wildcard $(SEAL_ARTIFACT))" \
 	-var "read_artifact_path=$(wildcard $(READ_ARTIFACT))" \
