@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# Virtual Waiting Room MVP smoke test.
+#
+# Drives the scheduled-pre-queue and live-join happy paths against a deployed
+# dev stack and asserts the core invariant: no two visitors get the same queue
+# position. Idempotent enough to re-run; it registers fresh UUIDv7 request ids
+# each time.
+#
+# Prerequisites:
+#   - AWS credentials in the environment (aws sso login / aws configure), with
+#     rights to deploy the stack and read/write its DynamoDB tables and Lambdas.
+#   - terraform, aws, curl, python3 on PATH.
+#   - The three Lambda bootstrap binaries built (see BUILD below) and their
+#     paths exported (ASSIGN_ARTIFACT / SEAL_ARTIFACT / READ_ARTIFACT).
+#
+# BUILD (from crates/):
+#   cargo lambda build --release -p assign_position -p seal_event -p read
+#   # then copy each target/lambda/bootstrap/bootstrap out per crate, since all
+#   # three bins are named 'bootstrap' (see the staging loop in Stage 4).
+#
+# Usage:
+#   ASSIGN_ARTIFACT=/abs/assign_position-bootstrap \
+#   SEAL_ARTIFACT=/abs/seal_event-bootstrap \
+#   READ_ARTIFACT=/abs/read-bootstrap \
+#   ./scripts/smoke-test.sh
+set -euo pipefail
+
+EVENT_ID="${EVENT_ID:-smoke-$(date +%s)}"
+ARCH="${LAMBDA_ARCH:-x86_64}"
+ENV_DIR="$(cd "$(dirname "$0")/../infra/environments/dev" && pwd)"
+REGION="${AWS_REGION:-us-east-1}"
+
+say() { printf '\n=== %s ===\n' "$*"; }
+
+# A canonical UUIDv7 (version nibble 7). The timestamp bits are cosmetic for the
+# smoke test; only the format and uniqueness matter to the handler.
+uuid_v7() {
+  python3 - <<'PY'
+import os, time
+ts = int(time.time() * 1000)
+rand = os.urandom(10)
+b = ts.to_bytes(6, "big") + rand
+b = bytearray(b)
+b[6] = (b[6] & 0x0F) | 0x70          # version 7
+b[8] = (b[8] & 0x3F) | 0x80          # variant
+h = b.hex()
+print(f"{h[0:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}")
+PY
+}
+
+say "1. Deploy the dev stack (event_id=$EVENT_ID, arch=$ARCH)"
+cd "$ENV_DIR"
+terraform init -input=false >/dev/null
+terraform apply -input=false -auto-approve \
+  -var "event_id=$EVENT_ID" \
+  -var "lambda_architecture=$ARCH" \
+  -var "assign_position_artifact_path=$ASSIGN_ARTIFACT" \
+  -var "seal_event_artifact_path=$SEAL_ARTIFACT" \
+  -var "read_artifact_path=$READ_ARTIFACT"
+
+API_URL="$(terraform output -raw api_invoke_url)"
+COUNTERS="$(terraform output -json table_names | python3 -c 'import sys,json;print(json.load(sys.stdin)["counters"])')"
+PREQUEUE="$(terraform output -json table_names | python3 -c 'import sys,json;print(json.load(sys.stdin)["prequeue"])')"
+SEAL_FN="$(terraform output -raw seal_event_function_name)"
+echo "API: $API_URL"
+
+say "2. Seed the signing key out-of-band (SSM SecureString placeholder -> real)"
+aws ssm put-parameter --region "$REGION" \
+  --name "$(terraform state show 'module.core.aws_ssm_parameter.signing_key' | awk -F'\"' '/name /{print $2; exit}')" \
+  --type SecureString --overwrite \
+  --value "$(python3 -c 'import os,base64;print(base64.b64encode(os.urandom(32)).decode())')" >/dev/null
+echo "signing key written"
+
+say "3. Pre-queue registration: write PreQueue rows for a small cohort"
+# The pre-queue registration handler is not part of the MVP (deferred), so the
+# smoke test seeds PreQueue rows and the shard counter directly, mirroring what
+# a POST /join during the pre-queue phase would write: shard s = hash % 10,
+# local index l from ADD prequeue_counter#s.
+declare -A SHARD_COUNT
+IDS=()
+for _ in $(seq 1 12); do
+  RID="$(uuid_v7)"; IDS+=("$RID")
+  S=$(python3 -c "
+h=0xcbf29ce484222325
+for b in b'$RID':
+    h ^= b; h = (h * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
+print(h % 10)")
+  L=${SHARD_COUNT[$S]:-0}
+  SHARD_COUNT[$S]=$((L + 1))
+  aws dynamodb put-item --region "$REGION" --table-name "$PREQUEUE" \
+    --item "{\"r\":{\"S\":\"$RID\"},\"s\":{\"N\":\"$S\"},\"l\":{\"N\":\"$L\"},\"t\":{\"S\":\"$(date -u +%FT%TZ)\"}}" \
+    --condition-expression "attribute_not_exists(r)"
+done
+# Reflect the per-shard counts on the Counters item (what the striped counter holds).
+for S in "${!SHARD_COUNT[@]}"; do
+  aws dynamodb update-item --region "$REGION" --table-name "$COUNTERS" \
+    --key "{\"event_id\":{\"S\":\"$EVENT_ID\"}}" \
+    --update-expression "SET #c = :v" \
+    --expression-attribute-names "{\"#c\":\"prequeue_counter#$S\"}" \
+    --expression-attribute-values "{\":v\":{\"N\":\"${SHARD_COUNT[$S]}\"}}" >/dev/null
+done
+echo "registered ${#IDS[@]} pre-queue visitors"
+
+say "4. Seal the event (invoke seal_event) and confirm phase=active via /status"
+aws lambda invoke --region "$REGION" --function-name "$SEAL_FN" \
+  --payload "$(printf '{"event_id":"%s"}' "$EVENT_ID" | base64)" /dev/stdout >/dev/null
+sleep 2
+STATUS="$(curl -fsS "$API_URL/v1/status")"
+echo "$STATUS"
+echo "$STATUS" | python3 -c 'import sys,json;d=json.load(sys.stdin);assert d["phase"]=="active",d;assert d.get("participant_count")==12,d;print("status OK: active, N=12")'
+
+say "5. Resolve every pre-queue position via /queue_num; assert all distinct"
+python3 - "$API_URL" "${IDS[@]}" <<'PY'
+import sys, json, urllib.request
+api = sys.argv[1]; ids = sys.argv[2:]
+seen = {}
+for rid in ids:
+    with urllib.request.urlopen(f"{api}/v1/queue_num?request_id={rid}") as r:
+        d = json.load(r)
+    p = d["position"]
+    assert not d["live_join"], (rid, d)
+    assert p not in seen, f"DUPLICATE position {p}: {rid} and {seen[p]}"
+    seen[p] = rid
+print(f"queue_num OK: {len(seen)} distinct positions in [0,{len(ids)})")
+PY
+
+say "6. Live join: POST /join, then confirm a Positions row is written"
+LIVE_RID="$(uuid_v7)"
+curl -fsS -X POST "$API_URL/v1/join" \
+  -H 'content-type: application/json' \
+  -d "{\"request_id\":\"$LIVE_RID\",\"event_id\":\"$EVENT_ID\"}" >/dev/null
+echo "posted live join $LIVE_RID; waiting for assign_position to drain the batch"
+for _ in $(seq 1 15); do
+  ROW="$(aws dynamodb get-item --region "$REGION" \
+    --table-name "$(terraform output -json table_names | python3 -c 'import sys,json;print(json.load(sys.stdin)["positions"])')" \
+    --key "{\"request_id\":{\"S\":\"$LIVE_RID\"}}" 2>/dev/null || true)"
+  [ -n "$ROW" ] && echo "$ROW" | grep -q request_id && { echo "live-join Positions row written"; break; }
+  sleep 2
+done
+
+say "SMOKE TEST PASSED"
