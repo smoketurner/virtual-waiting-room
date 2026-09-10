@@ -5,7 +5,7 @@ use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
 use aws_sdk_dynamodb::types::AttributeValue;
-use wr_domain::Phase;
+use wr_domain::{AdmissionControl, Phase};
 
 use crate::{ControlState, Store, StoreError};
 
@@ -65,8 +65,8 @@ impl Store for DynamoStore {
             admission_paused: item
                 .get("admission_control")
                 .and_then(|v| v.as_s().ok())
-                .map(String::as_str)
-                == Some("paused"),
+                .and_then(|s| s.parse::<AdmissionControl>().ok())
+                == Some(AdmissionControl::Paused),
             last_action: str_attr("last_action"),
             last_action_by: str_attr("last_action_by"),
             last_action_at: str_attr("last_action_at"),
@@ -122,7 +122,7 @@ impl Store for DynamoStore {
                  last_action_at = :at, last_action_epoch_ms = :ms",
             )
             .expression_attribute_values(":r", AttributeValue::N(rate.to_string()));
-        req = apply_audit_values(req, "set_rate", actor, now_ms);
+        req = apply_audit_values(req, crate::AdminAction::SetRate, actor, now_ms);
         req = guard_expected_rate(req, expected);
         req = guard_debounce(req, now_ms);
         send_guarded(req, "rate").await
@@ -145,7 +145,7 @@ impl Store for DynamoStore {
                  last_action_at = :at, last_action_epoch_ms = :ms",
             )
             .expression_attribute_values(":m", AttributeValue::S(message.to_owned()));
-        req = apply_audit_values(req, "set_message", actor, now_ms);
+        req = apply_audit_values(req, crate::AdminAction::SetMessage, actor, now_ms);
         req = guard_debounce(req, now_ms);
         send_guarded(req, "message").await
     }
@@ -161,10 +161,16 @@ impl Store for DynamoStore {
         // Idempotency guard on the stored admission_control (ADR-0019): the
         // toggle is legal only from the expected prior value. `open` is the
         // default, so attribute_not_exists covers a never-written row.
-        let (from_str, to_str) = (
-            if from { "paused" } else { "open" },
-            if to { "paused" } else { "open" },
-        );
+        let from_ctl = if from {
+            AdmissionControl::Paused
+        } else {
+            AdmissionControl::Open
+        };
+        let to_ctl = if to {
+            AdmissionControl::Paused
+        } else {
+            AdmissionControl::Open
+        };
         let control_guard = if from {
             "admission_control = :from"
         } else {
@@ -180,14 +186,26 @@ impl Store for DynamoStore {
                 "SET admission_control = :to, last_action = :a, last_action_by = :by, \
                  last_action_at = :at, last_action_epoch_ms = :ms",
             )
-            .expression_attribute_values(":to", AttributeValue::S(to_str.to_owned()))
-            .expression_attribute_values(":from", AttributeValue::S(from_str.to_owned()))
+            .expression_attribute_values(":to", AttributeValue::S(to_ctl.as_wire_str().to_owned()))
+            .expression_attribute_values(
+                ":from",
+                AttributeValue::S(from_ctl.as_wire_str().to_owned()),
+            )
             .condition_expression(format!(
                 "{control_guard} AND (attribute_not_exists(last_action_epoch_ms) \
                  OR last_action_epoch_ms < :cutoff)"
             ))
             .expression_attribute_values(":cutoff", AttributeValue::N(cutoff));
-        req = apply_audit_values(req, if to { "pause" } else { "resume" }, actor, now_ms);
+        req = apply_audit_values(
+            req,
+            if to {
+                crate::AdminAction::Pause
+            } else {
+                crate::AdminAction::Resume
+            },
+            actor,
+            now_ms,
+        );
         send_guarded(req, "paused").await
     }
 
@@ -215,7 +233,7 @@ impl Store for DynamoStore {
             )
             .condition_expression("phase = :from")
             .expression_attribute_values(":from", AttributeValue::S(from.as_wire_str().to_owned()));
-        req = apply_audit_values(req, "force_maintenance", actor, now_ms);
+        req = apply_audit_values(req, crate::AdminAction::ForceMaintenance, actor, now_ms);
         send_guarded(req, "force_maintenance").await
     }
 }
@@ -223,11 +241,16 @@ impl Store for DynamoStore {
 type UpdateReq = aws_sdk_dynamodb::operation::update_item::builders::UpdateItemFluentBuilder;
 
 /// Stamps the shared audit + epoch values onto a mutation.
-fn apply_audit_values(req: UpdateReq, action: &str, actor: &str, now_ms: u64) -> UpdateReq {
+fn apply_audit_values(
+    req: UpdateReq,
+    action: crate::AdminAction,
+    actor: &str,
+    now_ms: u64,
+) -> UpdateReq {
     let at = aws_smithy_types::DateTime::from_millis(i64::try_from(now_ms).unwrap_or(0))
         .fmt(aws_smithy_types::date_time::Format::DateTime)
         .unwrap_or_default();
-    req.expression_attribute_values(":a", AttributeValue::S(action.to_owned()))
+    req.expression_attribute_values(":a", AttributeValue::S(action.as_str().to_owned()))
         .expression_attribute_values(":by", AttributeValue::S(actor.to_owned()))
         .expression_attribute_values(":at", AttributeValue::S(at))
         .expression_attribute_values(":ms", AttributeValue::N(now_ms.to_string()))

@@ -4,7 +4,7 @@ use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
 use aws_sdk_dynamodb::types::AttributeValue;
-use wr_domain::SHARDS;
+use wr_domain::{Phase, SHARDS};
 
 use crate::{SealValues, Store, StoreError};
 
@@ -79,7 +79,10 @@ impl Store for DynamoStore {
                 AttributeValue::N(values.participant_count.to_string()),
             )
             .expression_attribute_values(":offsets", AttributeValue::L(offsets_list))
-            .expression_attribute_values(":active", AttributeValue::S("active".to_owned()))
+            .expression_attribute_values(
+                ":active",
+                AttributeValue::S(Phase::Active.as_wire_str().to_owned()),
+            )
             .send()
             .await;
 

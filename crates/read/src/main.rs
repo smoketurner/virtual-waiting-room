@@ -186,16 +186,12 @@ fn counters_from_item(
             .and_then(|v| v.as_s().ok())
             .filter(|s| !s.is_empty())
             .cloned(),
-        admission_control: match item
+        admission_control: item
             .get("admission_control")
             .and_then(|v| v.as_s().ok())
-            .map(String::as_str)
-        {
-            Some("paused") => AdmissionControl::Paused,
-            Some("fail_open") => AdmissionControl::FailOpen,
-            // "open", missing, or unrecognized: normal admission.
-            _ => AdmissionControl::Open,
-        },
+            .and_then(|s| s.parse().ok())
+            // "open", missing, or unrecognized: normal admission (safe default).
+            .unwrap_or(AdmissionControl::Open),
     }
 }
 
