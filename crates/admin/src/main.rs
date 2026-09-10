@@ -483,7 +483,7 @@ fn now_ms() -> u64 {
 async fn deferred() -> Response {
     (
         StatusCode::NOT_IMPLEMENTED,
-        "Not yet available — the authorizer and session plane ship after the MVP.",
+        "Not yet available. The authorizer and session plane ship after the MVP.",
     )
         .into_response()
 }
@@ -525,14 +525,14 @@ fn finish(result: Result<(), ApplyError>) -> Response {
         // Debounce rejection — a double-click / fast toggle.
         Err(ApplyError::Action(ActionError::TooFast)) => (
             StatusCode::TOO_MANY_REQUESTS,
-            "Too soon after the previous change — wait a moment and retry.",
+            "Too soon after the previous change. Wait a moment and retry.",
         )
             .into_response(),
         Err(ApplyError::Action(e)) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
         // Lost race or no-op guard (e.g. pausing when already paused).
         Err(ApplyError::Store(StoreError::Conflict)) => (
             StatusCode::CONFLICT,
-            "State changed underneath you (or no change to make) — reload and retry.",
+            "State changed underneath you (or there is no change to make). Reload and retry.",
         )
             .into_response(),
         Err(ApplyError::Store(e)) => server_error(&e.to_string()),

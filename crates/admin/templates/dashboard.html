@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 
-{% block title %}Waiting Room Admin — {{ event_id }}{% endblock %}
+{% block title %}Waiting Room Admin: {{ event_id }}{% endblock %}
 
 {% block content %}
 <header class="top-nav">
@@ -11,11 +11,11 @@
 <main class="content">
   <div class="page-header">
     <h1>Event <span class="event">{{ event_id }}</span></h1>
-    <p class="desc">Operator control plane. Actions take effect immediately.</p>
+    <p class="desc">Operator control plane. An action takes effect on submit. A repeat of the same action within 2 seconds is rejected.</p>
   </div>
 
   {% if admission_paused %}
-  <div class="banner" id="pause-banner">Admission is PAUSED — the queue keeps forming; no one is admitted.</div>
+  <div class="banner" id="pause-banner">Admission is PAUSED. The queue keeps forming; no one is admitted.</div>
   {% endif %}
 
   <div class="grid">
@@ -23,7 +23,7 @@
     <section class="card span-2">
       <div class="card-header">
         <h2>Current state</h2>
-        <p class="sub">Live — refreshes automatically.</p>
+        <p class="sub">Live. Refreshes automatically.</p>
       </div>
       <div class="card-body">
         <div class="kpis">
@@ -54,26 +54,26 @@
     <section class="card emergency">
       <div class="card-header">
         <h2>Emergency</h2>
-        <p class="sub">Andon cord — pull to stop the line.</p>
+        <p class="sub">Andon cord. Pull it to stop the line.</p>
       </div>
       <div class="card-body">
         {% if admission_paused %}
-        <p class="deferred">Admission is paused — no visitors are being let through.</p>
+        <p class="deferred">Admission is paused. No visitors reach the origin.</p>
         <form method="post" action="/admin/resume">
-          <button class="normal big" type="submit" title="Resume letting visitors through at the configured target rate.">Resume admission</button>
+          <button class="normal big" type="submit" title="Resume admission at the current target rate.">Resume admission</button>
         </form>
-        <p class="help" style="margin-top:12px;color:var(--gray-500);">Restarts admission at the current target rate. The queue continues from where it paused.</p>
+        <p class="help" style="margin-top:12px;color:var(--gray-500);">Resume restarts admission at the current target rate. The queue keeps every position it held during the pause.</p>
         {% else %}
         <form method="post" action="/admin/pause">
-          <button class="danger big" type="submit" title="Immediately stop admitting anyone. Reversible — the queue and everyone's position are kept.">Pause admission</button>
+          <button class="danger big" type="submit" title="Stop admission now. The queue and every position are kept. Resume reverses it in one click.">Pause admission</button>
         </form>
-        <p class="help" style="margin-top:12px;color:var(--gray-500);"><strong>Stops letting visitors through, now.</strong> The queue keeps forming and everyone keeps their position — nothing is lost. Reversible with one click. Use this first if something looks wrong.</p>
+        <p class="help" style="margin-top:12px;color:var(--gray-500);"><strong>Pause stops admission now.</strong> The queue keeps forming and every visitor keeps their position. Resume reverses it in one click. Reach for Pause before Force maintenance.</p>
         {% endif %}
         <hr class="divider">
-        <form method="post" action="/admin/reset" data-confirm="Force maintenance mode? This moves the event to the maintenance phase and halts it for EVERYONE. Continue?">
-          <button class="danger" type="submit" title="Move the whole event to the maintenance phase. Heavier than Pause — halts everything. Asks for confirmation.">Force maintenance</button>
+        <form method="post" action="/admin/reset" data-confirm="Force maintenance moves the event to the maintenance phase and halts it for every visitor. Continue?">
+          <button class="danger" type="submit" title="Move the event to the maintenance phase. Halts the whole room, not just admission. Requires confirmation.">Force maintenance</button>
         </form>
-        <p class="help" style="margin-top:12px;color:var(--gray-500);"><strong>Heavier than Pause.</strong> Moves the event to the <em>maintenance</em> phase — halts the whole room, not just admission. Asks you to confirm first. Prefer Pause unless you need a full stop.</p>
+        <p class="help" style="margin-top:12px;color:var(--gray-500);"><strong>Force maintenance halts the whole room, not just admission.</strong> It moves the event to the <em>maintenance</em> phase and requires confirmation. Pause stops admission; this stops everything.</p>
       </div>
     </section>
 
@@ -87,13 +87,13 @@
         <form method="post" action="/admin/phase">
           <div class="form-field">
             <label for="phase">Transition to</label>
-            <select id="phase" name="phase" title="Pick the phase to move the event into. Forward transitions only (idle → pre_queue → active → post_event).">
-              <option value="idle">idle — event not started; nobody queued yet</option>
-              <option value="pre_queue">pre_queue — early arrivals wait on the countdown page</option>
-              <option value="active">active — positions assigned; admitting visitors</option>
-              <option value="post_event">post_event — event over; queue drained</option>
+            <select id="phase" name="phase" title="Select the next phase. The lifecycle runs forward only: idle → pre_queue → active → post_event.">
+              <option value="idle">idle: event not started; nobody queued</option>
+              <option value="pre_queue">pre_queue: early arrivals wait on the countdown page</option>
+              <option value="active">active: positions assigned; admitting visitors</option>
+              <option value="post_event">post_event: event over; queue drained</option>
             </select>
-            <span class="help">The lifecycle runs forward: <code>idle → pre_queue → active → post_event</code>. Backward jumps are rejected; use Force maintenance to halt.</span>
+            <span class="help">The lifecycle runs forward only: <code>idle → pre_queue → active → post_event</code>. The server rejects a backward transition. To halt the room, use Force maintenance.</span>
           </div>
           <button type="submit" title="Apply the selected phase transition.">Set phase</button>
         </form>
@@ -104,16 +104,16 @@
     <section class="card">
       <div class="card-header">
         <h2>Admission rate</h2>
-        <p class="sub">How fast visitors are let into the origin.</p>
+        <p class="sub">Visitors admitted to the origin per second.</p>
       </div>
       <div class="card-body">
         <form method="post" action="/admin/rate">
           <div class="form-field">
             <label for="rate">Target rate (visitors per second)</label>
-            <input id="rate" name="rate" type="number" min="1" required title="Visitors admitted to your origin per second. Higher = more load on your site.">
-            <span class="help">Visitors admitted <strong>per second</strong> — set this to what your origin can safely absorb. Must be a positive whole number, up to the deployment ceiling. To stop admission entirely, use <strong>Pause</strong>, not rate 0.</span>
+            <input id="rate" name="rate" type="number" min="1" required title="Visitors admitted to the origin per second. Each visitor per second is one more request per second at your origin.">
+            <span class="help">Set this to the requests per second the origin sustains. Each unit is one visitor per second admitted. The value is a whole number from 1 to the deployment ceiling. To stop admission, use <strong>Pause</strong>; rate 0 is rejected.</span>
           </div>
-          <button type="submit" title="Set the admission target rate the controller admits visitors at.">Set rate</button>
+          <button type="submit" title="Set the target rate the controller admits visitors at.">Set rate</button>
         </form>
       </div>
     </section>
@@ -122,14 +122,14 @@
     <section class="card">
       <div class="card-header">
         <h2>Broadcast message</h2>
-        <p class="sub">Text shown to visitors while they wait.</p>
+        <p class="sub">Text shown to every waiting visitor.</p>
       </div>
       <div class="card-body">
         <form method="post" action="/admin/message">
           <div class="form-field">
             <label for="message">Message shown to waiting visitors</label>
-            <input id="message" name="message" type="text" title="Shown on the waiting page and returned by /status. Visible to everyone in the queue.">
-            <span class="help">Displayed on the waiting page and in <code>/status</code> — visible to <strong>everyone</strong> in the queue. Submit empty to clear it.</span>
+            <input id="message" name="message" type="text" title="Shown on the waiting page and returned by /status. Every visitor in the queue sees it.">
+            <span class="help">The text appears on the waiting page and in the <code>/status</code> response. Every visitor in the queue sees it. Submit an empty field to clear it.</span>
           </div>
           <button type="submit" title="Update the message shown to waiting visitors.">Set message</button>
         </form>
@@ -140,7 +140,7 @@
     <section class="card">
       <div class="card-header"><h2>Protection rules · sessions</h2></div>
       <div class="card-body">
-        <p class="deferred">Not yet available — the authorizer and session plane ship after the MVP.</p>
+        <p class="deferred">Not yet available. The authorizer and session plane ship after the MVP.</p>
       </div>
     </section>
   </div>

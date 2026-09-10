@@ -37,7 +37,7 @@ impl Dashboard {
     /// Builds the view from control state, formatting optionals for display.
     #[must_use]
     pub fn from_state(state: &ControlState) -> Self {
-        let dash = |s: Option<String>| s.unwrap_or_else(|| "—".to_owned());
+        let dash = |s: Option<String>| s.unwrap_or_else(|| "not set".to_owned());
         Self {
             event_id: state.event_id.clone(),
             phase: format!("{:?}", state.phase).to_lowercase(),
@@ -53,7 +53,7 @@ impl Dashboard {
                 &state.last_action_at,
             ) {
                 (Some(a), Some(by), Some(at)) => format!("{a} by {by} at {at}"),
-                _ => "—".to_owned(),
+                _ => "none yet".to_owned(),
             },
             csp_nonce: String::new(),
             operator_email: String::new(),
@@ -128,7 +128,7 @@ mod tests {
         s.target_rate = None;
         s.message = None;
         let html = Dashboard::from_state(&s).render().unwrap();
-        assert!(html.contains("—"));
+        assert!(html.contains("not set"));
     }
 
     #[test]
