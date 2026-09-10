@@ -18,6 +18,9 @@ pub struct StatusResponse {
     /// reconstruct its global index without a round trip.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prequeue_offsets: Option<[u64; SHARDS]>,
+    /// Operator broadcast text for the waiting page. Absent when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 /// A resolved `/queue_num` response.
@@ -37,6 +40,7 @@ pub fn status(counters: &Counters) -> StatusResponse {
         serving_position: counters.serving_counter,
         participant_count: counters.participant_count,
         prequeue_offsets: counters.prequeue_offsets,
+        message: counters.message.clone(),
     }
 }
 
@@ -122,6 +126,7 @@ mod tests {
             shuffle_seed: Some(seed),
             participant_count: Some(sealed.participant_count()),
             prequeue_offsets: Some(offsets),
+            message: None,
         }
     }
 
@@ -145,6 +150,7 @@ mod tests {
             shuffle_seed: None,
             participant_count: None,
             prequeue_offsets: None,
+            message: None,
         };
         let json = serde_json::to_value(status(&counters)).unwrap();
         assert_eq!(json["phase"], "pre_queue");
@@ -163,6 +169,21 @@ mod tests {
     }
 
     #[test]
+    fn status_surfaces_the_broadcast_message_when_set() {
+        let mut counters = sealed_counters([1; SHARDS], [7u8; 32]);
+        counters.message = Some("Doors open at noon".to_owned());
+        let json = serde_json::to_value(status(&counters)).unwrap();
+        assert_eq!(json["message"], "Doors open at noon");
+    }
+
+    #[test]
+    fn status_omits_the_message_when_absent() {
+        let counters = sealed_counters([1; SHARDS], [7u8; 32]);
+        let json = serde_json::to_value(status(&counters)).unwrap();
+        assert!(json.get("message").is_none());
+    }
+
+    #[test]
     fn queue_num_before_seal_is_not_sealed() {
         let counters = Counters {
             event_id: "evt-1".to_owned(),
@@ -173,6 +194,7 @@ mod tests {
             shuffle_seed: None,
             participant_count: None,
             prequeue_offsets: None,
+            message: None,
         };
         assert_eq!(
             queue_num(&counters, &row(0, 0)),

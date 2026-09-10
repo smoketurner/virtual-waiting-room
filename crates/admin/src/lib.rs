@@ -187,8 +187,23 @@ pub fn transition_allowed(from: Phase, to: Phase) -> bool {
     )
 }
 
-/// Applies a phase-transition action: validates the target and the transition,
-/// then performs the guarded store write.
+/// The legal forward phase transitions from `from`, excluding the same-phase
+/// no-op and Maintenance (which is the separate Force-maintenance control). The
+/// dropdown offers exactly these, so an operator cannot select an illegal jump
+/// like `idle -> active`.
+#[must_use]
+pub fn next_phases(from: Phase) -> Vec<Phase> {
+    use Phase::{Active, Idle, PostEvent, PreQueue};
+    match from {
+        Idle => vec![PreQueue],
+        PreQueue => vec![Active],
+        Active => vec![PostEvent],
+        // Terminal, or already halted: no forward step. Use Force maintenance
+        // or a new event.
+        PostEvent | Phase::Maintenance => vec![],
+    }
+}
+
 ///
 /// # Errors
 ///
@@ -531,6 +546,17 @@ mod tests {
         assert!(transition_allowed(Active, Maintenance));
         assert!(transition_allowed(Maintenance, Idle));
         assert!(transition_allowed(Active, Active));
+    }
+
+    #[test]
+    fn next_phases_offers_only_the_single_forward_step() {
+        use Phase::{Active, Idle, Maintenance, PostEvent, PreQueue};
+        assert_eq!(next_phases(Idle), vec![PreQueue]);
+        assert_eq!(next_phases(PreQueue), vec![Active]);
+        assert_eq!(next_phases(Active), vec![PostEvent]);
+        // Terminal / halted phases offer nothing (no idle -> active, no restart).
+        assert_eq!(next_phases(PostEvent), Vec::<Phase>::new());
+        assert_eq!(next_phases(Maintenance), Vec::<Phase>::new());
     }
 
     #[tokio::test]

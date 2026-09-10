@@ -60,20 +60,20 @@
         {% if admission_paused %}
         <p class="deferred">Admission is paused. No visitors reach the origin.</p>
         <form method="post" action="/admin/resume">
-          <button class="normal big" type="submit" title="Resume admission at the current target rate.">Resume admission</button>
+          <button class="normal big" type="submit" title="Start admitting visitors again at the current target rate.">Resume admission</button>
         </form>
-        <p class="help" style="margin-top:12px;color:var(--gray-500);">Resume restarts admission at the current target rate. The queue keeps every position it held during the pause.</p>
+        <p class="help" style="margin-top:12px;color:var(--gray-500);">Resume starts admission again. The queue kept every position during the pause.</p>
         {% else %}
         <form method="post" action="/admin/pause">
-          <button class="danger big" type="submit" title="Stop admission now. The queue and every position are kept. Resume reverses it in one click.">Pause admission</button>
+          <button class="danger big" type="submit" title="Stop admitting visitors now. The queue and every position are kept.">Pause admission</button>
         </form>
-        <p class="help" style="margin-top:12px;color:var(--gray-500);"><strong>Pause stops admission now.</strong> The queue keeps forming and every visitor keeps their position. Resume reverses it in one click. Reach for Pause before Force maintenance.</p>
+        <p class="help" style="margin-top:12px;color:var(--gray-500);"><strong>Pause stops admission now.</strong> The queue keeps forming and every visitor keeps their position. A Resume button appears here to start admission again.</p>
         {% endif %}
         <hr class="divider">
-        <form method="post" action="/admin/reset" data-confirm="Force maintenance moves the event to the maintenance phase and halts it for every visitor. Continue?">
-          <button class="danger" type="submit" title="Move the event to the maintenance phase. Halts the whole room, not just admission. Requires confirmation.">Force maintenance</button>
+        <form method="post" action="/admin/reset" data-confirm="Force maintenance sets the event to the maintenance phase and stops it for every visitor. Continue?">
+          <button class="danger" type="submit" title="Set the event to the maintenance phase. Stops the whole room. Requires confirmation.">Force maintenance</button>
         </form>
-        <p class="help" style="margin-top:12px;color:var(--gray-500);"><strong>Force maintenance halts the whole room, not just admission.</strong> It moves the event to the <em>maintenance</em> phase and requires confirmation. Pause stops admission; this stops everything.</p>
+        <p class="help" style="margin-top:12px;color:var(--gray-500);"><strong>Force maintenance sets the event to the maintenance phase.</strong> The whole room stops: no queue, no admission, and the waiting page shows a maintenance state. Pause only stops admission. Use this when the event must come down.</p>
       </div>
     </section>
 
@@ -81,22 +81,25 @@
     <section class="card">
       <div class="card-header">
         <h2>Phase</h2>
-        <p class="sub">Move the event through its lifecycle.</p>
+        <p class="sub">Move the event to its next stage.</p>
       </div>
       <div class="card-body">
+        {% if allowed_transitions.is_empty() %}
+        <p class="deferred">No transition is available from the <code>{{ phase }}</code> phase. Use Force maintenance to stop the room, or start a new event.</p>
+        {% else %}
         <form method="post" action="/admin/phase">
           <div class="form-field">
             <label for="phase">Transition to</label>
-            <select id="phase" name="phase" title="Select the next phase. The lifecycle runs forward only: idle → pre_queue → active → post_event.">
-              <option value="idle">idle: event not started; nobody queued</option>
-              <option value="pre_queue">pre_queue: early arrivals wait on the countdown page</option>
-              <option value="active">active: positions assigned; admitting visitors</option>
-              <option value="post_event">post_event: event over; queue drained</option>
+            <select id="phase" name="phase" title="The only phase you can move to next. The lifecycle runs one step at a time: idle → pre_queue → active → post_event.">
+              {% for opt in allowed_transitions %}
+              <option value="{{ opt.value }}">{{ opt.label }}</option>
+              {% endfor %}
             </select>
-            <span class="help">The lifecycle runs forward only: <code>idle → pre_queue → active → post_event</code>. The server rejects a backward transition. To halt the room, use Force maintenance.</span>
+            <span class="help">The lifecycle advances one step at a time: <code>idle → pre_queue → active → post_event</code>. Only the next step is offered. Skipping a step (for example <code>idle → active</code>) is rejected by the server.</span>
           </div>
-          <button type="submit" title="Apply the selected phase transition.">Set phase</button>
+          <button type="submit" title="Apply the phase transition.">Set phase</button>
         </form>
+        {% endif %}
       </div>
     </section>
 
@@ -104,16 +107,16 @@
     <section class="card">
       <div class="card-header">
         <h2>Admission rate</h2>
-        <p class="sub">Visitors admitted to the origin per second.</p>
+        <p class="sub">Target visitors admitted to the origin per second.</p>
       </div>
       <div class="card-body">
         <form method="post" action="/admin/rate">
           <div class="form-field">
             <label for="rate">Target rate (visitors per second)</label>
-            <input id="rate" name="rate" type="number" min="1" required title="Visitors admitted to the origin per second. Each visitor per second is one more request per second at your origin.">
-            <span class="help">Set this to the requests per second the origin sustains. Each unit is one visitor per second admitted. The value is a whole number from 1 to the deployment ceiling. To stop admission, use <strong>Pause</strong>; rate 0 is rejected.</span>
+            <input id="rate" name="rate" type="number" min="1" required title="Target visitors per second. One unit is one visitor per second at the origin.">
+            <span class="help">Set this to the requests per second the origin sustains. One unit is one visitor per second. The value is a whole number from 1 to the deployment ceiling. To stop admission, use <strong>Pause</strong>; rate 0 is rejected. <strong>The admission controller ships after the MVP</strong>, so this value is stored but not yet enforced.</span>
           </div>
-          <button type="submit" title="Set the target rate the controller admits visitors at.">Set rate</button>
+          <button type="submit" title="Store the target admission rate.">Set rate</button>
         </form>
       </div>
     </section>
@@ -128,8 +131,8 @@
         <form method="post" action="/admin/message">
           <div class="form-field">
             <label for="message">Message shown to waiting visitors</label>
-            <input id="message" name="message" type="text" title="Shown on the waiting page and returned by /status. Every visitor in the queue sees it.">
-            <span class="help">The text appears on the waiting page and in the <code>/status</code> response. Every visitor in the queue sees it. Submit an empty field to clear it.</span>
+            <input id="message" name="message" type="text" title="Returned in the /status response that the waiting page polls. Every waiting visitor sees it.">
+            <span class="help">The text is returned in the <code>/status</code> response that the waiting page polls, so every waiting visitor sees it. Submit an empty field to clear it.</span>
           </div>
           <button type="submit" title="Update the message shown to waiting visitors.">Set message</button>
         </form>

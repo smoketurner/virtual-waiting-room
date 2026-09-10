@@ -6,8 +6,16 @@ use askama::Template;
 
 use crate::ControlState;
 
-/// The dashboard view. Optional fields render as an em dash when absent so the
-/// operator sees "not set" rather than a blank. Also serialized as JSON by the
+/// One selectable phase transition in the Phase control's dropdown: the target
+/// phase value plus a self-describing label.
+#[derive(serde::Serialize)]
+pub struct PhaseOption {
+    pub value: String,
+    pub label: String,
+}
+
+/// The dashboard view. Optional fields render as "not set" when absent so the
+/// operator sees a label rather than a blank. Also serialized as JSON by the
 /// `/admin/state` poller endpoint.
 #[derive(Template, serde::Serialize)]
 #[template(path = "dashboard.html")]
@@ -23,6 +31,9 @@ pub struct Dashboard {
     /// human "last changed by X at T" line for the audit trail.
     pub admission_paused: bool,
     pub last_action_line: String,
+    /// The phase transitions the operator may select right now (legal forward
+    /// steps only). Empty when the event is in a terminal or halted phase.
+    pub allowed_transitions: Vec<PhaseOption>,
     /// Signed-in operator email for the top nav (set by the handler, not from
     /// control state). Not part of the JSON state view.
     #[serde(skip)]
@@ -47,6 +58,13 @@ impl Dashboard {
             target_rate: dash(state.target_rate.map(|n| n.to_string())),
             message: dash(state.message.clone()),
             admission_paused: state.admission_paused,
+            allowed_transitions: crate::next_phases(state.phase)
+                .into_iter()
+                .map(|p| PhaseOption {
+                    value: phase_value(p).to_owned(),
+                    label: phase_label(p),
+                })
+                .collect(),
             last_action_line: match (
                 &state.last_action,
                 &state.last_action_by,
@@ -59,6 +77,31 @@ impl Dashboard {
             operator_email: String::new(),
         }
     }
+}
+
+/// The stored `snake_case` value for a phase (matches what the handler parses).
+fn phase_value(p: wr_domain::Phase) -> &'static str {
+    use wr_domain::Phase::{Active, Idle, Maintenance, PostEvent, PreQueue};
+    match p {
+        Idle => "idle",
+        PreQueue => "pre_queue",
+        Active => "active",
+        PostEvent => "post_event",
+        Maintenance => "maintenance",
+    }
+}
+
+/// A self-describing dropdown label for a phase transition.
+fn phase_label(p: wr_domain::Phase) -> String {
+    use wr_domain::Phase::{Active, Idle, Maintenance, PostEvent, PreQueue};
+    match p {
+        Idle => "idle: reset before the event starts",
+        PreQueue => "pre_queue: open the countdown page for early arrivals",
+        Active => "active: assign positions and start admitting",
+        PostEvent => "post_event: close the event and drain the queue",
+        Maintenance => "maintenance: halt the room",
+    }
+    .to_owned()
 }
 
 #[cfg(test)]
