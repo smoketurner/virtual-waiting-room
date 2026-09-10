@@ -211,6 +211,12 @@ fn json<T: serde::Serialize>(status: u16, body: &T) -> Result<Response<Body>, Er
     Ok(Response::builder()
         .status(status)
         .header("content-type", "application/json")
+        // Stated rather than left to the browser's judgement. With no directive
+        // at all a browser is free to apply heuristic freshness and answer a
+        // poll from its own cache, which reads as a queue that has stopped
+        // moving. max-age=0 keeps every poll honest; s-maxage preserves the edge
+        // collapsing that makes origin load independent of how many people wait.
+        .header("cache-control", "max-age=0, s-maxage=1")
         .body(Body::from(payload))?)
 }
 
