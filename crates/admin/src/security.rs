@@ -13,33 +13,14 @@ use axum::http::header::{HeaderMap, HeaderName};
 #[must_use]
 pub fn nonce() -> String {
     use aws_lc_rs::rand::{SecureRandom, SystemRandom};
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let mut bytes = [0u8; 16];
     // The system RNG only fails if the OS entropy source is unavailable, which
     // does not happen on Lambda; an all-zero nonce would merely fail closed
     // (the inline script would not run), never widen the policy.
     let _ = SystemRandom::new().fill(&mut bytes);
-    base64url(&bytes)
-}
-
-/// Minimal base64url (no padding) — avoids adding a base64 dependency for a
-/// 16-byte value.
-fn base64url(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0] as usize;
-        let b1 = chunk.get(1).copied().unwrap_or(0) as usize;
-        let b2 = chunk.get(2).copied().unwrap_or(0) as usize;
-        out.push(ALPHABET[b0 >> 2] as char);
-        out.push(ALPHABET[((b0 & 0x03) << 4) | (b1 >> 4)] as char);
-        if chunk.len() > 1 {
-            out.push(ALPHABET[((b1 & 0x0f) << 2) | (b2 >> 6)] as char);
-        }
-        if chunk.len() > 2 {
-            out.push(ALPHABET[b2 & 0x3f] as char);
-        }
-    }
-    out
+    URL_SAFE_NO_PAD.encode(bytes)
 }
 
 /// Applies the hardening headers to a response's header map. `nonce` is the

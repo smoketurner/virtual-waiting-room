@@ -27,7 +27,7 @@ pub fn claim_local_index_update(shard: usize) -> String {
 
 /// The `Counters` attribute name for an arrival shard counter,
 /// `arrivals#<shard>`, incremented by the authorizer and summed by the
-/// controller (DESIGN §7).
+/// controller.
 ///
 /// # Panics
 ///
