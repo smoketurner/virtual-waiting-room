@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 
-{% block title %}Waiting Room Admin — {{ event_id }}{% endblock %}
+{% block title %}Waiting Room Admin: {{ event_id }}{% endblock %}
 
 {% block content %}
 <header class="top-nav">
@@ -15,7 +15,7 @@
   </div>
 
   {% if admission_paused %}
-  <div class="banner" id="pause-banner">Admission is PAUSED — the queue keeps forming; no one is admitted.</div>
+  <div class="banner" id="pause-banner">Admission is PAUSED. The queue keeps forming; no one is admitted.</div>
   {% endif %}
 
   <div class="grid">
@@ -23,7 +23,7 @@
     <section class="card span-2">
       <div class="card-header">
         <h2>Current state</h2>
-        <p class="sub">Live — refreshes automatically.</p>
+        <p class="sub">Live. Refreshes automatically.</p>
       </div>
       <div class="card-body">
         <div class="kpis">
@@ -88,10 +88,10 @@
           <div class="form-field">
             <label for="phase">Transition to</label>
             <select id="phase" name="phase" title="Select the next phase. The lifecycle runs forward only: idle → pre_queue → active → post_event.">
-              <option value="idle">idle — event not started; nobody queued</option>
-              <option value="pre_queue">pre_queue — early arrivals wait on the countdown page</option>
-              <option value="active">active — positions assigned; admitting visitors</option>
-              <option value="post_event">post_event — event over; queue drained</option>
+              <option value="idle">idle: event not started; nobody queued</option>
+              <option value="pre_queue">pre_queue: early arrivals wait on the countdown page</option>
+              <option value="active">active: positions assigned; admitting visitors</option>
+              <option value="post_event">post_event: event over; queue drained</option>
             </select>
             <span class="help">The lifecycle runs forward only: <code>idle → pre_queue → active → post_event</code>. The server rejects a backward transition. To halt the room, use Force maintenance.</span>
           </div>
@@ -140,7 +140,7 @@
     <section class="card">
       <div class="card-header"><h2>Protection rules · sessions</h2></div>
       <div class="card-body">
-        <p class="deferred">Not yet available — the authorizer and session plane ship after the MVP.</p>
+        <p class="deferred">Not yet available. The authorizer and session plane ship after the MVP.</p>
       </div>
     </section>
   </div>
