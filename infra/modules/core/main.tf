@@ -234,6 +234,18 @@ resource "aws_lambda_function" "assign_position" {
 # deployed, so the live join batch is
 # consumed by a non-functional handler. BatchSize 100 / batching window 1s,
 # ReportBatchItemFailures so only failed record IDs return to the queue.
+# batch_size is 100 because each invocation makes exactly ONE `ADD queue_counter`
+# no matter how many joins are in the batch, and that counter is a single
+# DynamoDB item with a write ceiling near 1,000/s. At the 10k joins/s target,
+# batching by 100 costs 100 counter writes a second; batching by 10 would cost
+# 1,000 and sit on the ceiling. Do not lower it to chase latency.
+#
+# The cost of that choice: a batch size above 10 requires a batching window of
+# at least 1 second, and AWS documents that any window at all lets Lambda wait
+# up to 20 seconds before invoking on a low-traffic queue. So a lone join during
+# testing, or the last straggler of an event, can take ~20s to get a position.
+# Under load — which is the case this system exists for — messages are always
+# available and the window never binds.
 resource "aws_lambda_event_source_mapping" "join" {
   event_source_arn                   = aws_sqs_queue.join.arn
   function_name                      = aws_lambda_function.assign_position.arn

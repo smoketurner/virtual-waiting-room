@@ -214,9 +214,15 @@
   }
 
   // How many consecutive "no position for this id" answers to accept before
-  // concluding the place is gone rather than late. assign_position drains a
-  // batch in seconds; several polls is well past that.
-  var MAX_MISSES = 4;
+  // concluding the place is gone rather than late.
+  //
+  // This has to clear the ingest's worst-case delivery latency, not its typical
+  // one. A Lambda event source mapping with a batch window set may wait up to
+  // 20 seconds before invoking on a quiet queue, which AWS documents and which
+  // no amount of tuning below 20s avoids. At roughly six seconds a poll, four
+  // misses lands inside that window, so the recovery fired on every normal join
+  // and sent a duplicate message for a place that was simply still in flight.
+  var MAX_MISSES = 8;
   var misses = 0;
 
   function forgetJoin() {
