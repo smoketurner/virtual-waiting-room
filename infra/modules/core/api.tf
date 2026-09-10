@@ -221,7 +221,9 @@ resource "aws_api_gateway_integration" "endpoint" {
   # else until its crate lands. Admin routing keys on the endpoint being an admin
   # one, not on its auth type (auth is NONE — the Lambda enforces the session).
   uri = contains(["status", "queue_num"], each.key) ? aws_lambda_function.read.invoke_arn : (
-    local.is_admin_endpoint[each.key] && !local.admin_is_placeholder ? aws_lambda_function.admin.invoke_arn : aws_lambda_function.api_placeholder.invoke_arn
+    each.key == "generate_token" ? aws_lambda_function.generate_token.invoke_arn : (
+      local.is_admin_endpoint[each.key] && !local.admin_is_placeholder ? aws_lambda_function.admin.invoke_arn : aws_lambda_function.api_placeholder.invoke_arn
+    )
   )
 }
 

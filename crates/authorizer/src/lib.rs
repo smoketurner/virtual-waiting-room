@@ -13,7 +13,7 @@
 pub mod dynamo;
 pub mod token;
 
-use wr_crypto::{Session, SigningKey, VerifyError};
+use wr_common::{Session, SigningKey, VerifyError};
 
 pub use token::{TokenError, generate_token};
 
@@ -185,12 +185,12 @@ pub fn decide(
     // 2. A valid admission token becomes a session: mint the cookie, mark the
     //    arrival, strip the token from the URL.
     if let Some(token) = &req.url_token
-        && let Ok(admitted) = wr_crypto::AdmissionToken::verify(token, key, now)
+        && let Ok(admitted) = wr_common::AdmissionToken::verify(token, key, now)
         && admitted.event_id == cfg.event_id
     {
         let session = mint_session(&admitted.request_id, cfg, now);
         let set_cookie = session_cookie(&session.sign(key), cfg, now);
-        let arrival_shard = wr_domain::shard_for(admitted.request_id.as_bytes());
+        let arrival_shard = wr_common::shard_for(admitted.request_id.as_bytes());
         let stripped_path = strip_token(&req.path);
         return Decision::SetSessionAndForward {
             set_cookie,
@@ -328,7 +328,7 @@ mod tests {
     )]
 
     use super::*;
-    use wr_crypto::AdmissionToken;
+    use wr_common::AdmissionToken;
 
     fn key() -> SigningKey {
         SigningKey::new(b"a-32-byte-test-signing-key-value")
@@ -424,7 +424,7 @@ mod tests {
             } => {
                 assert!(set_cookie.starts_with("vwr_session="));
                 assert!(set_cookie.contains("HttpOnly"));
-                assert!(arrival_shard < wr_domain::SHARDS);
+                assert!(arrival_shard < wr_common::SHARDS);
                 // The minted cookie must verify as a session for this event.
                 let value = set_cookie.split(['=', ';']).nth(1).unwrap();
                 let s = Session::verify(value, &key(), 2000).unwrap();

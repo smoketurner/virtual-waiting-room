@@ -15,7 +15,7 @@ name = "seal_event"
 path = "src/lib.rs"
 
 [dependencies]
-wr-domain = { workspace = true }
+wr-common = { workspace = true }
 lambda_runtime = { workspace = true }
 aws-config = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 aws-sdk-dynamodb = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }

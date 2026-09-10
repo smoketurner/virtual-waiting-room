@@ -15,10 +15,6 @@
 # seal_start_time) lives in infra/environments/dev/terraform.tfvars and is
 # authoritative — this Makefile does not pass those as -var (which would override
 # the file). Only the built artifact paths are passed.
-#
-# The one build-time override (make build ARCH=arm64):
-#   ARCH        cargo-lambda build target: x86_64 (default) or arm64. Keep this
-#               in sync with lambda_architecture in terraform.tfvars.
 
 SHELL       := /usr/bin/env bash
 .SHELLFLAGS := -eu -o pipefail -c
@@ -27,12 +23,16 @@ ROOT        := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 ENV_DIR     := $(ROOT)/infra/environments/dev
 MANIFEST    := $(ROOT)/Cargo.toml
 ARTIFACTS   := $(ROOT)/.artifacts
+TFVARS      := $(ENV_DIR)/terraform.tfvars
 
-ARCH        ?= x86_64
+# The build target is read from lambda_architecture in terraform.tfvars, the
+# same value Terraform deploys the functions with, so the two cannot drift into
+# a stack whose binaries do not match its functions. Falling back to arm64
+# matches the Terraform default for a tfvars that does not set it (the file is
+# gitignored, so it may not exist at all). ARCH= still overrides for a one-off.
+ARCH ?= $(shell awk -F'"' '/^[[:space:]]*lambda_architecture[[:space:]]*=/ {print $$2; found=1} END {if (!found) print "arm64"}' $(TFVARS) 2>/dev/null || echo arm64)
 
 # cargo-lambda cross-compiles for x86_64 by default; --arm64 selects Graviton.
-# ARCH only selects the BUILD target here; the Lambda's lambda_architecture is
-# set in terraform.tfvars and must be kept in sync with what you build.
 ifeq ($(ARCH),arm64)
 ARCH_FLAG := --arm64
 else
@@ -46,7 +46,7 @@ endif
 # controller and authorizer are built here but deploy only when their enable_*
 # variable is set: the controller needs a schedule to fire it, and the authorizer
 # is attached at the customer's origin rather than to anything in this account.
-LAMBDA_CRATES := assign_position seal_event read admin controller authorizer
+LAMBDA_CRATES := assign_position seal_event read admin controller authorizer generate_token
 
 ASSIGN_ARTIFACT     := $(ARTIFACTS)/assign_position/bootstrap/bootstrap.zip
 SEAL_ARTIFACT       := $(ARTIFACTS)/seal_event/bootstrap/bootstrap.zip
@@ -54,6 +54,7 @@ READ_ARTIFACT       := $(ARTIFACTS)/read/bootstrap/bootstrap.zip
 ADMIN_ARTIFACT      := $(ARTIFACTS)/admin/bootstrap/bootstrap.zip
 CONTROLLER_ARTIFACT := $(ARTIFACTS)/controller/bootstrap/bootstrap.zip
 AUTHORIZER_ARTIFACT := $(ARTIFACTS)/authorizer/bootstrap/bootstrap.zip
+TOKEN_ARTIFACT      := $(ARTIFACTS)/generate_token/bootstrap/bootstrap.zip
 
 # All Terraform config — region, aws_profile, event_id, lambda_architecture,
 # seal_start_time, and the *_artifact_path values — lives in
@@ -75,7 +76,7 @@ build: ## Cross-compile every Lambda to a zip under .artifacts/<crate>/.
 			--lambda-dir $(ARTIFACTS)/$$crate \
 			-p $$crate --manifest-path $(MANIFEST); \
 	done
-	@echo "built: $(ASSIGN_ARTIFACT) $(SEAL_ARTIFACT) $(READ_ARTIFACT) $(ADMIN_ARTIFACT) $(CONTROLLER_ARTIFACT) $(AUTHORIZER_ARTIFACT)"
+	@echo "built: $(ASSIGN_ARTIFACT) $(SEAL_ARTIFACT) $(READ_ARTIFACT) $(ADMIN_ARTIFACT) $(CONTROLLER_ARTIFACT) $(AUTHORIZER_ARTIFACT) $(TOKEN_ARTIFACT)"
 
 init: ## terraform init (safe, idempotent).
 	terraform -chdir=$(ENV_DIR) init -input=false

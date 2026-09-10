@@ -18,8 +18,13 @@ One record per decision. Each states the context, the decision, and its conseque
 | [0011](0011-session-cookie-after-token.md) | Establish a session after validating the admission token |
 | [0012](0012-anti-ddos-count-mode.md) | Ship the anti-DDoS rule group in Count mode |
 | [0013](0013-cache-behaviour-separation.md) | Separate cache behaviours to preserve request collapsing |
-| [0014](0014-admin-ui-askama-cloudscape-tokens.md) | Render the admin UI with askama and Cloudscape design tokens |
+| [0014](0014-admin-ui-askama-cloudscape-tokens.md) | Render the admin UI with askama compile-time templates (styling superseded by 0018) |
 | [0015](0015-stripe-prequeue-counter.md) | Stripe the pre-queue registration counter across 10 shards |
+| [0016](0016-admin-oidc-dynamodb-sessions.md) | Authenticate the admin UI with OIDC and DynamoDB sessions |
+| [0017](0017-andon-cord-emergency-controls.md) | Give the operator an andon cord and guarded emergency controls |
+| [0018](0018-admin-vouch-design-language.md) | Style the admin UI with the Vouch design language (supersedes 0014's styling) |
+| [0019](0019-visitor-facing-serving-state.md) | Express the visitor-facing serving state as one enum |
+| [0020](0020-cloudfront-signed-cookie-gate.md) | Gate the protected origin with CloudFront signed cookies |
 
 ## Open
 

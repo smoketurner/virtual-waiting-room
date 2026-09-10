@@ -5,7 +5,7 @@ use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
 use aws_sdk_dynamodb::types::AttributeValue;
-use wr_domain::{AdmissionControl, Phase};
+use wr_common::{AdmissionControl, Phase};
 
 use crate::{ControlState, Store, StoreError};
 

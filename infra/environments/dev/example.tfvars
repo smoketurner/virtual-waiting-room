@@ -33,6 +33,10 @@ controller_artifact_path = "../../../.artifacts/controller/bootstrap/bootstrap.z
 # where the origin lives.
 authorizer_artifact_path = "../../../.artifacts/authorizer/bootstrap/bootstrap.zip"
 
+# Mints the CloudFront admission cookies. Without it nobody can be let through,
+# because the protected behaviour refuses every request that carries none.
+generate_token_artifact_path = "../../../.artifacts/generate_token/bootstrap/bootstrap.zip"
+
 # --- Admin OIDC login (ADR-0016) ----------------------------------------------
 # The client SECRET is NOT here — write it to the SSM SecureString out of band:
 #   aws ssm put-parameter --name /<name_prefix>/oidc-client-secret \

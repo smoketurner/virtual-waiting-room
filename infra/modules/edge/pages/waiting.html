@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>You're in line</title>
+    <link rel="stylesheet" href="/_wr/waiting.css" />
+  </head>
+  <body>
+    <main class="room">
+      <header class="head">
+        <p class="eyebrow">Virtual Waiting Room</p>
+        <h1 id="headline">Getting your place in line…</h1>
+        <p class="sub" id="subhead">
+          Keep this page open. You'll be let through automatically.
+        </p>
+      </header>
+
+      <section class="card" id="stats" hidden>
+        <div class="stat">
+          <div class="label">Your position</div>
+          <div class="value" id="position">—</div>
+        </div>
+        <div class="stat">
+          <div class="label">Now serving</div>
+          <div class="value" id="serving">—</div>
+        </div>
+        <div class="stat">
+          <div class="label">Ahead of you</div>
+          <div class="value" id="ahead">—</div>
+        </div>
+      </section>
+
+      <div class="bar" id="bar" hidden><div class="fill" id="fill"></div></div>
+
+      <p class="broadcast" id="broadcast" hidden></p>
+
+      <p class="note" id="note">
+        Closing this page keeps your place — reopening it picks the same place
+        back up.
+      </p>
+
+      <noscript>
+        <p class="note error">
+          This waiting room needs JavaScript to hold your place in line and let
+          you through when it's your turn.
+        </p>
+      </noscript>
+    </main>
+
+    <script src="/_wr/waiting.js"></script>
+  </body>
+</html>

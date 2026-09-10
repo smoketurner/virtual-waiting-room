@@ -72,8 +72,8 @@ impl Dashboard {
             message_raw: state.message.clone().unwrap_or_default(),
             admission_control: state.admission_control.as_wire_str().to_owned(),
             serving_state: {
-                use wr_domain::ServingState::{Closed, FailOpen, Paused, Running};
-                match wr_domain::serving_state(state.phase, state.admission_control) {
+                use wr_common::ServingState::{Closed, FailOpen, Paused, Running};
+                match wr_common::serving_state(state.phase, state.admission_control) {
                     Running => "Running",
                     Paused => "Paused",
                     Closed => "Closed",
@@ -103,8 +103,8 @@ impl Dashboard {
 }
 
 /// A self-describing dropdown label for a phase transition.
-fn phase_label(p: wr_domain::Phase) -> String {
-    use wr_domain::Phase::{Active, Idle, Maintenance, PostEvent, PreQueue};
+fn phase_label(p: wr_common::Phase) -> String {
+    use wr_common::Phase::{Active, Idle, Maintenance, PostEvent, PreQueue};
     match p {
         Idle => "idle: reset before the event starts",
         PreQueue => "pre_queue: open the countdown page for early arrivals",
@@ -120,7 +120,7 @@ mod tests {
     #![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
 
     use askama::Template;
-    use wr_domain::Phase;
+    use wr_common::Phase;
 
     use super::*;
 
@@ -133,7 +133,7 @@ mod tests {
             participant_count: Some(1000),
             target_rate: Some(500),
             message: Some("Doors open at noon".to_owned()),
-            admission_control: wr_domain::AdmissionControl::Open,
+            admission_control: wr_common::AdmissionControl::Open,
             last_action: Some("set_rate".to_owned()),
             last_action_by: Some("op@example.com".to_owned()),
             last_action_at: Some("2026-09-09T22:00:00Z".to_owned()),
@@ -187,7 +187,7 @@ mod tests {
 
     #[test]
     fn each_admission_state_renders_its_own_banner_and_badge() {
-        use wr_domain::AdmissionControl::{FailOpen, Open, Paused};
+        use wr_common::AdmissionControl::{FailOpen, Open, Paused};
 
         let render = |control| {
             let mut s = state();
@@ -219,7 +219,7 @@ mod tests {
     #[test]
     fn serving_state_reports_fail_open_to_the_operator() {
         let mut s = state();
-        s.admission_control = wr_domain::AdmissionControl::FailOpen;
+        s.admission_control = wr_common::AdmissionControl::FailOpen;
         assert_eq!(Dashboard::from_state(&s).serving_state, "Fail open");
     }
 

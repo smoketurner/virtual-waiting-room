@@ -58,6 +58,10 @@ module "edge" {
   api_gateway_domain_name   = module.core.api_gateway_domain_name
   env                       = var.env
   client_origin_domain_name = var.client_origin_domain_name
+
+  # Turns the gate on: CloudFront verifies admission cookies signed by this key
+  # group before it will reach the protected origin.
+  trusted_key_group_ids = [module.core.admission_key_group_id]
 }
 
 # authorizer. The function is the gate at the customer's protected origin: it

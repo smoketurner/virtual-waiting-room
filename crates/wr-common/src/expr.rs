@@ -2,7 +2,7 @@
 //! position writes, kept in one place so the attribute names live beside the
 //! item shapes rather than scattered across handlers.
 
-use wr_permutation::SHARDS;
+use crate::permutation::SHARDS;
 
 /// The `Counters` attribute name for a pre-queue shard counter,
 /// `prequeue_counter#<shard>`.
@@ -10,7 +10,7 @@ use wr_permutation::SHARDS;
 /// # Panics
 ///
 /// Panics if `shard >= SHARDS`; callers pick the shard with
-/// `wr_permutation::shard_for`, which is always in range.
+/// `crate::permutation::shard_for`, which is always in range.
 #[must_use]
 pub fn prequeue_shard_attr(shard: usize) -> String {
     assert!(shard < SHARDS, "shard {shard} out of range 0..{SHARDS}");
@@ -32,7 +32,7 @@ pub fn claim_local_index_update(shard: usize) -> String {
 /// # Panics
 ///
 /// Panics if `shard >= SHARDS`; callers pick the shard with
-/// `wr_permutation::shard_for`, which is always in range.
+/// `crate::permutation::shard_for`, which is always in range.
 #[must_use]
 pub fn arrivals_shard_attr(shard: usize) -> String {
     assert!(shard < SHARDS, "shard {shard} out of range 0..{SHARDS}");

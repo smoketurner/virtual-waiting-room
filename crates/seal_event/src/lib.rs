@@ -7,13 +7,13 @@
 //!
 //! The seal is also where `queue_counter` starts at the cohort size, so live
 //! joiners are numbered behind the whole pre-queue cohort instead of colliding
-//! with `[0, N)`. That clause lives in [`wr_domain::expr::seal_update`] with the
+//! with `[0, N)`. That clause lives in [`wr_common::expr::seal_update`] with the
 //! rest of the seal write, because it must be in the same atomic update: a
 //! separate write could be lost between the seal and the first live join.
 
 use std::future::Future;
 
-use wr_domain::{Phase, SHARDS, SealError, SealedOffsets};
+use wr_common::{Phase, SHARDS, SealError, SealedOffsets};
 
 pub mod dynamo;
 

@@ -5,7 +5,7 @@ use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::types::AttributeValue;
 use lambda_http::{Body, Error, Request, RequestExt, Response, service_fn};
 use read::{QueueNumError, queue_num, status};
-use wr_domain::{AdmissionControl, Counters, Phase, PreQueueItem, SHARDS};
+use wr_common::{AdmissionControl, Counters, Phase, PreQueueItem, SHARDS};
 
 struct Ctx {
     client: Client,
@@ -218,7 +218,7 @@ fn json<T: serde::Serialize>(status: u16, body: &T) -> Result<Response<Body>, Er
 mod tests {
     #![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
 
-    use wr_domain::{PositionItem, PositionStatus};
+    use wr_common::{PositionItem, PositionStatus};
 
     use super::*;
 

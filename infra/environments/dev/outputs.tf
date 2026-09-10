@@ -67,3 +67,13 @@ output "waiting_room_url" {
   description = "The URL the authorizer redirects un-admitted visitors to."
   value       = local.waiting_room_url
 }
+
+output "waiting_room_page_url" {
+  description = "The page an un-admitted visitor is shown. CloudFront serves it in place of the 403 it returns when admission cookies are missing."
+  value       = "https://${module.edge[0].distribution_domain_name}/_wr/waiting.html"
+}
+
+output "admission_key_pair_id" {
+  description = "ID of the CloudFront public key that verifies admission cookies."
+  value       = module.core.admission_key_pair_id
+}

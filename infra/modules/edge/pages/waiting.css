@@ -1,0 +1,155 @@
+/* The waiting page. Self-contained and system-font only: it is the one page
+   that has to render instantly for a million people at once, so it loads no
+   fonts, no images, and no third-party anything. */
+
+:root {
+  --bg: #f7f7f8;
+  --surface: #ffffff;
+  --ink: #16181d;
+  --muted: #5c6270;
+  --line: #e3e5ea;
+  --accent: #2f6fed;
+  --accent-soft: #e8effd;
+  --warn: #a4501a;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1115;
+    --surface: #171a20;
+    --ink: #f2f3f5;
+    --muted: #a0a6b4;
+    --line: #262a33;
+    --accent: #6f9dff;
+    --accent-soft: #1b2537;
+    --warn: #e0a56a;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: var(--bg);
+  color: var(--ink);
+  font-family:
+    system-ui,
+    -apple-system,
+    "Segoe UI",
+    Roboto,
+    Helvetica,
+    Arial,
+    sans-serif;
+  line-height: 1.5;
+}
+
+.room {
+  width: 100%;
+  max-width: 560px;
+}
+
+.head {
+  text-align: center;
+  margin-bottom: 28px;
+}
+
+.eyebrow {
+  margin: 0 0 8px;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+h1 {
+  margin: 0 0 8px;
+  font-size: 28px;
+  line-height: 1.25;
+  letter-spacing: -0.01em;
+}
+
+.sub {
+  margin: 0;
+  color: var(--muted);
+}
+
+.card {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1px;
+  background: var(--line);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.stat {
+  background: var(--surface);
+  padding: 18px 12px;
+  text-align: center;
+}
+
+.label {
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+
+.value {
+  font-size: 24px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.bar {
+  margin-top: 16px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  overflow: hidden;
+}
+
+.fill {
+  height: 100%;
+  width: 0;
+  border-radius: 999px;
+  background: var(--accent);
+  /* Eases between polls so the queue reads as moving rather than jumping. */
+  transition: width 600ms ease;
+}
+
+.broadcast {
+  margin: 20px 0 0;
+  padding: 12px 14px;
+  border-left: 3px solid var(--accent);
+  background: var(--accent-soft);
+  border-radius: 0 8px 8px 0;
+}
+
+.note {
+  margin: 24px 0 0;
+  text-align: center;
+  font-size: 14px;
+  color: var(--muted);
+}
+
+.note.error {
+  color: var(--warn);
+}
+
+@media (max-width: 420px) {
+  .card {
+    grid-template-columns: 1fr;
+  }
+
+  h1 {
+    font-size: 23px;
+  }
+}

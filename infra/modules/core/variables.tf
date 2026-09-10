@@ -77,6 +77,23 @@ variable "controller_artifact_path" {
   default     = ""
 }
 
+variable "generate_token_artifact_path" {
+  description = "Path to the generate_token Lambda bootstrap zip. It mints the CloudFront admission cookies and is the only writer of the arrivals counters. Empty = vendored placeholder."
+  type        = string
+  default     = ""
+}
+
+variable "admission_cookie_ttl_seconds" {
+  description = "How long an admission cookie set stays valid. Long enough to complete a purchase, short enough that a leaked set is not a standing bypass."
+  type        = number
+  default     = 3600
+
+  validation {
+    condition     = var.admission_cookie_ttl_seconds > 0 && var.admission_cookie_ttl_seconds <= 86400
+    error_message = "admission_cookie_ttl_seconds must be between 1 second and 24 hours."
+  }
+}
+
 variable "enable_controller" {
   description = "Create the recurring controller schedule (rate(1 minute), six 10s passes per invoke). Off by default; enable ahead of an event so admission is metered and positions expire."
   type        = bool

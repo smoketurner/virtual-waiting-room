@@ -6,8 +6,8 @@
 //! the shards in a flat `[u64; SHARDS]` and (de)serializes them with a manual
 //! bridge in [`Counters::shard_counts`] / [`Counters::from_item`].
 
+use crate::permutation::{Assignment, SHARDS, SealError, SealedOffsets, Seed};
 use serde::{Deserialize, Serialize};
-use wr_permutation::{SHARDS, SealError, SealedOffsets};
 
 use crate::ids::{AdmissionControl, Phase};
 
@@ -96,6 +96,67 @@ impl Counters {
     pub fn seal(&self) -> Result<SealedOffsets, SealError> {
         SealedOffsets::seal(self.prequeue_counts)
     }
+
+    /// Resolves a pre-queue registration to its queue position.
+    ///
+    /// Reconstructs the global index `i = offset[s] + l` from the sealed offsets
+    /// and the row, then derives the position with the permutation. A row whose
+    /// reconstructed `i` lands at or past the cohort size raced the seal and
+    /// belongs to the live-join sequence instead, so the permutation is never
+    /// evaluated outside its domain.
+    ///
+    /// # Errors
+    ///
+    /// [`ResolveError::NotSealed`] before the seal has written the seed, cohort
+    /// size, and offsets; [`ResolveError::BadShard`] if the row's shard is
+    /// outside `0..SHARDS`.
+    pub fn resolve_prequeue(&self, row: &PreQueueItem) -> Result<ResolvedPosition, ResolveError> {
+        let (Some(seed_bytes), Some(offsets)) = (self.shuffle_seed, self.prequeue_offsets) else {
+            return Err(ResolveError::NotSealed);
+        };
+        let participant_count = self.participant_count.ok_or(ResolveError::NotSealed)?;
+
+        let shard = usize::from(row.s);
+        if shard >= SHARDS {
+            return Err(ResolveError::BadShard);
+        }
+
+        let sealed = SealedOffsets::from_parts(offsets, participant_count);
+        Ok(match sealed.assign(shard, row.l) {
+            Assignment::PreQueue { index } => ResolvedPosition::PreQueue(crate::permutation::prp(
+                &Seed(seed_bytes),
+                index,
+                participant_count,
+            )),
+            // The live sequence starts at the cohort size, so a straggler is
+            // served behind the whole cohort. The exact position is claimed by
+            // the live-join path; this is the base it counts from.
+            Assignment::LiveJoin => ResolvedPosition::LiveJoin {
+                base: participant_count,
+            },
+        })
+    }
+}
+
+/// Where a pre-queue registration resolves to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedPosition {
+    /// A position inside the sealed cohort's `[0, N)`, derived from the seed.
+    PreQueue(u64),
+    /// The registration raced the seal and is numbered by the live-join
+    /// sequence, which starts at `base`.
+    LiveJoin { base: u64 },
+}
+
+/// Why a pre-queue registration cannot be resolved to a position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ResolveError {
+    /// The event has not been sealed, so no pre-queue position exists yet.
+    #[error("event not yet sealed")]
+    NotSealed,
+    /// The stored shard is outside `0..SHARDS` (a corrupt row).
+    #[error("shard index out of range")]
+    BadShard,
 }
 
 #[cfg(test)]

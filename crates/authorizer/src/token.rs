@@ -6,7 +6,7 @@
 //! the handler records its issuance in the `Tokens` table so a second request
 //! for the same visitor is rejected.
 
-use wr_crypto::{AdmissionToken, SigningKey};
+use wr_common::{AdmissionToken, SigningKey};
 
 /// Why a token could not be issued. Coarse on purpose: a caller learns only
 /// that it is not yet eligible or already has one, never internal detail.
@@ -53,7 +53,7 @@ mod tests {
     #![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
 
     use super::*;
-    use wr_crypto::VerifyError;
+    use wr_common::VerifyError;
 
     fn key() -> SigningKey {
         SigningKey::new(b"a-32-byte-test-signing-key-value")

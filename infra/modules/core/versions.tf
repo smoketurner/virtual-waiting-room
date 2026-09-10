@@ -14,5 +14,10 @@ terraform {
       source  = "hashicorp/archive"
       version = "~> 2.0"
     }
+    # Generates the CloudFront signed-cookie key pair at apply time.
+    tls = {
+      source  = "hashicorp/tls"
+      version = "~> 4.0"
+    }
   }
 }

@@ -5,7 +5,7 @@
 
 use std::future::Future;
 
-use wr_domain::{AdmissionControl, IllegalControl, Phase};
+use wr_common::{AdmissionControl, IllegalControl, Phase};
 
 pub mod dynamo;
 pub mod oidc;
@@ -772,8 +772,8 @@ mod tests {
         let state = store.load("evt").await.unwrap().unwrap();
         assert_eq!(state.admission_control, AdmissionControl::FailOpen);
         assert_eq!(
-            wr_domain::serving_state(state.phase, state.admission_control),
-            wr_domain::ServingState::FailOpen
+            wr_common::serving_state(state.phase, state.admission_control),
+            wr_common::ServingState::FailOpen
         );
     }
 

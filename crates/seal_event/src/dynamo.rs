@@ -4,7 +4,7 @@ use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
 use aws_sdk_dynamodb::types::AttributeValue;
-use wr_domain::{Phase, SHARDS};
+use wr_common::{Phase, SHARDS};
 
 use crate::{SealValues, Store, StoreError};
 
@@ -65,8 +65,8 @@ impl Store for DynamoStore {
             .update_item()
             .table_name(&self.counters_table)
             .key("event_id", AttributeValue::S(event_id.to_owned()))
-            .update_expression(wr_domain::expr::seal_update())
-            .condition_expression(wr_domain::expr::seal_guard())
+            .update_expression(wr_common::expr::seal_update())
+            .condition_expression(wr_common::expr::seal_guard())
             .expression_attribute_values(
                 ":seed",
                 AttributeValue::B(aws_sdk_dynamodb::primitives::Blob::new(values.seed)),

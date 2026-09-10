@@ -19,7 +19,7 @@
 
 use std::future::Future;
 
-use wr_domain::{AdmissionControl, Phase, SHARDS};
+use wr_common::{AdmissionControl, Phase, SHARDS};
 
 pub mod dynamo;
 

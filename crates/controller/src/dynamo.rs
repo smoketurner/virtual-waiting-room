@@ -10,7 +10,7 @@ use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
 use aws_sdk_dynamodb::types::AttributeValue;
-use wr_domain::{AdmissionControl, Phase, PositionStatus, SHARDS};
+use wr_common::{AdmissionControl, Phase, PositionStatus, SHARDS};
 
 use crate::{
     ControllerState, ExpiredPosition, NoShowState, ReleaseDecision, ReleaseInputs, Store,

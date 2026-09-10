@@ -87,3 +87,18 @@ output "join_esm_enabled" {
   description = "True when a real assign_position artifact is deployed and the SQS event-source mapping is live; false while it is the placeholder."
   value       = !local.assign_position_is_placeholder
 }
+
+output "admission_key_group_id" {
+  description = "ID of the CloudFront key group that verifies admission cookies. The edge module names it as the trusted key group on the protected behaviour, which is what turns the gate on."
+  value       = aws_cloudfront_key_group.signer.id
+}
+
+output "admission_key_pair_id" {
+  description = "ID of the CloudFront public key, sent as the CloudFront-Key-Pair-Id cookie."
+  value       = aws_cloudfront_public_key.signer.id
+}
+
+output "generate_token_function_name" {
+  description = "Name of the Lambda that mints admission cookies and records arrivals."
+  value       = aws_lambda_function.generate_token.function_name
+}

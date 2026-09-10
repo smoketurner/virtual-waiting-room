@@ -241,3 +241,40 @@ data "aws_iam_policy_document" "scheduler_assume_role" {
     }
   }
 }
+
+# generate_token: read the counters and the visitor's position, count the
+# arrival, and read the signing key. It writes only the arrivals counter, so an
+# UpdateItem on Counters is the whole write surface.
+data "aws_iam_policy_document" "generate_token" {
+  statement {
+    sid     = "ReadQueueState"
+    effect  = "Allow"
+    actions = ["dynamodb:GetItem"]
+    resources = [
+      aws_dynamodb_table.counters.arn,
+      aws_dynamodb_table.prequeue.arn,
+      aws_dynamodb_table.positions.arn,
+    ]
+  }
+
+  statement {
+    sid       = "RecordArrival"
+    effect    = "Allow"
+    actions   = ["dynamodb:UpdateItem"]
+    resources = [aws_dynamodb_table.counters.arn]
+  }
+
+  statement {
+    sid       = "ReadSignerKey"
+    effect    = "Allow"
+    actions   = ["ssm:GetParameter"]
+    resources = [aws_ssm_parameter.cf_signer_key.arn]
+  }
+
+  statement {
+    sid       = "Logs"
+    effect    = "Allow"
+    actions   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+    resources = ["arn:${data.aws_partition.current.partition}:logs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:*"]
+  }
+}

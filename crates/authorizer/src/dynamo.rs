@@ -11,7 +11,7 @@ use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::put_item::PutItemError;
 use aws_sdk_dynamodb::types::AttributeValue;
-use wr_domain::expr::arrivals_shard_attr;
+use wr_common::expr::arrivals_shard_attr;
 
 /// A side-effect failure. The handler treats a failure to record an arrival as
 /// non-fatal (the visitor is still admitted; the controller tolerates a missed

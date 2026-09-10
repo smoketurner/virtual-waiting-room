@@ -149,6 +149,14 @@ resource "aws_cloudfront_distribution" "this" {
     }
   }
 
+  # Origin 3: the waiting room's own pages. Private bucket, read only by this
+  # distribution through the origin access control.
+  origin {
+    origin_id                = local.waiting_origin_id
+    domain_name              = aws_s3_bucket.waiting.bucket_regional_domain_name
+    origin_access_control_id = aws_cloudfront_origin_access_control.waiting.id
+  }
+
   # Default behaviour: the protected origin. Uncached, session cookie forwarded.
   default_cache_behavior {
     target_origin_id         = local.client_origin_id
@@ -158,6 +166,24 @@ resource "aws_cloudfront_distribution" "this" {
     cache_policy_id          = local.caching_disabled_policy_id
     origin_request_policy_id = aws_cloudfront_origin_request_policy.protected.id
     compress                 = true
+
+    # The gate. CloudFront verifies the admission cookies at the edge and
+    # refuses anyone without them, so no compute sits in the request path and
+    # the origin never sees an un-admitted visitor. Refusals are 403s, mapped to
+    # the waiting page by custom_error_response below.
+    trusted_key_groups = var.trusted_key_group_ids
+  }
+
+  # The waiting room's pages. Deliberately outside the gate: this is what a
+  # refused visitor is shown.
+  ordered_cache_behavior {
+    path_pattern           = local.waiting_path_pattern
+    target_origin_id       = local.waiting_origin_id
+    viewer_protocol_policy = "redirect-to-https"
+    allowed_methods        = ["GET", "HEAD", "OPTIONS"]
+    cached_methods         = ["GET", "HEAD"]
+    cache_policy_id        = aws_cloudfront_cache_policy.waiting.id
+    compress               = true
   }
 
   # Polled: /status (path-only cache key).
@@ -226,6 +252,21 @@ resource "aws_cloudfront_distribution" "this" {
       origin_request_policy_id = local.all_viewer_except_host_policy_id
       compress                 = true
     }
+  }
+
+  # A refused visitor is shown the waiting page rather than CloudFront's error.
+  # The 200 is deliberate: the page is the correct answer to "you are not
+  # admitted yet", and a 403 body would keep browsers from rendering it as a
+  # normal page.
+  #
+  # error_caching_min_ttl must stay 0. CloudFront caches its own error responses,
+  # and a cached refusal would keep showing the waiting page to a visitor who has
+  # since been admitted.
+  custom_error_response {
+    error_code            = 403
+    response_code         = 200
+    response_page_path    = local.waiting_page_path
+    error_caching_min_ttl = 0
   }
 
   restrictions {

@@ -1,7 +1,14 @@
 locals {
   # Origin identifiers used to bind cache behaviours to origins.
-  api_origin_id    = "${var.name_prefix}-api"
-  client_origin_id = "${var.name_prefix}-origin"
+  api_origin_id     = "${var.name_prefix}-api"
+  client_origin_id  = "${var.name_prefix}-origin"
+  waiting_origin_id = "${var.name_prefix}-waiting"
+
+  # The waiting room's own pages, on their own unprotected behaviour. A visitor
+  # refused by the gate is shown waiting_page_path, so it must be reachable
+  # without a credential or the refusal would loop.
+  waiting_path_pattern = "/_wr/*"
+  waiting_page_path    = "/_wr/waiting.html"
 
   # AWS-managed cache policy "CachingDisabled" - the blessed way to make a
   # behaviour uncached. Used for the write behaviours and the protected default.

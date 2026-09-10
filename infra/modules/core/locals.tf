@@ -33,6 +33,7 @@ locals {
   read_name            = "${var.name_prefix}-read"
   admin_name           = "${var.name_prefix}-admin"
   controller_name      = "${var.name_prefix}-controller"
+  generate_token_name  = "${var.name_prefix}-generate-token"
 
   # warm_throughput is omitted from the table entirely when both units are 0, so
   # an un-warmed table stays at the on-demand cold baseline (idle default, no
@@ -47,18 +48,21 @@ locals {
   read_is_placeholder            = var.read_artifact_path == ""
   admin_is_placeholder           = var.admin_artifact_path == ""
   controller_is_placeholder      = var.controller_artifact_path == ""
+  generate_token_is_placeholder  = var.generate_token_artifact_path == ""
 
   assign_position_zip = local.assign_position_is_placeholder ? data.archive_file.placeholder[0].output_path : var.assign_position_artifact_path
   seal_event_zip      = local.seal_event_is_placeholder ? data.archive_file.placeholder[0].output_path : var.seal_event_artifact_path
   read_zip            = local.read_is_placeholder ? data.archive_file.placeholder[0].output_path : var.read_artifact_path
   admin_zip           = local.admin_is_placeholder ? data.archive_file.placeholder[0].output_path : var.admin_artifact_path
   controller_zip      = local.controller_is_placeholder ? data.archive_file.placeholder[0].output_path : var.controller_artifact_path
+  generate_token_zip  = local.generate_token_is_placeholder ? data.archive_file.placeholder[0].output_path : var.generate_token_artifact_path
 
   assign_position_hash = local.assign_position_is_placeholder ? data.archive_file.placeholder[0].output_base64sha256 : filebase64sha256(var.assign_position_artifact_path)
   seal_event_hash      = local.seal_event_is_placeholder ? data.archive_file.placeholder[0].output_base64sha256 : filebase64sha256(var.seal_event_artifact_path)
   read_hash            = local.read_is_placeholder ? data.archive_file.placeholder[0].output_base64sha256 : filebase64sha256(var.read_artifact_path)
   admin_hash           = local.admin_is_placeholder ? data.archive_file.placeholder[0].output_base64sha256 : filebase64sha256(var.admin_artifact_path)
   controller_hash      = local.controller_is_placeholder ? data.archive_file.placeholder[0].output_base64sha256 : filebase64sha256(var.controller_artifact_path)
+  generate_token_hash  = local.generate_token_is_placeholder ? data.archive_file.placeholder[0].output_base64sha256 : filebase64sha256(var.generate_token_artifact_path)
 
   lambda_runtime_arch = var.lambda_architecture
 }

@@ -17,7 +17,7 @@ use authorizer::{
 };
 use lambda_http::{Body, Error, Request as HttpRequest, RequestExt, Response, run, service_fn};
 use tracing::{error, info, warn};
-use wr_crypto::SigningKey;
+use wr_common::SigningKey;
 
 /// Resolved once at cold start and shared across invokes.
 struct AppState {

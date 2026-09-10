@@ -78,6 +78,12 @@ variable "controller_artifact_path" {
   default     = ""
 }
 
+variable "generate_token_artifact_path" {
+  description = "Path to the built generate_token bootstrap binary. It mints the CloudFront admission cookies that let an admitted visitor reach the origin; empty leaves the endpoint on the placeholder and nobody can be admitted."
+  type        = string
+  default     = ""
+}
+
 variable "lambda_architecture" {
   description = "Lambda CPU architecture for every function: arm64 or x86_64. Must match the built artifacts."
   type        = string

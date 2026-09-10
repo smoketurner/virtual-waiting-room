@@ -1,5 +1,5 @@
 [package]
-name = "authorizer"
+name = "generate_token"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
@@ -11,24 +11,25 @@ name = "bootstrap"
 path = "src/main.rs"
 
 [lib]
-name = "authorizer"
+name = "generate_token"
 path = "src/lib.rs"
 
 [dependencies]
 wr-common = { workspace = true }
+aws-lc-rs = { workspace = true, features = ["aws-lc-sys"] }
+base64 = { workspace = true, features = ["std"] }
 lambda_http = { workspace = true, features = ["apigw_rest", "tracing"] }
 lambda_runtime = { workspace = true }
 aws-config = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 aws-sdk-dynamodb = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 aws-sdk-ssm = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
-cookie = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["std"] }
+serde_dynamo = { workspace = true, features = ["aws-sdk-dynamodb+1"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 thiserror = { workspace = true }
 tracing = { workspace = true, default-features = true }
 tracing-subscriber = { workspace = true, features = ["fmt", "env-filter", "json"] }
-anyhow = { workspace = true, features = ["std"] }
 
 [lints]
 workspace = true

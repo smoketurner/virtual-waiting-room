@@ -62,3 +62,9 @@ variable "price_class" {
     error_message = "price_class must be one of PriceClass_All, PriceClass_200, PriceClass_100."
   }
 }
+
+variable "trusted_key_group_ids" {
+  description = "CloudFront key group IDs allowed to sign admission cookies for the protected behaviour. Empty leaves the origin ungated, which is only correct before the signing key exists."
+  type        = list(string)
+  default     = []
+}
