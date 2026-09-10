@@ -111,29 +111,43 @@ resource "aws_s3_bucket_policy" "waiting" {
 #
 # Content-typed explicitly because S3 does not infer it, and a page served as
 # application/octet-stream downloads instead of rendering.
+#
+# max-age=0 with s-maxage is not belt and braces, it is the difference between
+# the gate working and not. CloudFront serves this page as the body of its 403,
+# so the response the browser stores under "/" IS this object's headers. With no
+# Cache-Control at all a browser applies heuristic freshness — roughly a tenth
+# of the age since Last-Modified — and then answers later navigations to "/"
+# from its own disk without ever contacting CloudFront. An admitted visitor
+# holding valid cookies keeps seeing the waiting page, because the request that
+# would have proved their admission is never made. max-age=0 forces the browser
+# to revalidate every time; s-maxage keeps the edge copy that stops a million
+# arrivals reaching S3.
 resource "aws_s3_object" "waiting_page" {
-  bucket       = aws_s3_bucket.waiting.id
-  key          = "_wr/waiting.html"
-  content      = file("${path.module}/pages/waiting.html")
-  content_type = "text/html; charset=utf-8"
-  etag         = filemd5("${path.module}/pages/waiting.html")
-  tags         = var.tags
+  bucket        = aws_s3_bucket.waiting.id
+  key           = "_wr/waiting.html"
+  content       = file("${path.module}/pages/waiting.html")
+  content_type  = "text/html; charset=utf-8"
+  cache_control = "max-age=0, s-maxage=60"
+  etag          = filemd5("${path.module}/pages/waiting.html")
+  tags          = var.tags
 }
 
 resource "aws_s3_object" "waiting_style" {
-  bucket       = aws_s3_bucket.waiting.id
-  key          = "_wr/waiting.css"
-  content      = file("${path.module}/pages/waiting.css")
-  content_type = "text/css; charset=utf-8"
-  etag         = filemd5("${path.module}/pages/waiting.css")
-  tags         = var.tags
+  bucket        = aws_s3_bucket.waiting.id
+  key           = "_wr/waiting.css"
+  content       = file("${path.module}/pages/waiting.css")
+  content_type  = "text/css; charset=utf-8"
+  cache_control = "max-age=0, s-maxage=300"
+  etag          = filemd5("${path.module}/pages/waiting.css")
+  tags          = var.tags
 }
 
 resource "aws_s3_object" "waiting_script" {
-  bucket       = aws_s3_bucket.waiting.id
-  key          = "_wr/waiting.js"
-  content      = file("${path.module}/pages/waiting.js")
-  content_type = "text/javascript; charset=utf-8"
-  etag         = filemd5("${path.module}/pages/waiting.js")
-  tags         = var.tags
+  bucket        = aws_s3_bucket.waiting.id
+  key           = "_wr/waiting.js"
+  content       = file("${path.module}/pages/waiting.js")
+  content_type  = "text/javascript; charset=utf-8"
+  cache_control = "max-age=0, s-maxage=300"
+  etag          = filemd5("${path.module}/pages/waiting.js")
+  tags          = var.tags
 }

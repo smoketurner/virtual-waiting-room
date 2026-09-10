@@ -82,11 +82,18 @@ resource "aws_s3_bucket_policy" "this" {
 
 # The page a visitor sees once the gate lets them through. Served at the
 # distribution root via default_root_object.
+#
+# max-age=0 for the same reason the waiting page carries it, in the other
+# direction: a browser that caches this page keeps serving it after the pass
+# expires, so the visitor stays "through" locally while the edge would have sent
+# them back to the queue. Anything behind the gate has to be revalidated, or the
+# gate is only enforced on the first visit.
 resource "aws_s3_object" "index" {
-  bucket       = aws_s3_bucket.this.id
-  key          = "index.html"
-  content      = file("${path.module}/pages/index.html")
-  content_type = "text/html; charset=utf-8"
-  etag         = filemd5("${path.module}/pages/index.html")
-  tags         = var.tags
+  bucket        = aws_s3_bucket.this.id
+  key           = "index.html"
+  content       = file("${path.module}/pages/index.html")
+  content_type  = "text/html; charset=utf-8"
+  cache_control = "max-age=0, s-maxage=60"
+  etag          = filemd5("${path.module}/pages/index.html")
+  tags          = var.tags
 }
