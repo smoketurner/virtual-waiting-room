@@ -113,6 +113,32 @@ pub const MAX_ADMISSION_RATE: u32 = 100_000;
 /// emergency full-stop (force maintenance) is deliberately NOT debounced.
 pub const DEBOUNCE_MS: u64 = 2000;
 
+/// The mutating operator actions, recorded verbatim in the `last_action` audit
+/// field (ADR-0017). An enum rather than scattered string literals so the audit
+/// vocabulary has a single source of truth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminAction {
+    SetRate,
+    SetMessage,
+    Pause,
+    Resume,
+    ForceMaintenance,
+}
+
+impl AdminAction {
+    /// The stored audit label.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SetRate => "set_rate",
+            Self::SetMessage => "set_message",
+            Self::Pause => "pause",
+            Self::Resume => "resume",
+            Self::ForceMaintenance => "force_maintenance",
+        }
+    }
+}
+
 /// A store failure or a lost transition race.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {

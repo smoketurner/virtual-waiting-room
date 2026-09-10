@@ -9,8 +9,8 @@ pub mod ids;
 pub mod items;
 
 pub use ids::{
-    AdmissionControl, EventId, IllegalControl, Phase, RequestId, ServingState, UnknownPhase,
-    serving_state,
+    AdmissionControl, EventId, IllegalControl, Phase, RequestId, ServingState, UnknownControl,
+    UnknownPhase, serving_state,
 };
 pub use items::{Counters, PositionItem, PositionStatus, PreQueueItem};
 pub use wr_permutation::{Assignment, SHARDS, SealError, SealedOffsets, Seed, prp, shard_for};

@@ -103,7 +103,37 @@ impl AdmissionControl {
     pub fn recover(self) -> Self {
         Self::Open
     }
+
+    /// The stored wire string, matching the `serde` `snake_case` representation.
+    /// Single source of truth so no caller hand-writes "open"/"paused"/etc.
+    #[must_use]
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Paused => "paused",
+            Self::FailOpen => "fail_open",
+        }
+    }
 }
+
+impl std::str::FromStr for AdmissionControl {
+    type Err = UnknownControl;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "open" => Ok(Self::Open),
+            "paused" => Ok(Self::Paused),
+            "fail_open" => Ok(Self::FailOpen),
+            other => Err(UnknownControl(other.to_owned())),
+        }
+    }
+}
+
+/// A string that names no known [`AdmissionControl`]. A stored value that fails
+/// to parse resolves to [`AdmissionControl::Open`] (the safe default).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown admission control: {0}")]
+pub struct UnknownControl(pub String);
 
 /// What a visitor arriving right now experiences (ADR-0019). The visitor-facing
 /// projection published by `/status`, distinct from [`Phase`] (the timeline). It
@@ -229,6 +259,21 @@ mod tests {
         // Cannot pause/resume out of fail-open; recover first.
         assert!(FailOpen.pause().is_err());
         assert!(FailOpen.resume().is_err());
+    }
+
+    #[test]
+    fn admission_control_wire_string_round_trips() {
+        for c in [
+            AdmissionControl::Open,
+            AdmissionControl::Paused,
+            AdmissionControl::FailOpen,
+        ] {
+            assert_eq!(c.as_wire_str().parse::<AdmissionControl>().unwrap(), c);
+            // Wire string matches the serde representation.
+            let json = serde_json::to_string(&c).unwrap();
+            assert_eq!(json, format!("\"{}\"", c.as_wire_str()));
+        }
+        assert!("bogus".parse::<AdmissionControl>().is_err());
     }
 
     #[test]
