@@ -248,8 +248,16 @@
       el.fill.style.width = done.toFixed(1) + "%";
     }
 
-    if (ahead === 0) {
+    // The headline follows the admission rule, not `ahead`. A visitor is
+    // admitted once position < serving, but `ahead` reaches zero one release
+    // earlier — so keying the headline off `ahead` promises entry while the
+    // gate still refuses, and the promise stands until the cursor moves again.
+    // At the end of a cohort it never does: the controller stops at
+    // queue_counter + 1, so the last visitor in line sits at ahead === 0.
+    if (position < serving) {
       say("You're next", "Letting you through…");
+    } else if (ahead === 0) {
+      say("You're next", "Waiting for the next release…");
     } else {
       say(
         "You're in line",
