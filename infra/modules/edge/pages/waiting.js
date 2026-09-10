@@ -98,6 +98,48 @@
   var eventId = null;
   var admitting = false;
 
+  // Admission is a navigation away from this page, so if the page loads again
+  // straight afterwards the pass was not accepted — the cookies did not stick,
+  // or the edge refused them. Without this the page redeems, navigates, is
+  // refused, loads again, and redeems again as fast as the network allows.
+  var REDEEM_KEY = "vwr_redeemed_at";
+  var BOUNCE_KEY = "vwr_bounces";
+  var BOUNCE_WINDOW_MS = 20000;
+  var MAX_BOUNCES = 2;
+
+  function sessionGet(key) {
+    try {
+      return window.sessionStorage.getItem(key);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function sessionSet(key, value) {
+    try {
+      window.sessionStorage.setItem(key, value);
+    } catch (e) {
+      /* storage unavailable; the loop guard degrades to off */
+    }
+  }
+
+  function noteRedeem() {
+    sessionSet(REDEEM_KEY, String(Date.now()));
+  }
+
+  /// True when this page load followed a redeem that should have taken the
+  /// visitor to the origin, meaning the pass was refused.
+  function bouncedBack() {
+    var at = parseInt(sessionGet(REDEEM_KEY) || "0", 10);
+    if (!at || Date.now() - at > BOUNCE_WINDOW_MS) {
+      sessionSet(BOUNCE_KEY, "0");
+      return false;
+    }
+    var n = parseInt(sessionGet(BOUNCE_KEY) || "0", 10) + 1;
+    sessionSet(BOUNCE_KEY, String(n));
+    return n > MAX_BOUNCES;
+  }
+
   function jitter() {
     return POLL_MS + Math.floor(Math.random() * JITTER_MS);
   }
@@ -155,8 +197,13 @@
     return postJSON("/v1/join", {
       request_id: requestId,
       event_id: eventId,
-    }).then(function () {
-      writeStored(JOINED_KEY, requestId);
+    }).then(function (res) {
+      // Only a request the ingest accepted claims a place. postJSON resolves
+      // for any status, so recording unconditionally marks a rejected join as
+      // done and leaves the visitor polling a position nothing will ever write.
+      if (res.status >= 200 && res.status < 300) {
+        writeStored(JOINED_KEY, requestId);
+      }
     });
   }
 
@@ -223,6 +270,7 @@
     }).then(function (res) {
       if (res.status === 200 && res.body.admitted) {
         say("You're through", "Taking you to the site…");
+        noteRedeem();
         // Replace so the waiting page does not sit in the back history.
         window.location.replace("/");
         return;
@@ -345,6 +393,18 @@
         // like a lost place.
         schedule();
       });
+  }
+
+  if (bouncedBack()) {
+    stop();
+    say(
+      "Your browser isn't keeping your pass",
+      "You were admitted, but the pass was not accepted on the way back."
+    );
+    el.note.textContent =
+      "This usually means cookies are blocked for this site. Enable them and reload to try again.";
+    el.note.className = "note error";
+    return;
   }
 
   el.note.textContent =
