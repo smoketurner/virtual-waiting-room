@@ -18,8 +18,8 @@ path = "src/lib.rs"
 wr-domain = { workspace = true }
 lambda_runtime = { workspace = true }
 aws_lambda_events = { workspace = true, features = ["sqs"] }
-aws-config = { workspace = true, features = ["behavior-version-latest"] }
-aws-sdk-dynamodb = { workspace = true, features = ["default-https-client", "rt-tokio"] }
+aws-config = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+aws-sdk-dynamodb = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["std"] }
 serde_dynamo = { workspace = true, features = ["aws-sdk-dynamodb+1"] }
