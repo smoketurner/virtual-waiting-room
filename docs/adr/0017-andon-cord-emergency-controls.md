@@ -106,3 +106,31 @@ distinct, visually-emphatic **Emergency** card on the dashboard.
   actor via the session). Recorded as a known limitation.
 - Additive to ADR-0014/0016; depends on ADR-0009's authorizer for §3 enforcement and the future
   outflow controller for §1 enforcement.
+
+## Revision (2026-09-10): stops are judged by the waiting visitor, and both are reversible
+
+Reviewing the shipped controls against the person waiting in the queue exposed two gaps that
+this revision closes. The governing principle is stated plainly: **a stop control is judged by
+what the waiting visitor experiences, not by the field it writes.**
+
+- **`admission_paused` is now surfaced to visitors.** It was written by the admin but never read
+  by the `/status` path, so Pause had *no* visitor-facing effect — the operator was misled into
+  thinking the line was held while visitors saw no change. `admission_paused` is added to
+  `wr_domain::Counters`, the `read` Lambda's counters load, and the `/status` payload. The
+  waiting page shows a "you keep your place" notice while paused. Pause now does what it says.
+
+- **Force maintenance is reversible from the UI.** The phase dropdown offered only forward
+  lifecycle steps and nothing from `Maintenance`, so Force maintenance was a one-way door: the
+  event was stuck from the operator's side even though the store permits `maintenance -> anything`.
+  `next_phases(Maintenance)` now returns `[active, idle]` — resume the event or reset it — so the
+  Phase control is the documented recovery path. Only `post_event` remains a genuine dead end
+  (a finished event; start a new one).
+
+- **Two visitor states, both honest and reversible.** Pause = "admission is paused, you keep your
+  place" (queue intact). Maintenance = "the event is temporarily down" (a different page, for an
+  outage, not a routine hold). Both reach the visitor via `/status`; both have a clear exit in
+  the admin UI. The distinction is the message the visitor sees, not a hidden mechanism.
+
+This does not change the graded-cord decision above; it makes §1 (Pause) visitor-visible ahead of
+the outflow controller by rendering the flag on the waiting page, and removes the maintenance
+dead end.

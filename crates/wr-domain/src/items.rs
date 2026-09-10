@@ -69,6 +69,9 @@ pub struct Counters {
     /// Operator broadcast text shown to waiting visitors. Absent until an
     /// operator sets it; cleared by setting it empty.
     pub message: Option<String>,
+    /// Andon cord (ADR-0017): when true, the waiting page tells visitors
+    /// admission is paused. They keep their queue position.
+    pub admission_paused: bool,
 }
 
 impl Counters {
@@ -135,6 +138,7 @@ mod tests {
             participant_count: None,
             prequeue_offsets: None,
             message: None,
+            admission_paused: false,
         };
         let sealed = counters.seal().unwrap();
         assert_eq!(sealed.participant_count(), 15);

@@ -21,6 +21,10 @@ pub struct StatusResponse {
     /// Operator broadcast text for the waiting page. Absent when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Andon cord (ADR-0017): true while admission is paused. The waiting page
+    /// tells visitors they keep their place. Always present so the page can
+    /// clear the notice on resume.
+    pub admission_paused: bool,
 }
 
 /// A resolved `/queue_num` response.
@@ -41,6 +45,7 @@ pub fn status(counters: &Counters) -> StatusResponse {
         participant_count: counters.participant_count,
         prequeue_offsets: counters.prequeue_offsets,
         message: counters.message.clone(),
+        admission_paused: counters.admission_paused,
     }
 }
 
@@ -127,6 +132,7 @@ mod tests {
             participant_count: Some(sealed.participant_count()),
             prequeue_offsets: Some(offsets),
             message: None,
+            admission_paused: false,
         }
     }
 
@@ -151,6 +157,7 @@ mod tests {
             participant_count: None,
             prequeue_offsets: None,
             message: None,
+            admission_paused: false,
         };
         let json = serde_json::to_value(status(&counters)).unwrap();
         assert_eq!(json["phase"], "pre_queue");
@@ -184,6 +191,20 @@ mod tests {
     }
 
     #[test]
+    fn status_surfaces_admission_paused() {
+        let mut counters = sealed_counters([1; SHARDS], [7u8; 32]);
+        assert_eq!(
+            serde_json::to_value(status(&counters)).unwrap()["admission_paused"],
+            false
+        );
+        counters.admission_paused = true;
+        assert_eq!(
+            serde_json::to_value(status(&counters)).unwrap()["admission_paused"],
+            true
+        );
+    }
+
+    #[test]
     fn queue_num_before_seal_is_not_sealed() {
         let counters = Counters {
             event_id: "evt-1".to_owned(),
@@ -195,6 +216,7 @@ mod tests {
             participant_count: None,
             prequeue_offsets: None,
             message: None,
+            admission_paused: false,
         };
         assert_eq!(
             queue_num(&counters, &row(0, 0)),

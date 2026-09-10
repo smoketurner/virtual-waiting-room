@@ -186,6 +186,11 @@ fn counters_from_item(
             .and_then(|v| v.as_s().ok())
             .filter(|s| !s.is_empty())
             .cloned(),
+        admission_paused: item
+            .get("admission_paused")
+            .and_then(|v| v.as_bool().ok())
+            .copied()
+            .unwrap_or(false),
     }
 }
 

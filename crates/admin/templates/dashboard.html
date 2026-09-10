@@ -58,22 +58,26 @@
       </div>
       <div class="card-body">
         {% if admission_paused %}
-        <p class="deferred">Admission is paused. No visitors reach the origin.</p>
+        <p class="deferred">Admission is paused. Waiting visitors see a "you keep your place" notice and nobody new is let through.</p>
         <form method="post" action="/admin/resume">
-          <button class="normal big" type="submit" title="Start admitting visitors again at the current target rate.">Resume admission</button>
+          <button class="normal big" type="submit" title="Start admitting visitors again. The notice clears.">Resume admission</button>
         </form>
-        <p class="help" style="margin-top:12px;color:var(--gray-500);">Resume starts admission again. The queue kept every position during the pause.</p>
+        <p class="help" style="margin-top:12px;color:var(--gray-500);">Resume clears the notice and starts admitting again. Every visitor kept their queue position through the pause.</p>
         {% else %}
         <form method="post" action="/admin/pause">
-          <button class="danger big" type="submit" title="Stop admitting visitors now. The queue and every position are kept.">Pause admission</button>
+          <button class="danger big" type="submit" title="Pause admission. Waiting visitors see a 'you keep your place' notice; nobody new is let through.">Pause admission</button>
         </form>
-        <p class="help" style="margin-top:12px;color:var(--gray-500);"><strong>Pause stops admission now.</strong> The queue keeps forming and every visitor keeps their position. A Resume button appears here to start admission again.</p>
+        <p class="help" style="margin-top:12px;color:var(--gray-500);"><strong>Pause holds the line.</strong> Waiting visitors see a "you keep your place" notice, the queue keeps forming, and nobody new is admitted. A Resume button appears here to clear it. Reversible.</p>
         {% endif %}
         <hr class="divider">
-        <form method="post" action="/admin/reset" data-confirm="Force maintenance sets the event to the maintenance phase and stops it for every visitor. Continue?">
-          <button class="danger" type="submit" title="Set the event to the maintenance phase. Stops the whole room. Requires confirmation.">Force maintenance</button>
+        {% if phase == "maintenance" %}
+        <p class="deferred">The event is in maintenance. Waiting visitors see an "event is temporarily down" page. Recover from the Phase control: return to <code>active</code> to resume, or <code>idle</code> to reset.</p>
+        {% else %}
+        <form method="post" action="/admin/reset" data-confirm="Force maintenance takes the whole event down. Waiting visitors see an 'event is temporarily down' page. Continue?">
+          <button class="danger" type="submit" title="Take the event down. Waiting visitors see an 'event is temporarily down' page. Requires confirmation. Reversible from the Phase control.">Force maintenance</button>
         </form>
-        <p class="help" style="margin-top:12px;color:var(--gray-500);"><strong>Force maintenance sets the event to the maintenance phase.</strong> The whole room stops: no queue, no admission, and the waiting page shows a maintenance state. Pause only stops admission. Use this when the event must come down.</p>
+        <p class="help" style="margin-top:12px;color:var(--gray-500);"><strong>Force maintenance takes the whole event down.</strong> Waiting visitors see an "event is temporarily down" page, not a queue. Use it for an outage, not a routine hold. Recover from the Phase control (return to <code>active</code> or <code>idle</code>). Pause only holds admission; this stops everything.</p>
+        {% endif %}
       </div>
     </section>
 
@@ -85,17 +89,17 @@
       </div>
       <div class="card-body">
         {% if allowed_transitions.is_empty() %}
-        <p class="deferred">No transition is available from the <code>{{ phase }}</code> phase. Use Force maintenance to stop the room, or start a new event.</p>
+        <p class="deferred">The event is over (<code>post_event</code>). There is no next phase. Start a new event to run again.</p>
         {% else %}
         <form method="post" action="/admin/phase">
           <div class="form-field">
             <label for="phase">Transition to</label>
-            <select id="phase" name="phase" title="The only phase you can move to next. The lifecycle runs one step at a time: idle → pre_queue → active → post_event.">
+            <select id="phase" name="phase" title="The phases you can move to next.">
               {% for opt in allowed_transitions %}
               <option value="{{ opt.value }}">{{ opt.label }}</option>
               {% endfor %}
             </select>
-            <span class="help">The lifecycle advances one step at a time: <code>idle → pre_queue → active → post_event</code>. Only the next step is offered. Skipping a step (for example <code>idle → active</code>) is rejected by the server.</span>
+            <span class="help">The lifecycle advances one step at a time: <code>idle → pre_queue → active → post_event</code>. Only the next step is offered, so skipping (for example <code>idle → active</code>) is not possible. From <code>maintenance</code> the options are to return to <code>active</code> or reset to <code>idle</code>.</span>
           </div>
           <button type="submit" title="Apply the phase transition.">Set phase</button>
         </form>
