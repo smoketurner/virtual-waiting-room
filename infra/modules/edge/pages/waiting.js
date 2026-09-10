@@ -91,6 +91,10 @@
     writeStored(STORAGE_KEY, requestId);
   }
 
+  // Learned from /status. The join request is validated at the edge against a
+  // schema requiring a non-empty event_id, so joining before this is known
+  // produces a 400, no queue message, and a visitor who waits forever for a
+  // position that was never claimed.
   var eventId = null;
   var admitting = false;
 
@@ -265,6 +269,12 @@
         }
         var s = res.body;
         showBroadcast(s.message);
+        eventId = s.event_id || eventId;
+        if (!eventId) {
+          // Nothing to join yet; the next poll tries again.
+          say("Getting your place in line…", "Just a moment.");
+          return schedule();
+        }
 
         if (s.serving_state === "closed") {
           el.stats.hidden = true;
