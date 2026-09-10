@@ -231,7 +231,6 @@ mod tests {
             queue_position: 4_242,
             entry_time: 1_788_000_000,
             status: PositionStatus::Issued,
-            expires_at: 1_788_000_300,
             ttl: 1_788_086_700,
         };
         let item: std::collections::HashMap<String, AttributeValue> =

@@ -109,6 +109,7 @@ impl Store for DynamoStore {
                 last_arrivals_total: num(item, "last_arrivals_total"),
                 last_serving_counter: num(item, "last_serving_counter"),
                 serving_counter: num(item, "serving_counter"),
+                queue_counter: num(item, "queue_counter"),
                 target_rate,
             },
             prev_no_show,
@@ -140,9 +141,13 @@ impl Store for DynamoStore {
                 ":next",
                 AttributeValue::N(decision.next_serving_counter.to_string()),
             )
+            // The cursor as it was BEFORE this release. Writing the value after
+            // it makes the next interval measure a release of zero, which takes
+            // the "nothing to measure" branch every time and leaves the
+            // controller running open-loop at the raw target forever.
             .expression_attribute_values(
                 ":last_serving",
-                AttributeValue::N(decision.next_serving_counter.to_string()),
+                AttributeValue::N(decision.previous_serving_counter.to_string()),
             )
             .expression_attribute_values(
                 ":arrivals_total",
@@ -175,29 +180,38 @@ impl Store for DynamoStore {
         }
     }
 
-    async fn query_expired(&self, now: u64) -> Result<Vec<ExpiredPosition>, StoreError> {
+    async fn query_expired(
+        &self,
+        cutoff_position: u64,
+    ) -> Result<Vec<ExpiredPosition>, StoreError> {
         let mut expired = Vec::new();
         let mut pages = self
             .client
             .scan()
             .table_name(&self.positions_table)
-            .filter_expression("expires_at < :now AND #s = :issued")
+            .filter_expression("queue_position < :cutoff AND #s = :issued")
             .expression_attribute_names("#s", "status")
-            .expression_attribute_values(":now", AttributeValue::N(now.to_string()))
+            .expression_attribute_values(":cutoff", AttributeValue::N(cutoff_position.to_string()))
             .expression_attribute_values(
                 ":issued",
                 AttributeValue::S(status_wire(PositionStatus::Issued).to_owned()),
             )
-            .projection_expression("request_id")
+            .projection_expression("request_id, queue_position")
             .into_paginator()
             .items()
             .send();
 
         while let Some(item) = pages.next().await {
             let item = item.map_err(|e| StoreError(format!("scan positions: {e}")))?;
-            if let Some(request_id) = item.get("request_id").and_then(|v| v.as_s().ok()) {
+            let request_id = item.get("request_id").and_then(|v| v.as_s().ok());
+            let position = item
+                .get("queue_position")
+                .and_then(|v| v.as_n().ok())
+                .and_then(|n| n.parse::<u64>().ok());
+            if let (Some(request_id), Some(position)) = (request_id, position) {
                 expired.push(ExpiredPosition {
                     request_id: request_id.clone(),
+                    position,
                 });
             }
         }

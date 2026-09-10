@@ -7,7 +7,7 @@
 //! minute at the 10-second cadence. The function timeout must exceed
 //! `PASSES_PER_INVOKE * INTERVAL_SECS` plus the per-pass work.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use controller::dynamo::DynamoStore;
 use controller::{INTERVAL_SECS, PASSES_PER_INVOKE, Store, run_pass};
@@ -46,7 +46,7 @@ async fn main() -> Result<(), Error> {
 async fn handle(store: &DynamoStore, _event: LambdaEvent<Value>) -> Result<(), Error> {
     let event_id = store.event_id().to_owned();
     for pass in 0..PASSES_PER_INVOKE {
-        run_pass(store, &event_id, now_secs()).await?;
+        run_pass(store, &event_id).await?;
         // Sleep between passes to hit the 10-second cadence; skip the final
         // sleep so the invoke returns promptly after its last pass.
         if pass + 1 < PASSES_PER_INVOKE {
@@ -54,13 +54,4 @@ async fn handle(store: &DynamoStore, _event: LambdaEvent<Value>) -> Result<(), E
         }
     }
     Ok(())
-}
-
-/// Current epoch-seconds. A clock before the epoch is impossible on Lambda;
-/// should it ever read backwards, treat now as 0 (expiring nothing) rather than
-/// panicking.
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
 }

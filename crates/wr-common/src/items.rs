@@ -48,9 +48,11 @@ pub struct PositionItem {
     /// client-supplied and untrusted.
     pub entry_time: u64,
     pub status: PositionStatus,
-    /// Position expiry the controller acts on.
-    pub expires_at: u64,
-    /// Post-event storage reclamation only; never the expiry mechanism.
+    /// Post-event storage reclamation only, never the expiry mechanism. A
+    /// position is expired by the controller when the admission cursor has
+    /// passed it and it was not claimed; there is deliberately no per-row
+    /// deadline, because a deadline set when the position is issued expires
+    /// people for waiting the length of the queue they are waiting in.
     pub ttl: u64,
 }
 
@@ -186,7 +188,6 @@ mod tests {
             queue_position: 4_242,
             entry_time: 1_788_000_000,
             status: PositionStatus::Issued,
-            expires_at: 1_800_000_000,
             ttl: 1_900_000_000,
         };
         let av: std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue> =
@@ -212,7 +213,6 @@ mod tests {
             queue_position: 7,
             entry_time: 1_788_000_000,
             status: PositionStatus::Issued,
-            expires_at: 1_800_000_000,
             ttl: 1_900_000_000,
         };
         let av: std::collections::HashMap<String, AttributeValue> =

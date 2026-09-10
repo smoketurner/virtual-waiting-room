@@ -8,10 +8,10 @@ use wr_common::{PositionItem, PositionStatus};
 
 use crate::{PositionWrite, Store, StoreError, WriteOutcome};
 
-/// Seconds a `Positions` row lives past its expiry before TTL reclaims it.
-const POSITION_TTL_GRACE_SECS: u64 = 86_400;
-/// Seconds after admission a position is considered expired by the controller.
-const POSITION_EXPIRY_SECS: u64 = 300;
+/// How long a `Positions` row is kept before `DynamoDB` TTL reclaims it. Storage
+/// hygiene only: whether a position is still claimable is decided by the
+/// controller against the admission cursor, not by this.
+const POSITION_TTL_SECS: u64 = 86_400;
 
 /// A live `DynamoDB` store bound to the counters and positions tables.
 pub struct DynamoStore {
@@ -61,8 +61,7 @@ impl Store for DynamoStore {
             queue_position: write.position,
             entry_time: now,
             status: PositionStatus::Issued,
-            expires_at: now + POSITION_EXPIRY_SECS,
-            ttl: now + POSITION_EXPIRY_SECS + POSITION_TTL_GRACE_SECS,
+            ttl: now.saturating_add(POSITION_TTL_SECS),
         };
         let attrs: std::collections::HashMap<String, AttributeValue> =
             serde_dynamo::to_item(&item).map_err(|e| StoreError(format!("serialize: {e}")))?;
