@@ -1,15 +1,18 @@
 //! The `aws-sdk-dynamodb`-backed [`Store`] for the controller.
 //!
 //! `Positions` is keyed only by `request_id` with no secondary index, so the
-//! expiry read is a `Scan` with a `FilterExpression` on `expires_at` and
-//! `status` (the filter also drops a TTL-pending-but-still-visible
-//! item). The `Counters` reads and writes are single-item `GetItem`/`UpdateItem`
-//! on the event key.
+//! expiry read is a `Scan` filtering on `queue_position` and `status` — the
+//! positions the admission cursor has left behind that nobody claimed.
+//!
+//! The event's own state is a single-item `GetItem`/`UpdateItem`. The arrivals
+//! shards are separate items under their own partition keys, so summing them
+//! is a `BatchGetItem` rather than attributes already in hand.
 
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
 use aws_sdk_dynamodb::types::AttributeValue;
+use wr_common::expr::{arrivals_shard_key, event_key, shard_count_of, shard_index_of};
 use wr_common::{AdmissionControl, Phase, PositionStatus, SHARDS};
 
 use crate::{
@@ -57,7 +60,7 @@ impl Store for DynamoStore {
             .client
             .get_item()
             .table_name(&self.counters_table)
-            .set_key(Some(wr_common::expr::event_key(event_id)))
+            .set_key(Some(event_key(event_id)))
             .consistent_read(true)
             .send()
             .await
@@ -124,7 +127,7 @@ impl Store for DynamoStore {
             .client
             .update_item()
             .table_name(&self.counters_table)
-            .set_key(Some(wr_common::expr::event_key(event_id)))
+            .set_key(Some(event_key(event_id)))
             .update_expression(
                 "SET serving_counter = :next, last_serving_counter = :last_serving, \
                  last_arrivals_total = :arrivals_total, no_show_rate = :no_show",
@@ -260,7 +263,7 @@ impl Store for DynamoStore {
             .client
             .update_item()
             .table_name(&self.counters_table)
-            .set_key(Some(wr_common::expr::event_key(event_id)))
+            .set_key(Some(event_key(event_id)))
             .update_expression("SET max_expired_position = :m")
             // Only ever move the cursor forward.
             .condition_expression(
@@ -292,7 +295,7 @@ impl DynamoStore {
     /// `BatchGetItem` rather than attributes already in hand.
     async fn read_arrivals(&self, event_id: &str) -> Result<[u64; SHARDS], StoreError> {
         let keys: Vec<_> = (0..SHARDS)
-            .map(|shard| wr_common::expr::arrivals_shard_key(event_id, shard))
+            .map(|shard| arrivals_shard_key(event_id, shard))
             .collect();
 
         let request = aws_sdk_dynamodb::types::KeysAndAttributes::builder()
@@ -317,14 +320,10 @@ impl DynamoStore {
         {
             // The item says which shard it is, so a batch returned in arbitrary
             // order needs no key parsing.
-            let Some(shard) = wr_common::expr::shard_index_of(item) else {
+            let Some(shard) = shard_index_of(item) else {
                 continue;
             };
-            arrivals[shard] = item
-                .get(wr_common::expr::SHARD_COUNT_ATTR)
-                .and_then(|v| v.as_n().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0);
+            arrivals[shard] = shard_count_of(item);
         }
         // An incomplete batch under-counts arrivals, which reads as a higher
         // no-show rate and releases more. Better to skip the pass than to

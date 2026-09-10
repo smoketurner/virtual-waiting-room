@@ -4,6 +4,9 @@ use std::collections::HashMap;
 
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::types::AttributeValue;
+use wr_common::expr::{
+    arrivals_shard_key, event_key, increment_shard_update, increment_shard_values,
+};
 use wr_common::{AdmissionControl, Counters, Phase, PositionStatus, PreQueueItem, SHARDS};
 
 use crate::{Store, StoreError};
@@ -42,7 +45,7 @@ impl Store for DynamoStore {
             // Consistent: a visitor polling for admission must not be told to
             // keep waiting because a replica lagged behind the controller.
             .consistent_read(true)
-            .set_key(Some(wr_common::expr::event_key(event_id)))
+            .set_key(Some(event_key(event_id)))
             .send()
             .await
             .map_err(|e| StoreError(format!("get_item counters: {e}")))?;
@@ -91,9 +94,9 @@ impl Store for DynamoStore {
         self.client
             .update_item()
             .table_name(&self.counters_table)
-            .set_key(Some(wr_common::expr::arrivals_shard_key(event_id, shard)))
-            .update_expression(wr_common::expr::increment_shard_update())
-            .set_expression_attribute_values(Some(wr_common::expr::increment_shard_values(shard)))
+            .set_key(Some(arrivals_shard_key(event_id, shard)))
+            .update_expression(increment_shard_update())
+            .set_expression_attribute_values(Some(increment_shard_values(shard)))
             .send()
             .await
             .map_err(|e| StoreError(format!("update_item arrivals: {e}")))?;

@@ -4,6 +4,9 @@ use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
 use aws_sdk_dynamodb::types::AttributeValue;
+use wr_common::expr::{
+    event_key, prequeue_shard_key, seal_guard, seal_update, shard_count_of, shard_index_of,
+};
 use wr_common::{Phase, SHARDS};
 
 use crate::{SealValues, Store, StoreError};
@@ -31,7 +34,7 @@ impl Store for DynamoStore {
         // registration writes do not contend, which means the seal has to
         // gather them.
         let keys: Vec<_> = (0..SHARDS)
-            .map(|shard| wr_common::expr::prequeue_shard_key(event_id, shard))
+            .map(|shard| prequeue_shard_key(event_id, shard))
             .collect();
 
         let request = aws_sdk_dynamodb::types::KeysAndAttributes::builder()
@@ -68,14 +71,10 @@ impl Store for DynamoStore {
         {
             // The item says which shard it is, so a batch returned in arbitrary
             // order needs no key parsing.
-            let Some(shard) = wr_common::expr::shard_index_of(item) else {
+            let Some(shard) = shard_index_of(item) else {
                 continue;
             };
-            counts[shard] = item
-                .get(wr_common::expr::SHARD_COUNT_ATTR)
-                .and_then(|v| v.as_n().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0);
+            counts[shard] = shard_count_of(item);
         }
         Ok(counts)
     }
@@ -91,9 +90,9 @@ impl Store for DynamoStore {
             .client
             .update_item()
             .table_name(&self.counters_table)
-            .set_key(Some(wr_common::expr::event_key(event_id)))
-            .update_expression(wr_common::expr::seal_update())
-            .condition_expression(wr_common::expr::seal_guard())
+            .set_key(Some(event_key(event_id)))
+            .update_expression(seal_update())
+            .condition_expression(seal_guard())
             .expression_attribute_values(
                 ":seed",
                 AttributeValue::B(aws_sdk_dynamodb::primitives::Blob::new(values.seed)),

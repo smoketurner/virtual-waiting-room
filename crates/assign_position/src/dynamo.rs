@@ -4,6 +4,7 @@ use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::put_item::PutItemError;
 use aws_sdk_dynamodb::types::{AttributeValue, ReturnValue};
+use wr_common::expr::{claim_live_block_update, event_key, not_exists_condition};
 use wr_common::{PositionItem, PositionStatus};
 
 use crate::{PositionWrite, Store, StoreError, WriteOutcome};
@@ -37,8 +38,8 @@ impl Store for DynamoStore {
             .client
             .update_item()
             .table_name(&self.counters_table)
-            .set_key(Some(wr_common::expr::event_key(event_id)))
-            .update_expression(wr_common::expr::claim_live_block_update())
+            .set_key(Some(event_key(event_id)))
+            .update_expression(claim_live_block_update())
             .expression_attribute_values(":n", AttributeValue::N(n.to_string()))
             .return_values(ReturnValue::AllNew)
             .send()
@@ -71,7 +72,7 @@ impl Store for DynamoStore {
             .put_item()
             .table_name(&self.positions_table)
             .set_item(Some(attrs))
-            .condition_expression(wr_common::expr::not_exists_condition("request_id"))
+            .condition_expression(not_exists_condition("request_id"))
             .send()
             .await;
 

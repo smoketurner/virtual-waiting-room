@@ -5,6 +5,7 @@ use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::types::AttributeValue;
 use lambda_http::{Body, Error, Request, RequestExt, Response, service_fn};
 use read::{QueueNumError, queue_num, status};
+use wr_common::expr::event_key;
 use wr_common::{AdmissionControl, Counters, Phase, PreQueueItem, SHARDS};
 
 struct Ctx {
@@ -92,7 +93,7 @@ async fn load_counters(ctx: &Ctx) -> Result<Option<Counters>, Error> {
         .client
         .get_item()
         .table_name(&ctx.counters_table)
-        .set_key(Some(wr_common::expr::event_key(&ctx.event_id)))
+        .set_key(Some(event_key(&ctx.event_id)))
         .send()
         .await?;
     let Some(item) = out.item() else {
