@@ -42,8 +42,8 @@
             <dd class="kv-val"><span class="status status-{{ phase }}" id="s-phase-badge">{{ phase }}</span></dd>
           </div>
           <div>
-            <dt class="kv-key">Admission</dt>
-            <dd class="kv-val" id="s-admission-badge">{% if admission_paused %}<span class="status status-error">paused</span>{% else %}<span class="status status-success">admitting</span>{% endif %}</dd>
+            <dt class="kv-key">Admission control</dt>
+            <dd class="kv-val" id="s-admission-badge">{% if admission_paused %}<span class="status status-error">paused</span>{% else %}<span class="status status-success">open</span>{% endif %}</dd>
           </div>
           <div>
             <dt class="kv-key">Broadcast message</dt>
@@ -139,11 +139,17 @@
         <form method="post" action="/admin/message">
           <div class="form-field">
             <label for="message">Message shown to waiting visitors</label>
-            <input id="message" name="message" type="text" title="Shown on the waiting page to every waiting visitor.">
-            <span class="help">Every waiting visitor sees this on the waiting page. Submit an empty field to clear it.</span>
+            <input id="message" name="message" type="text" value="{{ message_raw }}" title="Shown on the waiting page to every waiting visitor.">
+            <span class="help">Every waiting visitor sees this on the waiting page. Edit and Set to change it, or Clear to remove it.</span>
           </div>
           <button type="submit" title="Update the message shown to waiting visitors.">Set message</button>
         </form>
+        {% if !message_raw.is_empty() %}
+        <form method="post" action="/admin/message" data-confirm="Clear the broadcast message? Waiting visitors will no longer see it." style="margin-top:12px;">
+          <input type="hidden" name="message" value="">
+          <button type="submit" class="normal" title="Remove the broadcast message.">Clear message</button>
+        </form>
+        {% endif %}
       </div>
     </section>
 

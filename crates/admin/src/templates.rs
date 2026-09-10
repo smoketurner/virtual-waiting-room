@@ -27,6 +27,12 @@ pub struct Dashboard {
     pub participant_count: String,
     pub target_rate: String,
     pub message: String,
+    /// The raw broadcast message (empty string when unset), for pre-filling the
+    /// input value so the operator sees the current message is still set. The
+    /// `message` field above is the "not set"-dashed display form. Not part of
+    /// the JSON state view.
+    #[serde(skip)]
+    pub message_raw: String,
     /// Andon cord (ADR-0017): whether admission is currently paused, and a
     /// human "last changed by X at T" line for the audit trail.
     pub admission_paused: bool,
@@ -61,6 +67,7 @@ impl Dashboard {
             participant_count: dash(state.participant_count.map(|n| n.to_string())),
             target_rate: dash(state.target_rate.map(|n| n.to_string())),
             message: dash(state.message.clone()),
+            message_raw: state.message.clone().unwrap_or_default(),
             admission_paused: state.admission_paused,
             serving_state: {
                 use wr_domain::ServingState::{Closed, FailOpen, Paused, Running};
