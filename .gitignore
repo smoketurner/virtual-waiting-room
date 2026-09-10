@@ -54,3 +54,6 @@ infra/modules/core/.artifacts/
 
 # Python bytecode cache (scripts/smoke_test.py)
 __pycache__/
+
+.claude/settings.local.json
+

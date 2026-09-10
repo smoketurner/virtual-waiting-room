@@ -14,6 +14,53 @@ variable "signing_key_parameter_arn" {
   type        = string
 }
 
+variable "signing_key_parameter_name" {
+  description = "Name of the SSM SecureString parameter holding the signing key (from modules/core). Passed to the Lambda as SIGNING_KEY_PARAMETER; the handler reads it by name at cold start."
+  type        = string
+}
+
+variable "counters_table_name" {
+  description = "Name of the Counters DynamoDB table (from modules/core). The authorizer increments arrivals#<shard> on it when a token becomes a session."
+  type        = string
+}
+
+variable "counters_table_arn" {
+  description = "ARN of the Counters DynamoDB table, for scoping the ADD-arrivals IAM statement."
+  type        = string
+}
+
+variable "tokens_table_name" {
+  description = "Name of the Tokens DynamoDB table (from modules/core). The authorizer reserves single-use admission tokens in it (token#<request_id>)."
+  type        = string
+}
+
+variable "tokens_table_arn" {
+  description = "ARN of the Tokens DynamoDB table, for scoping the token-reservation IAM statement."
+  type        = string
+}
+
+variable "event_id" {
+  description = "The single event id this deployment serves. The authorizer scopes session and token validation to it."
+  type        = string
+}
+
+variable "waiting_room_url" {
+  description = "Absolute URL an un-admitted visitor is redirected to (302). Typically the CloudFront waiting-page path."
+  type        = string
+}
+
+variable "protected_path_prefixes" {
+  description = "Path prefixes the authorizer gates. A request matching none is forwarded without a credential. Empty means the whole origin is protected."
+  type        = list(string)
+  default     = []
+}
+
+variable "origin_arn" {
+  description = "ARN of the client origin the CloudFront VPC origin fronts. Required when enable_vpc = true."
+  type        = string
+  default     = ""
+}
+
 variable "lambda_artifact_path" {
   description = "Path to the built authorizer Lambda bootstrap zip (provided.al2023, arm64). Empty until the Rust crate is built (Phase 1/2)."
   type        = string
