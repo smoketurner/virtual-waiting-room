@@ -193,6 +193,42 @@ data "aws_iam_policy_document" "admin" {
   }
 }
 
+# Execution-role permissions for the controller: read and advance the Counters
+# item (serving_counter, max_expired_position, smoothing state), scan Positions
+# for expiry and mark them expired, plus logs. DESIGN section 7, ADR-0006.
+data "aws_iam_policy_document" "controller" {
+  statement {
+    sid    = "AdvanceCounters"
+    effect = "Allow"
+    actions = [
+      "dynamodb:GetItem",
+      "dynamodb:UpdateItem",
+    ]
+    resources = [aws_dynamodb_table.counters.arn]
+  }
+
+  statement {
+    sid    = "ExpirePositions"
+    effect = "Allow"
+    actions = [
+      "dynamodb:Scan",
+      "dynamodb:UpdateItem",
+    ]
+    resources = [aws_dynamodb_table.positions.arn]
+  }
+
+  statement {
+    sid    = "Logs"
+    effect = "Allow"
+    actions = [
+      "logs:CreateLogGroup",
+      "logs:CreateLogStream",
+      "logs:PutLogEvents",
+    ]
+    resources = ["arn:${data.aws_partition.current.partition}:logs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/${local.controller_name}*"]
+  }
+}
+
 # Trust policy for the EventBridge Scheduler role that invokes the seal Lambda.
 data "aws_iam_policy_document" "scheduler_assume_role" {
   statement {

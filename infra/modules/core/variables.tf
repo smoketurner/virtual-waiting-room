@@ -71,6 +71,18 @@ variable "admin_artifact_path" {
   default     = ""
 }
 
+variable "controller_artifact_path" {
+  description = "Path to the controller Lambda bootstrap zip (10s outflow controller, DESIGN section 7). Empty = vendored placeholder."
+  type        = string
+  default     = ""
+}
+
+variable "enable_controller" {
+  description = "Create the recurring controller schedule (rate(1 minute), six 10s passes per invoke). Off by default; enable ahead of an event so admission is metered and positions expire."
+  type        = bool
+  default     = false
+}
+
 variable "lambda_architecture" {
   description = "Lambda CPU architecture for every function: arm64 (design default) or x86_64. Must match the built artifacts."
   type        = string

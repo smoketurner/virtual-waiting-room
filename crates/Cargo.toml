@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["wr-permutation", "wr-domain", "wr-crypto", "assign_position", "seal_event", "read", "admin"]
+members = ["wr-permutation", "wr-domain", "wr-crypto", "assign_position", "seal_event", "read", "admin", "controller"]
 
 [workspace.package]
 edition = "2024"
