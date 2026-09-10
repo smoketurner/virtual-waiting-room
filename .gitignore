@@ -56,3 +56,6 @@ infra/modules/core/.artifacts/
 __pycache__/
 
 .claude/settings.local.json
+
+# HAR captures record live session cookies and signed admission policies.
+*.har

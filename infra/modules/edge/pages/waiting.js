@@ -104,8 +104,14 @@
   // refused, loads again, and redeems again as fast as the network allows.
   var REDEEM_KEY = "vwr_redeemed_at";
   var BOUNCE_KEY = "vwr_bounces";
-  var BOUNCE_WINDOW_MS = 20000;
-  var MAX_BOUNCES = 2;
+  var BOUNCE_WINDOW_MS = 30000;
+  // A refused pass is usually temporary — a newly rotated signing key takes a
+  // few minutes to reach every edge, and an edge that has not learned it yet
+  // refuses a cookie that is otherwise perfectly valid. So back off and try the
+  // same pass again rather than tearing through the join-poll-redeem cycle at
+  // network speed, and only give up after the delay has covered that window.
+  var BOUNCE_RETRY_MS = 8000;
+  var MAX_BOUNCE_RETRIES = 5;
 
   function sessionGet(key) {
     try {
@@ -127,17 +133,17 @@
     sessionSet(REDEEM_KEY, String(Date.now()));
   }
 
-  /// True when this page load followed a redeem that should have taken the
-  /// visitor to the origin, meaning the pass was refused.
-  function bouncedBack() {
+  /// How many times in a row this page has loaded straight after a redeem that
+  /// should have navigated away. Zero means this is a normal arrival.
+  function bounceCount() {
     var at = parseInt(sessionGet(REDEEM_KEY) || "0", 10);
     if (!at || Date.now() - at > BOUNCE_WINDOW_MS) {
       sessionSet(BOUNCE_KEY, "0");
-      return false;
+      return 0;
     }
     var n = parseInt(sessionGet(BOUNCE_KEY) || "0", 10) + 1;
     sessionSet(BOUNCE_KEY, String(n));
-    return n > MAX_BOUNCES;
+    return n;
   }
 
   function jitter() {
@@ -395,14 +401,26 @@
       });
   }
 
-  if (bouncedBack()) {
+  var bounces = bounceCount();
+  if (bounces > 0) {
+    // The pass exists and was refused. Hold it and try the same one again
+    // shortly; re-running the queue would take a second place in line for a
+    // visitor who already has one.
+    if (bounces <= MAX_BOUNCE_RETRIES) {
+      say("Almost through", "Getting you in — one moment.");
+      noteRedeem();
+      window.setTimeout(function () {
+        window.location.replace("/");
+      }, BOUNCE_RETRY_MS);
+      return;
+    }
     stop();
     say(
-      "Your browser isn't keeping your pass",
-      "You were admitted, but the pass was not accepted on the way back."
+      "We couldn't get you through",
+      "You were admitted, but the pass kept being refused on the way back."
     );
     el.note.textContent =
-      "This usually means cookies are blocked for this site. Enable them and reload to try again.";
+      "Reload to try again. If it keeps happening, check that cookies are enabled for this site.";
     el.note.className = "note error";
     return;
   }
