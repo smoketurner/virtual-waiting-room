@@ -88,7 +88,7 @@ resource "aws_lambda_function" "authorizer" {
 #
 # Only when enable_vpc = true: places the client origin in a private subnet with
 # CloudFront as the sole ingress. VPC origins forbid Lambda@Edge origin triggers
-# and are unavailable in GovCloud (DESIGN §12).
+# and are unavailable in GovCloud.
 
 resource "aws_cloudfront_vpc_origin" "this" {
   count = var.enable_vpc ? 1 : 0

@@ -1,5 +1,5 @@
 //! `/generate_token`: exchange a served queue position for a single-use
-//! admission token (DESIGN §8, F3.3).
+//! admission token.
 //!
 //! A visitor is eligible when the event is serving their position
 //! (`serving_counter >= position`). The token is short-lived and single-use;

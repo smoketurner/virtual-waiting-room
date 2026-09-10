@@ -1,4 +1,4 @@
-//! Origin-authorizer decision logic (DESIGN §2.3, §8, §10).
+//! Origin-authorizer decision logic.
 //!
 //! Every authorizer decision is local: the request carries its own credentials
 //! (a session cookie, or an admission token on the URL), and the authorizer
@@ -17,7 +17,7 @@ use wr_crypto::{Session, SigningKey, VerifyError};
 
 pub use token::{TokenError, generate_token};
 
-/// How a session's lifetime is bounded (F3.7).
+/// How a session's lifetime is bounded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionMode {
     /// The session expires a fixed duration after issue, regardless of activity.
@@ -28,7 +28,7 @@ pub enum SessionMode {
 }
 
 /// Whether the authorizer admits or blocks when the waiting room is
-/// unreachable (ADR-0009). Fail-open is the default; a client may fail closed.
+/// unreachable. Fail-open is the default; a client may fail closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UnreachablePolicy {
     /// Admit with a time-limited bypass cookie while the client retries.
@@ -38,7 +38,7 @@ pub enum UnreachablePolicy {
     FailClosed,
 }
 
-/// One local protection rule (F0.6): a request matches when the named request
+/// One local protection rule: a request matches when the named request
 /// attribute contains the configured substring. A path that no rule matches is
 /// unprotected and forwarded without a credential.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,7 +143,7 @@ pub enum Decision {
         stripped_path: String,
     },
     /// The waiting room is unreachable and the policy is fail-open. Forward with
-    /// this time-limited bypass cookie (ADR-0009).
+    /// this time-limited bypass cookie.
     FailOpenBypass { set_cookie: String },
     /// No valid credential and the path is protected. Redirect to the waiting
     /// room.
@@ -158,7 +158,7 @@ pub enum Reachability {
     Unreachable,
 }
 
-/// The core decision tree (DESIGN §2.3). Pure: no I/O, no clock — `now` is
+/// The core decision tree. Pure: no I/O, no clock — `now` is
 /// passed in, and the effect (writing the arrival, setting cookies) is carried
 /// out by the caller from the returned [`Decision`].
 ///
@@ -290,7 +290,7 @@ fn bypass_cookie(cfg: &Config, now: u64) -> String {
 }
 
 /// Removes the admission token from the path's query string so the forwarded
-/// URL no longer carries the single-use credential (ADR-0011). The `Request`
+/// URL no longer carries the single-use credential. The `Request`
 /// path here already excludes the query in the API-Gateway shape, so this is a
 /// defensive strip for shapes that include it.
 fn strip_token(path: &str) -> String {
@@ -452,7 +452,7 @@ mod tests {
     #[test]
     fn a_session_string_is_not_accepted_as_a_token() {
         // A session credential placed in the URL token slot must not admit: the
-        // kind tags differ, so AdmissionToken::verify rejects it (ADR-0011).
+        // kind tags differ, so AdmissionToken::verify rejects it.
         let session = Session {
             event_id: "smoke".to_owned(),
             request_id: "r1".to_owned(),

@@ -1,7 +1,7 @@
-//! Lambda entry point for the origin authorizer (DESIGN §2.3).
+//! Lambda entry point for the origin authorizer.
 //!
 //! Invocation model: a regular Rust Lambda at the `CloudFront` VPC origin (NOT
-//! `Lambda@Edge`, which VPC origins forbid — DESIGN §12), invoked with the
+//! `Lambda@Edge`, which VPC origins forbid), invoked with the
 //! `API-Gateway`/ALB HTTP request shape via `lambda_http`. It reads the signing
 //! key from SSM once at cold start, then decides every request locally.
 //!
@@ -40,7 +40,8 @@ async fn main() -> Result<(), Error> {
 }
 
 /// Reads configuration and the signing key. Runs in the boosted Init phase, so
-/// the SSM read (a TLS handshake) also warms the client (tech.md cold-start).
+/// the SSM read (a TLS handshake) also warms the client so the jitter-entropy
+/// seed and handshake land on boosted Init CPU rather than the first invoke.
 async fn init() -> Result<AppState, Error> {
     let config = aws_config::load_from_env().await;
     let dynamo = aws_sdk_dynamodb::Client::new(&config);
