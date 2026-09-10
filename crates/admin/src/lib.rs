@@ -32,36 +32,51 @@ pub trait Store {
         to: Phase,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
-    /// Sets the admission target rate the outflow controller reads.
+    /// Sets the admission target rate, guarded (ADR-0017 defensive controls):
+    /// the write applies only if the stored rate still equals `expected` and the
+    /// last mutation is older than the debounce window (`now_ms - DEBOUNCE_MS`).
+    /// It also stamps the audit fields and `last_action_epoch_ms` atomically.
+    /// Returns `Conflict` if the guard fails (lost race or too-fast).
     fn set_rate(
         &self,
         event_id: &str,
+        expected: Option<u32>,
         rate: u32,
+        actor: &str,
+        now_ms: u64,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
-    /// Sets the operator broadcast message shown on phase pages / `/status`.
+    /// Sets the operator broadcast message, guarded on the debounce window and
+    /// stamping the audit fields atomically.
     fn set_message(
         &self,
         event_id: &str,
         message: &str,
+        actor: &str,
+        now_ms: u64,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
-    /// Sets the andon-cord admission-pause flag (ADR-0017). `target_rate` is
-    /// untouched, so resuming restores the operator's configured rate.
+    /// Sets the andon-cord admission-pause flag (ADR-0017), guarded on the
+    /// expected current value (so pause-when-paused is a no-op `Conflict`, making
+    /// the toggle idempotent) and the debounce window; stamps audit atomically.
+    /// `target_rate` is untouched, so resuming restores the configured rate.
     fn set_paused(
         &self,
         event_id: &str,
-        paused: bool,
+        from: bool,
+        to: bool,
+        actor: &str,
+        now_ms: u64,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
-    /// Records the last mutating action for the audit trail (ADR-0017): the
-    /// action name, the acting operator, and an RFC3339 timestamp.
-    fn record_action(
+    /// Forces the maintenance phase, guarded on the expected current phase and
+    /// stamping audit. NOT debounced — the emergency full-stop must always apply.
+    fn force_maintenance(
         &self,
         event_id: &str,
-        action: &str,
+        from: Phase,
         actor: &str,
-        at: &str,
+        now_ms: u64,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 }
 
@@ -83,12 +98,20 @@ pub struct ControlState {
     pub last_action: Option<String>,
     pub last_action_by: Option<String>,
     pub last_action_at: Option<String>,
+    /// Epoch-millis of the last mutation, for the debounce guard (ADR-0017).
+    pub last_action_epoch_ms: Option<u64>,
 }
 
 /// The upper sanity bound on the admission target rate (ADR-0017 §4): a
 /// per-second admission ceiling that stops a fat-fingered runaway value from
 /// being written. Chosen well above any realistic origin capacity.
 pub const MAX_ADMISSION_RATE: u32 = 100_000;
+
+/// Debounce window for control-plane mutations (ADR-0017 defensive controls):
+/// two mutations to the same event closer together than this are rejected as
+/// [`ActionError::TooFast`], defeating double-clicks and fast toggling. The
+/// emergency full-stop (force maintenance) is deliberately NOT debounced.
+pub const DEBOUNCE_MS: u64 = 2000;
 
 /// A store failure or a lost transition race.
 #[derive(Debug, thiserror::Error)]
@@ -116,6 +139,14 @@ pub enum ActionError {
     /// The rate exceeds the admission ceiling (ADR-0017 §4).
     #[error("rate exceeds the maximum of {max}")]
     RateTooHigh { max: u32 },
+    /// A control-plane mutation arrived within the debounce window (ADR-0017
+    /// defensive controls) — a double-click or fast toggle.
+    #[error("action rejected: too soon after the previous change")]
+    TooFast,
+    /// The action would not change state (e.g. pause when already paused), or
+    /// lost a race with a concurrent operator.
+    #[error("no change or concurrent update")]
+    Conflict,
     /// The event does not exist.
     #[error("event not found")]
     NotFound,
@@ -184,32 +215,50 @@ pub async fn apply_phase<S: Store>(
     Ok(to)
 }
 
-/// Forces the maintenance phase — the safe operator stop, legal from any phase.
+/// Forces the maintenance phase — the emergency full-stop, legal from any phase.
+/// NOT debounced: the stop must always apply.
 ///
 /// # Errors
 ///
 /// [`ApplyError`] if the event is missing or the store write fails.
-pub async fn apply_reset<S: Store>(store: &S, event_id: &str) -> Result<(), ApplyError> {
+pub async fn apply_reset<S: Store>(
+    store: &S,
+    event_id: &str,
+    actor: &str,
+    now_ms: u64,
+) -> Result<(), ApplyError> {
     let Some(state) = store.load(event_id).await? else {
         return Err(ActionError::NotFound.into());
     };
     store
-        .set_phase(event_id, state.phase, Phase::Maintenance)
+        .force_maintenance(event_id, state.phase, actor, now_ms)
         .await?;
     Ok(())
 }
 
-/// Sets the admission target rate.
+/// Returns `Err(TooFast)` if the last mutation is within the debounce window.
+fn debounce_check(state: &ControlState, now_ms: u64) -> Result<(), ActionError> {
+    if let Some(last) = state.last_action_epoch_ms
+        && now_ms.saturating_sub(last) < DEBOUNCE_MS
+    {
+        return Err(ActionError::TooFast);
+    }
+    Ok(())
+}
+
+/// Sets the admission target rate (guarded + debounced).
 ///
 /// # Errors
 ///
-/// [`ActionError::InvalidRate`] if `rate` is not a positive integer;
-/// [`ActionError::RateTooHigh`] if it exceeds [`MAX_ADMISSION_RATE`]; store
-/// errors otherwise.
+/// [`ActionError::InvalidRate`] if not a positive integer;
+/// [`ActionError::RateTooHigh`] over the ceiling; [`ActionError::TooFast`] inside
+/// the debounce window; store errors otherwise.
 pub async fn apply_rate<S: Store>(
     store: &S,
     event_id: &str,
     rate: &str,
+    actor: &str,
+    now_ms: u64,
 ) -> Result<u32, ApplyError> {
     let rate: u32 = rate.parse().map_err(|_| ActionError::InvalidRate)?;
     if rate == 0 {
@@ -221,48 +270,82 @@ pub async fn apply_rate<S: Store>(
         }
         .into());
     }
-    store.set_rate(event_id, rate).await?;
+    let Some(state) = store.load(event_id).await? else {
+        return Err(ActionError::NotFound.into());
+    };
+    debounce_check(&state, now_ms)?;
+    store
+        .set_rate(event_id, state.target_rate, rate, actor, now_ms)
+        .await?;
     Ok(rate)
 }
 
-/// Pauses admission (andon cord, ADR-0017): the controller admits nobody while
-/// the queue stays intact. Reversible via [`apply_resume`].
+/// Pauses admission (andon cord, ADR-0017): guarded on not-already-paused
+/// (idempotent) and debounced.
 ///
 /// # Errors
 ///
-/// [`ApplyError`] if the event is missing or the store write fails.
-pub async fn apply_pause<S: Store>(store: &S, event_id: &str) -> Result<(), ApplyError> {
-    if store.load(event_id).await?.is_none() {
+/// [`ActionError::NotFound`] / [`ActionError::TooFast`] / store errors.
+pub async fn apply_pause<S: Store>(
+    store: &S,
+    event_id: &str,
+    actor: &str,
+    now_ms: u64,
+) -> Result<(), ApplyError> {
+    let Some(state) = store.load(event_id).await? else {
         return Err(ActionError::NotFound.into());
-    }
-    store.set_paused(event_id, true).await?;
+    };
+    debounce_check(&state, now_ms)?;
+    // Guard requires currently NOT paused; pausing when already paused is a
+    // no-op Conflict (idempotent).
+    store
+        .set_paused(event_id, false, true, actor, now_ms)
+        .await?;
     Ok(())
 }
 
 /// Resumes admission after a pause, restoring the configured `target_rate`.
+/// Guarded on currently-paused and debounced.
 ///
 /// # Errors
 ///
-/// [`ApplyError`] if the event is missing or the store write fails.
-pub async fn apply_resume<S: Store>(store: &S, event_id: &str) -> Result<(), ApplyError> {
-    if store.load(event_id).await?.is_none() {
+/// [`ActionError::NotFound`] / [`ActionError::TooFast`] / store errors.
+pub async fn apply_resume<S: Store>(
+    store: &S,
+    event_id: &str,
+    actor: &str,
+    now_ms: u64,
+) -> Result<(), ApplyError> {
+    let Some(state) = store.load(event_id).await? else {
         return Err(ActionError::NotFound.into());
-    }
-    store.set_paused(event_id, false).await?;
+    };
+    debounce_check(&state, now_ms)?;
+    // Guard requires currently paused; resuming when not paused is a no-op
+    // Conflict (idempotent).
+    store
+        .set_paused(event_id, true, false, actor, now_ms)
+        .await?;
     Ok(())
 }
 
-/// Sets the operator broadcast message.
+/// Sets the operator broadcast message (debounced, audit-stamped).
 ///
 /// # Errors
 ///
-/// Store errors only; any string (including empty, which clears it) is allowed.
+/// [`ActionError::NotFound`] / [`ActionError::TooFast`] / store errors. Any
+/// string (including empty, which clears it) is allowed.
 pub async fn apply_message<S: Store>(
     store: &S,
     event_id: &str,
     message: &str,
+    actor: &str,
+    now_ms: u64,
 ) -> Result<(), ApplyError> {
-    store.set_message(event_id, message).await?;
+    let Some(state) = store.load(event_id).await? else {
+        return Err(ActionError::NotFound.into());
+    };
+    debounce_check(&state, now_ms)?;
+    store.set_message(event_id, message, actor, now_ms).await?;
     Ok(())
 }
 
@@ -288,8 +371,9 @@ mod tests {
         rate: Mutex<Option<u32>>,
         message: Mutex<Option<String>>,
         paused: Mutex<bool>,
+        last_epoch: Mutex<Option<u64>>,
         missing: bool,
-        /// When set, the next `set_phase` reports a lost race.
+        /// When set, the next guarded write reports a lost race.
         conflict: bool,
     }
 
@@ -300,6 +384,7 @@ mod tests {
                 rate: Mutex::new(None),
                 message: Mutex::new(None),
                 paused: Mutex::new(false),
+                last_epoch: Mutex::new(None),
                 missing: false,
                 conflict: false,
             }
@@ -335,6 +420,7 @@ mod tests {
                     last_action: None,
                     last_action_by: None,
                     last_action_at: None,
+                    last_action_epoch_ms: *self.last_epoch.lock().unwrap(),
                 }))
             };
             std::future::ready(result)
@@ -358,38 +444,68 @@ mod tests {
         fn set_rate(
             &self,
             _event_id: &str,
+            _expected: Option<u32>,
             rate: u32,
+            _actor: &str,
+            now_ms: u64,
         ) -> impl Future<Output = Result<(), StoreError>> + Send {
-            *self.rate.lock().unwrap() = Some(rate);
-            std::future::ready(Ok(()))
+            let result = if self.conflict {
+                Err(StoreError::Conflict)
+            } else {
+                *self.rate.lock().unwrap() = Some(rate);
+                *self.last_epoch.lock().unwrap() = Some(now_ms);
+                Ok(())
+            };
+            std::future::ready(result)
         }
 
         fn set_message(
             &self,
             _event_id: &str,
             message: &str,
+            _actor: &str,
+            now_ms: u64,
         ) -> impl Future<Output = Result<(), StoreError>> + Send {
             *self.message.lock().unwrap() = Some(message.to_owned());
+            *self.last_epoch.lock().unwrap() = Some(now_ms);
             std::future::ready(Ok(()))
         }
 
         fn set_paused(
             &self,
             _event_id: &str,
-            paused: bool,
+            from: bool,
+            to: bool,
+            _actor: &str,
+            now_ms: u64,
         ) -> impl Future<Output = Result<(), StoreError>> + Send {
-            *self.paused.lock().unwrap() = paused;
-            std::future::ready(Ok(()))
+            // Idempotency guard: pause-when-paused (from == to) is a Conflict.
+            let mut guard = self.paused.lock().unwrap();
+            let result = if self.conflict || *guard != from {
+                Err(StoreError::Conflict)
+            } else {
+                *guard = to;
+                *self.last_epoch.lock().unwrap() = Some(now_ms);
+                Ok(())
+            };
+            std::future::ready(result)
         }
 
-        fn record_action(
+        fn force_maintenance(
             &self,
             _event_id: &str,
-            _action: &str,
+            _from: Phase,
             _actor: &str,
-            _at: &str,
+            now_ms: u64,
         ) -> impl Future<Output = Result<(), StoreError>> + Send {
-            std::future::ready(Ok(()))
+            let result = if self.conflict {
+                Err(StoreError::Conflict)
+            } else {
+                *self.phase.lock().unwrap() = Phase::Maintenance;
+                *self.last_epoch.lock().unwrap() = Some(now_ms);
+                Ok(())
+            };
+            std::future::ready(result)
         }
     }
 
@@ -471,7 +587,7 @@ mod tests {
     #[tokio::test]
     async fn reset_forces_maintenance_from_any_phase() {
         let store = FakeStore::with_phase(Phase::Active);
-        apply_reset(&store, "evt").await.unwrap();
+        apply_reset(&store, "evt", "op@x", 1000).await.unwrap();
         assert_eq!(*store.phase.lock().unwrap(), Phase::Maintenance);
     }
 
@@ -479,46 +595,53 @@ mod tests {
     async fn rate_rejects_zero_and_nonnumeric() {
         let store = FakeStore::with_phase(Phase::Active);
         assert!(matches!(
-            apply_rate(&store, "evt", "0").await.unwrap_err(),
+            apply_rate(&store, "evt", "0", "op@x", 1000)
+                .await
+                .unwrap_err(),
             ApplyError::Action(ActionError::InvalidRate)
         ));
         assert!(matches!(
-            apply_rate(&store, "evt", "fast").await.unwrap_err(),
+            apply_rate(&store, "evt", "fast", "op@x", 1000)
+                .await
+                .unwrap_err(),
             ApplyError::Action(ActionError::InvalidRate)
         ));
-        assert_eq!(apply_rate(&store, "evt", "500").await.unwrap(), 500);
+        assert_eq!(
+            apply_rate(&store, "evt", "500", "op@x", 1000)
+                .await
+                .unwrap(),
+            500
+        );
         assert_eq!(*store.rate.lock().unwrap(), Some(500));
     }
 
     #[tokio::test]
     async fn message_sets_and_allows_empty() {
         let store = FakeStore::with_phase(Phase::Active);
-        apply_message(&store, "evt", "Doors open at noon")
+        apply_message(&store, "evt", "Doors open at noon", "op@x", 1000)
             .await
             .unwrap();
         assert_eq!(
             store.message.lock().unwrap().as_deref(),
             Some("Doors open at noon")
         );
-        apply_message(&store, "evt", "").await.unwrap();
+        // Second call is spaced beyond the debounce window.
+        apply_message(&store, "evt", "", "op@x", 1000 + DEBOUNCE_MS)
+            .await
+            .unwrap();
         assert_eq!(store.message.lock().unwrap().as_deref(), Some(""));
     }
 
     #[tokio::test]
-    async fn rate_zero_and_over_ceiling_are_rejected() {
+    async fn rate_over_ceiling_is_rejected() {
         let store = FakeStore::with_phase(Phase::Active);
-        assert!(matches!(
-            apply_rate(&store, "evt", "0").await,
-            Err(ApplyError::Action(ActionError::InvalidRate))
-        ));
         let over = (u64::from(MAX_ADMISSION_RATE) + 1).to_string();
         assert!(matches!(
-            apply_rate(&store, "evt", &over).await,
+            apply_rate(&store, "evt", &over, "op@x", 1000).await,
             Err(ApplyError::Action(ActionError::RateTooHigh { .. }))
         ));
-        // The ceiling itself is accepted.
         assert!(
-            apply_rate(&store, "evt", &MAX_ADMISSION_RATE.to_string())
+            apply_rate(&store, "evt", &MAX_ADMISSION_RATE.to_string(), "op@x", 1000)
                 .await
                 .is_ok()
         );
@@ -527,9 +650,12 @@ mod tests {
     #[tokio::test]
     async fn pause_and_resume_toggle_the_flag() {
         let store = FakeStore::with_phase(Phase::Active);
-        apply_pause(&store, "evt").await.unwrap();
+        apply_pause(&store, "evt", "op@x", 1000).await.unwrap();
         assert!(*store.paused.lock().unwrap());
-        apply_resume(&store, "evt").await.unwrap();
+        // Resume spaced beyond the debounce window.
+        apply_resume(&store, "evt", "op@x", 1000 + DEBOUNCE_MS)
+            .await
+            .unwrap();
         assert!(!*store.paused.lock().unwrap());
     }
 
@@ -540,8 +666,55 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(
-            apply_pause(&store, "evt").await,
+            apply_pause(&store, "evt", "op@x", 1000).await,
             Err(ApplyError::Action(ActionError::NotFound))
         ));
+    }
+
+    #[tokio::test]
+    async fn second_mutation_within_debounce_window_is_rejected() {
+        let store = FakeStore::with_phase(Phase::Active);
+        apply_rate(&store, "evt", "500", "op@x", 1000)
+            .await
+            .unwrap();
+        // A second mutation 100ms later (< DEBOUNCE_MS) is rejected.
+        assert!(matches!(
+            apply_rate(&store, "evt", "600", "op@x", 1100).await,
+            Err(ApplyError::Action(ActionError::TooFast))
+        ));
+        // The rate did not change.
+        assert_eq!(*store.rate.lock().unwrap(), Some(500));
+        // After the window, it succeeds.
+        assert!(
+            apply_rate(&store, "evt", "600", "op@x", 1000 + DEBOUNCE_MS)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn pause_when_already_paused_is_a_conflict() {
+        let store = FakeStore {
+            paused: Mutex::new(true),
+            phase: Mutex::new(Phase::Active),
+            ..Default::default()
+        };
+        // Guarded on not-already-paused: pausing again is a no-op Conflict.
+        assert!(matches!(
+            apply_pause(&store, "evt", "op@x", 1000).await,
+            Err(ApplyError::Store(StoreError::Conflict))
+        ));
+    }
+
+    #[tokio::test]
+    async fn force_maintenance_is_not_debounced() {
+        let store = FakeStore::with_phase(Phase::Active);
+        // A recent mutation sets the debounce clock.
+        apply_rate(&store, "evt", "500", "op@x", 1000)
+            .await
+            .unwrap();
+        // Force maintenance immediately after still applies (emergency stop).
+        apply_reset(&store, "evt", "op@x", 1100).await.unwrap();
+        assert_eq!(*store.phase.lock().unwrap(), Phase::Maintenance);
     }
 }

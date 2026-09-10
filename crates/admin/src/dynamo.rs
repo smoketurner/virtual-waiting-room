@@ -91,6 +91,10 @@ impl Store for DynamoStore {
             last_action: str_attr("last_action"),
             last_action_by: str_attr("last_action_by"),
             last_action_at: str_attr("last_action_at"),
+            last_action_epoch_ms: item
+                .get("last_action_epoch_ms")
+                .and_then(|v| v.as_n().ok())
+                .and_then(|n| n.parse().ok()),
         }))
     }
 
@@ -121,63 +125,165 @@ impl Store for DynamoStore {
         }
     }
 
-    async fn set_rate(&self, event_id: &str, rate: u32) -> Result<(), StoreError> {
-        self.client
-            .update_item()
-            .table_name(&self.counters_table)
-            .key("event_id", AttributeValue::S(event_id.to_owned()))
-            .update_expression("SET target_rate = :r")
-            .expression_attribute_values(":r", AttributeValue::N(rate.to_string()))
-            .send()
-            .await
-            .map_err(|e| StoreError::Backend(format!("update_item(rate): {e}")))?;
-        Ok(())
-    }
-
-    async fn set_message(&self, event_id: &str, message: &str) -> Result<(), StoreError> {
-        self.client
-            .update_item()
-            .table_name(&self.counters_table)
-            .key("event_id", AttributeValue::S(event_id.to_owned()))
-            .update_expression("SET message = :m")
-            .expression_attribute_values(":m", AttributeValue::S(message.to_owned()))
-            .send()
-            .await
-            .map_err(|e| StoreError::Backend(format!("update_item(message): {e}")))?;
-        Ok(())
-    }
-
-    async fn set_paused(&self, event_id: &str, paused: bool) -> Result<(), StoreError> {
-        self.client
-            .update_item()
-            .table_name(&self.counters_table)
-            .key("event_id", AttributeValue::S(event_id.to_owned()))
-            .update_expression("SET admission_paused = :p")
-            .expression_attribute_values(":p", AttributeValue::Bool(paused))
-            .send()
-            .await
-            .map_err(|e| StoreError::Backend(format!("update_item(paused): {e}")))?;
-        Ok(())
-    }
-
-    async fn record_action(
+    async fn set_rate(
         &self,
         event_id: &str,
-        action: &str,
+        expected: Option<u32>,
+        rate: u32,
         actor: &str,
-        at: &str,
+        now_ms: u64,
     ) -> Result<(), StoreError> {
-        self.client
+        let mut req = self
+            .client
             .update_item()
             .table_name(&self.counters_table)
             .key("event_id", AttributeValue::S(event_id.to_owned()))
-            .update_expression("SET last_action = :a, last_action_by = :b, last_action_at = :t")
-            .expression_attribute_values(":a", AttributeValue::S(action.to_owned()))
-            .expression_attribute_values(":b", AttributeValue::S(actor.to_owned()))
-            .expression_attribute_values(":t", AttributeValue::S(at.to_owned()))
-            .send()
-            .await
-            .map_err(|e| StoreError::Backend(format!("update_item(audit): {e}")))?;
-        Ok(())
+            .update_expression(
+                "SET target_rate = :r, last_action = :a, last_action_by = :by, \
+                 last_action_at = :at, last_action_epoch_ms = :ms",
+            )
+            .expression_attribute_values(":r", AttributeValue::N(rate.to_string()));
+        req = apply_audit_values(req, "set_rate", actor, now_ms);
+        req = guard_expected_rate(req, expected);
+        req = guard_debounce(req, now_ms);
+        send_guarded(req, "rate").await
+    }
+
+    async fn set_message(
+        &self,
+        event_id: &str,
+        message: &str,
+        actor: &str,
+        now_ms: u64,
+    ) -> Result<(), StoreError> {
+        let mut req = self
+            .client
+            .update_item()
+            .table_name(&self.counters_table)
+            .key("event_id", AttributeValue::S(event_id.to_owned()))
+            .update_expression(
+                "SET message = :m, last_action = :a, last_action_by = :by, \
+                 last_action_at = :at, last_action_epoch_ms = :ms",
+            )
+            .expression_attribute_values(":m", AttributeValue::S(message.to_owned()));
+        req = apply_audit_values(req, "set_message", actor, now_ms);
+        req = guard_debounce(req, now_ms);
+        send_guarded(req, "message").await
+    }
+
+    async fn set_paused(
+        &self,
+        event_id: &str,
+        from: bool,
+        to: bool,
+        actor: &str,
+        now_ms: u64,
+    ) -> Result<(), StoreError> {
+        // Idempotency guard: stored admission_paused must equal `from`. When
+        // `from` is false, attribute_not_exists covers the never-paused default.
+        let paused_guard = if from {
+            "admission_paused = :from"
+        } else {
+            "(attribute_not_exists(admission_paused) OR admission_paused = :from)"
+        };
+        let cutoff = now_ms.saturating_sub(crate::DEBOUNCE_MS).to_string();
+        let mut req = self
+            .client
+            .update_item()
+            .table_name(&self.counters_table)
+            .key("event_id", AttributeValue::S(event_id.to_owned()))
+            .update_expression(
+                "SET admission_paused = :to, last_action = :a, last_action_by = :by, \
+                 last_action_at = :at, last_action_epoch_ms = :ms",
+            )
+            .expression_attribute_values(":to", AttributeValue::Bool(to))
+            .expression_attribute_values(":from", AttributeValue::Bool(from))
+            .condition_expression(format!(
+                "{paused_guard} AND (attribute_not_exists(last_action_epoch_ms) \
+                 OR last_action_epoch_ms < :cutoff)"
+            ))
+            .expression_attribute_values(":cutoff", AttributeValue::N(cutoff));
+        req = apply_audit_values(req, if to { "pause" } else { "resume" }, actor, now_ms);
+        send_guarded(req, "paused").await
+    }
+
+    async fn force_maintenance(
+        &self,
+        event_id: &str,
+        from: Phase,
+        actor: &str,
+        now_ms: u64,
+    ) -> Result<(), StoreError> {
+        // Guarded on the expected phase (lost-race safety) but NOT debounced —
+        // the emergency stop must always apply.
+        let mut req = self
+            .client
+            .update_item()
+            .table_name(&self.counters_table)
+            .key("event_id", AttributeValue::S(event_id.to_owned()))
+            .update_expression(
+                "SET phase = :to, last_action = :a, last_action_by = :by, \
+                 last_action_at = :at, last_action_epoch_ms = :ms",
+            )
+            .expression_attribute_values(
+                ":to",
+                AttributeValue::S(phase_str(Phase::Maintenance).to_owned()),
+            )
+            .condition_expression("phase = :from")
+            .expression_attribute_values(":from", AttributeValue::S(phase_str(from).to_owned()));
+        req = apply_audit_values(req, "force_maintenance", actor, now_ms);
+        send_guarded(req, "force_maintenance").await
+    }
+}
+
+type UpdateReq = aws_sdk_dynamodb::operation::update_item::builders::UpdateItemFluentBuilder;
+
+/// Stamps the shared audit + epoch values onto a mutation.
+fn apply_audit_values(req: UpdateReq, action: &str, actor: &str, now_ms: u64) -> UpdateReq {
+    let at = aws_smithy_types::DateTime::from_millis(i64::try_from(now_ms).unwrap_or(0))
+        .fmt(aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_default();
+    req.expression_attribute_values(":a", AttributeValue::S(action.to_owned()))
+        .expression_attribute_values(":by", AttributeValue::S(actor.to_owned()))
+        .expression_attribute_values(":at", AttributeValue::S(at))
+        .expression_attribute_values(":ms", AttributeValue::N(now_ms.to_string()))
+}
+
+/// Adds the expected-prior-rate guard (lost-race safety).
+fn guard_expected_rate(req: UpdateReq, expected: Option<u32>) -> UpdateReq {
+    match expected {
+        Some(r) => req
+            .condition_expression("target_rate = :exp")
+            .expression_attribute_values(":exp", AttributeValue::N(r.to_string())),
+        None => req.condition_expression("attribute_not_exists(target_rate)"),
+    }
+}
+
+/// Adds the debounce guard (last mutation older than the window), composing with
+/// any existing condition via AND.
+fn guard_debounce(req: UpdateReq, now_ms: u64) -> UpdateReq {
+    let cutoff = now_ms.saturating_sub(crate::DEBOUNCE_MS).to_string();
+    let debounce = "(attribute_not_exists(last_action_epoch_ms) OR last_action_epoch_ms < :cutoff)";
+    let combined = match req.get_condition_expression().clone() {
+        Some(c) => format!("{c} AND {debounce}"),
+        None => debounce.to_owned(),
+    };
+    req.condition_expression(combined)
+        .expression_attribute_values(":cutoff", AttributeValue::N(cutoff))
+}
+
+/// Sends a guarded update, mapping a failed condition to `Conflict`.
+async fn send_guarded(req: UpdateReq, what: &str) -> Result<(), StoreError> {
+    match req.send().await {
+        Ok(_) => Ok(()),
+        Err(SdkError::ServiceError(se))
+            if matches!(
+                se.err(),
+                UpdateItemError::ConditionalCheckFailedException(_)
+            ) =>
+        {
+            Err(StoreError::Conflict)
+        }
+        Err(e) => Err(StoreError::Backend(format!("update_item({what}): {e}"))),
     }
 }

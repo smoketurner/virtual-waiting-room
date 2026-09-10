@@ -387,14 +387,14 @@ async fn set_phase(
     headers: HeaderMap,
     Form(form): Form<PhaseForm>,
 ) -> Response {
-    let Some(session) = authed(&state, &headers).await else {
+    if authed(&state, &headers).await.is_none() {
         return Redirect::to("/admin/login").into_response();
-    };
-    let result = apply_phase(&state.store, &state.event_id, &form.phase)
-        .await
-        .map(|_| ());
-    state.audit(&result, "set_phase", &session.email).await;
-    finish(result)
+    }
+    finish(
+        apply_phase(&state.store, &state.event_id, &form.phase)
+            .await
+            .map(|_| ()),
+    )
 }
 
 #[derive(Deserialize)]
@@ -410,11 +410,17 @@ async fn set_rate(
     let Some(session) = authed(&state, &headers).await else {
         return Redirect::to("/admin/login").into_response();
     };
-    let result = apply_rate(&state.store, &state.event_id, &form.rate)
+    finish(
+        apply_rate(
+            &state.store,
+            &state.event_id,
+            &form.rate,
+            &session.email,
+            now_ms(),
+        )
         .await
-        .map(|_| ());
-    state.audit(&result, "set_rate", &session.email).await;
-    finish(result)
+        .map(|_| ()),
+    )
 }
 
 #[derive(Deserialize)]
@@ -430,20 +436,23 @@ async fn set_message(
     let Some(session) = authed(&state, &headers).await else {
         return Redirect::to("/admin/login").into_response();
     };
-    let result = apply_message(&state.store, &state.event_id, &form.message).await;
-    state.audit(&result, "set_message", &session.email).await;
-    finish(result)
+    finish(
+        apply_message(
+            &state.store,
+            &state.event_id,
+            &form.message,
+            &session.email,
+            now_ms(),
+        )
+        .await,
+    )
 }
 
 async fn reset(State(state): State<Shared>, headers: HeaderMap) -> Response {
     let Some(session) = authed(&state, &headers).await else {
         return Redirect::to("/admin/login").into_response();
     };
-    let result = apply_reset(&state.store, &state.event_id).await;
-    state
-        .audit(&result, "force_maintenance", &session.email)
-        .await;
-    finish(result)
+    finish(apply_reset(&state.store, &state.event_id, &session.email, now_ms()).await)
 }
 
 /// Andon cord: pause admission (ADR-0017). Reversible, no confirmation.
@@ -451,11 +460,7 @@ async fn pause(State(state): State<Shared>, headers: HeaderMap) -> Response {
     let Some(session) = authed(&state, &headers).await else {
         return Redirect::to("/admin/login").into_response();
     };
-    let result = apply_pause(&state.store, &state.event_id).await;
-    state
-        .audit(&result, "pause_admission", &session.email)
-        .await;
-    finish(result)
+    finish(apply_pause(&state.store, &state.event_id, &session.email, now_ms()).await)
 }
 
 /// Resume admission after a pause.
@@ -463,11 +468,15 @@ async fn resume(State(state): State<Shared>, headers: HeaderMap) -> Response {
     let Some(session) = authed(&state, &headers).await else {
         return Redirect::to("/admin/login").into_response();
     };
-    let result = apply_resume(&state.store, &state.event_id).await;
-    state
-        .audit(&result, "resume_admission", &session.email)
-        .await;
-    finish(result)
+    finish(apply_resume(&state.store, &state.event_id, &session.email, now_ms()).await)
+}
+
+/// Current epoch-millis for the audit stamp + debounce guard.
+fn now_ms() -> u64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => u64::try_from(d.as_millis()).unwrap_or(u64::MAX),
+        Err(_) => 0,
+    }
 }
 
 /// A route whose backing plane (authorizer / sessions) is not in the MVP.
@@ -496,26 +505,6 @@ async fn static_asset(Path(path): Path<String>) -> Response {
 }
 
 impl AppState {
-    /// Records a successful mutating action to the audit trail (ADR-0017),
-    /// best-effort: an audit-write failure is logged but never fails the action
-    /// the operator already performed. No-op when the action itself failed.
-    async fn audit(&self, result: &Result<(), ApplyError>, action: &str, actor: &str) {
-        use admin::Store;
-        if result.is_err() {
-            return;
-        }
-        let at = aws_smithy_types::DateTime::from(std::time::SystemTime::now())
-            .fmt(aws_smithy_types::date_time::Format::DateTime)
-            .unwrap_or_default();
-        if let Err(e) = self
-            .store
-            .record_action(&self.event_id, action, actor, &at)
-            .await
-        {
-            tracing::warn!(error = %e, action, "audit record failed");
-        }
-    }
-
     /// Loads control state and maps it to the dashboard view.
     async fn store_load(&self) -> Result<Option<Dashboard>, String> {
         use admin::Store;
@@ -528,11 +517,24 @@ impl AppState {
 }
 
 /// Turns an action result into a 303 redirect back to the dashboard on success
-/// (POST/redirect/GET), or a 4xx/5xx with a plain-text reason on failure.
+/// (POST/redirect/GET), or a status + plain-text reason on failure.
 fn finish(result: Result<(), ApplyError>) -> Response {
+    use admin::{ActionError, StoreError};
     match result {
         Ok(()) => (StatusCode::SEE_OTHER, [(header::LOCATION, "/admin")]).into_response(),
+        // Debounce rejection — a double-click / fast toggle.
+        Err(ApplyError::Action(ActionError::TooFast)) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too soon after the previous change — wait a moment and retry.",
+        )
+            .into_response(),
         Err(ApplyError::Action(e)) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        // Lost race or no-op guard (e.g. pausing when already paused).
+        Err(ApplyError::Store(StoreError::Conflict)) => (
+            StatusCode::CONFLICT,
+            "State changed underneath you (or no change to make) — reload and retry.",
+        )
+            .into_response(),
         Err(ApplyError::Store(e)) => server_error(&e.to_string()),
     }
 }
