@@ -16,8 +16,13 @@ have just been deleted, so positions resolve against a cohort that no longer
 exists, and attributes from superseded schema versions linger indefinitely
 because nothing writes them any more and nothing removes them either.
 
-Reads table names and the event id from `terraform output`, so it always acts on
-the stack that is actually deployed. It never touches Terraform state.
+Then invalidates the CloudFront cache. Resetting the data while the edge still
+holds the previous pages is only half a reset: the waiting page is served as the
+body of CloudFront's 403, so a stale copy is what an arriving visitor sees.
+
+Reads table names, the event id, and the distribution from `terraform output`,
+so it always acts on the stack that is actually deployed. It never touches
+Terraform state.
 
 DESTRUCTIVE: every row in PreQueue, Positions, and Tokens is deleted. Prompts
 before doing it unless --yes is passed.
@@ -30,6 +35,7 @@ Usage:
   AWS_PROFILE=dev-admin ./scripts/reset-env.py
   AWS_PROFILE=dev-admin ./scripts/reset-env.py --target-rate 20
   AWS_PROFILE=dev-admin ./scripts/reset-env.py --phase idle --yes
+  AWS_PROFILE=dev-admin ./scripts/reset-env.py --no-wait
 """
 
 from __future__ import annotations
@@ -39,6 +45,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import boto3
@@ -56,6 +63,10 @@ PHASES = ("idle", "pre_queue", "active", "post_event", "maintenance")
 
 # DynamoDB caps a BatchWriteItem at 25 requests.
 BATCH_LIMIT = 25
+
+# One wildcard counts as a single path against the monthly free allowance, and
+# covers the pages, their assets, and any cached read responses in one go.
+INVALIDATION_PATHS = ["/*"]
 
 
 def say(msg: str) -> None:
@@ -129,6 +140,39 @@ def flush(ddb, table: str, batch: list[dict]) -> int:
     raise RuntimeError(f"{table}: {remaining} deletes still unprocessed after 10 attempts")
 
 
+def invalidate(cf, distribution_id: str, wait: bool) -> str:
+    """Invalidates the edge cache, returning the invalidation id.
+
+    The caller reference only has to be unique per distribution; the epoch in
+    milliseconds is, and it makes a repeated reset a new invalidation rather
+    than a silent no-op returning the previous one.
+    """
+    ref = f"reset-env-{time.time_ns() // 1_000_000}"
+    result = cf.create_invalidation(
+        DistributionId=distribution_id,
+        InvalidationBatch={
+            "Paths": {"Quantity": len(INVALIDATION_PATHS), "Items": INVALIDATION_PATHS},
+            "CallerReference": ref,
+        },
+    )
+    invalidation_id = result["Invalidation"]["Id"]
+    print(f"invalidation {invalidation_id} created for {' '.join(INVALIDATION_PATHS)}")
+
+    if not wait:
+        print("not waiting; it completes in the background")
+        return invalidation_id
+
+    print("waiting for it to complete (usually under a minute; Ctrl-C is safe)")
+    waiter = cf.get_waiter("invalidation_completed")
+    waiter.wait(
+        DistributionId=distribution_id,
+        Id=invalidation_id,
+        WaiterConfig={"Delay": 5, "MaxAttempts": 40},
+    )
+    print("invalidation complete")
+    return invalidation_id
+
+
 def fresh_counters(event_id: str, phase: str, target_rate: int) -> dict:
     """The `Counters` item for an event that has never run.
 
@@ -174,6 +218,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip the confirmation prompt.",
     )
+    p.add_argument(
+        "--no-wait",
+        action="store_true",
+        help="Create the cache invalidation but do not wait for it to finish.",
+    )
     return p.parse_args()
 
 
@@ -184,7 +233,11 @@ def main() -> int:
         return 2
 
     region = os.environ.get("AWS_REGION", "us-east-1")
-    ddb = boto3.Session(region_name=region).client("dynamodb")
+    session = boto3.Session(region_name=region)
+    ddb = session.client("dynamodb")
+    # CloudFront is a global service and its API lives in us-east-1 regardless
+    # of where the rest of the stack is.
+    cf = session.client("cloudfront", region_name="us-east-1")
 
     say("Reading the deployed stack from terraform outputs")
     subprocess.run(
@@ -194,8 +247,15 @@ def main() -> int:
     )
     event_id = tf_output("event_id")
     tables = tf_output_json("table_names")
+    try:
+        distribution_id = tf_output("cloudfront_distribution_id")
+    except subprocess.CalledProcessError:
+        # A stack applied before that output existed. Worth saying rather than
+        # silently skipping, because the edge will then serve the old pages.
+        distribution_id = ""
     print(f"region:   {region}")
     print(f"event_id: {event_id}")
+    print(f"cdn:      {distribution_id or '(no distribution output)'}")
     for name in ("counters", *VISITOR_TABLES):
         print(f"  {name:9} {tables[name]}")
 
@@ -221,6 +281,15 @@ def main() -> int:
     ddb.put_item(TableName=tables["counters"], Item=item)
     for key in sorted(item):
         print(f"  {key:18} {next(iter(item[key].values()))}")
+
+    say("Invalidating the edge cache")
+    if distribution_id:
+        invalidate(cf, distribution_id, wait=not args.no_wait)
+    else:
+        print(
+            "no cloudfront_distribution_id output; skipping.\n"
+            "Apply the stack to pick up the output, or the edge keeps serving the old pages."
+        )
 
     say("Reset complete")
     if args.phase != "active":
