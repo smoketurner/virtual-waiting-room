@@ -62,7 +62,7 @@ pub struct Counters {
     pub prequeue_counts: [u64; SHARDS],
     /// Per-shard arrival counts (`arrivals#0..9`), incremented by the authorizer
     /// when it converts an admission token into a session. The controller sums
-    /// these each interval to measure the no-show rate (DESIGN §7). Sharded for
+    /// these each interval to measure the no-show rate. Sharded for
     /// the same single-item write-ceiling reason as the pre-queue counter.
     pub arrivals: [u64; SHARDS],
     /// Set only at the seal, absent before: the 256-bit permutation seed.

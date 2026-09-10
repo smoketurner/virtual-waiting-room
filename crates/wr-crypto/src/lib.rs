@@ -1,4 +1,4 @@
-//! Signed admission tokens and session cookies for the authorizer (ADR-0011).
+//! Signed admission tokens and session cookies for the authorizer.
 //!
 //! Both credentials are minted from one per-deployment key with
 //! `HMAC-SHA256`, but over domain-separated messages so neither validates as
@@ -344,7 +344,7 @@ mod tests {
     #[test]
     fn a_token_does_not_verify_as_a_session() {
         // Same fields, but the kind tag differs, so the MACs differ: a captured
-        // admission token cannot be replayed as a session (ADR-0011).
+        // admission token cannot be replayed as a session.
         let signed = token().sign(&key());
         assert_eq!(
             Session::verify(&signed, &key(), 1_500_000_000),
