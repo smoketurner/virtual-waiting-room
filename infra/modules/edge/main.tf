@@ -223,16 +223,24 @@ resource "aws_cloudfront_distribution" "this" {
   }
 
   # Write: /join, /generate_token (uncached).
+  #
+  # The origin request policy is load-bearing, not tidiness: a behaviour that
+  # forwards no cookies has its Set-Cookie response headers STRIPPED by
+  # CloudFront before they reach the viewer. /generate_token's whole job is to
+  # return the admission cookies, so without this the visitor is admitted,
+  # receives nothing, and waits forever. AllViewerExceptHostHeader forwards
+  # cookies and drops Host, which API Gateway rejects if forwarded.
   dynamic "ordered_cache_behavior" {
     for_each = toset(local.write_paths)
     content {
-      path_pattern           = ordered_cache_behavior.value
-      target_origin_id       = local.api_origin_id
-      viewer_protocol_policy = "redirect-to-https"
-      allowed_methods        = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
-      cached_methods         = ["GET", "HEAD"]
-      cache_policy_id        = local.caching_disabled_policy_id
-      compress               = true
+      path_pattern             = ordered_cache_behavior.value
+      target_origin_id         = local.api_origin_id
+      viewer_protocol_policy   = "redirect-to-https"
+      allowed_methods          = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
+      cached_methods           = ["GET", "HEAD"]
+      cache_policy_id          = local.caching_disabled_policy_id
+      origin_request_policy_id = local.all_viewer_except_host_policy_id
+      compress                 = true
     }
   }
 
