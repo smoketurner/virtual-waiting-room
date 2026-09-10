@@ -271,10 +271,31 @@ resource "aws_scheduler_schedule" "controller" {
   schedule_expression          = "rate(1 minute)"
   schedule_expression_timezone = "UTC"
 
+  # The universal target, not the templated Lambda one. Two things a durable
+  # function needs cannot be expressed by the templated target:
+  #
+  #   InvocationType = Event. The templated target calls Invoke with no
+  #   invocation type, so Lambda defaults to RequestResponse, and a synchronous
+  #   durable invocation is held open for the whole execution - including the
+  #   waits it is supposed to suspend through. That bills the full minute of
+  #   cadence and defeats the point of ADR-0022.
+  #
+  #   A qualified FunctionName. Durable functions cannot be invoked through an
+  #   unqualified identifier; an execution is pinned to the version that started
+  #   it so that replay runs the same code.
+  #
+  # $LATEST is the qualifier because the function publishes no versions. An
+  # execution that is mid-flight when a deploy lands may fail to replay against
+  # changed code; the window is one minute of cadence. Publishing versions and
+  # pointing this at an alias removes even that.
   target {
-    arn      = aws_lambda_function.controller.arn
+    arn      = "arn:aws:scheduler:::aws-sdk:lambda:invoke"
     role_arn = aws_iam_role.controller_scheduler.arn
-    input    = jsonencode({ event_id = var.event_id })
+    input = jsonencode({
+      FunctionName   = "${aws_lambda_function.controller.arn}:$LATEST"
+      InvocationType = "Event"
+      Payload        = jsonencode({ event_id = var.event_id })
+    })
   }
 }
 
@@ -290,9 +311,15 @@ resource "aws_iam_role_policy" "controller_scheduler" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Effect   = "Allow"
-      Action   = "lambda:InvokeFunction"
-      Resource = aws_lambda_function.controller.arn
+      Effect = "Allow"
+      Action = "lambda:InvokeFunction"
+      # Both forms: IAM evaluates a qualified invoke against the qualified ARN,
+      # so granting only the unqualified one fails once the schedule names a
+      # version. The unqualified entry stays for a direct manual invoke.
+      Resource = [
+        aws_lambda_function.controller.arn,
+        "${aws_lambda_function.controller.arn}:*",
+      ]
     }]
   })
 }
