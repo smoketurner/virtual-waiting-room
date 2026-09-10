@@ -77,3 +77,8 @@ output "admission_key_pair_id" {
   description = "ID of the CloudFront public key that verifies admission cookies."
   value       = module.core.admission_key_pair_id
 }
+
+output "demo_origin_bucket" {
+  description = "Bucket holding the demo protected origin's pages. Only serving traffic while client_origin_domain_name is empty."
+  value       = module.demo_origin.bucket_name
+}

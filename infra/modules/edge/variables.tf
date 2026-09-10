@@ -22,8 +22,21 @@ variable "env" {
 }
 
 variable "client_origin_domain_name" {
-  description = "Domain name of the client's protected origin (the default behaviour). Behind a CloudFront VPC origin when the authorizer module enables it (not yet wired)."
+  description = "Domain name of the client's protected origin (the default behaviour). Empty points the protected behaviour at the demo origin instead, so the gate can be exercised without a real origin to protect."
   type        = string
+  default     = ""
+}
+
+variable "demo_origin_domain_name" {
+  description = "Regional domain name of the demo origin bucket, used as the protected origin when client_origin_domain_name is empty."
+  type        = string
+  default     = ""
+}
+
+variable "demo_origin_access_control_id" {
+  description = "Origin access control CloudFront signs its demo-origin reads with."
+  type        = string
+  default     = ""
 }
 
 # --- Caching (ADR-0013, DESIGN §8) --------------------------------------------

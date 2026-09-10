@@ -113,10 +113,11 @@ resource "aws_cloudfront_origin_request_policy" "protected" {
 # --- Distribution -------------------------------------------------------------
 
 resource "aws_cloudfront_distribution" "this" {
-  enabled         = true
-  is_ipv6_enabled = true
-  comment         = "Virtual Waiting Room - ${var.name_prefix}"
-  price_class     = var.price_class
+  enabled             = true
+  is_ipv6_enabled     = true
+  default_root_object = local.demo_root_object
+  comment             = "Virtual Waiting Room - ${var.name_prefix}"
+  price_class         = var.price_class
 
   # Origin 1: the core REST API (polled + write behaviours). origin_path is the
   # stage (= env), so a viewer request for /v1/status is forwarded to
@@ -134,18 +135,30 @@ resource "aws_cloudfront_distribution" "this" {
     }
   }
 
-  # Origin 2: the client's protected origin (default behaviour). A plain custom
-  # origin today; swapped for a vpc_origin_config when the authorizer module
-  # enables the CloudFront VPC origin (var.enable_vpc).
-  origin {
-    origin_id   = local.client_origin_id
-    domain_name = var.client_origin_domain_name
+  # Origin 2: the client's protected origin (default behaviour). Absent when no
+  # customer origin is configured — the demo origin below stands in.
+  dynamic "origin" {
+    for_each = local.use_demo_origin ? [] : [1]
+    content {
+      origin_id   = local.client_origin_id
+      domain_name = var.client_origin_domain_name
 
-    custom_origin_config {
-      http_port              = 80
-      https_port             = 443
-      origin_protocol_policy = "https-only"
-      origin_ssl_protocols   = ["TLSv1.2"]
+      custom_origin_config {
+        http_port              = 80
+        https_port             = 443
+        origin_protocol_policy = "https-only"
+        origin_ssl_protocols   = ["TLSv1.2"]
+      }
+    }
+  }
+
+  # Origin 2a: the demo fixture standing in for a customer origin.
+  dynamic "origin" {
+    for_each = local.use_demo_origin ? [1] : []
+    content {
+      origin_id                = local.demo_origin_id
+      domain_name              = var.demo_origin_domain_name
+      origin_access_control_id = var.demo_origin_access_control_id
     }
   }
 
@@ -159,12 +172,12 @@ resource "aws_cloudfront_distribution" "this" {
 
   # Default behaviour: the protected origin. Uncached, session cookie forwarded.
   default_cache_behavior {
-    target_origin_id         = local.client_origin_id
+    target_origin_id         = local.protected_origin_id
     viewer_protocol_policy   = "redirect-to-https"
     allowed_methods          = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"]
     cached_methods           = ["GET", "HEAD"]
     cache_policy_id          = local.caching_disabled_policy_id
-    origin_request_policy_id = aws_cloudfront_origin_request_policy.protected.id
+    origin_request_policy_id = local.protected_origin_request_policy
     compress                 = true
 
     # The gate. CloudFront verifies the admission cookies at the edge and

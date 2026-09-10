@@ -10,6 +10,25 @@ locals {
   waiting_path_pattern = "/_wr/*"
   waiting_page_path    = "/_wr/waiting.html"
 
+  demo_origin_id = "${var.name_prefix}-demo-origin"
+
+  # With no customer origin configured, the protected behaviour points at the
+  # demo fixture instead, so the gate has something real to let a visitor
+  # through to.
+  use_demo_origin     = var.client_origin_domain_name == ""
+  protected_origin_id = local.use_demo_origin ? local.demo_origin_id : local.client_origin_id
+
+  # S3 with an origin access control signs SigV4 over the origin's host, so
+  # forwarding the viewer's Host breaks the signature and every request 403s.
+  # A real customer origin wants the opposite: it serves the viewer's hostname
+  # and needs that Host to route. Hence one policy or none, by origin type.
+  protected_origin_request_policy = local.use_demo_origin ? null : aws_cloudfront_origin_request_policy.protected.id
+
+  # Only meaningful for the demo fixture, whose page lives at index.html. A
+  # customer origin serves its own root and must not have /index.html forced
+  # onto it.
+  demo_root_object = local.use_demo_origin ? "index.html" : null
+
   # AWS-managed cache policy "CachingDisabled" - the blessed way to make a
   # behaviour uncached. Used for the write behaviours and the protected default.
   # https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/using-managed-cache-policies.html

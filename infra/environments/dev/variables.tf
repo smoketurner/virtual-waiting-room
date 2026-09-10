@@ -35,12 +35,13 @@ variable "warm_throughput_read_units" {
 }
 
 variable "client_origin_domain_name" {
-  description = "Bare domain name of the client's protected origin, used as the CloudFront default-behaviour origin (e.g. www.example.com). Required: a CloudFront origin cannot exist without one, and leaving it empty would silently tear the distribution down."
+  description = "Bare domain name of the client's protected origin (e.g. www.example.com). Empty protects the demo origin instead, which is what makes the gate exercisable without a real origin to protect."
   type        = string
+  default     = ""
 
   validation {
-    condition     = length(var.client_origin_domain_name) > 0 && !can(regex("://|/", var.client_origin_domain_name))
-    error_message = "client_origin_domain_name must be a non-empty bare domain (host only, no scheme and no path) - e.g. www.example.com, not https://www.example.com."
+    condition     = var.client_origin_domain_name == "" || !can(regex("://|/", var.client_origin_domain_name))
+    error_message = "client_origin_domain_name must be a bare domain (host only, no scheme and no path) - e.g. www.example.com, not https://www.example.com."
   }
 }
 

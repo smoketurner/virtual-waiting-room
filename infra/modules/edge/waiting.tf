@@ -104,11 +104,16 @@ resource "aws_s3_bucket_policy" "waiting" {
   policy = data.aws_iam_policy_document.waiting_bucket.json
 }
 
-# The pages themselves. Content-typed explicitly because S3 does not infer it,
-# and a page served as application/octet-stream downloads instead of rendering.
+# The pages themselves. Keys carry the _wr/ prefix because CloudFront turns the
+# request URI into the S3 object key: a request for /_wr/waiting.html asks S3
+# for _wr/waiting.html, so an object stored at waiting.html is a 404 and the
+# gate's error page renders as nothing.
+#
+# Content-typed explicitly because S3 does not infer it, and a page served as
+# application/octet-stream downloads instead of rendering.
 resource "aws_s3_object" "waiting_page" {
   bucket       = aws_s3_bucket.waiting.id
-  key          = "waiting.html"
+  key          = "_wr/waiting.html"
   content      = file("${path.module}/pages/waiting.html")
   content_type = "text/html; charset=utf-8"
   etag         = filemd5("${path.module}/pages/waiting.html")
@@ -117,7 +122,7 @@ resource "aws_s3_object" "waiting_page" {
 
 resource "aws_s3_object" "waiting_style" {
   bucket       = aws_s3_bucket.waiting.id
-  key          = "waiting.css"
+  key          = "_wr/waiting.css"
   content      = file("${path.module}/pages/waiting.css")
   content_type = "text/css; charset=utf-8"
   etag         = filemd5("${path.module}/pages/waiting.css")
@@ -126,7 +131,7 @@ resource "aws_s3_object" "waiting_style" {
 
 resource "aws_s3_object" "waiting_script" {
   bucket       = aws_s3_bucket.waiting.id
-  key          = "waiting.js"
+  key          = "_wr/waiting.js"
   content      = file("${path.module}/pages/waiting.js")
   content_type = "text/javascript; charset=utf-8"
   etag         = filemd5("${path.module}/pages/waiting.js")

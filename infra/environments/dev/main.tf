@@ -37,6 +37,17 @@ module "core" {
   oidc_allowed_emails = var.oidc_allowed_emails
 }
 
+# demo-origin: a stand-in for the customer's protected origin. This is the dev
+# root, which is where the gate gets exercised, so the fixture is always built —
+# an S3 bucket holding one page costs nothing. A production root does not
+# include this module and points client_origin_domain_name at the real origin.
+module "demo_origin" {
+  source = "../../modules/demo-origin"
+
+  name_prefix = var.name_prefix
+  tags        = local.common_tags
+}
+
 # edge (CloudFront). client_origin_domain_name is a required variable (the
 # customer's own site is the default-behaviour origin), so the edge cannot be
 # configured without one and is never optional. The API origin points at core's
@@ -51,6 +62,10 @@ module "edge" {
   api_gateway_domain_name   = module.core.api_gateway_domain_name
   env                       = var.env
   client_origin_domain_name = var.client_origin_domain_name
+
+  # Used as the protected origin when no customer origin is configured.
+  demo_origin_domain_name       = module.demo_origin.bucket_regional_domain_name
+  demo_origin_access_control_id = module.demo_origin.origin_access_control_id
 
   # Turns the gate on: CloudFront verifies admission cookies signed by this key
   # group before it will reach the protected origin.

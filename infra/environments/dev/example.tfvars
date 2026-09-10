@@ -10,10 +10,14 @@ event_id            = "smoke"
 lambda_architecture = "arm64" # must match `make build ARCH=...`
 seal_start_time     = ""      # EventBridge at() value; "" = manual seal
 
-# REQUIRED (no default): bare domain of the protected origin CloudFront fronts as
-# its default behaviour. Host only - no scheme, no path. An empty or missing
-# value fails the plan rather than silently destroying the distribution.
-client_origin_domain_name = "www.example.com"
+# Bare domain of the protected origin CloudFront fronts as its default
+# behaviour. Host only - no scheme, no path.
+#
+# Leave it empty to protect the built-in demo origin instead, which is what you
+# want for testing: CloudFront forwards the viewer's Host to the protected
+# origin, so a third-party site answers 404 for a hostname it does not serve and
+# any redirect it issues takes the visitor off the distribution entirely.
+client_origin_domain_name = ""
 
 # --- Built Lambda artifacts ---------------------------------------------------
 # Deterministic build outputs, relative to this directory. Leave empty ("") to
