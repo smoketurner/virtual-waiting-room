@@ -1,5 +1,9 @@
 # Technology
 
+Rows marked **not built** are design intent with no code or Terraform behind them yet. Keep the
+mark accurate: a steering file that describes an unbuilt thing as present is the drift that
+costs the most, because it is loaded into every session.
+
 ## Runtime and language
 
 - **Rust** on AWS Lambda, `provided.al2023`, **arm64**. Every function in the system is Rust.
@@ -7,35 +11,69 @@
   `SendMessage`. Lambda appears only downstream of SQS and on the control/admin plane.
 - Async with `tokio`; AWS SDK for Rust.
 
+## The seven Lambdas
+
+| Function | Trigger | Job |
+|---|---|---|
+| `assign_position` | SQS event source mapping | Claims a contiguous position range per batch, writes `Positions` rows |
+| `seal_event` | EventBridge Scheduler, `at(seal_start_time)` | One conditional `UpdateItem` at T−0: seed, offsets, count, phase |
+| `read` | API Gateway | `GET /v1/status`, `GET /v1/queue_num` |
+| `generate_token` | API Gateway | Checks the position against `serving_counter`, records the arrival, mints CloudFront signed cookies |
+| `controller` | EventBridge Scheduler, `rate(1 minute)` | Durable function: six 10-second passes per execution — no-show correction, `serving_counter`, position expiry. Waits between passes suspend the execution rather than being billed |
+| `admin` | API Gateway | Axum app: operator UI and `/admin/*` actions, OIDC-authenticated |
+| `authorizer` | ALB / API Gateway at the operator's origin | The alternative gate, for an origin the operator controls. Deployed by `modules/authorizer`, not in the CloudFront path |
+
 ## Cargo workspace and crates
 
-Follow the reference layout in
-[`aws-messaging-webhook/Cargo.toml`](https://github.com/smoketurner/aws-messaging-webhook/blob/main/Cargo.toml):
-edition 2024, `resolver = "3"`, one crate per Lambda plus shared libs under `crates/`, deps
+Edition 2024, `resolver = "3"`, one crate per Lambda plus `wr-common` under `crates/`, deps
 declared once in `[workspace.dependencies]`. Pinning and lint rules are in `conventions.md`.
 
-The intended crate set (each pinned exactly, `default-features = false`, features enabled only
-in the member crate that uses them):
+The actual dependency set (each pinned exactly, `default-features = false`, features enabled
+only in the member crate that uses them):
 
 | Purpose | Crate |
 |---|---|
-| Lambda HTTP runtime | `lambda_http` |
-| Web framework (admin UI + handlers) | `axum`, `tower`, `tower-http` |
+| Lambda runtime | `lambda_runtime`, `lambda_http`, `aws_lambda_events` |
+| Web framework (admin UI) | `axum`, `tower`, `tower-http` |
 | Async runtime | `tokio` |
-| AWS SDK | `aws-config`, `aws-sdk-dynamodb`, `aws-sdk-sqs`, `aws-sdk-eventbridge`, `aws-sdk-secretsmanager`, `aws-smithy-types` |
-| Typed Lambda event shapes | `aws_lambda_events`, `serde_dynamo` (DynamoDB Streams) |
-| Serialization | `serde`, `serde_json` |
-| Templating (admin UI) | `askama` |
-| Crypto | **`aws-lc-rs`** — the signing/HMAC backend for tokens, sessions, and the permutation HMAC |
-| Observability | `metrics`, `metrics_cloudwatch_embedded`, `tracing` |
-| Errors | `thiserror` (libs), `anyhow` (binaries) |
-| Dev | `proptest`, `wiremock` |
+| AWS SDK | `aws-config`, `aws-sdk-dynamodb`, `aws-sdk-ssm`, `aws-smithy-types` |
+| Templating + static assets (admin UI) | `askama`, `rust-embed`, `mime_guess` |
+| Admin OIDC login (ADR-0016) | `openidconnect`, `jsonwebtoken`, `reqwest`, `rustls`, `cookie` |
+| Serialization | `serde`, `serde_json`, `serde_dynamo`, `base64` |
+| Crypto | **`aws-lc-rs`** — signing/HMAC backend for tokens, sessions, the CloudFront cookie signature, and the permutation HMAC |
+| Errors and logging | `thiserror` (libs), `anyhow` (binaries), `tracing`, `tracing-subscriber` |
+| Dev | `proptest` |
+
+There is no SQS SDK dependency: API Gateway writes to the queue and `assign_position` receives
+the batch as a Lambda event. There is no EventBridge or Secrets Manager SDK dependency either —
+schedules are Terraform-managed and secrets are read from SSM.
 
 - **Crypto is `aws-lc-rs` only — never `ring` or `openssl`.** Select the AWS SDK's
   `aws-lc-rs`-backed TLS/crypto path and disable defaults so no second crypto stack (legacy
   rustls/`ring`) is pulled in. One FIPS-capable, AWS-maintained backend across the whole tree.
 - AWS SDK crates take `default-features = false` deliberately: it drops the legacy rustls 0.21
   connector; each crate then enables the current hyper-1 HTTPS client explicitly.
+
+### The OIDC dependency chain, and why it is pinned the way it is
+
+The admin login is the one place where the single-crypto-backend rule is hard to hold, so the
+feature selection is deliberate and fragile. Manifests carry no comments, so the reasoning lives
+here:
+
+- `openidconnect`'s default `rustls-tls` feature forces `reqwest`'s **ring**-backed provider,
+  which this project forbids. Defaults are therefore off and only the `reqwest` transport
+  feature is enabled.
+- `openidconnect` re-exports the `oauth2` 5 / `reqwest` 0.12 types that its `request_async`
+  signature expects, so `reqwest` is pinned to 0.12 or the admin crate does not typecheck.
+- `reqwest` uses `rustls-tls-webpki-roots-no-provider`, so no provider is chosen for it, and the
+  admin binary installs rustls's **`aws-lc-rs`** `CryptoProvider` at startup.
+- `jsonwebtoken` verifies JWKS signatures with its `aws_lc_rs` feature.
+
+Changing any one of these can silently pull `ring` back into the tree. **Nothing currently catches
+that.** `deny.toml`'s `[bans]` section sets only `multiple-versions = "warn"` and
+`wildcards = "deny"`; there is no `deny` list, so `cargo deny check bans` would not object to
+`ring`, `openssl`, or a RustCrypto stack appearing. The rule is enforced by review alone. Closing
+that gap is tracked in [#74](https://github.com/smoketurner/virtual-waiting-room/issues/74).
 
 ## Release profile (Lambda size / cold start)
 
@@ -70,45 +108,50 @@ spike.
 
 | Concern | Service |
 |---|---|
-| Edge / CDN / request collapsing | CloudFront (three separate cache behaviours — see ADR-0013) |
-| Bot & abuse mitigation | WAF: Bot Control, ASN matching, anti-DDoS rule group (Count mode by default) |
+| Edge / CDN / request collapsing | CloudFront — polled, write, waiting-page and protected behaviours (ADR-0013) |
+| **The admission gate** | CloudFront trusted key group on the protected behaviour; `generate_token` signs a custom policy with RSA PKCS#1 v1.5 over SHA-256 (ADR-0020). No compute in the request path |
+| Bot & abuse mitigation | WAF: Bot Control, ASN matching, anti-DDoS in Count mode — **not built** (N7, #59, #70) |
 | Ingest | API Gateway **REST** (regional) with request validator → SQS |
 | Buffer | SQS standard queue + DLQ (`maxReceiveCount` 5), ESM `ReportBatchItemFailures` |
-| Compute | Lambda (Rust, arm64) — assign_position, controller, authorizer, phase, admin |
+| Compute | Lambda (Rust, arm64) — the seven functions above |
 | State | DynamoDB on-demand + PITR: `Counters`, `PreQueue`, `Positions`, `Tokens` |
-| Scheduling | EventBridge Scheduler (T−0 seal, 10 s outflow controller) |
-| Secrets | Secrets Manager (per-deployment signing key) |
-| Metrics | CloudWatch via Embedded Metric Format (EMF); inflow from `AWS/CloudFront` `Requests` |
+| Scheduling | EventBridge Scheduler (T−0 seal, controller every minute × six passes via durable waits) |
+| Secrets | **SSM Parameter Store SecureString** — the CloudFront signing key, the HMAC signing key, and the OIDC client secret. Not Secrets Manager: a SecureString is free where a secret is $0.40/mo, which N1 does not allow |
+| Metrics | CloudWatch. EMF emission and the shipped dashboard are **not built** (F5.1) |
 
 **No VPC by default** — all services are IAM-authenticated public endpoints (no NAT, no VPC
-endpoints). VPC is an opt-in variable for ATO-constrained clients; Lambda code is identical.
+endpoints). VPC is an opt-in variable for ATO-constrained operators; Lambda code is identical.
+
+### Public API surface as deployed
+
+`POST /v1/join` (direct SQS integration), `GET /v1/status`, `GET /v1/queue_num`,
+`POST /v1/generate_token`, plus `/admin`, `/admin/{proxy+}`, `/metrics`, `/update_session` and
+`/static/{proxy+}` fronting the admin Lambda. `/queue_pos_expiry` and `/public_key` appear in
+`docs/DESIGN.md` §8 but are **not routed**.
 
 ## Infrastructure as code
 
-- **Terraform**, no manual console steps (N5). Modules: `core`, `edge`, `authorizer`.
+- **Terraform**, no manual console steps (N5). Modules: `core`, `edge`, `authorizer`,
+  `demo-origin` (a fixture standing in for an operator origin in the dev root).
 - Target ≤ 80 Terraform-managed resources for the core module (N6). Every new resource counts
   against this budget — justify additions.
-- API documented as **OpenAPI**; public and admin surfaces generated from the spec (N8).
+- API documented as **OpenAPI** (N8) — **not built**.
 
-## Admin web interface — Option A (accepted)
+## Admin web interface
 
-The operator dashboard is a **single Axum-based Rust Lambda** rendering server-side HTML with
-**askama** compile-time templates, styled with the **Cloudscape design language**.
+A **single Axum-based Rust Lambda** rendering server-side HTML with **askama** compile-time
+templates.
 
-- **Cloudscape components are React-only** — there is no server-rendered HTML component
-  library. We therefore use Cloudscape **design tokens**, not components.
-- **No runtime dependency on `@cloudscape-design/design-tokens`** (it ships Sass/JS vars and
-  presupposes the React components). At **build time**, extract token *values* from the
-  blessed `index-visual-refresh.json` artifact (via `style-dictionary` or a small script)
-  into a plain CSS custom-properties stylesheet (`:root { --color-…: … }`) vendored into the
-  Lambda. Runtime stays React-free and dependency-free.
-- Interactivity = plain HTML `<form>` POSTs to the same `/admin/*` actions + a tiny vanilla-JS
-  poller for metrics. **No React, no bundler in the request path.** Core actions work with JS
-  disabled.
-- The UI is a **thin server-rendered client over the existing admin Lambda logic** — it adds
-  no capability the API lacks (F5.5 API-first still holds) and uses the same **SigV4** auth.
-- Tradeoff accepted: hand-author markup that Cloudscape-React would provide as components, in
-  exchange for one React-free Rust Lambda that fits N1 (idle cost) and N6 (resource budget).
+- Styled with the **Vouch design language** as a self-contained plain-CSS stylesheet embedded in
+  the binary via `rust-embed` (ADR-0018, which superseded the Cloudscape design tokens and their
+  `extract_tokens.py` build step). No React, no bundler, no runtime npm dependency.
+- Auth is **OIDC Authorization Code + PKCE** with sessions and pending logins in the `Tokens`
+  table (ADR-0016, superseding SigV4). API Gateway auth is `NONE` because the Lambda is the
+  enforcement point.
+- Interactivity = plain HTML `<form>` POSTs to the same `/admin/*` actions plus a small
+  vanilla-JS metrics poller. Core actions work with JavaScript disabled.
+- The UI is a **thin server-rendered client over the admin Lambda's own logic** — it adds no
+  capability the API lacks (F5.5 API-first still holds).
 
 ## Justify new dependencies
 

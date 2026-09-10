@@ -78,9 +78,12 @@ Position assignment has two paths:
   only, then writes each row with `attribute_not_exists(request_id)`. Gaps are acceptable;
   duplicates are not.
 
-Admission is closed-loop: `controller` runs six passes per `rate(1 minute)` invoke
+Admission is closed-loop: `controller` runs six passes per `rate(1 minute)` execution
 (10 s cadence), measures arrivals against what it released, smooths the no-show rate with an
-EWMA, and advances `serving_counter` by a bounded correction. It also expires positions and
+EWMA, and advances `serving_counter` by a bounded correction. It is a **Lambda durable
+function** (ADR-0022): each pass is a checkpointed durable step and each 10 s gap a durable
+wait that suspends the execution instead of holding the invocation open, so the waiting is not
+billed. The SDK (`aws-durable-execution-sdk`) is an experimental preview, pinned exactly. It also expires positions and
 advances `max_expired_position` (ADR-0006 — expiry is controller-driven, not DynamoDB TTL).
 
 **The gate is CloudFront itself.** The protected behaviour names a trusted key group, so

@@ -72,7 +72,7 @@ authorizer without a call to the waiting-room backend.
 ### 2.3 Admission
 
 ```
-  Outflow controller (EventBridge Scheduler, every 10 s)
+  Outflow controller (EventBridge Scheduler, rate(1 minute) × six 10 s passes)
         1. sum arrivals#0..9 and released count
         2. no_show_rate = 1 − (arrivals / released)
         3. release = target_rate / (1 − smoothed_no_show_rate), bounded
@@ -82,20 +82,30 @@ authorizer without a call to the waiting-room backend.
         ▼
   Visitor polls /status → serving_counter ≥ own position
         │
-  POST /generate_token → admission token (short expiry, single use)
+  POST /v1/generate_token → generate_token (Rust)
+        1. position reached, event admitting, position still a live claim?
+        2. ADD arrivals#(hash % 10)
+        3. sign a CloudFront custom policy, RSA PKCS#1 v1.5 over SHA-256
+        4. Set-Cookie: CloudFront-Policy, -Signature, -Key-Pair-Id,
+                       -Hash-Algorithm=SHA256      (Path=/, no Domain)
         │
         ▼
-  authorizer (Rust — CloudFront VPC origin, or at the client origin)
-     ├─ valid session cookie?        → forward to origin
-     ├─ valid admission token?       → set session cookie, strip token from URL,
-     │                                 ADD arrivals#(hash % 10), forward
-     ├─ request not protected?       → forward
-     ├─ waiting room unreachable?    → forward with bypass cookie (§10)
-     └─ otherwise                    → 302 to the waiting room
-        │
-        ▼
-  Client origin — private subnet, reachable only via the CloudFront VPC origin
+  CloudFront protected behaviour [trusted key group]   ← the gate, no compute
+     ├─ valid signed cookies    → forward to the operator's origin
+     └─ missing or expired      → 403, mapped by custom_error_response to
+                                  /_wr/waiting.html (an ungated behaviour)
 ```
+
+**The alternative gate** (ADR-0020). For an origin the operator controls and wants per-request
+rules on — header, cookie, user agent — `modules/authorizer` runs a Rust Lambda at that origin
+instead: session cookie → admission token → protection-rule match → 302, deciding locally with
+no backend call. It is built and deployable and is not in the CloudFront path.
+
+Two properties of the edge gate are load-bearing and currently open. It has **no fail-open
+path** — an outage of the token path returns 403 to every visitor of the whole distribution
+([#58](https://github.com/smoketurner/virtual-waiting-room/issues/58)) — and it has **no dormant
+state**, so standby mode is not deliverable through it
+([#60](https://github.com/smoketurner/virtual-waiting-room/issues/60)).
 
 ---
 
@@ -115,8 +125,8 @@ Three of the four phases serve a static operator-authored page from content deli
 | Concern | Mechanism |
 |---|---|
 | Phase state | Attribute on the `Counters` item; one conditional `UpdateItem` transitions a phase |
-| Scheduled transitions | EventBridge Scheduler rules invoking the phase Lambda |
-| Manual transitions | The same Lambda behind the admin API |
+| Scheduled transitions | EventBridge Scheduler invoking `seal_event` at T−0 |
+| Manual transitions | `/admin/phase` on the admin Lambda, writing the same conditional `UpdateItem` |
 | Phase pages | Client HTML in S3, served through CloudFront with a long time to live (TTL) |
 | Current phase for clients | `/status`, cached 5 s globally |
 | Maintenance mode | A phase override attribute checked before `phase` |
@@ -146,7 +156,7 @@ CloudFront publishes a `Requests` metric per distribution to CloudWatch in `us-e
 | Concern | Mechanism |
 |---|---|
 | Inflow measurement | CloudWatch alarm on `AWS/CloudFront` `Requests`, `Sum`, 60 s period |
-| Activation | Alarm → EventBridge rule → phase Lambda sets `ACTIVE` |
+| Activation | Alarm → EventBridge rule → phase transition to `ACTIVE` — **not built** ([#60](https://github.com/smoketurner/virtual-waiting-room/issues/60)) |
 | Propagation | Authorizer reads phase from `/status`, cached 5 s |
 | Deactivation | Second alarm on sustained low `Requests`, longer evaluation period |
 | Manual override | Admin API sets a forced phase suppressing both alarms |
@@ -190,7 +200,7 @@ Queue order is a bijection from registration index to queue position, realised a
 **pseudorandom permutation (PRP)** rather than stored rows
 ([ADR-0002](adr/0002-seeded-permutation-not-materialised-shuffle.md)).
 
-At T−0 the phase Lambda performs one `UpdateItem` on `Counters`. It reads the 10 shard counts
+At T−0 `seal_event` performs one `UpdateItem` on `Counters`. It reads the 10 shard counts
 (`prequeue_counter#0`–`#9`), computes the prefix offsets `offset[s] = Σ counts[0..s)` and the
 cohort size `N = Σ counts`, and writes them alongside the seed and phase in the same conditional
 write ([ADR-0015](adr/0015-stripe-prequeue-counter.md)):
@@ -371,8 +381,8 @@ skipped number.
 | `serving_counter` | N | Admission high-water mark |
 | `max_expired_position` | N | Highest expired position |
 | `arrivals#0`–`arrivals#9` | N | Sharded arrival count |
-| `phase` | S | `idle` / `pre_queue` / `active` / `post_event` |
-| `phase_override` | S | Maintenance mode, checked before `phase` |
+| `phase` | S | `idle` / `pre_queue` / `active` / `post_event` / `maintenance` |
+| `admission_control` | S | Operator's live intent: `open` / `paused` / `fail_open` (ADR-0019), which with `phase` derives the visitor-facing `ServingState` |
 | `target_rate` | N | Operator-set admissions per minute |
 | `shuffle_seed` | B | 256-bit permutation key, written once at T−0 |
 | `participant_count` | N | Pre-queue cohort size, the permutation domain |
@@ -452,9 +462,16 @@ release_next          = target_rate / (1 − smoothed_no_show_rate)
 The rate is smoothed across intervals to avoid oscillation and the correction is bounded, so
 a transient measurement error cannot release a damaging burst.
 
-An EventBridge Scheduler rule invokes the controller every 10 seconds. It sums the arrival
-shards, reads the released count, computes the correction, and writes `serving_counter` with
-one `UpdateItem`.
+An EventBridge Scheduler rule starts one controller execution every minute — the scheduler's
+finest granularity — and that execution runs six 10-second passes, so the control interval is 10
+seconds while the schedule is one per minute. Each pass sums the arrival shards, reads the
+released count, computes the correction, and writes `serving_counter` with one `UpdateItem`.
+
+The gap between passes is a **durable wait**, not a sleep: it suspends the execution instead of
+holding the invocation open, so the controller is not billed for the 50 seconds it spends
+waiting ([ADR-0022](adr/0022-durable-controller-cadence.md)). Each pass is a durable step,
+checkpointed so replay returns its result
+rather than advancing `serving_counter` a second time.
 
 **Counting arrivals.** The authorizer increments an arrival counter when it converts an
 admission token into a session — one write per admitted visitor. At a 60,000/minute admission
@@ -478,10 +495,10 @@ observe a TTL-pending item apply a `FilterExpression` on `expires_at`.
 |---|---|---|---|---|
 | `/status` | 1 s | path only | none | Phase, serving position, admission rate, operator message; after T−0 also `shuffle_seed`, `participant_count`, `prequeue_offsets` |
 | `/queue_num` | 1 s | path + `event_id`, `request_id` | none | Own position; 404 means re-join |
-| `/queue_pos_expiry` | 1 s | path + `event_id`, `request_id` | none | Seconds until position lapses |
-| `/public_key` | 1 s | path + `event_id` | none | Signature verification material |
+| `/queue_pos_expiry` | 1 s | path + `event_id`, `request_id` | none | Seconds until position lapses — **not routed yet** |
+| `/public_key` | 1 s | path + `event_id` | none | Signature verification material — **not routed yet** |
 | `/join` | uncached | — | none | Join the queue or pre-queue |
-| `/generate_token` | uncached | — | none | Exchange a served position for an admission token |
+| `/generate_token` | uncached | — | none | Exchange a served position for the CloudFront admission cookies |
 
 ### Cache behaviours
 
@@ -489,14 +506,15 @@ observe a TTL-pending item apply a `FilterExpression` on `expires_at`.
 |---|---|---|---|---|
 | Polled | `/status`, `/queue_num`, `/queue_pos_expiry`, `/public_key` | Min TTL 1 s | none | API Gateway |
 | Write | `/join`, `/generate_token` | disabled | none | API Gateway |
-| Protected origin | `/*` (default) | disabled | session cookie forwarded | Client origin, via VPC origin |
+| Protected origin | `/*` (default) | disabled | admission cookies forwarded | Operator origin, gated by a trusted key group |
+| Waiting page | `/_wr/*` | cached | none | S3, deliberately ungated — this is what a refused visitor sees |
 
 Minimum TTL must exceed zero and polled behaviours must forward no cookies, or CloudFront
 disables request collapsing and every poll reaches the origin
 ([ADR-0013](adr/0013-cache-behaviour-separation.md)). `stale-while-revalidate` on `/status`
 serves the previous value if the origin is slow.
 
-### Admin endpoints (SigV4)
+### Admin endpoints (OIDC session, ADR-0016)
 
 | Path | Purpose |
 |---|---|
@@ -520,8 +538,15 @@ the other ([ADR-0011](adr/0011-session-cookie-after-token.md)):
   short-lived, validated once.
 - **Session cookie** — set by the authorizer after the token validates, scoped per event.
   Supports a sliding window extended on activity and a hard cap from issue time.
+- **CloudFront signed cookie set** — what the edge gate actually checks, and the only credential
+  in the deployed CloudFront path: `CloudFront-Policy`, `-Signature`, `-Key-Pair-Id` and
+  `-Hash-Algorithm=SHA256`, minted by `generate_token` over an RSA key pair whose public half is
+  in a trusted key group (ADR-0020). It is a bearer credential until its policy expires: it
+  carries no visitor binding, is scoped `https://*`
+  ([#61](https://github.com/smoketurner/virtual-waiting-room/issues/61)), and cannot be revoked
+  ([#63](https://github.com/smoketurner/virtual-waiting-room/issues/63)).
 
-The signing key is per-deployment, held in Secrets Manager. Its compromise permits minting
+The signing key is per-deployment, held in an SSM Parameter Store SecureString (a SecureString is free where a Secrets Manager secret is $0.40/mo, which N1 does not allow). Its compromise permits minting
 admission for every event in that deployment.
 
 ### Entry gating
@@ -560,7 +585,7 @@ minutes it exceeds the CloudFront bill (§12).
 | Branding | Client HTML, CSS and assets in S3 behind CloudFront; the module ships a reference theme |
 | Operator messaging | A `Counters` attribute delivered in the existing `/status` payload |
 | Position and estimated wait | `/queue_num` returns position; the client computes wait from the measured admission rate in `/status` |
-| Operator actions | Admin REST API with SigV4, backed by the same Lambdas as the scheduled paths |
+| Operator actions | Admin REST API and server-rendered UI on the admin Lambda, authenticated by an OIDC Authorization Code + PKCE session (ADR-0016), backed by the same writes as the scheduled paths |
 
 Broadcasting a message to 1,000,000 waiting visitors costs one `UpdateItem` and zero
 additional requests; delivery completes within one cache TTL. Estimated wait is computed from
@@ -592,7 +617,7 @@ outage.
 Single-tenant, deployed into the client's own AWS account
 ([ADR-0007](adr/0007-single-tenant-deployment.md)). No component runs anywhere else.
 
-**No virtual private cloud (VPC).** DynamoDB, SQS, Secrets Manager, EventBridge and Lambda
+**No virtual private cloud (VPC).** DynamoDB, SQS, SSM Parameter Store, EventBridge and Lambda
 are all Identity and Access Management (IAM) authenticated public-endpoint services, reached
 with no network address translation (NAT) gateway and no VPC endpoints. A VPC is available as
 an opt-in variable for clients whose Authority to Operate (ATO) boundary mandates
@@ -624,7 +649,14 @@ different topology, not a configuration flag, and is priced separately.
 
 ## 12. Cost
 
-For a 1,000,000-visitor event at 10-second polling:
+For a 1,000,000-visitor event at 10-second polling.
+
+**These figures do not describe the shipped client.** `waiting.js` polls every 5 seconds with up
+to 1.5 s of jitter (`POLL_MS = 5000`, `JITTER_MS = 1500`), so real request volume is roughly
+double the table below and every request-driven line with it. The table is kept as the modelled
+baseline until it is recomputed against the client that actually ships
+([#69](https://github.com/smoketurner/virtual-waiting-room/issues/69)), which also proposes
+making the interval a function of distance from the front rather than a constant.
 
 | Component | Driver | Approximate |
 |---|---|---|

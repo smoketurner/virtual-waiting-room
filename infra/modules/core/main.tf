@@ -344,7 +344,7 @@ resource "aws_api_gateway_integration" "join_sqs" {
   type                    = "AWS"
   integration_http_method = "POST"
   credentials             = aws_iam_role.apigw_sqs.arn
-  uri                     = "arn:${data.aws_partition.current.partition}:apigateway:${data.aws_region.current.region}:sqs:path/${data.aws_caller_identity.current.account_id}/${aws_sqs_queue.join.name}"
+  uri                     = "arn:${local.aws_partition}:apigateway:${local.aws_region}:sqs:path/${local.aws_account_id}/${aws_sqs_queue.join.name}"
 
   request_parameters = {
     "integration.request.header.Content-Type" = "'application/x-www-form-urlencoded'"

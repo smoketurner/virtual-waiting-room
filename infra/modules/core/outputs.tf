@@ -80,7 +80,7 @@ output "api_invoke_url" {
 
 output "api_gateway_domain_name" {
   description = "Host of the regional API (no scheme, no stage path). This is the origin the edge module's polled + write behaviours point at; the stage is set as the CloudFront origin_path."
-  value       = "${aws_api_gateway_rest_api.this.id}.execute-api.${data.aws_region.current.region}.amazonaws.com"
+  value       = "${aws_api_gateway_rest_api.this.id}.execute-api.${local.aws_region}.amazonaws.com"
 }
 
 

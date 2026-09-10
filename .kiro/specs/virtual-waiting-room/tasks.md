@@ -53,17 +53,21 @@ Throwaway code. Measures what documentation cannot settle.
 
 ### 1e. Read path
 
-- [ ] `/status` (phase, serving position, rate, operator message — one payload), `/queue_num`, `/queue_pos_expiry` [F3.1] — Partial: `/status` and `/queue_num` are served by the read Lambda; `/queue_pos_expiry` is routed but still on the placeholder.
+- [ ] `/status` (phase, serving position, rate, operator message — one payload), `/queue_num`, `/queue_pos_expiry` [F3.1] — Partial: `/status` and `/queue_num` are served by the read Lambda; `/queue_pos_expiry` is not routed at all, and neither is `/public_key`.
 
 ### 1f. Admission, session, and outflow control
 
 - [x] Deploy-time signing key into an SSM SecureString parameter, generated and rotated out of band so the key never lands in the repo or in Terraform state. Not Secrets Manager: a standard SecureString is free where a secret is $0.40/mo, which N1 (idle cost) does not allow
-- [ ] `/generate_token` — single-use admission token, short expiry [F3.3] — Partial: token minting is implemented in the authorizer crate (`token.rs`); no deployed Lambda serves the endpoint.
+- [x] `/v1/generate_token` — the `generate_token` Lambda checks the position against `serving_counter`, records the arrival, and mints the CloudFront signed-cookie set (custom policy, RSA PKCS#1 v1.5 over SHA-256, `CloudFront-Hash-Algorithm=SHA256`) [F3.3, ADR-0020]
+- [x] **The gate is CloudFront itself**: the protected behaviour names a trusted key group; a refusal is a 403 mapped by `custom_error_response` to the ungated waiting page. Key pair, public key and key group live in `modules/core` beside the Lambda that signs [F3.4, ADR-0020]
+- [ ] Gate scope and lifetime: `Resource` is `https://*` with no visitor binding and a 1 h default TTL — cookies admit across events in one distribution and are transferable ([#61](https://github.com/smoketurner/virtual-waiting-room/issues/61)), and nothing can revoke them ([#63](https://github.com/smoketurner/virtual-waiting-room/issues/63))
+- [ ] HMAC admission-token minting also exists in the authorizer crate (`token.rs`) for the authorizer gate; it is not what the CloudFront path uses
 - [x] Authorizer decision tree: session → token → protection match → 302 [F3.4]
 - [x] Session cookie set after token validation (ADR-0011), signed over different inputs from the token, scoped per event, token stripped from the URL [F3.5, F3.6]
 - [x] Sliding and fixed session validity modes [F3.7]
-- [x] Fail open with a time-limited bypass cookie, configurable (ADR-0009) [F4.1, F4.2, F4.3]
-- [x] No-show compensating outflow controller: measure arrivals against releases, smooth, bound the correction, adjust `serving_counter` on a 10 s schedule. Arrival counter sharded ×10 (`arrivals#0..9`) [F3.2, F3.8]
+- [ ] Fail open with a time-limited bypass cookie, configurable (ADR-0009) [F4.1, F4.2, F4.3] — Partial: implemented in the authorizer, which is no longer the primary gate. The CloudFront gate fails **closed**: an outage of the token path 403s every visitor to the whole distribution ([#58](https://github.com/smoketurner/virtual-waiting-room/issues/58))
+- [x] No-show compensating outflow controller: measure arrivals against releases, smooth, bound the correction, adjust `serving_counter` on a 10 s interval (`rate(1 minute)` × six passes, the scheduler's floor being one minute; the gaps are durable waits, so the controller is not billed for them — ADR-0022). Arrival counter sharded ×10 (`arrivals#0..9`) [F3.2, F3.8]
+- [ ] Concurrency term in the control law: `/update_session` is a stub, so completions and abandonments never close the loop and origin concurrency drifts with session duration ([#65](https://github.com/smoketurner/virtual-waiting-room/issues/65))
 - [ ] Decide signing-key rotation (open question 2)
 
 ### 1g. Entry gating and abuse mitigation
@@ -156,6 +160,36 @@ Ships second, priced separately. No CloudFront, no edge compute, no VPC origins.
 - [ ] Replace CDN cache collapse for `/status` — the read-scaling story differs materially inside the boundary
 - [ ] Document the commercial-CloudFront-fronting-GovCloud-origin data-boundary question for the client's Authorizing Official (AO)
 - [ ] Validate deploy in a real GovCloud account
+
+---
+
+## Gaps from the architecture audit
+
+Filed as issues so they carry discussion; listed here because tasks.md is the build-state
+record and these are the things that stand between the current MVP and a waiting room an
+operator can run an event on.
+
+Reliability — the waiting room must not be the reason the site is down:
+
+- [ ] [#58](https://github.com/smoketurner/virtual-waiting-room/issues/58) Gate fails closed: no fail-open path [F4.1]
+- [ ] [#60](https://github.com/smoketurner/virtual-waiting-room/issues/60) Standby mode unreachable through the CloudFront gate [F0.4, F0.5, F0.7]
+- [ ] [#64](https://github.com/smoketurner/virtual-waiting-room/issues/64) Origin 403s replaced by the waiting page
+- [ ] [#67](https://github.com/smoketurner/virtual-waiting-room/issues/67) Visitors without JavaScript can never join
+- [ ] [#68](https://github.com/smoketurner/virtual-waiting-room/issues/68) Single-region failure domain undocumented and untested
+- [ ] [#70](https://github.com/smoketurner/virtual-waiting-room/issues/70) Pre-event readiness as a command, not a runbook [O1, O2, N7]
+
+Fairness and abuse — the raffle is only as fair as the identities behind the tickets:
+
+- [ ] [#59](https://github.com/smoketurner/virtual-waiting-room/issues/59) No one-position-per-visitor control [F6.1, F6.2, F6.3]
+- [ ] [#61](https://github.com/smoketurner/virtual-waiting-room/issues/61) Admission cookies wildcard-scoped and transferable
+- [ ] [#62](https://github.com/smoketurner/virtual-waiting-room/issues/62) `request_id` is both a public cache key and the bearer credential
+- [ ] [#63](https://github.com/smoketurner/virtual-waiting-room/issues/63) No way to revoke an admission
+
+Control and cost:
+
+- [ ] [#65](https://github.com/smoketurner/virtual-waiting-room/issues/65) Outflow control has no concurrency term [F3.10]
+- [ ] [#66](https://github.com/smoketurner/virtual-waiting-room/issues/66) Per-request protection rules unavailable at the gate [F0.6]
+- [ ] [#69](https://github.com/smoketurner/virtual-waiting-room/issues/69) Adaptive poll interval — the dominant cost driver [O6]
 
 ---
 

@@ -56,7 +56,7 @@ data "aws_iam_policy_document" "assign_position" {
       "logs:CreateLogStream",
       "logs:PutLogEvents",
     ]
-    resources = ["arn:${data.aws_partition.current.partition}:logs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/${local.assign_position_name}*"]
+    resources = ["arn:${local.aws_partition}:logs:${local.aws_region}:${local.aws_account_id}:log-group:/aws/lambda/${local.assign_position_name}*"]
   }
 }
 
@@ -107,7 +107,7 @@ data "aws_iam_policy_document" "seal_event" {
       "logs:CreateLogStream",
       "logs:PutLogEvents",
     ]
-    resources = ["arn:${data.aws_partition.current.partition}:logs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/${local.seal_event_name}*"]
+    resources = ["arn:${local.aws_partition}:logs:${local.aws_region}:${local.aws_account_id}:log-group:/aws/lambda/${local.seal_event_name}*"]
   }
 }
 
@@ -135,7 +135,7 @@ data "aws_iam_policy_document" "read" {
       "logs:CreateLogStream",
       "logs:PutLogEvents",
     ]
-    resources = ["arn:${data.aws_partition.current.partition}:logs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/${local.read_name}*"]
+    resources = ["arn:${local.aws_partition}:logs:${local.aws_region}:${local.aws_account_id}:log-group:/aws/lambda/${local.read_name}*"]
   }
 }
 
@@ -179,7 +179,7 @@ data "aws_iam_policy_document" "admin" {
       "logs:CreateLogStream",
       "logs:PutLogEvents",
     ]
-    resources = ["arn:${data.aws_partition.current.partition}:logs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/${local.admin_name}*"]
+    resources = ["arn:${local.aws_partition}:logs:${local.aws_region}:${local.aws_account_id}:log-group:/aws/lambda/${local.admin_name}*"]
   }
 }
 
@@ -210,6 +210,19 @@ data "aws_iam_policy_document" "controller" {
   }
 
   statement {
+    sid    = "DurableExecution"
+    effect = "Allow"
+    actions = [
+      "lambda:CheckpointDurableExecution",
+      "lambda:GetDurableExecutionState",
+    ]
+    # A durable execution is a sub-resource of a function VERSION, so its ARN
+    # always carries a qualifier. An unqualified function ARN never matches one
+    # and the checkpoint is denied.
+    resources = ["arn:${local.aws_partition}:lambda:${local.aws_region}:${local.aws_account_id}:function:${local.controller_name}:*"]
+  }
+
+  statement {
     sid    = "Logs"
     effect = "Allow"
     actions = [
@@ -217,7 +230,7 @@ data "aws_iam_policy_document" "controller" {
       "logs:CreateLogStream",
       "logs:PutLogEvents",
     ]
-    resources = ["arn:${data.aws_partition.current.partition}:logs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/${local.controller_name}*"]
+    resources = ["arn:${local.aws_partition}:logs:${local.aws_region}:${local.aws_account_id}:log-group:/aws/lambda/${local.controller_name}*"]
   }
 }
 
@@ -267,6 +280,6 @@ data "aws_iam_policy_document" "generate_token" {
     sid       = "Logs"
     effect    = "Allow"
     actions   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
-    resources = ["arn:${data.aws_partition.current.partition}:logs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:*"]
+    resources = ["arn:${local.aws_partition}:logs:${local.aws_region}:${local.aws_account_id}:*"]
   }
 }

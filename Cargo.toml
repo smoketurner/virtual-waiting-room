@@ -1,14 +1,14 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/wr-common",
-    "crates/assign_position",
-    "crates/seal_event",
-    "crates/read",
     "crates/admin",
-    "crates/controller",
+    "crates/assign_position",
     "crates/authorizer",
+    "crates/controller",
     "crates/generate_token",
+    "crates/read",
+    "crates/seal_event",
+    "crates/wr-common",
 ]
 
 [workspace.package]
@@ -18,97 +18,58 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/smoketurner/virtual-waiting-room"
 
 [workspace.dependencies]
-wr-common = { path = "crates/wr-common", version = "=0.1.0" }
-
-# Exact version pins only, default features disabled on everything; each member
-# crate opts into exactly the features it uses (conventions.md).
-
-# Crypto — aws-lc-rs is the sole crypto/HMAC backend across the tree (tech.md).
-aws-lc-rs = { version = "=1.18.1", default-features = false }
-
-# Lambda runtime and typed event shapes.
-lambda_runtime = { version = "=1.4.0", default-features = false }
-lambda_http = { version = "=1.3.1", default-features = false }
-aws_lambda_events = { version = "=1.2.0", default-features = false }
-
-# AWS SDK — defaults off so no second crypto stack / legacy connector is pulled
-# in; the DynamoDB AttributeValue type is used to build item maps and reads.
+anyhow = { version = "=1.0.104", default-features = false }
+askama = { version = "=0.16.1", default-features = false }
 aws-config = { version = "=1.12.0", default-features = false }
+# Experimental preview SDK (aws/aws-durable-execution-sdk-rust): the API may
+# change without notice, so the pin is exact and upgrades are deliberate.
+aws-durable-execution-sdk = { version = "=0.1.0", default-features = false }
+aws-lc-rs = { version = "=1.18.1", default-features = false }
 aws-sdk-dynamodb = { version = "=1.124.0", default-features = false }
-# RFC3339 audit timestamps (ADR-0017); already in the tree via the SDK.
+aws-sdk-ssm = { version = "=1.122.0", default-features = false }
 aws-smithy-types = { version = "=1.6.3", default-features = false }
-
-# Async runtime.
-tokio = { version = "=1.53.1", default-features = false }
-
-# Admin UI: Axum server-rendered HTML Lambda (tech.md Option A). askama is
-# compile-time templates; tower/tower-http provide middleware.
+aws_lambda_events = { version = "=1.2.0", default-features = false }
 axum = { version = "=0.8.9", default-features = false }
+base64 = { version = "=0.23.1", default-features = false }
+cookie = { version = "=0.18.2", default-features = false }
+jsonwebtoken = { version = "=11.0.0", default-features = false }
+lambda_http = { version = "=1.3.1", default-features = false }
+lambda_runtime = { version = "=1.4.0", default-features = false }
+mime_guess = { version = "=2.0.5", default-features = false }
+openidconnect = { version = "=4.0.1", default-features = false, features = ["reqwest"] }
+proptest = { version = "=1.11.0", default-features = false }
+reqwest = { version = "=0.12.28", default-features = false }
+rust-embed = { version = "=8.12.0", default-features = false }
+rustls = { version = "=0.23.44", default-features = false }
+serde = { version = "=1.0.229", default-features = false }
+serde_dynamo = { version = "=4.3.0", default-features = false }
+serde_json = { version = "=1.0.151", default-features = false }
+thiserror = { version = "=2.0.20", default-features = false }
+tokio = { version = "=1.53.1", default-features = false }
 tower = { version = "=0.5.3", default-features = false }
 tower-http = { version = "=0.7.1", default-features = false }
-askama = { version = "=0.16.1", default-features = false }
-# Embed the admin static assets (CSS) into the Lambda binary, served at /static.
-rust-embed = { version = "=8.12.0", default-features = false }
-mime_guess = { version = "=2.0.5", default-features = false }
-
-# Admin OIDC login (ADR-0016): Authorization Code + PKCE, session + PKCE state in
-# DynamoDB. openidconnect re-exports the oauth2 5 / reqwest 0.12 types its
-# request_async signature expects, so reqwest is pinned to 0.12 to typecheck.
-# openidconnect's default rustls-tls forces reqwest's ring-backed provider, which
-# tech.md forbids — so defaults are OFF and only the reqwest transport is enabled;
-# the admin crate selects reqwest's no-provider rustls and installs the aws-lc-rs
-# CryptoProvider at startup. jsonwebtoken verifies JWKS signatures via the
-# aws_lc_rs backend (single crypto stack, no ring).
-openidconnect = { version = "=4.0.1", default-features = false, features = ["reqwest"] }
-jsonwebtoken = { version = "=11.0.0", default-features = false }
-reqwest = { version = "=0.12.28", default-features = false }
-rustls = { version = "=0.23.44", default-features = false }
-cookie = { version = "=0.18.2", default-features = false }
-# Read the OIDC client secret from an encrypted SSM SecureString (ADR-0016).
-aws-sdk-ssm = { version = "=1.122.0", default-features = false }
-
-# Serialization
-serde = { version = "=1.0.229", default-features = false }
-serde_json = { version = "=1.0.151", default-features = false }
-# Typed DynamoDB AttributeValue de/serialization for item shapes.
-serde_dynamo = { version = "=4.3.0", default-features = false }
-# base64url codec for signed credentials (wr-crypto) and the admin CSP nonce.
-# A fuzzed, canonical-checking implementation on the credential-decode security
-# path, replacing hand-rolled copies.
-base64 = { version = "=0.23.1", default-features = false }
-
-# Errors and logging
-thiserror = { version = "=2.0.20", default-features = false }
-anyhow = { version = "=1.0.104", default-features = false }
 tracing = { version = "=0.1.44", default-features = false }
 tracing-subscriber = { version = "=0.3.23", default-features = false }
-
-# Dev
-proptest = { version = "=1.11.0", default-features = false }
+wr-common = { path = "crates/wr-common", version = "=0.1.0" }
 
 [workspace.lints.clippy]
-pedantic = { level = "warn", priority = -1 }
-# Panic prevention
-unwrap_used = "deny"
+allow_attributes = "deny"
+await_holding_lock = "deny"
+dbg_macro = "deny"
+exit = "deny"
 expect_used = "warn"
+large_futures = "deny"
+mem_forget = "deny"
+module_name_repetitions = "allow"
 panic = "deny"
 panic_in_result_fn = "deny"
-unimplemented = "deny"
-# No cheating
-allow_attributes = "deny"
-# Code hygiene
-dbg_macro = "deny"
-todo = "deny"
-print_stdout = "deny"
+pedantic = { level = "warn", priority = -1 }
 print_stderr = "deny"
-# Safety
-await_holding_lock = "deny"
-large_futures = "deny"
-exit = "deny"
-mem_forget = "deny"
-# Pedantic relaxations (too noisy)
-module_name_repetitions = "allow"
+print_stdout = "deny"
 similar_names = "allow"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"
 
 [profile.release]
 lto = true

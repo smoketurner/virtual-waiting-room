@@ -101,7 +101,9 @@ means you cannot silently `#[allow]` it — justify it or remove the cause.
 
 - Imperative mood, ≤72-char subject, one logical change per commit. Never amend/rebase commits
   already pushed to shared branches. **Never push to `main`** — feature branches and PRs only.
-- Never commit secrets. The per-deployment signing key lives in Secrets Manager, never in the
-  repo.
+- Never commit secrets. The per-deployment signing keys live in SSM Parameter Store
+  SecureStrings, never in the repo. Note the exception recorded in ADR-0020: the CloudFront
+  signing key pair is generated at apply time and therefore lives in Terraform state, which a
+  deployment whose threat model excludes state must override by supplying the pair out of band.
 - PR descriptions describe what the diff does now — not discarded approaches or alternatives.
 - Install and run `prek` (pre-commit) in the repo; run `prek run` before committing.

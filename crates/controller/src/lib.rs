@@ -19,6 +19,7 @@
 
 use std::future::Future;
 
+use serde::{Deserialize, Serialize};
 use wr_common::{AdmissionControl, Phase, SHARDS};
 
 pub mod dynamo;
@@ -29,8 +30,11 @@ pub mod dynamo;
 /// design's 10-second cadence within the scheduler's floor.
 pub const INTERVAL_SECS: u64 = 10;
 
-/// Passes per Lambda invoke. `INTERVAL_SECS * PASSES_PER_INVOKE == 60`, so one
-/// `rate(1 minute)` invoke covers a full minute at the 10-second cadence.
+/// Passes per durable execution. `INTERVAL_SECS * PASSES_PER_INVOKE == 60`, so
+/// one execution started by the `rate(1 minute)` schedule covers a full minute
+/// at the 10-second cadence. The execution spans several Lambda invocations:
+/// each durable wait suspends it and Lambda invokes the function again to
+/// resume.
 pub const PASSES_PER_INVOKE: u32 = 6;
 
 /// EWMA smoothing factor for the no-show rate. The smoothed rate is
@@ -323,7 +327,10 @@ pub trait Store {
 }
 
 /// The result of one controller pass.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// A pass runs as a durable step, so this is checkpointed and replayed from the
+/// checkpoint instead of being recomputed: it has to round-trip through serde.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum PassOutcome {
     /// The event is not `Active`; the controller did nothing.
     NotActive(Phase),

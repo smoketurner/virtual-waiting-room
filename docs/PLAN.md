@@ -42,7 +42,7 @@ Throwaway code. Measures what documentation cannot settle.
 - [ ] Protection rules (path, header, cookie, user agent), evaluated locally at the
       authorizer [F0.6]
 - [ ] Standby mode: CloudWatch alarm on `AWS/CloudFront` `Requests` (60 s period,
-      `us-east-1`) → EventBridge → phase Lambda. Activation latency ~125 s worst case
+      `us-east-1`) → EventBridge → phase transition. Activation latency ~125 s worst case
       [F0.4, F0.7]
 - [ ] Scheduled and standby coexisting on one origin [F0.3, F0.5]
 
@@ -77,7 +77,7 @@ Throwaway code. Measures what documentation cannot settle.
       `/queue_num`, `/queue_pos_expiry` [F3.1]
 
 ### 1f. Admission, session, and outflow control
-- [ ] Deploy-time signing key into Secrets Manager
+- [ ] Deploy-time signing key into an SSM Parameter Store SecureString
 - [ ] `/generate_token` — single-use admission token, short expiry [F3.3]
 - [ ] Authorizer decision tree: session → token → protection match → 302 [F3.4]
 - [ ] Session cookie set after token validation (ADR-0011), signed over different inputs
