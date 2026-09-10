@@ -139,19 +139,21 @@ endpoints). VPC is an opt-in variable for ATO-constrained operators; Lambda code
 
 ## Admin web interface
 
-A **single Axum-based Rust Lambda** rendering server-side HTML with **askama** compile-time
-templates.
+The operator dashboard is a **single Axum-based Rust Lambda** rendering server-side HTML with
+**askama** compile-time templates, styled in the **Vouch design language** (ADR-0018; replaces
+the Cloudscape styling of ADR-0014).
 
-- Styled with the **Vouch design language** as a self-contained plain-CSS stylesheet embedded in
-  the binary via `rust-embed` (ADR-0018, which superseded the Cloudscape design tokens and their
-  `extract_tokens.py` build step). No React, no bundler, no runtime npm dependency.
-- Auth is **OIDC Authorization Code + PKCE** with sessions and pending logins in the `Tokens`
-  table (ADR-0016, superseding SigV4). API Gateway auth is `NONE` because the Lambda is the
-  enforcement point.
-- Interactivity = plain HTML `<form>` POSTs to the same `/admin/*` actions plus a small
-  vanilla-JS metrics poller. Core actions work with JavaScript disabled.
-- The UI is a **thin server-rendered client over the admin Lambda's own logic** — it adds no
-  capability the API lacks (F5.5 API-first still holds).
+- **React-free, no build step.** Styling is a single self-contained plain-CSS stylesheet
+  (`/static/css/admin.css`) ported from Vouch's dark black-and-green palette — no design-token
+  extraction, no vendored `tokens.css`. Fonts (Inter + JetBrains Mono woff2) are self-hosted
+  under `/static/fonts`; the CSP allows `font-src 'self'`.
+- Interactivity = plain HTML `<form>` POSTs to the same `/admin/*` actions + a tiny vanilla-JS
+  poller for metrics. **No React, no bundler in the request path.** Core actions work with JS
+  disabled.
+- The UI is a **thin server-rendered client over the existing admin Lambda logic** — it adds
+  no capability the API lacks (F5.5 API-first still holds) and uses the same **SigV4** auth.
+- Tradeoff accepted: hand-author markup that Cloudscape-React would provide as components, in
+  exchange for one React-free Rust Lambda that fits N1 (idle cost) and N6 (resource budget).
 
 ## Justify new dependencies
 
