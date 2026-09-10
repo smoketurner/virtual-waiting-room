@@ -42,3 +42,28 @@ output "cloudfront_domain_name" {
   description = "CloudFront distribution domain name, when a client origin is supplied (edge created)."
   value       = length(module.edge) > 0 ? module.edge[0].distribution_domain_name : null
 }
+
+output "controller_function_name" {
+  description = "Name of the controller Lambda."
+  value       = module.core.controller_function_name
+}
+
+output "controller_scheduled" {
+  description = "True when the controller is a real build and its schedule exists, so admission is being metered and positions expire. False means the queue forms and never drains."
+  value       = var.controller_artifact_path != ""
+}
+
+output "authorizer_function_arn" {
+  description = "ARN of the origin authorizer Lambda, or null until its artifact is built. Attach this at the protected origin: it is invoked with the ALB / API Gateway request shape and answers 200 to serve the request or 302 to send the visitor to wait."
+  value       = module.authorizer.authorizer_function_arn
+}
+
+output "authorizer_role_arn" {
+  description = "ARN of the authorizer execution role."
+  value       = module.authorizer.authorizer_role_arn
+}
+
+output "waiting_room_url" {
+  description = "The URL the authorizer redirects un-admitted visitors to."
+  value       = local.waiting_room_url
+}

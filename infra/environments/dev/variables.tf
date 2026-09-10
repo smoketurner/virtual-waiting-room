@@ -72,10 +72,32 @@ variable "admin_artifact_path" {
   default     = ""
 }
 
+variable "controller_artifact_path" {
+  description = "Path to the built controller bootstrap binary. Supplying it also creates the schedule that meters admission and expires positions; empty leaves the controller on the placeholder and unscheduled."
+  type        = string
+  default     = ""
+}
+
 variable "lambda_architecture" {
   description = "Lambda CPU architecture for every function: arm64 or x86_64. Must match the built artifacts."
   type        = string
   default     = "arm64"
+}
+
+# --- Origin authorizer --------------------------------------------------------
+# The authorizer runs at the customer's protected origin, not at the edge: it is
+# invoked with the ALB / API Gateway request shape and answers 200 to serve the
+# request or 302 to send the visitor to wait. This root creates the function, its
+# role, and its policy, and exports the ARN; attaching it to the origin happens
+# where the origin lives, which this configuration does not own.
+#
+# The whole origin is protected. Narrowing that is a per-deployment decision made
+# at the origin, and defaulting to "gate everything" fails safe.
+
+variable "authorizer_artifact_path" {
+  description = "Path to the built authorizer bootstrap binary. Supplying it creates the function; empty creates only the execution role."
+  type        = string
+  default     = ""
 }
 
 variable "event_id" {

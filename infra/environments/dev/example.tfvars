@@ -22,6 +22,16 @@ assign_position_artifact_path = "../../../.artifacts/assign_position/bootstrap/b
 seal_event_artifact_path      = "../../../.artifacts/seal_event/bootstrap/bootstrap.zip"
 read_artifact_path            = "../../../.artifacts/read/bootstrap/bootstrap.zip"
 admin_artifact_path           = "../../../.artifacts/admin/bootstrap/bootstrap.zip"
+# Supplying controller_artifact_path also creates the schedule that meters
+# admission and expires positions. Leave it empty and the queue forms but never
+# drains.
+controller_artifact_path = "../../../.artifacts/controller/bootstrap/bootstrap.zip"
+
+# The authorizer gates the customer's protected origin and is the only writer of
+# the arrivals counters the controller measures no-shows against. Building it
+# creates the function and exports its ARN; attaching it at the origin happens
+# where the origin lives.
+authorizer_artifact_path = "../../../.artifacts/authorizer/bootstrap/bootstrap.zip"
 
 # --- Admin OIDC login (ADR-0016) ----------------------------------------------
 # The client SECRET is NOT here — write it to the SSM SecureString out of band:

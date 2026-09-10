@@ -20,9 +20,15 @@ module "core" {
   seal_event_artifact_path      = var.seal_event_artifact_path
   read_artifact_path            = var.read_artifact_path
   admin_artifact_path           = var.admin_artifact_path
-  lambda_architecture           = var.lambda_architecture
-  event_id                      = var.event_id
-  seal_start_time               = var.seal_start_time
+  controller_artifact_path      = var.controller_artifact_path
+  # Schedule the controller whenever a real one is deployed, the same way the
+  # join event-source mapping follows assign_position. A deployed controller that
+  # nothing fires means the queue forms and never drains, and the schedule costs
+  # a GetItem every ten seconds while the event is idle.
+  enable_controller   = var.controller_artifact_path != ""
+  lambda_architecture = var.lambda_architecture
+  event_id            = var.event_id
+  seal_start_time     = var.seal_start_time
 
   # Admin OIDC login (ADR-0016). Secret is an SSM SecureString written out of band.
   oidc_issuer         = var.oidc_issuer
@@ -54,13 +60,27 @@ module "edge" {
   client_origin_domain_name = var.client_origin_domain_name
 }
 
-# authorizer is wired once its Rust artifact is built (PLAN Phase 1f/2).
+# authorizer. The function is the gate at the customer's protected origin: it
+# answers 200 to serve a request or 302 to send the visitor to wait, and it is
+# the only writer of the arrivals counters the controller measures no-shows
+# against. An idle Lambda costs nothing, so it is created whenever its artifact
+# is built; attaching it at the origin happens where the origin lives.
 #
-# module "authorizer" {
-#   source = "../../modules/authorizer"
-#
-#   name_prefix                = var.name_prefix
-#   tags                       = local.common_tags
-#   signing_key_parameter_arn  = module.core.signing_key_parameter_arn
-#   lambda_artifact_path       = "../../../target/lambda/authorizer/bootstrap.zip"
-# }
+# Un-admitted visitors are sent to the CloudFront distribution created above,
+# which is the waiting room.
+module "authorizer" {
+  source = "../../modules/authorizer"
+
+  name_prefix = var.name_prefix
+  tags        = local.common_tags
+
+  signing_key_parameter_arn  = module.core.signing_key_parameter_arn
+  signing_key_parameter_name = module.core.signing_key_parameter_name
+  counters_table_name        = module.core.table_names.counters
+  counters_table_arn         = module.core.table_arns.counters
+  tokens_table_name          = module.core.table_names.tokens
+  tokens_table_arn           = module.core.table_arns.tokens
+  event_id                   = var.event_id
+  waiting_room_url           = local.waiting_room_url
+  lambda_artifact_path       = var.authorizer_artifact_path
+}
