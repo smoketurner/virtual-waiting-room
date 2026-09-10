@@ -60,6 +60,11 @@ pub struct Counters {
     pub serving_counter: u64,
     /// Per-shard registration counts (`prequeue_counter#0..9`).
     pub prequeue_counts: [u64; SHARDS],
+    /// Per-shard arrival counts (`arrivals#0..9`), incremented by the authorizer
+    /// when it converts an admission token into a session. The controller sums
+    /// these each interval to measure the no-show rate. Sharded for
+    /// the same single-item write-ceiling reason as the pre-queue counter.
+    pub arrivals: [u64; SHARDS],
     /// Set only at the seal, absent before: the 256-bit permutation seed.
     pub shuffle_seed: Option<[u8; 32]>,
     /// Set at the seal: cohort size `N = Σ prequeue_counts`.
@@ -135,6 +140,7 @@ mod tests {
             queue_counter: 0,
             serving_counter: 0,
             prequeue_counts: [3, 0, 5, 1, 0, 0, 2, 0, 0, 4],
+            arrivals: [0; SHARDS],
             shuffle_seed: None,
             participant_count: None,
             prequeue_offsets: None,

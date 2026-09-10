@@ -25,6 +25,27 @@ pub fn claim_local_index_update(shard: usize) -> String {
     format!("ADD {} :one", prequeue_shard_attr(shard))
 }
 
+/// The `Counters` attribute name for an arrival shard counter,
+/// `arrivals#<shard>`, incremented by the authorizer and summed by the
+/// controller.
+///
+/// # Panics
+///
+/// Panics if `shard >= SHARDS`; callers pick the shard with
+/// `wr_permutation::shard_for`, which is always in range.
+#[must_use]
+pub fn arrivals_shard_attr(shard: usize) -> String {
+    assert!(shard < SHARDS, "shard {shard} out of range 0..{SHARDS}");
+    format!("arrivals#{shard}")
+}
+
+/// `ADD arrivals#<shard> :one` — the authorizer's one write per admitted
+/// visitor, recording an arrival for the controller's no-show measurement.
+#[must_use]
+pub fn record_arrival_update(shard: usize) -> String {
+    format!("ADD {} :one", arrivals_shard_attr(shard))
+}
+
 /// `ADD queue_counter :n` — claims a contiguous block of `n` live-join
 /// positions. With `ReturnValue::AllNew` the returned value is the block end;
 /// the block is `[end - n + 1, end]`. `n` must be the count of *valid* records.
@@ -68,5 +89,18 @@ mod tests {
     #[test]
     fn shard_add_update_names_the_shard() {
         assert_eq!(claim_local_index_update(3), "ADD prequeue_counter#3 :one");
+    }
+
+    #[test]
+    fn arrivals_attr_names_are_hash_suffixed() {
+        assert_eq!(arrivals_shard_attr(0), "arrivals#0");
+        assert_eq!(arrivals_shard_attr(9), "arrivals#9");
+        assert_eq!(record_arrival_update(4), "ADD arrivals#4 :one");
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn arrivals_attr_out_of_range_panics() {
+        let _ = arrivals_shard_attr(SHARDS);
     }
 }
