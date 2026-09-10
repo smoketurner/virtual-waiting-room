@@ -59,3 +59,6 @@ __pycache__/
 
 # HAR captures record live session cookies and signed admission policies.
 *.har
+
+# macOS Finder metadata.
+.DS_Store
