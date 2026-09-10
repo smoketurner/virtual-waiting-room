@@ -11,7 +11,7 @@
 <main class="content">
   <div class="page-header">
     <h1>Event <span class="event">{{ event_id }}</span></h1>
-    <p class="desc">Operator control plane. An action takes effect on submit. A repeat of the same action within 2 seconds is rejected.</p>
+    <p class="desc">Operator control plane. A change is written on submit and reaches waiting visitors within the <code>/status</code> cache window (currently 1 second). A repeat of the same action within 2 seconds is rejected.</p>
   </div>
 
   {% if admission_paused %}
@@ -67,7 +67,7 @@
         <form method="post" action="/admin/pause">
           <button class="danger big" type="submit" title="Stop admitting visitors now. The queue and every position are kept.">Pause admission</button>
         </form>
-        <p class="help" style="margin-top:12px;color:var(--gray-500);"><strong>Pause stops admission now.</strong> The queue keeps forming and every visitor keeps their position. A Resume button appears here to start admission again.</p>
+        <p class="help" style="margin-top:12px;color:var(--gray-500);"><strong>Pause stops admission now.</strong> The queue keeps forming and every visitor keeps their position. A Resume button appears here to start admission again. Waiting visitors see the pause within the <code>/status</code> cache window (currently 1 second), not instantly.</p>
         {% endif %}
         <hr class="divider">
         <form method="post" action="/admin/reset" data-confirm="Force maintenance sets the event to the maintenance phase and stops it for every visitor. Continue?">
@@ -132,7 +132,7 @@
           <div class="form-field">
             <label for="message">Message shown to waiting visitors</label>
             <input id="message" name="message" type="text" title="Returned in the /status response that the waiting page polls. Every waiting visitor sees it.">
-            <span class="help">The text is returned in the <code>/status</code> response that the waiting page polls, so every waiting visitor sees it. Submit an empty field to clear it.</span>
+            <span class="help">The text is returned in the <code>/status</code> response that the waiting page polls, so every waiting visitor sees it within the cache window (currently 1 second). Submit an empty field to clear it.</span>
           </div>
           <button type="submit" title="Update the message shown to waiting visitors.">Set message</button>
         </form>
