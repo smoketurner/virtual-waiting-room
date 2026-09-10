@@ -81,14 +81,3 @@ module "authorizer" {
   waiting_room_url           = local.waiting_room_url
   lambda_artifact_path       = var.authorizer_artifact_path
 }
-
-# The edge module used to carry count = 1 purely to keep its state address
-# stable. Removing count renames every address under it, which Terraform would
-# otherwise read as destroying and recreating the live distribution — a new
-# domain name and a cold cache. This moves the existing state instead.
-#
-# Safe to delete once applied everywhere the state exists.
-moved {
-  from = module.edge[0]
-  to   = module.edge
-}
