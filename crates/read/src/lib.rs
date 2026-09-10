@@ -4,9 +4,9 @@
 
 use serde::Serialize;
 #[cfg(test)]
-use wr_domain::AdmissionControl;
-use wr_domain::{
-    Assignment, Counters, Phase, PreQueueItem, SHARDS, SealedOffsets, Seed, ServingState, prp,
+use wr_common::AdmissionControl;
+use wr_common::{
+    Counters, Phase, PreQueueItem, ResolveError, ResolvedPosition, SHARDS, ServingState,
     serving_state,
 };
 
@@ -14,6 +14,10 @@ use wr_domain::{
 /// Seal outputs appear only once the event is active.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StatusResponse {
+    /// The event this room is serving. Published because the join request is
+    /// validated against a schema requiring it, so a client that cannot read it
+    /// here has no way to construct a valid join.
+    pub event_id: String,
     pub phase: Phase,
     /// The visitor-facing serving state (ADR-0019): what an arriving visitor
     /// experiences right now. Derived from the phase and the operator's
@@ -45,6 +49,7 @@ pub struct QueueNumResponse {
 #[must_use]
 pub fn status(counters: &Counters) -> StatusResponse {
     StatusResponse {
+        event_id: counters.event_id.clone(),
         phase: counters.phase,
         serving_state: serving_state(counters.phase, counters.admission_control),
         serving_position: counters.serving_counter,
@@ -81,33 +86,17 @@ pub fn queue_num(
     counters: &Counters,
     row: &PreQueueItem,
 ) -> Result<QueueNumResponse, QueueNumError> {
-    let (Some(seed_bytes), Some(offsets)) = (counters.shuffle_seed, counters.prequeue_offsets)
-    else {
-        return Err(QueueNumError::NotSealed);
-    };
-    let participant_count = counters.participant_count.ok_or(QueueNumError::NotSealed)?;
-
-    let shard = usize::from(row.s);
-    if shard >= SHARDS {
-        return Err(QueueNumError::BadShard);
-    }
-
-    let sealed = SealedOffsets::from_parts(offsets, participant_count);
-    match sealed.assign(shard, row.l) {
-        Assignment::PreQueue { index } => {
-            let seed = Seed(seed_bytes);
-            Ok(QueueNumResponse {
-                position: prp(&seed, index, participant_count),
-                live_join: false,
-            })
-        }
-        Assignment::LiveJoin => Ok(QueueNumResponse {
-            // A straggler is served behind the whole pre-queue cohort; the live
-            // sequence starts at participant_count. The exact live position is
-            // claimed by the live-join path — here it is reported as the base.
-            position: participant_count,
+    match counters.resolve_prequeue(row) {
+        Ok(ResolvedPosition::PreQueue(position)) => Ok(QueueNumResponse {
+            position,
+            live_join: false,
+        }),
+        Ok(ResolvedPosition::LiveJoin { base }) => Ok(QueueNumResponse {
+            position: base,
             live_join: true,
         }),
+        Err(ResolveError::NotSealed) => Err(QueueNumError::NotSealed),
+        Err(ResolveError::BadShard) => Err(QueueNumError::BadShard),
     }
 }
 
@@ -118,6 +107,8 @@ mod tests {
         clippy::cast_possible_truncation,
         reason = "test code panics on setup failure; shard/len casts are provably small"
     )]
+
+    use wr_common::SealedOffsets;
 
     use super::*;
 
@@ -132,8 +123,6 @@ mod tests {
             phase: Phase::Active,
             queue_counter: sealed.participant_count(),
             serving_counter: 5,
-            prequeue_counts: counts,
-            arrivals: [0; SHARDS],
             shuffle_seed: Some(seed),
             participant_count: Some(sealed.participant_count()),
             prequeue_offsets: Some(offsets),
@@ -158,8 +147,6 @@ mod tests {
             phase: Phase::PreQueue,
             queue_counter: 0,
             serving_counter: 0,
-            prequeue_counts: [0; SHARDS],
-            arrivals: [0; SHARDS],
             shuffle_seed: None,
             participant_count: None,
             prequeue_offsets: None,
@@ -170,6 +157,17 @@ mod tests {
         assert_eq!(json["phase"], "pre_queue");
         assert!(json.get("participant_count").is_none());
         assert!(json.get("prequeue_offsets").is_none());
+    }
+
+    #[test]
+    fn status_publishes_the_event_id_a_join_needs() {
+        // The join request schema requires a non-empty event_id string, so a
+        // client that cannot read it from /status cannot construct a request
+        // that passes the edge validator.
+        let counters = sealed_counters([1; SHARDS], [7u8; 32]);
+        let json = serde_json::to_value(status(&counters)).unwrap();
+        assert_eq!(json["event_id"], "evt-1");
+        assert!(json["event_id"].as_str().is_some_and(|s| !s.is_empty()));
     }
 
     #[test]
@@ -235,8 +233,6 @@ mod tests {
             phase: Phase::PreQueue,
             queue_counter: 0,
             serving_counter: 0,
-            prequeue_counts: [1; SHARDS],
-            arrivals: [0; SHARDS],
             shuffle_seed: None,
             participant_count: None,
             prequeue_offsets: None,

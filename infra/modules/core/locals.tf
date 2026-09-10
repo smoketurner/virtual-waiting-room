@@ -13,7 +13,6 @@ locals {
   # Env for the DynamoDB-using Lambdas: the common set plus the account id, which
   # lets the SDK use account-based DynamoDB endpoints. Sourced from the caller
   # identity, never hardcoded, so it is correct in any account. The
-  # api_placeholder makes no DynamoDB calls and uses common_lambda_env instead.
   dynamo_lambda_env = merge(local.common_lambda_env, {
     AWS_ACCOUNT_ID = data.aws_caller_identity.current.account_id
   })
@@ -33,32 +32,26 @@ locals {
   read_name            = "${var.name_prefix}-read"
   admin_name           = "${var.name_prefix}-admin"
   controller_name      = "${var.name_prefix}-controller"
+  generate_token_name  = "${var.name_prefix}-generate-token"
 
   # warm_throughput is omitted from the table entirely when both units are 0, so
   # an un-warmed table stays at the on-demand cold baseline (idle default, no
   # cost) rather than pinning a floor.
   warm_throughput_enabled = var.warm_throughput_write_units > 0 || var.warm_throughput_read_units > 0
 
-  # Per-function artifact resolution. An empty path falls back to the vendored
-  # placeholder zip; a real path is a cargo-lambda zip referenced directly. The
-  # join event-source mapping is enabled only when assign_position is real.
-  assign_position_is_placeholder = var.assign_position_artifact_path == ""
-  seal_event_is_placeholder      = var.seal_event_artifact_path == ""
-  read_is_placeholder            = var.read_artifact_path == ""
-  admin_is_placeholder           = var.admin_artifact_path == ""
-  controller_is_placeholder      = var.controller_artifact_path == ""
+  # Every function deploys a real build. There is no placeholder fallback: a
+  # stack that stands up with stub binaries looks deployed and serves nobody,
+  # and every crate is built by `make build` before plan or apply runs.
+  lambda_zip = {
+    assign_position = var.assign_position_artifact_path
+    seal_event      = var.seal_event_artifact_path
+    read            = var.read_artifact_path
+    admin           = var.admin_artifact_path
+    controller      = var.controller_artifact_path
+    generate_token  = var.generate_token_artifact_path
+  }
 
-  assign_position_zip = local.assign_position_is_placeholder ? data.archive_file.placeholder[0].output_path : var.assign_position_artifact_path
-  seal_event_zip      = local.seal_event_is_placeholder ? data.archive_file.placeholder[0].output_path : var.seal_event_artifact_path
-  read_zip            = local.read_is_placeholder ? data.archive_file.placeholder[0].output_path : var.read_artifact_path
-  admin_zip           = local.admin_is_placeholder ? data.archive_file.placeholder[0].output_path : var.admin_artifact_path
-  controller_zip      = local.controller_is_placeholder ? data.archive_file.placeholder[0].output_path : var.controller_artifact_path
-
-  assign_position_hash = local.assign_position_is_placeholder ? data.archive_file.placeholder[0].output_base64sha256 : filebase64sha256(var.assign_position_artifact_path)
-  seal_event_hash      = local.seal_event_is_placeholder ? data.archive_file.placeholder[0].output_base64sha256 : filebase64sha256(var.seal_event_artifact_path)
-  read_hash            = local.read_is_placeholder ? data.archive_file.placeholder[0].output_base64sha256 : filebase64sha256(var.read_artifact_path)
-  admin_hash           = local.admin_is_placeholder ? data.archive_file.placeholder[0].output_base64sha256 : filebase64sha256(var.admin_artifact_path)
-  controller_hash      = local.controller_is_placeholder ? data.archive_file.placeholder[0].output_base64sha256 : filebase64sha256(var.controller_artifact_path)
+  lambda_hash = { for name, path in local.lambda_zip : name => filebase64sha256(path) }
 
   lambda_runtime_arch = var.lambda_architecture
 }

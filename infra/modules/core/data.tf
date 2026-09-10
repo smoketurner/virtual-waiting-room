@@ -7,19 +7,6 @@ data "aws_region" "current" {}
 
 data "aws_partition" "current" {}
 
-# Placeholder Lambda artifact. Always built: the token-minting and admin API
-# endpoints in api.tf are still fronted by it until those crates land, and each
-# real function falls back to it when its artifact path is empty. The vendored
-# source is a raw bootstrap binary, so Terraform zips it here; the real function
-# artifacts are already zips produced by `cargo lambda build --output-format
-# zip`, referenced directly (see locals), so they need no archive_file.
-data "archive_file" "placeholder" {
-  count       = 1
-  type        = "zip"
-  source_file = "${path.module}/placeholder-lambda/bootstrap"
-  output_path = "${path.module}/placeholder-lambda/placeholder.zip"
-}
-
 # Trust policy for the assign_position Lambda execution role.
 data "aws_iam_policy_document" "lambda_assume_role" {
   statement {
@@ -104,6 +91,9 @@ data "aws_iam_policy_document" "seal_event" {
     effect = "Allow"
     actions = [
       "dynamodb:GetItem",
+      # The pre-queue shards are separate items, so the seal gathers them in one
+      # BatchGetItem. GetItem does not authorise it — it is its own action.
+      "dynamodb:BatchGetItem",
       "dynamodb:UpdateItem",
     ]
     resources = [aws_dynamodb_table.counters.arn]
@@ -202,6 +192,8 @@ data "aws_iam_policy_document" "controller" {
     effect = "Allow"
     actions = [
       "dynamodb:GetItem",
+      # Summing the arrivals shards is a BatchGetItem over their own items.
+      "dynamodb:BatchGetItem",
       "dynamodb:UpdateItem",
     ]
     resources = [aws_dynamodb_table.counters.arn]
@@ -239,5 +231,42 @@ data "aws_iam_policy_document" "scheduler_assume_role" {
       type        = "Service"
       identifiers = ["scheduler.amazonaws.com"]
     }
+  }
+}
+
+# generate_token: read the counters and the visitor's position, count the
+# arrival, and read the signing key. It writes only the arrivals counter, so an
+# UpdateItem on Counters is the whole write surface.
+data "aws_iam_policy_document" "generate_token" {
+  statement {
+    sid     = "ReadQueueState"
+    effect  = "Allow"
+    actions = ["dynamodb:GetItem"]
+    resources = [
+      aws_dynamodb_table.counters.arn,
+      aws_dynamodb_table.prequeue.arn,
+      aws_dynamodb_table.positions.arn,
+    ]
+  }
+
+  statement {
+    sid       = "RecordArrival"
+    effect    = "Allow"
+    actions   = ["dynamodb:UpdateItem"]
+    resources = [aws_dynamodb_table.counters.arn]
+  }
+
+  statement {
+    sid       = "ReadSignerKey"
+    effect    = "Allow"
+    actions   = ["ssm:GetParameter"]
+    resources = [aws_ssm_parameter.cf_signer_key.arn]
+  }
+
+  statement {
+    sid       = "Logs"
+    effect    = "Allow"
+    actions   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+    resources = ["arn:${data.aws_partition.current.partition}:logs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:*"]
   }
 }

@@ -1,12 +1,19 @@
 //! Seal logic for the `seal_event` Lambda: at the scheduled start it reads the
 //! 10 pre-queue shard counts, folds them into prefix offsets and the cohort
 //! size, generates the permutation seed, and writes all four plus the active
-//! phase in one conditional update guarded by the seed's absence — so a retry
-//! or a double-fire seals exactly once.
+//! phase and the live-join counter's starting value in one conditional update
+//! guarded by the seed's absence — so a retry or a double-fire seals exactly
+//! once.
+//!
+//! The seal is also where `queue_counter` starts at the cohort size, so live
+//! joiners are numbered behind the whole pre-queue cohort instead of colliding
+//! with `[0, N)`. That clause lives in [`wr_common::expr::seal_update`] with the
+//! rest of the seal write, because it must be in the same atomic update: a
+//! separate write could be lost between the seal and the first live join.
 
 use std::future::Future;
 
-use wr_domain::{Phase, SHARDS, SealError, SealedOffsets};
+use wr_common::{Phase, SHARDS, SealError, SealedOffsets};
 
 pub mod dynamo;
 
@@ -41,7 +48,8 @@ pub trait Store {
         event_id: &str,
     ) -> impl Future<Output = Result<[u64; SHARDS], StoreError>> + Send;
 
-    /// Writes the seal values and flips the phase to active, guarded by
+    /// Writes the seal values, starts `queue_counter` at the cohort size, and
+    /// flips the phase to active, guarded by
     /// `attribute_not_exists(shuffle_seed)`. Returns `false` if the guard
     /// rejected the write (already sealed).
     fn write_seal(

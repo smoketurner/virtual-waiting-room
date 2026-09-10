@@ -7,6 +7,11 @@
 //! who never click through. It then expires positions whose `expires_at` has
 //! passed and advances `max_expired_position`.
 //!
+//! A pass runs only when the event is `Active` **and** the operator's
+//! [`AdmissionControl`] is `Open`. The phase says the event is running; the
+//! admission control says the operator is letting visitors through. Either gate
+//! closed means the pass returns without advancing `serving_counter`.
+//!
 //! All arithmetic here is checked or saturating: the release profile has no
 //! overflow checks, so a bare subtraction that underflows would wrap to a huge
 //! value and release a damaging burst. `no_show_state` and `release_next` never
@@ -14,7 +19,7 @@
 
 use std::future::Future;
 
-use wr_domain::{Phase, SHARDS};
+use wr_common::{AdmissionControl, Phase, SHARDS};
 
 pub mod dynamo;
 
@@ -33,6 +38,17 @@ pub const PASSES_PER_INVOKE: u32 = 6;
 /// slowly and damps oscillation harder. 0.3 tracks a real shift within a few
 /// intervals while absorbing single-interval measurement noise.
 pub const EWMA_ALPHA: f64 = 0.3;
+
+/// How long a visitor has to claim a position after the cursor reaches it,
+/// before the controller treats them as a no-show and expires it.
+///
+/// Expressed as time but applied positionally: at `target_rate` per second the
+/// cursor covers `target_rate * ADMISSION_GRACE_SECS` positions in that window,
+/// so a position this far behind the cursor was offered that long ago. Doing it
+/// this way needs no per-position write when a position is reached, and it
+/// stops automatically when admission is paused, because a paused cursor does
+/// not move.
+pub const ADMISSION_GRACE_SECS: u64 = 120;
 
 /// Upper bound on the correction: `release_next` is capped at this multiple of
 /// `target_rate`, so even a no-show rate measured near 1.0 (almost nobody
@@ -58,11 +74,18 @@ pub struct ReleaseInputs {
     /// The arrivals total observed at the end of the previous interval. The
     /// arrivals in this interval are `sum(arrivals) - last_arrivals_total`.
     pub last_arrivals_total: u64,
-    /// `serving_counter` at the end of the previous interval. The positions
-    /// released last interval are `serving_counter - last_serving_counter`.
+    /// `serving_counter` as it stood *before* the previous interval's release.
+    /// The positions released then are `serving_counter - last_serving_counter`,
+    /// which is zero for every interval if this records the value after the
+    /// release instead — and a measured release of zero disables the whole
+    /// no-show correction, because there is nothing to compare arrivals against.
     pub last_serving_counter: u64,
     /// The current `serving_counter`.
     pub serving_counter: u64,
+    /// The highest position ever issued. The live-join sequence ends here, and
+    /// after a seal it starts at the cohort size, so this is the end of the
+    /// line however the positions were assigned.
+    pub queue_counter: u64,
     /// Operator target rate in visitors per second (the `/admin/rate` value).
     pub target_rate: u32,
 }
@@ -70,10 +93,17 @@ pub struct ReleaseInputs {
 /// The outcome of one release computation.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ReleaseDecision {
-    /// Positions to release this interval (added to `serving_counter`).
+    /// Positions actually released this interval — the distance the cursor
+    /// moved, which is less than the computed target when the end of the line
+    /// is reached.
     pub release: u64,
     /// The new `serving_counter` after the advance.
     pub next_serving_counter: u64,
+    /// The cursor as it stood before this release. Persisted as
+    /// `last_serving_counter` so the next interval can measure what this one
+    /// released. Carried on the decision rather than recomputed at the store,
+    /// so there is one place for it to be right.
+    pub previous_serving_counter: u64,
     /// The arrivals total to persist as `last_arrivals_total` for next interval.
     pub arrivals_total: u64,
     /// The smoothed no-show state to persist for next interval.
@@ -150,11 +180,31 @@ pub fn compute_release(inputs: ReleaseInputs, prev: Option<NoShowState>) -> Rele
         )
     };
 
-    let next_serving_counter = inputs.serving_counter.saturating_add(release);
+    // The cursor is exclusive — position p is admitted once p < serving_counter —
+    // and queue_counter is the highest position ever issued, so one past it
+    // admits everyone in line and nobody who is not. Advancing further banks
+    // admission credit against an empty queue, and the next burst to arrive
+    // walks straight through every position already released, which is the one
+    // thing the room exists to prevent.
+    //
+    // .max() keeps the cursor monotonic: a queue_counter that reads behind the
+    // cursor must never drag admission backwards.
+    let ceiling = inputs.queue_counter.saturating_add(1);
+    let next_serving_counter = inputs
+        .serving_counter
+        .saturating_add(release)
+        .min(ceiling)
+        .max(inputs.serving_counter);
+
+    // What the cursor actually moved, not what was asked for. Reporting the
+    // requested figure would have the next interval measure arrivals against
+    // people who were never released.
+    let release = next_serving_counter.saturating_sub(inputs.serving_counter);
 
     ReleaseDecision {
         release,
         next_serving_counter,
+        previous_serving_counter: inputs.serving_counter,
         arrivals_total,
         no_show,
     }
@@ -203,11 +253,12 @@ fn bounded_release(target: u64, smoothed_no_show: f64) -> u64 {
     }
 }
 
-/// A position the expiry pass found live-but-expired: its `expires_at` has
-/// passed and its status is still `issued`.
+/// A position the cursor passed long enough ago to count as a no-show, whose
+/// status is still `issued`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpiredPosition {
     pub request_id: String,
+    pub position: u64,
 }
 
 /// A store failure worth retrying.
@@ -219,6 +270,11 @@ pub struct StoreError(pub String);
 #[derive(Debug, Clone, PartialEq)]
 pub struct ControllerState {
     pub phase: Phase,
+    /// The operator's live admission override. The phase says where the event is
+    /// on its timeline; this says whether the operator is letting visitors
+    /// through right now. Both must permit admission before the controller
+    /// advances `serving_counter`.
+    pub admission_control: AdmissionControl,
     pub inputs: ReleaseInputs,
     pub prev_no_show: Option<NoShowState>,
     pub max_expired_position: u64,
@@ -244,12 +300,11 @@ pub trait Store {
         expected_serving_counter: u64,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
-    /// Returns positions whose `expires_at < now` and `status = issued`, applying
-    /// a `FilterExpression` on `expires_at` so a TTL-pending-but-still-visible
-    /// item is never returned.
+    /// Returns positions below `cutoff` whose status is still `issued` — those
+    /// the cursor passed more than the grace window ago and nobody claimed.
     fn query_expired(
         &self,
-        now: u64,
+        cutoff_position: u64,
     ) -> impl Future<Output = Result<Vec<ExpiredPosition>, StoreError>> + Send;
 
     /// Marks a position `expired`, guarded on it still being `issued` so a
@@ -257,8 +312,9 @@ pub trait Store {
     fn mark_expired(&self, request_id: &str)
     -> impl Future<Output = Result<(), StoreError>> + Send;
 
-    /// Advances `max_expired_position` on the `Counters` item to the given value
-    /// (only ever forward; a lower value is a no-op at the store).
+    /// Advances `max_expired_position` on the `Counters` item to the highest
+    /// position just expired (only ever forward; a lower value is a no-op at
+    /// the store).
     fn advance_max_expired(
         &self,
         event_id: &str,
@@ -271,30 +327,44 @@ pub trait Store {
 pub enum PassOutcome {
     /// The event is not `Active`; the controller did nothing.
     NotActive(Phase),
+    /// The operator's admission override is not `Open`; the controller did
+    /// nothing. Distinct from [`PassOutcome::NotActive`]: the event is running
+    /// and only the operator's hold stops admission.
+    Held(AdmissionControl),
     /// The controller ran: it released `released` positions and expired
     /// `expired` positions.
     Ran { released: u64, expired: usize },
 }
 
-/// Runs one controller pass for the event: read state, gate on `Active`, compute
-/// and write the release, then expire due positions and advance
-/// `max_expired_position`.
-///
-/// `now` is the current epoch-seconds, passed in so the logic is deterministic
-/// under test.
+/// Runs one controller pass for the event: read state, gate on `Active` and on
+/// the operator's admission override, compute and write the release, then expire
+/// due positions and advance `max_expired_position`.
 ///
 /// # Errors
 ///
 /// Returns [`StoreError`] if any read or write fails.
-pub async fn run_pass<S: Store>(
-    store: &S,
-    event_id: &str,
-    now: u64,
-) -> Result<PassOutcome, StoreError> {
+pub async fn run_pass<S: Store>(store: &S, event_id: &str) -> Result<PassOutcome, StoreError> {
     let state = store.read_state(event_id).await?;
     if state.phase != Phase::Active {
         tracing::debug!(event_id, phase = ?state.phase, "controller skipped: not active");
         return Ok(PassOutcome::NotActive(state.phase));
+    }
+
+    // Any control other than Open returns the whole pass, so neither
+    // `serving_counter` nor the expiry cursor advances: a visitor cannot lose a
+    // position to expiry during a hold they had no way to act through. Under
+    // fail-open the waiting room is bypassed, so a release would meter nothing;
+    // leaving the counter put lets a recovery resume from it.
+    match state.admission_control {
+        AdmissionControl::Open => {}
+        control @ (AdmissionControl::Paused | AdmissionControl::FailOpen) => {
+            tracing::info!(
+                event_id,
+                control = control.as_wire_str(),
+                "controller held: admission is not open"
+            );
+            return Ok(PassOutcome::Held(control));
+        }
     }
 
     let decision = compute_release(state.inputs, state.prev_no_show);
@@ -302,7 +372,12 @@ pub async fn run_pass<S: Store>(
         .write_release(event_id, &decision, state.inputs.serving_counter)
         .await?;
 
-    let expired = expire_due(store, event_id, now, state.max_expired_position).await?;
+    let expired = expire_due(
+        store,
+        event_id,
+        expiry_cutoff(decision.next_serving_counter, state.inputs.target_rate),
+    )
+    .await?;
 
     tracing::info!(
         event_id,
@@ -318,15 +393,28 @@ pub async fn run_pass<S: Store>(
     })
 }
 
-/// Expires every due position and advances `max_expired_position` past the
-/// highest expired one. Returns the number expired.
-async fn expire_due<S: Store>(
-    store: &S,
-    event_id: &str,
-    now: u64,
-    current_max_expired: u64,
-) -> Result<usize, StoreError> {
-    let due = store.query_expired(now).await?;
+/// The position below which an unclaimed position counts as a no-show: the
+/// cursor less the ground it covers during the grace window.
+///
+/// A rate of zero releases nobody, so nothing has been offered and nothing can
+/// have been declined; returning zero expires nothing rather than treating the
+/// entire queue as no-shows.
+#[must_use]
+pub fn expiry_cutoff(serving_counter: u64, target_rate: u32) -> u64 {
+    if target_rate == 0 {
+        return 0;
+    }
+    let grace = u64::from(target_rate).saturating_mul(ADMISSION_GRACE_SECS);
+    serving_counter.saturating_sub(grace)
+}
+
+/// Expires every position the cursor left behind and advances
+/// `max_expired_position` to the highest one. Returns the number expired.
+async fn expire_due<S: Store>(store: &S, event_id: &str, cutoff: u64) -> Result<usize, StoreError> {
+    if cutoff == 0 {
+        return Ok(0);
+    }
+    let due = store.query_expired(cutoff).await?;
     if due.is_empty() {
         return Ok(0);
     }
@@ -335,11 +423,11 @@ async fn expire_due<S: Store>(
         store.mark_expired(&position.request_id).await?;
     }
 
-    // The controller advances the cursor past everything it just expired. The
-    // count of newly expired positions is a monotonic advance; adding it is
-    // saturating so the cursor cannot wrap.
-    let advanced = current_max_expired.saturating_add(due.len() as u64);
-    store.advance_max_expired(event_id, advanced).await?;
+    // The highest position actually expired, not a count of them: the attribute
+    // names a position, and adding a count to it produces a number that means
+    // nothing and drifts further from the truth on every pass.
+    let highest = due.iter().map(|p| p.position).max().unwrap_or(0);
+    store.advance_max_expired(event_id, highest).await?;
 
     Ok(due.len())
 }
@@ -366,6 +454,9 @@ mod tests {
             last_arrivals_total: last_arrivals,
             last_serving_counter: last_serving,
             serving_counter: serving,
+            // Far beyond the cursor, so the cases below exercise the release
+            // computation rather than the end-of-line clamp.
+            queue_counter: u64::MAX,
             target_rate: rate,
         }
     }
@@ -443,6 +534,114 @@ mod tests {
     }
 
     #[test]
+    fn the_cursor_stops_at_the_end_of_the_line() {
+        // 8 positions issued, cursor at 0, target release 500. The cursor may
+        // reach one past the last position and no further: it is exclusive, so
+        // 9 admits position 8 while admitting nothing that does not exist.
+        let mut i = inputs(0, 0, 0, 0, 50);
+        i.queue_counter = 8;
+        let d = compute_release(i, None);
+        assert_eq!(d.next_serving_counter, 9);
+        assert_eq!(d.release, 9, "release must report the distance moved");
+    }
+
+    #[test]
+    fn an_empty_queue_banks_no_admission_credit() {
+        // Nobody has ever joined. Left unclamped the cursor climbs every
+        // interval, and the next arrivals are admitted instantly because every
+        // position below the cursor is already released.
+        let mut i = inputs(0, 0, 0, 0, 50);
+        i.queue_counter = 0;
+        let d = compute_release(i, None);
+        assert_eq!(d.next_serving_counter, 1);
+
+        // Repeating the pass does not accumulate.
+        let mut i = inputs(0, 0, 1, 1, 50);
+        i.queue_counter = 0;
+        let d = compute_release(i, None);
+        assert_eq!(d.next_serving_counter, 1);
+        assert_eq!(d.release, 0);
+    }
+
+    #[test]
+    fn a_queue_counter_behind_the_cursor_never_rewinds_admission() {
+        // A stale or eventually-consistent read must not un-admit anyone.
+        let mut i = inputs(0, 0, 5_000, 5_000, 50);
+        i.queue_counter = 10;
+        let d = compute_release(i, None);
+        assert_eq!(d.next_serving_counter, 5_000);
+        assert_eq!(d.release, 0);
+    }
+
+    #[test]
+    fn a_release_is_measurable_by_the_interval_that_follows_it() {
+        // The closed loop only works if what one interval releases is visible
+        // to the next. Persisting the post-release cursor as
+        // last_serving_counter makes every measurement zero, which silently
+        // disables the no-show correction entirely.
+        let first = compute_release(inputs(0, 0, 1_000, 1_000, 50), None);
+        assert_eq!(first.release, 500);
+
+        // Next interval reads the counters the store just wrote.
+        let mut second = inputs(0, 0, first.next_serving_counter, 0, 50);
+        second.last_serving_counter = first.previous_serving_counter;
+        second.arrivals[0] = 250; // half of them showed up
+
+        let d = compute_release(second, None);
+        assert!(
+            (d.no_show.smoothed_rate - 0.5).abs() < 1e-9,
+            "measured no-show {} — the previous release was invisible",
+            d.no_show.smoothed_rate
+        );
+    }
+
+    #[test]
+    fn nothing_expires_until_the_grace_window_has_closed() {
+        // A position is only a no-show once it was offered and declined. Early
+        // in an event the cursor has not covered the grace window, so no
+        // position is old enough to expire — expiring on a join-time deadline
+        // instead throws people out for waiting the length of the queue.
+        assert_eq!(expiry_cutoff(0, 50), 0);
+        assert_eq!(expiry_cutoff(5_999, 50), 0);
+        assert_eq!(expiry_cutoff(6_001, 50), 1);
+    }
+
+    #[test]
+    fn a_zero_rate_expires_nobody() {
+        // Releasing nobody means offering nobody, so nobody can have declined.
+        // A cutoff at the cursor would expire the entire released queue.
+        assert_eq!(expiry_cutoff(100_000, 0), 0);
+    }
+
+    #[test]
+    fn the_grace_window_is_the_same_duration_at_any_rate() {
+        // Positional grace has to track the rate, or a fast event expires
+        // people seconds after offering them a place.
+        let slow = 10_000 - expiry_cutoff(10_000, 5);
+        let fast = 100_000 - expiry_cutoff(100_000, 50);
+        assert_eq!(slow, 5 * ADMISSION_GRACE_SECS);
+        assert_eq!(fast, 50 * ADMISSION_GRACE_SECS);
+        assert_eq!(fast, slow * 10);
+    }
+
+    #[tokio::test]
+    async fn a_paused_event_expires_nobody_while_it_is_held() {
+        // The cursor does not move while paused, so the window behind it does
+        // not either: a hold cannot cost anyone their place.
+        let mut state = active_state(0);
+        state.admission_control = AdmissionControl::Paused;
+        let store = FakeStore::new(
+            state,
+            vec![ExpiredPosition {
+                request_id: "r1".to_owned(),
+                position: 3,
+            }],
+        );
+        run_pass(&store, "evt").await.unwrap();
+        assert!(store.marked.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn sum_arrivals_saturates() {
         let d = compute_release(inputs(u64::MAX, 0, u64::MAX, 0, 100_000), None);
         // next_serving_counter saturates rather than wrapping.
@@ -491,9 +690,17 @@ mod tests {
 
         fn query_expired(
             &self,
-            _now: u64,
+            cutoff_position: u64,
         ) -> impl Future<Output = Result<Vec<ExpiredPosition>, StoreError>> + Send {
-            std::future::ready(Ok(self.due.clone()))
+            // Mirrors the store's filter, so a test that changes the cutoff sees
+            // the same rows the real scan would return.
+            let due: Vec<ExpiredPosition> = self
+                .due
+                .iter()
+                .filter(|p| p.position < cutoff_position)
+                .cloned()
+                .collect();
+            std::future::ready(Ok(due))
         }
 
         fn mark_expired(
@@ -517,7 +724,16 @@ mod tests {
     fn active_state(due_max_expired: u64) -> ControllerState {
         ControllerState {
             phase: Phase::Active,
-            inputs: inputs(250, 0, 1000, 500, 50),
+            admission_control: AdmissionControl::Open,
+            // The cursor is far enough along that the grace window has closed
+            // behind it: at 50/s over 120s it covers 6000 positions, so nothing
+            // expires until it is past that. Early in an event nothing has been
+            // offered long enough ago to count as declined.
+            inputs: {
+                let mut i = inputs(250, 0, 20_000, 19_500, 50);
+                i.queue_counter = u64::MAX;
+                i
+            },
             prev_no_show: None,
             max_expired_position: due_max_expired,
         }
@@ -528,13 +744,15 @@ mod tests {
         let due = vec![
             ExpiredPosition {
                 request_id: "r1".to_owned(),
+                position: 3,
             },
             ExpiredPosition {
                 request_id: "r2".to_owned(),
+                position: 7,
             },
         ];
         let store = FakeStore::new(active_state(10), due);
-        let outcome = run_pass(&store, "evt", 1_000).await.unwrap();
+        let outcome = run_pass(&store, "evt").await.unwrap();
         assert_eq!(
             outcome,
             PassOutcome::Ran {
@@ -543,8 +761,8 @@ mod tests {
             }
         );
         assert_eq!(store.marked.lock().unwrap().len(), 2);
-        // max_expired advanced from 10 by the 2 expired.
-        assert_eq!(*store.advanced.lock().unwrap(), Some(12));
+        // The highest position expired, not a count of them.
+        assert_eq!(*store.advanced.lock().unwrap(), Some(7));
         assert!(store.released.lock().unwrap().is_some());
     }
 
@@ -553,16 +771,68 @@ mod tests {
         let mut state = active_state(0);
         state.phase = Phase::PreQueue;
         let store = FakeStore::new(state, Vec::new());
-        let outcome = run_pass(&store, "evt", 1_000).await.unwrap();
+        let outcome = run_pass(&store, "evt").await.unwrap();
         assert_eq!(outcome, PassOutcome::NotActive(Phase::PreQueue));
         assert!(store.released.lock().unwrap().is_none());
         assert!(store.advanced.lock().unwrap().is_none());
     }
 
     #[tokio::test]
+    async fn pause_stops_admission_entirely() {
+        // A paused event is still Active, so the phase gate lets the pass
+        // through and only the admission control stops it. Nothing may advance:
+        // not serving_counter, not the expiry cursor.
+        let mut state = active_state(10);
+        state.admission_control = AdmissionControl::Paused;
+        let due = vec![ExpiredPosition {
+            request_id: "r1".to_owned(),
+            position: 3,
+        }];
+        let store = FakeStore::new(state, due);
+        let outcome = run_pass(&store, "evt").await.unwrap();
+        assert_eq!(outcome, PassOutcome::Held(AdmissionControl::Paused));
+        assert!(
+            store.released.lock().unwrap().is_none(),
+            "paused event released positions: pause is not holding admission"
+        );
+        assert!(
+            store.marked.lock().unwrap().is_empty(),
+            "paused event expired a position the visitor could not act on"
+        );
+        assert_eq!(*store.advanced.lock().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn fail_open_holds_the_controller_too() {
+        // Under fail-open the waiting room is bypassed, so metering releases
+        // nothing real; the counter stays put for recovery to resume from.
+        let mut state = active_state(0);
+        state.admission_control = AdmissionControl::FailOpen;
+        let store = FakeStore::new(state, Vec::new());
+        let outcome = run_pass(&store, "evt").await.unwrap();
+        assert_eq!(outcome, PassOutcome::Held(AdmissionControl::FailOpen));
+        assert!(store.released.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn resuming_lets_the_controller_run_again() {
+        // The same state with the control back to Open runs a full pass, so a
+        // hold costs nothing but the intervals it covered.
+        let store = FakeStore::new(active_state(0), Vec::new());
+        let outcome = run_pass(&store, "evt").await.unwrap();
+        assert_eq!(
+            outcome,
+            PassOutcome::Ran {
+                released: 1000,
+                expired: 0,
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn no_due_positions_skips_the_cursor_write() {
         let store = FakeStore::new(active_state(5), Vec::new());
-        let outcome = run_pass(&store, "evt", 1_000).await.unwrap();
+        let outcome = run_pass(&store, "evt").await.unwrap();
         assert_eq!(
             outcome,
             PassOutcome::Ran {
@@ -575,7 +845,9 @@ mod tests {
 
     // --- Property tests: no input underflows/overflows or panics -------------
 
-    use proptest::prelude::{Just, Strategy, any, prop_assert, prop_oneof, proptest};
+    use proptest::prelude::{
+        Just, Strategy, any, prop_assert, prop_assert_eq, prop_oneof, proptest,
+    };
 
     fn shard_arrivals() -> impl Strategy<Value = [u64; SHARDS]> {
         proptest::array::uniform10(prop_oneof![0u64..1_000_000, Just(u64::MAX), any::<u64>(),])
@@ -588,6 +860,7 @@ mod tests {
             last_arrivals in any::<u64>(),
             serving in any::<u64>(),
             last_serving in any::<u64>(),
+            queue in any::<u64>(),
             rate in 1u32..=100_000,
             prev_rate in prop_oneof![Just(None), (0.0f64..1.0).prop_map(|r| Some(NoShowState { smoothed_rate: r }))],
         ) {
@@ -597,6 +870,7 @@ mod tests {
                     last_arrivals_total: last_arrivals,
                     last_serving_counter: last_serving,
                     serving_counter: serving,
+                    queue_counter: queue,
                     target_rate: rate,
                 },
                 prev_rate,
@@ -604,8 +878,17 @@ mod tests {
             // release is bounded by the cap (2x target per interval), a finite u64.
             let cap = target_release_per_interval(rate).saturating_mul(2);
             prop_assert!(d.release <= cap.saturating_add(1));
-            // next_serving_counter never wraps below the current serving_counter.
-            prop_assert!(d.next_serving_counter >= serving || d.next_serving_counter == u64::MAX);
+            // The cursor is monotonic for every input, including a queue_counter
+            // that reads behind it.
+            prop_assert!(d.next_serving_counter >= serving);
+            // It never runs past the end of the line, so admission credit
+            // cannot accumulate against a queue nobody is in.
+            prop_assert!(
+                d.next_serving_counter <= queue.saturating_add(1) || d.next_serving_counter == serving
+            );
+            // The reported release is exactly the distance moved.
+            prop_assert_eq!(d.release, d.next_serving_counter - serving);
+            prop_assert_eq!(d.previous_serving_counter, serving);
             // smoothed rate stays a valid probability.
             prop_assert!(d.no_show.smoothed_rate >= 0.0 && d.no_show.smoothed_rate <= 1.0);
             prop_assert!(d.no_show.smoothed_rate.is_finite());

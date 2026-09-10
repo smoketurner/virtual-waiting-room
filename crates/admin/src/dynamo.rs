@@ -5,7 +5,8 @@ use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
 use aws_sdk_dynamodb::types::AttributeValue;
-use wr_domain::{AdmissionControl, Phase};
+use wr_common::expr::event_key;
+use wr_common::{AdmissionControl, Phase};
 
 use crate::{ControlState, Store, StoreError};
 
@@ -31,7 +32,7 @@ impl Store for DynamoStore {
             .client
             .get_item()
             .table_name(&self.counters_table)
-            .key("event_id", AttributeValue::S(event_id.to_owned()))
+            .set_key(Some(event_key(event_id)))
             .send()
             .await
             .map_err(|e| StoreError::Backend(format!("get_item: {e}")))?;
@@ -62,11 +63,7 @@ impl Store for DynamoStore {
             participant_count: num("participant_count"),
             target_rate: num("target_rate").and_then(|n| u32::try_from(n).ok()),
             message: item.get("message").and_then(|v| v.as_s().ok()).cloned(),
-            admission_paused: item
-                .get("admission_control")
-                .and_then(|v| v.as_s().ok())
-                .and_then(|s| s.parse::<AdmissionControl>().ok())
-                == Some(AdmissionControl::Paused),
+            admission_control: admission_control_from(item),
             last_action: str_attr("last_action"),
             last_action_by: str_attr("last_action_by"),
             last_action_at: str_attr("last_action_at"),
@@ -82,7 +79,7 @@ impl Store for DynamoStore {
             .client
             .update_item()
             .table_name(&self.counters_table)
-            .key("event_id", AttributeValue::S(event_id.to_owned()))
+            .set_key(Some(event_key(event_id)))
             .update_expression("SET phase = :to")
             .condition_expression("phase = :from")
             .expression_attribute_values(":to", AttributeValue::S(to.as_wire_str().to_owned()))
@@ -116,7 +113,7 @@ impl Store for DynamoStore {
             .client
             .update_item()
             .table_name(&self.counters_table)
-            .key("event_id", AttributeValue::S(event_id.to_owned()))
+            .set_key(Some(event_key(event_id)))
             .update_expression(
                 "SET target_rate = :r, last_action = :a, last_action_by = :by, \
                  last_action_at = :at, last_action_epoch_ms = :ms",
@@ -139,7 +136,7 @@ impl Store for DynamoStore {
             .client
             .update_item()
             .table_name(&self.counters_table)
-            .key("event_id", AttributeValue::S(event_id.to_owned()))
+            .set_key(Some(event_key(event_id)))
             .update_expression(
                 "SET message = :m, last_action = :a, last_action_by = :by, \
                  last_action_at = :at, last_action_epoch_ms = :ms",
@@ -150,63 +147,43 @@ impl Store for DynamoStore {
         send_guarded(req, "message").await
     }
 
-    async fn set_paused(
+    async fn set_admission_control(
         &self,
         event_id: &str,
-        from: bool,
-        to: bool,
+        from: AdmissionControl,
+        to: AdmissionControl,
+        action: crate::AdminAction,
         actor: &str,
         now_ms: u64,
     ) -> Result<(), StoreError> {
-        // Idempotency guard on the stored admission_control (ADR-0019): the
-        // toggle is legal only from the expected prior value. `open` is the
-        // default, so attribute_not_exists covers a never-written row.
-        let from_ctl = if from {
-            AdmissionControl::Paused
-        } else {
-            AdmissionControl::Open
-        };
-        let to_ctl = if to {
-            AdmissionControl::Paused
-        } else {
-            AdmissionControl::Open
-        };
-        let control_guard = if from {
-            "admission_control = :from"
-        } else {
+        // The write applies only from the expected prior value, so a transition
+        // another operator already made is a Conflict rather than a second
+        // apply. An event that has never been written carries no attribute at
+        // all, which reads as `open`.
+        let control_guard = if from == AdmissionControl::Open {
             "(attribute_not_exists(admission_control) OR admission_control = :from)"
+        } else {
+            "admission_control = :from"
         };
         let cutoff = now_ms.saturating_sub(crate::DEBOUNCE_MS).to_string();
         let mut req = self
             .client
             .update_item()
             .table_name(&self.counters_table)
-            .key("event_id", AttributeValue::S(event_id.to_owned()))
+            .set_key(Some(event_key(event_id)))
             .update_expression(
                 "SET admission_control = :to, last_action = :a, last_action_by = :by, \
                  last_action_at = :at, last_action_epoch_ms = :ms",
             )
-            .expression_attribute_values(":to", AttributeValue::S(to_ctl.as_wire_str().to_owned()))
-            .expression_attribute_values(
-                ":from",
-                AttributeValue::S(from_ctl.as_wire_str().to_owned()),
-            )
+            .expression_attribute_values(":to", AttributeValue::S(to.as_wire_str().to_owned()))
+            .expression_attribute_values(":from", AttributeValue::S(from.as_wire_str().to_owned()))
             .condition_expression(format!(
                 "{control_guard} AND (attribute_not_exists(last_action_epoch_ms) \
                  OR last_action_epoch_ms < :cutoff)"
             ))
             .expression_attribute_values(":cutoff", AttributeValue::N(cutoff));
-        req = apply_audit_values(
-            req,
-            if to {
-                crate::AdminAction::Pause
-            } else {
-                crate::AdminAction::Resume
-            },
-            actor,
-            now_ms,
-        );
-        send_guarded(req, "paused").await
+        req = apply_audit_values(req, action, actor, now_ms);
+        send_guarded(req, "admission_control").await
     }
 
     async fn force_maintenance(
@@ -222,7 +199,7 @@ impl Store for DynamoStore {
             .client
             .update_item()
             .table_name(&self.counters_table)
-            .key("event_id", AttributeValue::S(event_id.to_owned()))
+            .set_key(Some(event_key(event_id)))
             .update_expression(
                 "SET phase = :to, last_action = :a, last_action_by = :by, \
                  last_action_at = :at, last_action_epoch_ms = :ms",
@@ -236,6 +213,18 @@ impl Store for DynamoStore {
         req = apply_audit_values(req, crate::AdminAction::ForceMaintenance, actor, now_ms);
         send_guarded(req, "force_maintenance").await
     }
+}
+
+/// Reads the stored admission control off a `Counters` item, keeping all three
+/// states distinct. Absent or unparsable resolves to `Open`: that is the state an
+/// event is created in and the value no operator action has written.
+fn admission_control_from(
+    item: &std::collections::HashMap<String, AttributeValue>,
+) -> AdmissionControl {
+    item.get("admission_control")
+        .and_then(|v| v.as_s().ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(AdmissionControl::Open)
 }
 
 type UpdateReq = aws_sdk_dynamodb::operation::update_item::builders::UpdateItemFluentBuilder;
@@ -292,5 +281,65 @@ async fn send_guarded(req: UpdateReq, what: &str) -> Result<(), StoreError> {
             Err(StoreError::Conflict)
         }
         Err(e) => Err(StoreError::Backend(format!("update_item({what}): {e}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(control: Option<&str>) -> std::collections::HashMap<String, AttributeValue> {
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "event_id".to_owned(),
+            AttributeValue::S("launch".to_owned()),
+        );
+        if let Some(c) = control {
+            map.insert(
+                "admission_control".to_owned(),
+                AttributeValue::S(c.to_owned()),
+            );
+        }
+        map
+    }
+
+    #[test]
+    fn every_stored_control_reads_back_as_itself() {
+        for control in [
+            AdmissionControl::Open,
+            AdmissionControl::Paused,
+            AdmissionControl::FailOpen,
+        ] {
+            assert_eq!(
+                admission_control_from(&item(Some(control.as_wire_str()))),
+                control
+            );
+        }
+    }
+
+    #[test]
+    fn fail_open_does_not_read_back_as_open() {
+        // The distinction the dashboard depends on: a stored fail_open must not
+        // arrive as the normal admitting state, which is what testing only for
+        // equality with `paused` would produce.
+        let control = admission_control_from(&item(Some("fail_open")));
+        assert_ne!(control, AdmissionControl::Open);
+        assert_eq!(control, AdmissionControl::FailOpen);
+    }
+
+    #[test]
+    fn absent_or_unknown_control_defaults_to_open() {
+        assert_eq!(admission_control_from(&item(None)), AdmissionControl::Open);
+        assert_eq!(
+            admission_control_from(&item(Some("nonsense"))),
+            AdmissionControl::Open
+        );
+        // A non-string attribute is as unusable as a missing one.
+        let mut wrong_type = item(None);
+        wrong_type.insert(
+            "admission_control".to_owned(),
+            AttributeValue::N("1".to_owned()),
+        );
+        assert_eq!(admission_control_from(&wrong_type), AdmissionControl::Open);
     }
 }

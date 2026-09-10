@@ -455,7 +455,7 @@ async fn reset(State(state): State<Shared>, headers: HeaderMap) -> Response {
     finish(apply_reset(&state.store, &state.event_id, &session.email, now_ms()).await)
 }
 
-/// Andon cord: pause admission (ADR-0017). Reversible, no confirmation.
+/// Holds admission while the queue keeps forming. Reversible, no confirmation.
 async fn pause(State(state): State<Shared>, headers: HeaderMap) -> Response {
     let Some(session) = authed(&state, &headers).await else {
         return Redirect::to("/admin/login").into_response();

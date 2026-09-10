@@ -7,16 +7,10 @@
 # waiting room unreachable -> forward with a time-limited bypass cookie
 # (fail open, ADR-0009); otherwise 302 to the waiting room.
 #
-# The Lambda resources are added once the Rust crate is built and
-# var.lambda_artifact_path points at a bootstrap zip (PLAN Phase 1f/2). The
-# execution role's trust policy (data.aws_iam_policy_document.authorizer_assume_role)
-# is defined now because it has no artifact dependency.
-#
-# Planned resources:
-#   aws_iam_role                 (1) - execution role (trust policy ready in data.tf)
-#   aws_iam_role_policy          (1) - read signing key (ssm:GetParameter), ADD arrivals on Counters
-#   aws_lambda_function          (1) - provided.al2023, arm64
-#   aws_cloudfront_vpc_origin    (1) - only when enable_vpc = true
+# The function is built and deployed, but nothing in this account invokes it:
+# it attaches at the customer's own origin. CloudFront signed cookies are the
+# gate for origins we cannot run code in (ADR-0020); this remains for the ones
+# we can, where per-request rules on header, cookie, or user agent are needed.
 #
 # Fail fast on a misconfigured VPC seam.
 resource "terraform_data" "vpc_config_guard" {
@@ -57,8 +51,6 @@ resource "aws_iam_role_policy" "authorizer" {
 # single-use reservation on Tokens. Created only once an artifact is supplied.
 
 resource "aws_lambda_function" "authorizer" {
-  count = var.lambda_artifact_path == "" ? 0 : 1
-
   function_name = "${var.name_prefix}-authorizer"
   role          = aws_iam_role.authorizer.arn
   runtime       = "provided.al2023"

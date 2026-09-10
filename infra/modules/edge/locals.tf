@@ -1,7 +1,33 @@
 locals {
   # Origin identifiers used to bind cache behaviours to origins.
-  api_origin_id    = "${var.name_prefix}-api"
-  client_origin_id = "${var.name_prefix}-origin"
+  api_origin_id     = "${var.name_prefix}-api"
+  client_origin_id  = "${var.name_prefix}-origin"
+  waiting_origin_id = "${var.name_prefix}-waiting"
+
+  # The waiting room's own pages, on their own unprotected behaviour. A visitor
+  # refused by the gate is shown waiting_page_path, so it must be reachable
+  # without a credential or the refusal would loop.
+  waiting_path_pattern = "/_wr/*"
+  waiting_page_path    = "/_wr/waiting.html"
+
+  demo_origin_id = "${var.name_prefix}-demo-origin"
+
+  # With no customer origin configured, the protected behaviour points at the
+  # demo fixture instead, so the gate has something real to let a visitor
+  # through to.
+  use_demo_origin     = var.client_origin_domain_name == ""
+  protected_origin_id = local.use_demo_origin ? local.demo_origin_id : local.client_origin_id
+
+  # S3 with an origin access control signs SigV4 over the origin's host, so
+  # forwarding the viewer's Host breaks the signature and every request 403s.
+  # A real customer origin wants the opposite: it serves the viewer's hostname
+  # and needs that Host to route. Hence one policy or none, by origin type.
+  protected_origin_request_policy = local.use_demo_origin ? null : aws_cloudfront_origin_request_policy.protected.id
+
+  # Only meaningful for the demo fixture, whose page lives at index.html. A
+  # customer origin serves its own root and must not have /index.html forced
+  # onto it.
+  demo_root_object = local.use_demo_origin ? "index.html" : null
 
   # AWS-managed cache policy "CachingDisabled" - the blessed way to make a
   # behaviour uncached. Used for the write behaviours and the protected default.
@@ -12,10 +38,8 @@ locals {
   # the cache policy each uses. Grouped by cache key (DESIGN §8):
   #   status  - key is path only
   #   keyed   - key adds event_id + request_id (per-visitor answers)
-  #   pubkey  - key adds event_id only
   polled_status_path = "/v1/status"
-  polled_keyed_paths = ["/v1/queue_num", "/v1/queue_pos_expiry"]
-  polled_pubkey_path = "/v1/public_key"
+  polled_keyed_paths = ["/v1/queue_num"]
 
   # Uncached write behaviour path patterns: ingest and token minting.
   write_paths = ["/v1/join", "/v1/generate_token"]

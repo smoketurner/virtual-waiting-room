@@ -31,7 +31,7 @@ dependencies = [
  "tower-http 0.7.1",
  "tracing",
  "tracing-subscriber",
- "wr-domain",
+ "wr-common",
 ]
 
 [[package]]
@@ -136,7 +136,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "wr-domain",
+ "wr-common",
 ]
 
 [[package]]
@@ -184,8 +184,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "wr-crypto",
- "wr-domain",
+ "wr-common",
 ]
 
 [[package]]
@@ -846,7 +845,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "wr-domain",
+ "wr-common",
 ]
 
 [[package]]
@@ -1319,6 +1318,27 @@ dependencies = [
  "memchr",
  "pin-project-lite",
  "slab",
+]
+
+[[package]]
+name = "generate_token"
+version = "0.1.0"
+dependencies = [
+ "aws-config",
+ "aws-lc-rs",
+ "aws-sdk-dynamodb",
+ "aws-sdk-ssm",
+ "base64 0.23.1",
+ "lambda_http",
+ "lambda_runtime",
+ "serde",
+ "serde_dynamo",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "wr-common",
 ]
 
 [[package]]
@@ -2457,7 +2477,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "wr-domain",
+ "wr-common",
 ]
 
 [[package]]
@@ -2758,7 +2778,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "wr-domain",
+ "wr-common",
 ]
 
 [[package]]
@@ -3740,33 +3760,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
-name = "wr-crypto"
+name = "wr-common"
 version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
+ "aws-sdk-dynamodb",
  "base64 0.23.1",
  "proptest",
- "thiserror 2.0.20",
-]
-
-[[package]]
-name = "wr-domain"
-version = "0.1.0"
-dependencies = [
- "aws-sdk-dynamodb",
  "serde",
  "serde_dynamo",
  "serde_json",
- "thiserror 2.0.20",
- "wr-permutation",
-]
-
-[[package]]
-name = "wr-permutation"
-version = "0.1.0"
-dependencies = [
- "aws-lc-rs",
- "proptest",
  "thiserror 2.0.20",
 ]
 

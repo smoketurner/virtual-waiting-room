@@ -42,46 +42,52 @@ variable "warm_throughput_read_units" {
   }
 }
 
-# --- Lambda artifacts (DESIGN §2.2, §5.3, §6) ---------------------------------
-# Each function is a Rust bootstrap zip. An empty path falls back to the vendored
-# placeholder so the plane can be created before the crates are built. The join
-# event-source mapping stays DISABLED whenever assign_position is a placeholder.
+# --- Lambda artifacts ---------------------------------------------------------
+# Each function is a Rust bootstrap zip produced by `make build`. All are
+# required: there is no stub fallback, so a stack cannot come up looking
+# deployed while serving nobody.
 
 variable "assign_position_artifact_path" {
-  description = "Path to the assign_position Lambda bootstrap zip. Empty = vendored placeholder (join ESM stays disabled)."
+  description = "Path to the assign_position Lambda bootstrap zip (the SQS live-join consumer)."
   type        = string
-  default     = ""
 }
 
 variable "seal_event_artifact_path" {
-  description = "Path to the seal_event Lambda bootstrap zip. Empty = vendored placeholder."
+  description = "Path to the seal_event Lambda bootstrap zip."
   type        = string
-  default     = ""
 }
 
 variable "read_artifact_path" {
-  description = "Path to the read Lambda bootstrap zip (serves /v1/status and /v1/queue_num). Empty = vendored placeholder."
+  description = "Path to the read Lambda bootstrap zip (serves /v1/status and /v1/queue_num)."
   type        = string
-  default     = ""
 }
 
 variable "admin_artifact_path" {
-  description = "Path to the admin Lambda bootstrap zip (SigV4 /admin control plane). Empty = vendored placeholder."
+  description = "Path to the admin Lambda bootstrap zip (the OIDC-gated operator control plane)."
   type        = string
-  default     = ""
 }
 
 variable "controller_artifact_path" {
-  description = "Path to the controller Lambda bootstrap zip (10s outflow controller). Empty = vendored placeholder."
+  description = "Path to the controller Lambda bootstrap zip (meters admission, expires positions)."
   type        = string
-  default     = ""
 }
 
-variable "enable_controller" {
-  description = "Create the recurring controller schedule (rate(1 minute), six 10s passes per invoke). Off by default; enable ahead of an event so admission is metered and positions expire."
-  type        = bool
-  default     = false
+variable "generate_token_artifact_path" {
+  description = "Path to the generate_token Lambda bootstrap zip (mints admission cookies, records arrivals)."
+  type        = string
 }
+
+variable "admission_cookie_ttl_seconds" {
+  description = "How long an admission cookie set stays valid. Long enough to complete a purchase, short enough that a leaked set is not a standing bypass."
+  type        = number
+  default     = 3600
+
+  validation {
+    condition     = var.admission_cookie_ttl_seconds > 0 && var.admission_cookie_ttl_seconds <= 86400
+    error_message = "admission_cookie_ttl_seconds must be between 1 second and 24 hours."
+  }
+}
+
 
 variable "lambda_architecture" {
   description = "Lambda CPU architecture for every function: arm64 (design default) or x86_64. Must match the built artifacts."
@@ -98,6 +104,10 @@ variable "event_id" {
   description = "The single event id this MVP deployment serves. The read Lambda scopes /status and /queue_num to it."
   type        = string
   default     = "default"
+  validation {
+    condition     = !can(regex("#", var.event_id))
+    error_message = "event_id must not contain '#': it is the separator in the DynamoDB key, so 'a#PQ#1' would collide with the first pre-queue shard of event 'a'."
+  }
 }
 
 variable "seal_start_time" {

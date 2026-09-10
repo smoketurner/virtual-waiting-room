@@ -14,6 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::types::AttributeValue;
+use wr_common::expr::{oidc_session_key, pkce_transaction_key};
 
 /// TTL for a pending login transaction (PKCE verifier + nonce).
 const PKCE_TTL_SECS: u64 = 600;
@@ -75,7 +76,7 @@ impl SessionStore {
         self.client
             .put_item()
             .table_name(&self.tokens_table)
-            .item("request_id", AttributeValue::S(format!("pkce#{state}")))
+            .set_item(Some(pkce_transaction_key(state)))
             .item(
                 "pkce_verifier",
                 AttributeValue::S(pending.pkce_verifier.clone()),
@@ -94,12 +95,11 @@ impl SessionStore {
     /// # Errors
     /// Returns [`SessionError::Backend`] if the delete fails.
     pub async fn take_pending(&self, state: &str) -> Result<Option<PendingLogin>, SessionError> {
-        let key = format!("pkce#{state}");
         let out = self
             .client
             .delete_item()
             .table_name(&self.tokens_table)
-            .key("request_id", AttributeValue::S(key))
+            .set_key(Some(pkce_transaction_key(state)))
             .return_values(aws_sdk_dynamodb::types::ReturnValue::AllOld)
             .send()
             .await
@@ -132,7 +132,7 @@ impl SessionStore {
         self.client
             .put_item()
             .table_name(&self.tokens_table)
-            .item("request_id", AttributeValue::S(format!("session#{id}")))
+            .set_item(Some(oidc_session_key(&id)))
             .item("subject", AttributeValue::S(session.subject.clone()))
             .item("email", AttributeValue::S(session.email.clone()))
             .item("expires_at", AttributeValue::N(expires.to_string()))
@@ -153,7 +153,7 @@ impl SessionStore {
             .client
             .get_item()
             .table_name(&self.tokens_table)
-            .key("request_id", AttributeValue::S(format!("session#{id}")))
+            .set_key(Some(oidc_session_key(id)))
             .send()
             .await
             .map_err(|e| SessionError::Backend(format!("load_session: {e}")))?;
@@ -185,7 +185,7 @@ impl SessionStore {
         self.client
             .delete_item()
             .table_name(&self.tokens_table)
-            .key("request_id", AttributeValue::S(format!("session#{id}")))
+            .set_key(Some(oidc_session_key(id)))
             .send()
             .await
             .map_err(|e| SessionError::Backend(format!("delete_session: {e}")))?;

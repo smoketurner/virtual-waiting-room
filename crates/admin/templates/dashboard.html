@@ -14,8 +14,10 @@
     <p class="desc">Operator control plane. A change is saved on submit and reaches waiting visitors within about a second. A repeat of the same action within 2 seconds is rejected.</p>
   </div>
 
-  {% if admission_paused %}
+  {% if admission_control == "paused" %}
   <div class="banner" id="pause-banner">Admission is PAUSED. The queue keeps forming; no one is admitted.</div>
+  {% elif admission_control == "fail_open" %}
+  <div class="banner" id="pause-banner">FAIL OPEN. The waiting room is bypassed and every arrival goes straight to the origin.</div>
   {% endif %}
 
   <div class="grid">
@@ -43,7 +45,7 @@
           </div>
           <div>
             <dt class="kv-key">Admission control</dt>
-            <dd class="kv-val" id="s-admission-badge">{% if admission_paused %}<span class="status status-error">paused</span>{% else %}<span class="status status-success">open</span>{% endif %}</dd>
+            <dd class="kv-val" id="s-admission-badge">{% if admission_control == "paused" %}<span class="status status-error">paused</span>{% elif admission_control == "fail_open" %}<span class="status status-warning">fail open</span>{% else %}<span class="status status-success">open</span>{% endif %}</dd>
           </div>
           <div>
             <dt class="kv-key">Broadcast message</dt>
@@ -61,7 +63,7 @@
         <p class="sub">Andon cord. Pull it to stop the line.</p>
       </div>
       <div class="card-body">
-        {% if admission_paused %}
+        {% if admission_control == "paused" %}
         <p class="deferred">Admission is paused. Waiting visitors see a "you keep your place" notice and nobody new is let through.</p>
         <form method="post" action="/admin/resume">
           <button class="normal big" type="submit" title="Start admitting visitors again. The notice clears.">Resume admission</button>
@@ -199,10 +201,13 @@
           var pb = document.getElementById("s-phase-badge");
           if (pb && s.phase) { pb.textContent = s.phase; pb.className = "status status-" + s.phase; }
           var ab = document.getElementById("s-admission-badge");
-          if (ab && s.admission_paused !== undefined) {
-            ab.innerHTML = s.admission_paused
-              ? '<span class="status status-error">paused</span>'
-              : '<span class="status status-success">admitting</span>';
+          var badges = {
+            paused: '<span class="status status-error">paused</span>',
+            fail_open: '<span class="status status-warning">fail open</span>',
+            open: '<span class="status status-success">open</span>'
+          };
+          if (ab && badges[s.admission_control]) {
+            ab.innerHTML = badges[s.admission_control];
           }
         })
         .catch(function () { /* transient; retry next tick */ });

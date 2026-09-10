@@ -39,6 +39,47 @@ output "event_id" {
 }
 
 output "cloudfront_domain_name" {
-  description = "CloudFront distribution domain name, when a client origin is supplied (edge created)."
-  value       = length(module.edge) > 0 ? module.edge[0].distribution_domain_name : null
+  description = "CloudFront distribution domain name — the waiting room's public host."
+  value       = module.edge.distribution_domain_name
+}
+
+output "controller_function_name" {
+  description = "Name of the controller Lambda."
+  value       = module.core.controller_function_name
+}
+
+
+output "authorizer_function_arn" {
+  description = "ARN of the origin authorizer Lambda. Attach it at a protected origin you control: it is invoked with the ALB / API Gateway request shape and answers 200 to serve or 302 to send the visitor to wait."
+  value       = module.authorizer.authorizer_function_arn
+}
+
+output "authorizer_role_arn" {
+  description = "ARN of the authorizer execution role."
+  value       = module.authorizer.authorizer_role_arn
+}
+
+output "waiting_room_url" {
+  description = "The URL the authorizer redirects un-admitted visitors to."
+  value       = local.waiting_room_url
+}
+
+output "waiting_room_page_url" {
+  description = "The page an un-admitted visitor is shown. CloudFront serves it in place of the 403 it returns when admission cookies are missing."
+  value       = "https://${module.edge.distribution_domain_name}/_wr/waiting.html"
+}
+
+output "admission_key_pair_id" {
+  description = "ID of the CloudFront public key that verifies admission cookies."
+  value       = module.core.admission_key_pair_id
+}
+
+output "demo_origin_bucket" {
+  description = "Bucket holding the demo protected origin's pages. Only serving traffic while client_origin_domain_name is empty."
+  value       = module.demo_origin.bucket_name
+}
+
+output "cloudfront_distribution_id" {
+  description = "CloudFront distribution ID. Needed to invalidate the waiting-room pages after changing them, since they are cached at the edge for five minutes."
+  value       = module.edge.distribution_id
 }

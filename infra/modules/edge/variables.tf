@@ -22,16 +22,28 @@ variable "env" {
 }
 
 variable "client_origin_domain_name" {
-  description = "Domain name of the client's protected origin (the default behaviour). Behind a CloudFront VPC origin when the authorizer module enables it (not yet wired)."
+  description = "Domain name of the client's protected origin (the default behaviour). Empty points the protected behaviour at the demo origin instead, so the gate can be exercised without a real origin to protect."
   type        = string
+  default     = ""
+}
+
+variable "demo_origin_domain_name" {
+  description = "Regional domain name of the demo origin bucket, used as the protected origin when client_origin_domain_name is empty."
+  type        = string
+  default     = ""
+}
+
+variable "demo_origin_access_control_id" {
+  description = "Origin access control CloudFront signs its demo-origin reads with."
+  type        = string
+  default     = ""
 }
 
 # --- Caching (ADR-0013, DESIGN §8) --------------------------------------------
-# Three behaviours: polled (Min TTL > 0, zero cookies forwarded so CloudFront
-# collapses simultaneous misses into one origin fetch), write (uncached), and
-# the protected default (uncached, session cookie forwarded to origin). Per-
-# endpoint cache keys differ (DESIGN §8): /status = path only; /queue_num &
-# /queue_pos_expiry = path + event_id + request_id; /public_key = path + event_id.
+# Polled behaviours use Min TTL > 0 and forward zero cookies, so CloudFront
+# collapses simultaneous misses into one origin fetch. Cache keys differ per
+# endpoint: /status is keyed on path alone; /queue_num adds event_id and
+# request_id because its answer is per visitor.
 
 variable "polled_min_ttl_seconds" {
   description = "Min TTL for the polled cache policies. Must be > 0 or CloudFront disables request collapsing and every poll hits origin (ADR-0013)."
@@ -61,4 +73,10 @@ variable "price_class" {
     condition     = contains(["PriceClass_All", "PriceClass_200", "PriceClass_100"], var.price_class)
     error_message = "price_class must be one of PriceClass_All, PriceClass_200, PriceClass_100."
   }
+}
+
+variable "trusted_key_group_ids" {
+  description = "CloudFront key group IDs allowed to sign admission cookies for the protected behaviour. Empty leaves the origin ungated, which is only correct before the signing key exists."
+  type        = list(string)
+  default     = []
 }

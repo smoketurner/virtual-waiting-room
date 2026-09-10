@@ -5,7 +5,7 @@
 #   SSM        the per-deployment signing key as an encrypted SecureString
 #              (DESIGN §8, ADR-0011).
 #   SQS        one join queue + DLQ per deployment (event isolation, ADR-0008).
-#   Lambda     assign_position - SQS consumer (placeholder until the Rust crate
+#   Lambda     assign_position - SQS consumer (the Rust crate
 #              is built; ESM created disabled so no live batch is lost).
 #   API GW     regional REST API integrating DIRECTLY with SQS SendMessage - no
 #              Lambda in the ingest/burst path (DESIGN §6, ADR-0005).
@@ -215,8 +215,8 @@ resource "aws_lambda_function" "assign_position" {
   timeout       = 30
   memory_size   = 256
 
-  filename         = local.assign_position_zip
-  source_code_hash = local.assign_position_hash
+  filename         = local.lambda_zip["assign_position"]
+  source_code_hash = local.lambda_hash["assign_position"]
 
   reserved_concurrent_executions = var.assign_position_reserved_concurrency
 
@@ -231,13 +231,25 @@ resource "aws_lambda_function" "assign_position" {
 }
 
 # Event-source mapping. Enabled only when a real assign_position artifact is
-# deployed; with the placeholder it stays disabled so no live join batch is
+# deployed, so the live join batch is
 # consumed by a non-functional handler. BatchSize 100 / batching window 1s,
 # ReportBatchItemFailures so only failed record IDs return to the queue.
+# batch_size is 100 because each invocation makes exactly ONE `ADD queue_counter`
+# no matter how many joins are in the batch, and that counter is a single
+# DynamoDB item with a write ceiling near 1,000/s. At the 10k joins/s target,
+# batching by 100 costs 100 counter writes a second; batching by 10 would cost
+# 1,000 and sit on the ceiling. Do not lower it to chase latency.
+#
+# The cost of that choice: a batch size above 10 requires a batching window of
+# at least 1 second, and AWS documents that any window at all lets Lambda wait
+# up to 20 seconds before invoking on a low-traffic queue. So a lone join during
+# testing, or the last straggler of an event, can take ~20s to get a position.
+# Under load — which is the case this system exists for — messages are always
+# available and the window never binds.
 resource "aws_lambda_event_source_mapping" "join" {
   event_source_arn                   = aws_sqs_queue.join.arn
   function_name                      = aws_lambda_function.assign_position.arn
-  enabled                            = !local.assign_position_is_placeholder
+  enabled                            = true
   batch_size                         = 100
   maximum_batching_window_in_seconds = 1
   function_response_types            = ["ReportBatchItemFailures"]

@@ -4,14 +4,15 @@ use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::put_item::PutItemError;
 use aws_sdk_dynamodb::types::{AttributeValue, ReturnValue};
-use wr_domain::{PositionItem, PositionStatus};
+use wr_common::expr::{claim_live_block_update, event_key, not_exists_condition};
+use wr_common::{PositionItem, PositionStatus};
 
 use crate::{PositionWrite, Store, StoreError, WriteOutcome};
 
-/// Seconds a `Positions` row lives past its expiry before TTL reclaims it.
-const POSITION_TTL_GRACE_SECS: u64 = 86_400;
-/// Seconds after admission a position is considered expired by the controller.
-const POSITION_EXPIRY_SECS: u64 = 300;
+/// How long a `Positions` row is kept before `DynamoDB` TTL reclaims it. Storage
+/// hygiene only: whether a position is still claimable is decided by the
+/// controller against the admission cursor, not by this.
+const POSITION_TTL_SECS: u64 = 86_400;
 
 /// A live `DynamoDB` store bound to the counters and positions tables.
 pub struct DynamoStore {
@@ -37,8 +38,8 @@ impl Store for DynamoStore {
             .client
             .update_item()
             .table_name(&self.counters_table)
-            .key("event_id", AttributeValue::S(event_id.to_owned()))
-            .update_expression(wr_domain::expr::claim_live_block_update())
+            .set_key(Some(event_key(event_id)))
+            .update_expression(claim_live_block_update())
             .expression_attribute_values(":n", AttributeValue::N(n.to_string()))
             .return_values(ReturnValue::AllNew)
             .send()
@@ -58,10 +59,10 @@ impl Store for DynamoStore {
         let now = now_epoch_secs();
         let item = PositionItem {
             request_id: write.request_id.clone(),
-            entry_time: write.position.to_string(),
+            queue_position: write.position,
+            entry_time: now,
             status: PositionStatus::Issued,
-            expires_at: now + POSITION_EXPIRY_SECS,
-            ttl: now + POSITION_EXPIRY_SECS + POSITION_TTL_GRACE_SECS,
+            ttl: now.saturating_add(POSITION_TTL_SECS),
         };
         let attrs: std::collections::HashMap<String, AttributeValue> =
             serde_dynamo::to_item(&item).map_err(|e| StoreError(format!("serialize: {e}")))?;
@@ -71,7 +72,7 @@ impl Store for DynamoStore {
             .put_item()
             .table_name(&self.positions_table)
             .set_item(Some(attrs))
-            .condition_expression(wr_domain::expr::not_exists_condition("request_id"))
+            .condition_expression(not_exists_condition("request_id"))
             .send()
             .await;
 

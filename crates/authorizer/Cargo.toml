@@ -15,8 +15,7 @@ name = "authorizer"
 path = "src/lib.rs"
 
 [dependencies]
-wr-domain = { workspace = true }
-wr-crypto = { workspace = true }
+wr-common = { workspace = true }
 lambda_http = { workspace = true, features = ["apigw_rest", "tracing"] }
 lambda_runtime = { workspace = true }
 aws-config = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }

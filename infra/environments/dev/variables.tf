@@ -35,41 +35,14 @@ variable "warm_throughput_read_units" {
 }
 
 variable "client_origin_domain_name" {
-  description = "Bare domain name of the client's protected origin, used as the CloudFront default-behaviour origin (e.g. www.example.com). Required: a CloudFront origin cannot exist without one, and leaving it empty would silently tear the distribution down."
+  description = "Bare domain name of the client's protected origin (e.g. www.example.com). Empty protects the demo origin instead, which is what makes the gate exercisable without a real origin to protect."
   type        = string
+  default     = ""
 
   validation {
-    condition     = length(var.client_origin_domain_name) > 0 && !can(regex("://|/", var.client_origin_domain_name))
-    error_message = "client_origin_domain_name must be a non-empty bare domain (host only, no scheme and no path) - e.g. www.example.com, not https://www.example.com."
+    condition     = var.client_origin_domain_name == "" || !can(regex("://|/", var.client_origin_domain_name))
+    error_message = "client_origin_domain_name must be a bare domain (host only, no scheme and no path) - e.g. www.example.com, not https://www.example.com."
   }
-}
-
-# --- Rust Lambda artifacts ----------------------------------------------------
-# Point these at the built bootstrap binaries to deploy the real functions.
-# Empty leaves each as the vendored placeholder (and the join ESM disabled).
-
-variable "assign_position_artifact_path" {
-  description = "Path to the built assign_position bootstrap binary."
-  type        = string
-  default     = ""
-}
-
-variable "seal_event_artifact_path" {
-  description = "Path to the built seal_event bootstrap binary."
-  type        = string
-  default     = ""
-}
-
-variable "read_artifact_path" {
-  description = "Path to the built read bootstrap binary."
-  type        = string
-  default     = ""
-}
-
-variable "admin_artifact_path" {
-  description = "Path to the built admin bootstrap binary."
-  type        = string
-  default     = ""
 }
 
 variable "lambda_architecture" {
@@ -78,10 +51,24 @@ variable "lambda_architecture" {
   default     = "arm64"
 }
 
+# --- Origin authorizer --------------------------------------------------------
+# The authorizer runs at the customer's protected origin, not at the edge: it is
+# invoked with the ALB / API Gateway request shape and answers 200 to serve the
+# request or 302 to send the visitor to wait. This root creates the function, its
+# role, and its policy, and exports the ARN; attaching it to the origin happens
+# where the origin lives, which this configuration does not own.
+#
+# The whole origin is protected. Narrowing that is a per-deployment decision made
+# at the origin, and defaulting to "gate everything" fails safe.
+
 variable "event_id" {
   description = "The single event id this MVP deployment serves."
   type        = string
   default     = "default"
+  validation {
+    condition     = !can(regex("#", var.event_id))
+    error_message = "event_id must not contain '#': it is the separator in the DynamoDB key, so 'a#PQ#1' would collide with the first pre-queue shard of event 'a'."
+  }
 }
 
 variable "seal_start_time" {

@@ -10,18 +10,23 @@ event_id            = "smoke"
 lambda_architecture = "arm64" # must match `make build ARCH=...`
 seal_start_time     = ""      # EventBridge at() value; "" = manual seal
 
-# REQUIRED (no default): bare domain of the protected origin CloudFront fronts as
-# its default behaviour. Host only - no scheme, no path. An empty or missing
-# value fails the plan rather than silently destroying the distribution.
-client_origin_domain_name = "www.example.com"
+# Bare domain of the protected origin CloudFront fronts as its default
+# behaviour. Host only - no scheme, no path.
+#
+# Leave it empty to protect the built-in demo origin instead, which is what you
+# want for testing: CloudFront forwards the viewer's Host to the protected
+# origin, so a third-party site answers 404 for a hostname it does not serve and
+# any redirect it issues takes the visitor off the distribution entirely.
+client_origin_domain_name = ""
 
-# --- Built Lambda artifacts ---------------------------------------------------
-# Deterministic build outputs, relative to this directory. Leave empty ("") to
 # fall back to the vendored placeholder Lambda (lets `make plan` run pre-build).
-assign_position_artifact_path = "../../../.artifacts/assign_position/bootstrap/bootstrap.zip"
-seal_event_artifact_path      = "../../../.artifacts/seal_event/bootstrap/bootstrap.zip"
-read_artifact_path            = "../../../.artifacts/read/bootstrap/bootstrap.zip"
-admin_artifact_path           = "../../../.artifacts/admin/bootstrap/bootstrap.zip"
+# admission and expires positions. Leave it empty and the queue forms but never
+# drains.
+
+# the arrivals counters the controller measures no-shows against. Building it
+# where the origin lives.
+
+# because the protected behaviour refuses every request that carries none.
 
 # --- Admin OIDC login (ADR-0016) ----------------------------------------------
 # The client SECRET is NOT here — write it to the SSM SecureString out of band:

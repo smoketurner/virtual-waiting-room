@@ -5,7 +5,8 @@ use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::types::AttributeValue;
 use lambda_http::{Body, Error, Request, RequestExt, Response, service_fn};
 use read::{QueueNumError, queue_num, status};
-use wr_domain::{AdmissionControl, Counters, Phase, PreQueueItem, SHARDS};
+use wr_common::expr::event_key;
+use wr_common::{AdmissionControl, Counters, Phase, PreQueueItem, SHARDS};
 
 struct Ctx {
     client: Client,
@@ -92,7 +93,7 @@ async fn load_counters(ctx: &Ctx) -> Result<Option<Counters>, Error> {
         .client
         .get_item()
         .table_name(&ctx.counters_table)
-        .key("event_id", AttributeValue::S(ctx.event_id.clone()))
+        .set_key(Some(event_key(&ctx.event_id)))
         .send()
         .await?;
     let Some(item) = out.item() else {
@@ -115,9 +116,9 @@ async fn load_prequeue(ctx: &Ctx, request_id: &str) -> Result<Option<PreQueueIte
     }
 }
 
-/// Fetches a live joiner's position from the Positions table. The position is
-/// stored in `entry_time` (written by `assign_position`). Returns `None` when the
-/// request id has no Positions row.
+/// Fetches a live joiner's position from the `queue_position` attribute of their
+/// `Positions` row, written by `assign_position`. Returns `None` when the request
+/// id has no row.
 async fn load_position(ctx: &Ctx, request_id: &str) -> Result<Option<u64>, Error> {
     let out = ctx
         .client
@@ -126,15 +127,20 @@ async fn load_position(ctx: &Ctx, request_id: &str) -> Result<Option<u64>, Error
         .key("request_id", AttributeValue::S(request_id.to_owned()))
         .send()
         .await?;
-    Ok(out
-        .item()
-        .and_then(|item| item.get("entry_time"))
-        .and_then(|v| v.as_s().ok())
-        .and_then(|s| s.parse::<u64>().ok()))
+    Ok(out.item().and_then(position_from_item))
 }
 
-/// Reads the flat `Counters` item, assembling the `prequeue_counter#0..9`
-/// attributes and the optional seal outputs.
+/// Reads `queue_position` off a `Positions` item. `None` when the attribute is
+/// absent or is not a number, so a row written in some other shape reads as "no
+/// position" rather than as position zero.
+fn position_from_item(item: &std::collections::HashMap<String, AttributeValue>) -> Option<u64> {
+    item.get("queue_position")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+}
+
+/// Reads the `Counters` item and its optional seal outputs. The striped
+/// counters are separate items and no read path here needs them.
 fn counters_from_item(
     event_id: &str,
     item: &std::collections::HashMap<String, AttributeValue>,
@@ -144,16 +150,6 @@ fn counters_from_item(
             .and_then(|v| v.as_n().ok())
             .and_then(|s| s.parse::<u64>().ok())
     };
-
-    let mut prequeue_counts = [0u64; SHARDS];
-    for (shard, slot) in prequeue_counts.iter_mut().enumerate() {
-        *slot = num(&format!("prequeue_counter#{shard}")).unwrap_or(0);
-    }
-
-    let mut arrivals = [0u64; SHARDS];
-    for (shard, slot) in arrivals.iter_mut().enumerate() {
-        *slot = num(&format!("arrivals#{shard}")).unwrap_or(0);
-    }
 
     let shuffle_seed = item
         .get("shuffle_seed")
@@ -182,8 +178,6 @@ fn counters_from_item(
         phase,
         queue_counter: num("queue_counter").unwrap_or(0),
         serving_counter: num("serving_counter").unwrap_or(0),
-        prequeue_counts,
-        arrivals,
         shuffle_seed,
         participant_count: num("participant_count"),
         prequeue_offsets,
@@ -206,5 +200,54 @@ fn json<T: serde::Serialize>(status: u16, body: &T) -> Result<Response<Body>, Er
     Ok(Response::builder()
         .status(status)
         .header("content-type", "application/json")
+        // Stated rather than left to the browser's judgement. With no directive
+        // at all a browser is free to apply heuristic freshness and answer a
+        // poll from its own cache, which reads as a queue that has stopped
+        // moving. max-age=0 keeps every poll honest; s-maxage preserves the edge
+        // collapsing that makes origin load independent of how many people wait.
+        .header("cache-control", "max-age=0, s-maxage=1")
         .body(Body::from(payload))?)
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
+
+    use wr_common::{PositionItem, PositionStatus};
+
+    use super::*;
+
+    #[test]
+    fn reads_the_position_assign_position_wrote() {
+        // Round-trips a real PositionItem, so the reader and the writer cannot
+        // drift onto different attribute names or types.
+        let written = PositionItem {
+            request_id: "018f3a2b-7c9d-7e1f-abcd-0123456789ab".to_owned(),
+            queue_position: 4_242,
+            entry_time: 1_788_000_000,
+            status: PositionStatus::Issued,
+            ttl: 1_788_086_700,
+        };
+        let item: std::collections::HashMap<String, AttributeValue> =
+            serde_dynamo::to_item(&written).unwrap();
+        assert_eq!(position_from_item(&item), Some(4_242));
+    }
+
+    #[test]
+    fn a_row_without_a_position_reads_as_none_not_zero() {
+        // Position zero is a real position at the head of the queue; a missing
+        // attribute must never be reported as one.
+        let mut item = std::collections::HashMap::new();
+        item.insert(
+            "request_id".to_owned(),
+            AttributeValue::S("req-1".to_owned()),
+        );
+        assert_eq!(position_from_item(&item), None);
+        // A timestamp-shaped string in the old attribute is not a position.
+        item.insert(
+            "entry_time".to_owned(),
+            AttributeValue::S("2026-08-03T19:12:52.000Z".to_owned()),
+        );
+        assert_eq!(position_from_item(&item), None);
+    }
 }

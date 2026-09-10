@@ -11,7 +11,9 @@ use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::put_item::PutItemError;
 use aws_sdk_dynamodb::types::AttributeValue;
-use wr_domain::expr::arrivals_shard_attr;
+use wr_common::expr::{
+    admission_token_key, arrivals_shard_key, increment_shard_update, increment_shard_values,
+};
 
 /// A side-effect failure. The handler treats a failure to record an arrival as
 /// non-fatal (the visitor is still admitted; the controller tolerates a missed
@@ -60,13 +62,14 @@ impl DynamoStore {
 
 impl Store for DynamoStore {
     async fn record_arrival(&self, event_id: &str, shard: usize) -> Result<(), StoreError> {
-        let attr = arrivals_shard_attr(shard);
+        // The shard is its own item, so arrivals do not contend with the
+        // sequences on the Counters item.
         self.client
             .update_item()
             .table_name(&self.counters_table)
-            .key("event_id", AttributeValue::S(event_id.to_owned()))
-            .update_expression(format!("ADD {attr} :one"))
-            .expression_attribute_values(":one", AttributeValue::N("1".to_owned()))
+            .set_key(Some(arrivals_shard_key(event_id, shard)))
+            .update_expression(increment_shard_update())
+            .set_expression_attribute_values(Some(increment_shard_values(shard)))
             .send()
             .await
             .map_err(|e| StoreError::Backend(format!("record_arrival: {e}")))?;
@@ -78,10 +81,7 @@ impl Store for DynamoStore {
             .client
             .put_item()
             .table_name(&self.tokens_table)
-            .item(
-                "request_id",
-                AttributeValue::S(format!("token#{request_id}")),
-            )
+            .set_item(Some(admission_token_key(request_id)))
             .item("expires_at", AttributeValue::N(expires_at.to_string()))
             .condition_expression("attribute_not_exists(request_id)")
             .send()

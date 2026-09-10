@@ -15,7 +15,7 @@ name = "admin"
 path = "src/lib.rs"
 
 [dependencies]
-wr-domain = { workspace = true }
+wr-common = { workspace = true }
 lambda_http = { workspace = true, features = ["apigw_rest"] }
 axum = { workspace = true, features = ["http1", "query", "form", "json", "tokio"] }
 tower = { workspace = true }

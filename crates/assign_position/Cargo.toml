@@ -15,7 +15,7 @@ name = "assign_position"
 path = "src/lib.rs"
 
 [dependencies]
-wr-domain = { workspace = true }
+wr-common = { workspace = true }
 lambda_runtime = { workspace = true }
 aws_lambda_events = { workspace = true, features = ["sqs"] }
 aws-config = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }

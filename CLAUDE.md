@@ -17,7 +17,7 @@ The Cargo workspace root is the repository root; member crates live under `crate
 cargo fmt --all
 cargo clippy --all-targets --all-features -- -D warnings   # warnings are errors
 cargo test --workspace
-cargo test -p wr-permutation prop_bijective                # one crate / one test
+cargo test -p wr-common prop_bijective                     # one crate / one test
 cargo deny check                                           # advisories, licenses, bans
 ```
 
@@ -39,8 +39,9 @@ never run apply or destroy unless explicitly asked.
 Deployment configuration (region, `aws_profile`, `event_id`, `lambda_architecture`,
 `seal_start_time`, artifact paths) lives in `infra/environments/dev/terraform.tfvars` and is
 authoritative — the Makefile deliberately passes no `-var`, since a command-line `-var` would
-override the file. `ARCH` on `make build` is the only make-level override, and it must match
-`lambda_architecture`.
+override the file. `make build` reads `lambda_architecture` out of that file to pick its cross-compile
+target, so the binaries cannot be built for a different architecture than the functions are
+deployed with. `ARCH=` still overrides it for a one-off build.
 
 CI runs the same checks: `.github/workflows/rust-ci.yml` (fmt, clippy, test, cargo-deny,
 pinned to Rust 1.98.0) and `terraform-ci.yml` (fmt -check, init -backend=false, validate).
@@ -54,8 +55,10 @@ holds the reasoning for each.
 Request path:
 
 ```
-WAF → CloudFront → API Gateway REST (type: aws, direct SQS SendMessage) → SQS
-    → assign_position Lambda → DynamoDB
+join:      CloudFront → API Gateway REST (type: aws, direct SQS SendMessage) → SQS
+               → assign_position Lambda → DynamoDB
+protected: CloudFront [trusted key group] ─ valid admission cookies → client origin
+                                          └ missing/expired → 403 → /_wr/waiting.html
 ```
 
 Three separate CloudFront cache behaviours (ADR-0013). `/status` is Min TTL 1 s with no
@@ -80,18 +83,36 @@ Admission is closed-loop: `controller` runs six passes per `rate(1 minute)` invo
 EWMA, and advances `serving_counter` by a bounded correction. It also expires positions and
 advances `max_expired_position` (ADR-0006 — expiry is controller-driven, not DynamoDB TTL).
 
-`authorizer` decides locally with no backend call on the hot path: session cookie → admission
-token → protection-rule match → 302 to the waiting room. Tokens and sessions are both
-HMAC-SHA256 from one per-deployment key but domain-separated by a leading kind byte
-(`0x01` token, `0x02` session), so neither validates as the other (`wr-crypto`, ADR-0011).
-When the waiting room is unreachable the default is fail-open with a bypass cookie (ADR-0009).
+**The gate is CloudFront itself.** The protected behaviour names a trusted key group, so
+CloudFront verifies each request's signed cookies at the edge and refuses an un-admitted
+visitor with a 403 before the origin is touched — no compute in the request path, and it
+works against an origin the customer does not let us run code in. The 403 is mapped by
+`custom_error_response` to the waiting page, which is a separate ungated behaviour served
+from S3, so a refused visitor lands on the queue rather than on an error.
+
+`generate_token` is what mints those cookies: it checks the visitor's position against
+`serving_counter`, records the arrival, and signs a CloudFront custom policy with
+RSA-PKCS1-SHA256 (`CloudFront-Hash-Algorithm=SHA256` is required — CloudFront assumes SHA-1
+otherwise). It is the only writer of `arrivals#*`, so the controller's no-show correction
+depends on it.
+
+`authorizer` is the alternative gate for a customer who *does* control their origin and wants
+per-request rules the edge cannot express (header, cookie, user agent). It decides locally
+with no backend call: session cookie → admission token → protection-rule match → 302. Tokens
+and sessions are both HMAC-SHA256 from one per-deployment key but domain-separated by a
+leading kind byte (`0x01` token, `0x02` session), so neither validates as the other
+(ADR-0011). It is built and deployable but is not in the CloudFront path.
 
 ### Crates
 
-`wr-permutation` (Feistel PRP + shard assembly), `wr-domain` (newtypes, `Phase`,
-`AdmissionControl`, DynamoDB item shapes, expression fragments), `wr-crypto` (token and
-session signing) are the shared libraries. `assign_position`, `seal_event`, `read`,
-`controller`, `authorizer`, `admin` are the Lambdas.
+`wr-common` is the single shared library, laid out as `permutation` (Feistel PRP + shard
+assembly), `ids` + `items` (newtypes, `Phase`, `AdmissionControl`, DynamoDB item shapes),
+`expr` (update/condition fragments), and `crypto` (token and session signing). Its whole
+public surface is re-exported flat, so callers write `wr_common::Phase` rather than a path
+that encodes which layer a type lives in.
+
+`assign_position`, `seal_event`, `read`, `controller`, `authorizer`, `admin`, and
+`generate_token` are the Lambdas.
 
 Every Lambda crate follows the same three-file split, and new ones should:
 
@@ -107,23 +128,46 @@ actions must work with JavaScript disabled, and the UI adds no capability the ad
 
 ### State
 
-Four DynamoDB tables, all on-demand with PITR: `Counters` (PK `event_id`; one item per event
-holding every sequence, phase, seed, rate, message), `PreQueue` (PK `r`), `Positions`
-(PK `request_id`), `Tokens` (PK `request_id`). `queue_counter` and `serving_counter` are
-sequences and must stay on a single item — sharding them destroys ordering. `prequeue_counter`
-and `arrivals` are order-free and are striped ×10.
+Four DynamoDB tables, all on-demand with PITR: `Counters` (PK `event_id`), `PreQueue` (PK `r`),
+`Positions` (PK `request_id`), `Tokens` (PK `request_id`).
+
+The event's own `Counters` item holds the sequences, phase, seed, rate, and message.
+`queue_counter` and `serving_counter` must stay on it — sharding a sequence destroys ordering —
+and both are low-rate: one claim per ingest batch, one advance per controller pass.
+
+Keys are tagged only where a table holds more than one kind of item. `Counters` holds the
+event plus its shards, and `Tokens` holds admission-token reservations (`TKN#`), operator OIDC
+sessions (`SESS#`), and pending PKCE logins (`PKCE#`) — without the tag a session id and a
+token for the same string would be one row. `Positions` and `PreQueue` hold one kind each and
+take bare ids: a tag there disambiguates nothing and costs bytes in the partition key of every
+row, of which there is one per visitor.
+
+`prequeue_counter` and `arrivals` are order-free and striped ×10, **as separate items** keyed
+`EVT#{event_id}#PQ#{shard}` and `EVT#{event_id}#AR#{shard}`, each holding one attribute `n`.
+The event's own item is `EVT#{event_id}`. Every key is built by `wr_common::expr`, never at
+the call site, and `event_id` may not contain `#` — the separator would let one event's shard
+key collide with another event's item. The write
+ceiling is 1,000/s per partition key, so striping across attribute names on one item would
+share a single budget and distribute nothing (ADR-0015 amendment). Attribute names are billed
+on every write too, which is why the shard attribute is one letter.
 
 ### Infrastructure
 
 `infra/environments/dev` is the only deployable Terraform root; `apply` never runs inside a
 module. Modules are `core` (tables, SQS, Lambdas, IAM, REST API), `edge` (CloudFront, WAF),
 and `authorizer`. An **empty** artifact path leaves a function on the vendored placeholder
-binary, which lets the infrastructure plane stand up before any crate is built; the join
-event-source mapping is enabled only when `assign_position` is real. Note that `make build`
-compiles four crates (`assign_position`, `seal_event`, `read`, `admin`) while the core module
-also accepts `controller_artifact_path`, which the dev root does not expose — the controller
-deploys as a placeholder. The `authorizer` module is written but its `module` block in
-`infra/environments/dev/main.tf` is still commented out.
+binary, which lets the infrastructure plane stand up before any crate is built.
+
+Behaviour follows the artifact rather than a separate toggle, because a stack that looks
+complete and meters nobody is worse than one that plainly is not built yet: the join
+event-source mapping is enabled when `assign_position` is real, and the controller's
+schedule is created when the controller is. `make build` compiles every Lambda crate, reading
+its target architecture from `terraform.tfvars`.
+
+`core` owns the CloudFront signing key pair, public key, and key group alongside the
+`generate_token` Lambda that signs with it. They are global CloudFront resources that name no
+distribution, so keeping them there gives the Lambda its key-pair id without `core` and `edge`
+having to depend on each other.
 
 Keep the `core` module at or under 80 Terraform resources (requirement N6); justify additions.
 
