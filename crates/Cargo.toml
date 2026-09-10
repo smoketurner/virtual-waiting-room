@@ -65,6 +65,10 @@ serde = { version = "=1.0.229", default-features = false }
 serde_json = { version = "=1.0.151", default-features = false }
 # Typed DynamoDB AttributeValue de/serialization for item shapes.
 serde_dynamo = { version = "=4.3.0", default-features = false }
+# base64url codec for signed credentials (wr-crypto) and the admin CSP nonce.
+# A fuzzed, canonical-checking implementation on the credential-decode security
+# path, replacing hand-rolled copies.
+base64 = { version = "=0.23.1", default-features = false }
 
 # Errors and logging
 thiserror = { version = "=2.0.20", default-features = false }
