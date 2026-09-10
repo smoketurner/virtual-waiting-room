@@ -134,8 +134,16 @@
     });
   }
 
-  // Claimed once. The server rejects a duplicate request id, so a repeated join
-  // is harmless — but not repeating it keeps the ingest path quiet.
+  // Claimed once per visitor, not once per page load, so a reload does not send
+  // a second message for a place already held.
+  //
+  // The claim is not permanent. A position can stop existing after it was
+  // taken — the row expired, or the event was reset out from under a browser
+  // holding the id in localStorage — and a client that treats "joined" as
+  // final polls a row that will never come back, forever. So the flag is
+  // cleared after enough consecutive misses and the next tick re-joins. The
+  // position write is guarded on the request id not already existing, so
+  // re-joining is a no-op when the row is merely slow to arrive.
   function join() {
     if (readStored(JOINED_KEY) === requestId) {
       return Promise.resolve();
@@ -146,6 +154,21 @@
     }).then(function () {
       writeStored(JOINED_KEY, requestId);
     });
+  }
+
+  // How many consecutive "no position for this id" answers to accept before
+  // concluding the place is gone rather than late. assign_position drains a
+  // batch in seconds; several polls is well past that.
+  var MAX_MISSES = 4;
+  var misses = 0;
+
+  function forgetJoin() {
+    misses = 0;
+    try {
+      window.localStorage.removeItem(JOINED_KEY);
+    } catch (e) {
+      /* storage unavailable; the in-memory retry below still applies */
+    }
   }
 
   function renderQueue(position, serving, participants) {
@@ -214,7 +237,10 @@
   }
 
   var timer = null;
+  var stopped = false;
+
   function stop() {
+    stopped = true;
     if (timer) {
       window.clearTimeout(timer);
       timer = null;
@@ -222,7 +248,12 @@
   }
 
   function schedule() {
-    stop();
+    if (stopped) {
+      return;
+    }
+    if (timer) {
+      window.clearTimeout(timer);
+    }
     timer = window.setTimeout(tick, jitter());
   }
 
@@ -265,10 +296,19 @@
           })
           .then(function (q) {
             if (q.status === 404) {
-              // The join has not landed yet; the next poll picks it up.
-              say("Getting your place in line…", "Just a moment.");
+              misses += 1;
+              if (misses >= MAX_MISSES) {
+                // The place is gone rather than late. Drop the claim so the
+                // next tick takes a new one; keeping the same request id means
+                // a row that does reappear is still ours.
+                forgetJoin();
+                say("Getting your place in line…", "Taking a new place.");
+              } else {
+                say("Getting your place in line…", "Just a moment.");
+              }
               return schedule();
             }
+            misses = 0;
             if (q.status !== 200) {
               throw new Error("queue_num " + q.status);
             }
@@ -279,7 +319,10 @@
             );
             if (q.body.position < s.serving_position) {
               return redeem().then(function () {
-                if (admitting === false) {
+                // Still queued after all, or refused: keep polling. A success
+                // navigates away and a permanent refusal has called stop(),
+                // which schedule() honours.
+                if (!admitting) {
                   schedule();
                 }
               });
