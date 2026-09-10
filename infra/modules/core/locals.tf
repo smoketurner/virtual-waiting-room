@@ -10,6 +10,14 @@ locals {
     AWS_DEFAULTS_MODE          = "in-region"
   }
 
+  # Env for the DynamoDB-using Lambdas: the common set plus the account id, which
+  # lets the SDK use account-based DynamoDB endpoints. Sourced from the caller
+  # identity, never hardcoded, so it is correct in any account. The
+  # api_placeholder makes no DynamoDB calls and uses common_lambda_env instead.
+  dynamo_lambda_env = merge(local.common_lambda_env, {
+    AWS_ACCOUNT_ID = data.aws_caller_identity.current.account_id
+  })
+
   # Canonical table names. Every table is keyed by a single partition key and
   # carries no sort key (DESIGN §5.5); non-key attributes are schemaless and are
   # NOT declared here - DynamoDB only needs key attributes at create time.

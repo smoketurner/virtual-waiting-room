@@ -36,7 +36,7 @@ resource "aws_lambda_function" "seal_event" {
   source_code_hash = local.seal_event_hash
 
   environment {
-    variables = merge(local.common_lambda_env, {
+    variables = merge(local.dynamo_lambda_env, {
       COUNTERS_TABLE = aws_dynamodb_table.counters.name
     })
   }
@@ -71,7 +71,7 @@ resource "aws_lambda_function" "read" {
   source_code_hash = local.read_hash
 
   environment {
-    variables = merge(local.common_lambda_env, {
+    variables = merge(local.dynamo_lambda_env, {
       COUNTERS_TABLE  = aws_dynamodb_table.counters.name
       PREQUEUE_TABLE  = aws_dynamodb_table.prequeue.name
       POSITIONS_TABLE = aws_dynamodb_table.positions.name
@@ -118,7 +118,7 @@ resource "aws_lambda_function" "admin" {
   source_code_hash = local.admin_hash
 
   environment {
-    variables = merge(local.common_lambda_env, {
+    variables = merge(local.dynamo_lambda_env, {
       COUNTERS_TABLE = aws_dynamodb_table.counters.name
       TOKENS_TABLE   = aws_dynamodb_table.tokens.name
       EVENT_ID       = var.event_id
