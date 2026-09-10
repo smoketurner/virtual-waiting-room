@@ -23,6 +23,8 @@
 //!   a sliding window re-issues with a later `expires_at` on activity.
 
 use aws_lc_rs::hmac;
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 
 /// A credential kind tag, the first signed byte so the two credentials are
 /// domain-separated.
@@ -150,19 +152,17 @@ fn sign_payload(key: &SigningKey, kind: Kind, payload: &[u8]) -> String {
     message.push(kind.tag());
     message.extend_from_slice(payload);
     let mac = hmac::sign(&key.0, &message);
-    format!(
-        "{}.{}",
-        base64url_encode(payload),
-        base64url_encode(mac.as_ref())
-    )
+    format!("{}.{}", B64.encode(payload), B64.encode(mac.as_ref()))
 }
 
 /// Splits `payload.mac`, verifies the MAC over `kind || payload` in constant
 /// time, and returns the raw payload bytes on success.
 fn verify_payload(key: &SigningKey, kind: Kind, credential: &str) -> Result<Vec<u8>, VerifyError> {
     let (payload_b64, mac_b64) = credential.split_once('.').ok_or(VerifyError::Malformed)?;
-    let payload = base64url_decode(payload_b64).ok_or(VerifyError::Malformed)?;
-    let mac = base64url_decode(mac_b64).ok_or(VerifyError::Malformed)?;
+    let payload = B64
+        .decode(payload_b64)
+        .map_err(|_| VerifyError::Malformed)?;
+    let mac = B64.decode(mac_b64).map_err(|_| VerifyError::Malformed)?;
 
     let mut message = Vec::with_capacity(payload.len() + 1);
     message.push(kind.tag());
@@ -267,60 +267,6 @@ impl<'a> Cursor<'a> {
     fn at_end(&self) -> bool {
         self.pos == self.buf.len()
     }
-}
-
-const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-
-/// base64url without padding.
-fn base64url_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0] as usize;
-        let b1 = chunk.get(1).copied().unwrap_or(0) as usize;
-        let b2 = chunk.get(2).copied().unwrap_or(0) as usize;
-        out.push(ALPHABET[b0 >> 2] as char);
-        out.push(ALPHABET[((b0 & 0x03) << 4) | (b1 >> 4)] as char);
-        if chunk.len() > 1 {
-            out.push(ALPHABET[((b1 & 0x0f) << 2) | (b2 >> 6)] as char);
-        }
-        if chunk.len() > 2 {
-            out.push(ALPHABET[b2 & 0x3f] as char);
-        }
-    }
-    out
-}
-
-/// base64url (no padding) decode. Returns `None` on any invalid character or a
-/// length that cannot correspond to a byte string.
-fn base64url_decode(s: &str) -> Option<Vec<u8>> {
-    let mut acc = 0u32;
-    let mut bits = 0u32;
-    let mut out = Vec::with_capacity(s.len() * 3 / 4);
-    for c in s.bytes() {
-        let v = match c {
-            b'A'..=b'Z' => c - b'A',
-            b'a'..=b'z' => c - b'a' + 26,
-            b'0'..=b'9' => c - b'0' + 52,
-            b'-' => 62,
-            b'_' => 63,
-            _ => return None,
-        };
-        acc = (acc << 6) | u32::from(v);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            // The byte being emitted is the low 8 bits of the window; the
-            // groups above `bits` belong to the next byte. Take the low byte
-            // directly so no truncating cast is needed.
-            out.push((acc >> bits).to_le_bytes()[0]);
-        }
-    }
-    // A valid encoding leaves only zero leftover bits; any set leftover bit is
-    // a corrupt tail.
-    if acc & ((1 << bits) - 1) != 0 {
-        return None;
-    }
-    Some(out)
 }
 
 #[cfg(test)]
@@ -453,8 +399,8 @@ mod tests {
             let bytes: Vec<u8> = (0..len)
                 .map(|i| ((i * 7 + 3) % 256).to_le_bytes()[0])
                 .collect();
-            let encoded = base64url_encode(&bytes);
-            assert_eq!(base64url_decode(&encoded).unwrap(), bytes);
+            let encoded = B64.encode(&bytes);
+            assert_eq!(B64.decode(&encoded).unwrap(), bytes);
         }
     }
 
@@ -474,7 +420,7 @@ mod tests {
 
         #[test]
         fn base64url_decode_never_panics(s in ".{0,64}") {
-            let _ = base64url_decode(&s);
+            let _ = B64.decode(&s);
         }
     }
 }
