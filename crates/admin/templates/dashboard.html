@@ -58,68 +58,80 @@
       </div>
       <div class="card-body">
         {% if admission_paused %}
-        <p class="deferred">Admission is paused.</p>
+        <p class="deferred">Admission is paused — no visitors are being let through.</p>
         <form method="post" action="/admin/resume">
-          <button class="normal big" type="submit">Resume admission</button>
+          <button class="normal big" type="submit" title="Resume letting visitors through at the configured target rate.">Resume admission</button>
         </form>
+        <p class="help" style="margin-top:12px;color:var(--gray-500);">Restarts admission at the current target rate. The queue continues from where it paused.</p>
         {% else %}
         <form method="post" action="/admin/pause">
-          <button class="danger big" type="submit">Pause admission</button>
+          <button class="danger big" type="submit" title="Immediately stop admitting anyone. Reversible — the queue and everyone's position are kept.">Pause admission</button>
         </form>
-        <p class="help" style="margin-top:12px;color:var(--text-dim);">Holds new admissions; the queue and positions are preserved.</p>
+        <p class="help" style="margin-top:12px;color:var(--gray-500);"><strong>Stops letting visitors through, now.</strong> The queue keeps forming and everyone keeps their position — nothing is lost. Reversible with one click. Use this first if something looks wrong.</p>
         {% endif %}
         <hr class="divider">
-        <form method="post" action="/admin/reset" data-confirm="Force maintenance mode? This halts the event for everyone.">
-          <button class="danger" type="submit">Force maintenance</button>
+        <form method="post" action="/admin/reset" data-confirm="Force maintenance mode? This moves the event to the maintenance phase and halts it for EVERYONE. Continue?">
+          <button class="danger" type="submit" title="Move the whole event to the maintenance phase. Heavier than Pause — halts everything. Asks for confirmation.">Force maintenance</button>
         </form>
+        <p class="help" style="margin-top:12px;color:var(--gray-500);"><strong>Heavier than Pause.</strong> Moves the event to the <em>maintenance</em> phase — halts the whole room, not just admission. Asks you to confirm first. Prefer Pause unless you need a full stop.</p>
       </div>
     </section>
 
     <!-- Phase -->
     <section class="card">
-      <div class="card-header"><h2>Phase</h2></div>
+      <div class="card-header">
+        <h2>Phase</h2>
+        <p class="sub">Move the event through its lifecycle.</p>
+      </div>
       <div class="card-body">
         <form method="post" action="/admin/phase">
           <div class="form-field">
             <label for="phase">Transition to</label>
-            <select id="phase" name="phase">
-              <option value="idle">idle</option>
-              <option value="pre_queue">pre_queue</option>
-              <option value="active">active</option>
-              <option value="post_event">post_event</option>
+            <select id="phase" name="phase" title="Pick the phase to move the event into. Forward transitions only (idle → pre_queue → active → post_event).">
+              <option value="idle">idle — event not started; nobody queued yet</option>
+              <option value="pre_queue">pre_queue — early arrivals wait on the countdown page</option>
+              <option value="active">active — positions assigned; admitting visitors</option>
+              <option value="post_event">post_event — event over; queue drained</option>
             </select>
+            <span class="help">The lifecycle runs forward: <code>idle → pre_queue → active → post_event</code>. Backward jumps are rejected; use Force maintenance to halt.</span>
           </div>
-          <button type="submit">Set phase</button>
+          <button type="submit" title="Apply the selected phase transition.">Set phase</button>
         </form>
       </div>
     </section>
 
     <!-- Admission rate -->
     <section class="card">
-      <div class="card-header"><h2>Admission rate</h2></div>
+      <div class="card-header">
+        <h2>Admission rate</h2>
+        <p class="sub">How fast visitors are let into the origin.</p>
+      </div>
       <div class="card-body">
         <form method="post" action="/admin/rate">
           <div class="form-field">
             <label for="rate">Target rate (visitors per second)</label>
-            <input id="rate" name="rate" type="number" min="1" required>
-            <span class="help">Positive integer, up to the deployment ceiling.</span>
+            <input id="rate" name="rate" type="number" min="1" required title="Visitors admitted to your origin per second. Higher = more load on your site.">
+            <span class="help">Visitors admitted <strong>per second</strong> — set this to what your origin can safely absorb. Must be a positive whole number, up to the deployment ceiling. To stop admission entirely, use <strong>Pause</strong>, not rate 0.</span>
           </div>
-          <button type="submit">Set rate</button>
+          <button type="submit" title="Set the admission target rate the controller admits visitors at.">Set rate</button>
         </form>
       </div>
     </section>
 
     <!-- Broadcast message -->
     <section class="card">
-      <div class="card-header"><h2>Broadcast message</h2></div>
+      <div class="card-header">
+        <h2>Broadcast message</h2>
+        <p class="sub">Text shown to visitors while they wait.</p>
+      </div>
       <div class="card-body">
         <form method="post" action="/admin/message">
           <div class="form-field">
             <label for="message">Message shown to waiting visitors</label>
-            <input id="message" name="message" type="text">
-            <span class="help">Leave empty to clear.</span>
+            <input id="message" name="message" type="text" title="Shown on the waiting page and returned by /status. Visible to everyone in the queue.">
+            <span class="help">Displayed on the waiting page and in <code>/status</code> — visible to <strong>everyone</strong> in the queue. Submit empty to clear it.</span>
           </div>
-          <button type="submit">Set message</button>
+          <button type="submit" title="Update the message shown to waiting visitors.">Set message</button>
         </form>
       </div>
     </section>
@@ -142,6 +154,20 @@
     document.querySelectorAll("form[data-confirm]").forEach(function (f) {
       f.addEventListener("submit", function (e) {
         if (!window.confirm(f.getAttribute("data-confirm"))) { e.preventDefault(); }
+      });
+    });
+    // Defensive: on submit, disable the button and mark it in-progress so a
+    // double-click can't fire a second POST. The server-side conditional write +
+    // debounce are the real guard; this is immediate UX feedback.
+    document.querySelectorAll("form").forEach(function (f) {
+      f.addEventListener("submit", function (e) {
+        if (e.defaultPrevented) { return; }
+        var btn = f.querySelector("button[type=submit], button:not([type])");
+        if (btn && !btn.disabled) {
+          btn.dataset.label = btn.textContent;
+          btn.disabled = true;
+          btn.textContent = "Working…";
+        }
       });
     });
     var nums = ["serving_counter", "queue_counter", "participant_count", "target_rate", "message"];

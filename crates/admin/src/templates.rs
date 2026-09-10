@@ -83,6 +83,7 @@ mod tests {
             last_action: Some("set_rate".to_owned()),
             last_action_by: Some("op@example.com".to_owned()),
             last_action_at: Some("2026-09-09T22:00:00Z".to_owned()),
+            last_action_epoch_ms: Some(1_788_000_000_000),
         }
     }
 
