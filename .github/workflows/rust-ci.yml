@@ -7,11 +7,6 @@ on:
 
 permissions: {}
 
-defaults:
-  run:
-    # The Cargo workspace lives under crates/, not the repo root.
-    working-directory: crates
-
 jobs:
   lint-and-test:
     name: Lint and test
@@ -31,7 +26,6 @@ jobs:
           # Dependencies compile the same whether or not clippy/tests pass;
           # without this, a streak of red runs means every run builds cold.
           cache-on-failure: true
-          workspaces: crates
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --workspace

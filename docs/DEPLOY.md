@@ -7,16 +7,16 @@ and a first-deploy walkthrough.
 
 ## The build → package → deploy chain
 
-The three Rust functions (`assign_position`, `seal_event`, `read`) are
-**`provided.al2023` custom-runtime** Lambdas — plain zipped binaries, not
-container images. There are no Dockerfiles by design. Two distinct steps take
-source to a running function:
+The four Rust functions `make build` produces (`assign_position`, `seal_event`,
+`read`, `admin`) are **`provided.al2023` custom-runtime** Lambdas — plain zipped
+binaries, not container images. There are no Dockerfiles by design. Two distinct
+steps take source to a running function:
 
 1. **Build + package** — `cargo lambda build --release --output-format zip`
    cross-compiles each crate to a static Linux binary named `bootstrap` and
    packages it into a ready-to-deploy zip, one per function at
    `.artifacts/<crate>/bootstrap/bootstrap.zip` (`make build`). Each crate is
-   built separately: all three bins are named `bootstrap` (required by
+   built separately: all four bins are named `bootstrap` (required by
    `provided.al2023`), so a single `--output-format zip` invocation would
    collide them — the per-crate `--lambda-dir` keeps them apart. This runs
    *outside* Terraform, so a plan stays hermetic — it never triggers a compile.
@@ -30,8 +30,13 @@ source to a running function:
 
 The seam between build and deploy is a **path variable per function**
 (`assign_position_artifact_path`, `seal_event_artifact_path`,
-`read_artifact_path`). You build the zips out-of-band, point the variables at
-them, and Terraform deploys them directly.
+`read_artifact_path`, `admin_artifact_path`). You build the zips out-of-band,
+point the variables at them in `terraform.tfvars`, and Terraform deploys them
+directly.
+
+The `controller` crate is not in the `make build` loop and the dev root exposes
+no `controller_artifact_path`, so the outflow controller currently deploys as
+the placeholder.
 
 ### The placeholder fallback
 
@@ -57,6 +62,9 @@ placeholder never consumes the queue.
   from the environment.
 - **Remote state backend.** State lives in S3 (bucket and key are in
   `infra/environments/dev/versions.tf`); `make init` wires it up.
+- **A `terraform.tfvars`.** Copy `infra/environments/dev/example.tfvars` to
+  `infra/environments/dev/terraform.tfvars` and edit it. It is gitignored and
+  holds all deployment configuration (see below).
 
 ## Make targets
 
@@ -65,7 +73,7 @@ Terraform root.
 
 | Target          | What it does                                                             |
 | --------------- | ------------------------------------------------------------------------ |
-| `make build`    | Compile the three Lambdas and stage their bootstraps under `.artifacts/`. |
+| `make build`    | Compile the four Lambdas and stage their bootstraps under `.artifacts/`.  |
 | `make init`     | `terraform init` (safe, idempotent).                                     |
 | `make plan`     | `terraform plan` against the built artifacts.                            |
 | `make apply`    | `terraform apply` — the real deploy (needs AWS credentials).             |
@@ -75,23 +83,38 @@ Terraform root.
 | `make clean`    | Remove the staged Lambda artifacts.                                      |
 | `make help`     | List the targets.                                                        |
 
-### Overridable variables
+### Where configuration lives
 
-Pass these on the `make` command line; each has a default.
+All deployment configuration is in
+`infra/environments/dev/terraform.tfvars`, which Terraform auto-loads from the
+`-chdir` root. **The Makefile passes no `-var`** — a command-line `-var` would
+override the file, so the file stays the single source of truth. Copy
+`example.tfvars` for the full shape; the values you will normally set:
 
-| Variable     | Default     | Meaning                                                                 |
-| ------------ | ----------- | ----------------------------------------------------------------------- |
-| `ARCH`       | `x86_64`    | Lambda CPU architecture (`x86_64` or `arm64`). **Must match the built binaries.** |
-| `EVENT_ID`   | `default`   | The single event id this deployment serves.                             |
-| `SEAL_START` | *(empty)*   | One-time UTC seal time as an EventBridge `at()` value, e.g. `2026-09-10T18:00:00`. Empty = seal invoked manually. |
-| `REGION`     | `us-east-1` | AWS region.                                                             |
-| `PROFILE`    | *(empty)*   | Named AWS profile to authenticate with (sets the provider's `profile`). Empty uses the default credential chain — environment, active SSO session, or instance role. |
+| Variable                    | Default     | Meaning                                                                 |
+| --------------------------- | ----------- | ----------------------------------------------------------------------- |
+| `region`                    | `us-east-1` | AWS region.                                                             |
+| `aws_profile`               | *(empty)*   | Named AWS profile to authenticate with. Empty uses the default credential chain — environment, active SSO session, or instance role. |
+| `event_id`                  | `default`   | The single event id this deployment serves.                             |
+| `lambda_architecture`       | `arm64`     | Lambda CPU architecture (`arm64` or `x86_64`). **Must match the built binaries.** |
+| `seal_start_time`           | *(empty)*   | One-time UTC seal time as an EventBridge `at()` value, e.g. `2026-09-10T18:00:00`. Empty = seal invoked manually. |
+| `client_origin_domain_name` | *(none)*    | **Required.** Bare domain of the protected origin CloudFront fronts. Host only — no scheme, no path. |
+| `*_artifact_path`           | *(empty)*   | The four built zips. Empty = that function stays on the placeholder.     |
+| `oidc_*`                    | *(varies)*  | Admin login (ADR-0016). The client secret is not here — it goes in an SSM SecureString out of band. |
 
-> **Architecture must match.** `ARCH` defaults to `x86_64` because that is what
-> the standard host toolchain builds. To ship `arm64` you need the
-> `aarch64-unknown-linux-gnu` Rust target installed, then build and deploy with
-> `ARCH=arm64` on both `make build` and `make apply`. A mismatch between the
-> binary and the function's `architectures` fails at invoke time, not deploy.
+The one `make`-level override is the build target:
+
+| Variable | Default  | Meaning                                                    |
+| -------- | -------- | ---------------------------------------------------------- |
+| `ARCH`   | `x86_64` | `cargo lambda build` target: `x86_64` or `arm64`.           |
+
+> **Architecture must match.** `ARCH` selects only what you *build*;
+> `lambda_architecture` in `terraform.tfvars` selects what the function *runs*,
+> and the two must agree. `ARCH` defaults to `x86_64` because that is what the
+> standard host toolchain builds, while `lambda_architecture` defaults to
+> `arm64` — so shipping the default `arm64` function means installing the
+> `aarch64-unknown-linux-gnu` Rust target and running `make build ARCH=arm64`.
+> A mismatch fails at invoke time, not at deploy.
 
 ## First deploy
 
@@ -99,12 +122,16 @@ Pass these on the `make` command line; each has a default.
 # 1. Authenticate to AWS (in your shell).
 aws sso login          # or: aws configure
 
-# 2. Build the three Lambda binaries and stage them under .artifacts/.
-make build
+# 2. Configure the deployment: event id, region, origin domain, artifact paths.
+cp infra/environments/dev/example.tfvars infra/environments/dev/terraform.tfvars
+$EDITOR infra/environments/dev/terraform.tfvars
 
-# 3. Review the plan, then deploy. Set an event id and (optionally) a seal time.
-make plan  EVENT_ID=launch
-make apply EVENT_ID=launch SEAL_START=2026-09-10T18:00:00
+# 3. Build the four Lambda binaries and stage them under .artifacts/.
+make build ARCH=arm64          # must match lambda_architecture
+
+# 4. Review the plan, then deploy.
+make plan
+make apply
 ```
 
 `make apply` prints the stack outputs, including the API invoke URL and the
@@ -121,9 +148,9 @@ AWS_PROFILE=dev-admin uv run scripts/smoke_test.py
 ## Tear down
 
 ```bash
-make destroy EVENT_ID=launch
+make destroy
 ```
 
 Terraform prompts for confirmation before deleting anything (the target does
-not pass `-auto-approve`). Pass the same `EVENT_ID` / `ARCH` you deployed with
-so the plan resolves the same resources.
+not pass `-auto-approve`). It reads the same `terraform.tfvars` you deployed
+with, so leave that file in place until the stack is gone.

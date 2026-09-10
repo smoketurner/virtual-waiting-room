@@ -20,16 +20,16 @@ Throwaway code. Measures what documentation cannot settle.
 
 ### 1a. Data and counter
 
-- [ ] Four tables — `Counters`, `PreQueue`, `Positions`, `Tokens` — on-demand, PITR, `warm_throughput_*` and optional `max_throughput_*` as variables (DESIGN §6.7) [O1]
-- [ ] `Counters` attributes: `queue_counter`, `serving_counter`, `max_expired_position`, `arrivals#0..9`, `phase`, `phase_override`, `target_rate`, `shuffle_seed`, `operator_message`
-- [ ] Batch range allocation via `UpdateItem ADD` / `ALL_NEW`; increment by **valid** count only [F2.2, F2.6]
-- [ ] `PutItem` with `attribute_not_exists(request_id)` on every position write [F2.5]
+- [x] Four tables — `Counters`, `PreQueue`, `Positions`, `Tokens` — on-demand, PITR, `warm_throughput_*` and optional `max_throughput_*` as variables (DESIGN §6.7) [O1] — Note: no `max_throughput_*` variables yet.
+- [x] `Counters` attributes: `queue_counter`, `serving_counter`, `max_expired_position`, `arrivals#0..9`, `phase`, `phase_override`, `target_rate`, `shuffle_seed`, `operator_message` — Note: `phase_override` is instead the `Phase::Maintenance` variant, and `admission_control` (ADR-0019) replaces the `admission_paused`/`fail_open` pair.
+- [x] Batch range allocation via `UpdateItem ADD` / `ALL_NEW`; increment by **valid** count only [F2.2, F2.6]
+- [x] `PutItem` with `attribute_not_exists(request_id)` on every position write [F2.5]
 
 ### 1b. Event lifecycle and modes
 
-- [ ] Phase state machine: idle → pre-queue → active → post-event, plus maintenance [F0.1, F0.8]
+- [x] Phase state machine: idle → pre-queue → active → post-event, plus maintenance [F0.1, F0.8]
 - [ ] Operator-authored static page per phase, CDN-cached [F0.2]
-- [ ] Protection rules (path, header, cookie, user agent), evaluated locally at the authorizer [F0.6]
+- [ ] Protection rules (path, header, cookie, user agent), evaluated locally at the authorizer [F0.6] — Partial: path-prefix matching only (`PROTECTED_PATH_PREFIXES`); header, cookie, and user-agent matching outstanding.
 - [ ] Standby mode: CloudWatch alarm on `AWS/CloudFront` `Requests` (60 s period, `us-east-1`) → EventBridge → phase Lambda. Activation latency ~125 s worst case [F0.4, F0.7]
 - [ ] Scheduled and standby coexisting on one origin [F0.3, F0.5]
 
@@ -37,33 +37,33 @@ Throwaway code. Measures what documentation cannot settle.
 
 - [ ] Static countdown page, CDN-cached, zero origin calls per view [F1.1, F1.2]
 - [ ] Pre-queue registration (identity only, spread across the window); striped counter for ~10,000/s registration ceiling [C1]
-- [ ] `/status` carries phase, so the countdown page polls one endpoint (Min TTL 1 s, no cookies forwarded — DESIGN §8); after T−0 also carries `shuffle_seed`, `participant_count`, `prequeue_offsets`
+- [x] `/status` carries phase, so the countdown page polls one endpoint (Min TTL 1 s, no cookies forwarded — DESIGN §8); after T−0 also carries `shuffle_seed`, `participant_count`, `prequeue_offsets`
 - [ ] Registration writes `PreQueue {r, s, l, t}` with `attribute_not_exists(r)`; shard `s = hash(request_id) % 10`, local index `l` from `ADD prequeue_counter#s :1` / `ALL_NEW` (DESIGN §4.1, ADR-0015) [F2.5]
-- [ ] Seeded permutation (DESIGN §4.2, ADR-0002): at T−0 one `UpdateItem` on `Counters` that reads the 10 shard counts, computes `prequeue_offsets` (prefix sums) and `participant_count = ΣΣcounts`, and sets `shuffle_seed`, `participant_count`, `prequeue_offsets`, `phase`, guarded by `attribute_not_exists(shuffle_seed)`. Global index `i = offset[s] + l`; position derived on read as `PRP(seed, i, N)` [F1.3, F1.4, F1.5, C2]
-- [ ] Pseudorandom permutation (PRP): 4-round balanced Feistel, `HMAC-SHA256(seed, round || x)` round function, cycle-walking into `[0, N)`. Property tests for bijectivity over the full domain at N ≤ 10⁶, uniformity by chi-square, determinism across processes; assert the assembled global index space is exactly contiguous `[0, N)` across all 10 shards [F1.5]
-- [ ] Property test — **burned slot** (ADR-0015, F2.3): with an injected registration-write failure rate (counter incremented, `PreQueue` row absent), assert (a) the assembled index space is still a contiguous `[0, N)` where `N` = Σ shard counts, (b) `PRP` remains bijective over `[0, N)`, (c) a burned index resolves to a valid position that maps to no `PreQueue` row, and (d) the serving counter advancing past it admits nobody — no duplicate, no panic, no gap in the permutation [F1.5, F2.3]
-- [ ] Property test — **straggler join racing the seal** (ADR-0015): for a join whose local index was claimed after the seal counted its shard, assert its reconstructed `i ≥ participant_count` and that `/queue_num` returns a live-join position behind the whole pre-queue cohort rather than evaluating `PRP` out of domain (never calls `PRP` with `i ≥ N`) [F1.5]
+- [x] Seeded permutation (DESIGN §4.2, ADR-0002): at T−0 one `UpdateItem` on `Counters` that reads the 10 shard counts, computes `prequeue_offsets` (prefix sums) and `participant_count = ΣΣcounts`, and sets `shuffle_seed`, `participant_count`, `prequeue_offsets`, `phase`, guarded by `attribute_not_exists(shuffle_seed)`. Global index `i = offset[s] + l`; position derived on read as `PRP(seed, i, N)` [F1.3, F1.4, F1.5, C2]
+- [x] Pseudorandom permutation (PRP): 4-round balanced Feistel, `HMAC-SHA256(seed, round || x)` round function, cycle-walking into `[0, N)`. Property tests for bijectivity over the full domain at N ≤ 10⁶, uniformity by chi-square, determinism across processes; assert the assembled global index space is exactly contiguous `[0, N)` across all 10 shards [F1.5] — Note: proptest bijectivity covers N < 2000 exhaustively; the 10⁶ cohort is Phase 3.
+- [x] Property test — **burned slot** (ADR-0015, F2.3): with an injected registration-write failure rate (counter incremented, `PreQueue` row absent), assert (a) the assembled index space is still a contiguous `[0, N)` where `N` = Σ shard counts, (b) `PRP` remains bijective over `[0, N)`, (c) a burned index resolves to a valid position that maps to no `PreQueue` row, and (d) the serving counter advancing past it admits nobody — no duplicate, no panic, no gap in the permutation [F1.5, F2.3]
+- [x] Property test — **straggler join racing the seal** (ADR-0015): for a join whose local index was claimed after the seal counted its shard, assert its reconstructed `i ≥ participant_count` and that `/queue_num` returns a live-join position behind the whole pre-queue cohort rather than evaluating `PRP` out of domain (never calls `PRP` with `i ≥ N`) [F1.5]
 
 ### 1d. Live join
 
-- [ ] REST API `AWS` integration → SQS `SendMessage`, request validator with JSON Schema, DLQ with `maxReceiveCount` 5, `FunctionResponseTypes: [ReportBatchItemFailures]`, visibility timeout ≥ 6× function timeout + batching window [F2.1, F2.4, C5]
-- [ ] `BatchSize` / `MaximumBatchingWindowInSeconds` variables, default 100 / 1s
+- [x] REST API `AWS` integration → SQS `SendMessage`, request validator with JSON Schema, DLQ with `maxReceiveCount` 5, `FunctionResponseTypes: [ReportBatchItemFailures]`, visibility timeout ≥ 6× function timeout + batching window [F2.1, F2.4, C5]
+- [ ] `BatchSize` / `MaximumBatchingWindowInSeconds` variables, default 100 / 1s — Partial: `BatchSize` 100 and a 1s window are hardcoded on the event-source mapping, not variables.
 - [ ] SQS ESM Provisioned Mode as an opt-in variable, default off — mutually exclusive with the maximum-concurrency setting
 - [ ] Per-event partition: one SQS queue and one Lambda function per event, each with reserved concurrency (ADR-0008) [N9]
 
 ### 1e. Read path
 
-- [ ] `/status` (phase, serving position, rate, operator message — one payload), `/queue_num`, `/queue_pos_expiry` [F3.1]
+- [ ] `/status` (phase, serving position, rate, operator message — one payload), `/queue_num`, `/queue_pos_expiry` [F3.1] — Partial: `/status` and `/queue_num` are served by the read Lambda; `/queue_pos_expiry` is routed but still on the placeholder.
 
 ### 1f. Admission, session, and outflow control
 
-- [ ] Deploy-time signing key into Secrets Manager
-- [ ] `/generate_token` — single-use admission token, short expiry [F3.3]
-- [ ] Authorizer decision tree: session → token → protection match → 302 [F3.4]
-- [ ] Session cookie set after token validation (ADR-0011), signed over different inputs from the token, scoped per event, token stripped from the URL [F3.5, F3.6]
-- [ ] Sliding and fixed session validity modes [F3.7]
-- [ ] Fail open with a time-limited bypass cookie, configurable (ADR-0009) [F4.1, F4.2, F4.3]
-- [ ] No-show compensating outflow controller: measure arrivals against releases, smooth, bound the correction, adjust `serving_counter` on a 10 s schedule. Arrival counter sharded ×10 (`arrivals#0..9`) [F3.2, F3.8]
+- [x] Deploy-time signing key into an SSM SecureString parameter, generated and rotated out of band so the key never lands in the repo or in Terraform state. Not Secrets Manager: a standard SecureString is free where a secret is $0.40/mo, which N1 (idle cost) does not allow
+- [ ] `/generate_token` — single-use admission token, short expiry [F3.3] — Partial: token minting is implemented in the authorizer crate (`token.rs`); no deployed Lambda serves the endpoint.
+- [x] Authorizer decision tree: session → token → protection match → 302 [F3.4]
+- [x] Session cookie set after token validation (ADR-0011), signed over different inputs from the token, scoped per event, token stripped from the URL [F3.5, F3.6]
+- [x] Sliding and fixed session validity modes [F3.7]
+- [x] Fail open with a time-limited bypass cookie, configurable (ADR-0009) [F4.1, F4.2, F4.3]
+- [x] No-show compensating outflow controller: measure arrivals against releases, smooth, bound the correction, adjust `serving_counter` on a 10 s schedule. Arrival counter sharded ×10 (`arrivals#0..9`) [F3.2, F3.8]
 - [ ] Decide signing-key rotation (open question 2)
 
 ### 1g. Entry gating and abuse mitigation
@@ -75,37 +75,37 @@ Throwaway code. Measures what documentation cannot settle.
 
 - [ ] Live metrics via EMF logs → CloudWatch: queue depth, admitted, no-show rate, expiry rate. Inflow from the `AWS/CloudFront` `Requests` metric, not counted in our code [F5.1]
 - [ ] Brandable waiting page — client supplies assets, no module fork [F5.2]
-- [ ] Operator message as a `Counters` attribute, delivered in the existing `/status` payload — one `UpdateItem`, zero additional requests [F5.3]
+- [x] Operator message as a `Counters` attribute, delivered in the existing `/status` payload — one `UpdateItem`, zero additional requests [F5.3]
 - [ ] Position and estimated wait derived from measured admission rate [F5.4]
 - [ ] Every operator action available via API; no console dependency [F5.5]
 
 ### 1i. Control plane
 
-- [ ] Admin API: `/admin/phase`, `/admin/rate`, `/admin/message`, `/admin/reset`, `/admin/rules`, `/metrics`, `/update_session` [F3.10, F5.5]
-- [ ] Position expiry in the controller (ADR-0006): query `expires_at` past due with `status = issued`, mark expired, advance `max_expired_position`. Time to live (TTL) enabled only for post-event storage reclamation, with `FilterExpression` on reads that could see a pending-delete item [F3.9]
+- [ ] Admin API: `/admin/phase`, `/admin/rate`, `/admin/message`, `/admin/reset`, `/admin/rules`, `/metrics`, `/update_session` [F3.10, F5.5] — Partial: phase, rate, message, reset, pause, and resume are live; `/admin/rules`, `/metrics`, and `/update_session` return the deferred stub.
+- [x] Position expiry in the controller (ADR-0006): query `expires_at` past due with `status = issued`, mark expired, advance `max_expired_position`. Time to live (TTL) enabled only for post-event storage reclamation, with `FilterExpression` on reads that could see a pending-delete item [F3.9]
 
-### 1j. Operator web interface (Cloudscape-styled Axum Lambda)
+### 1j. Operator web interface (Axum Lambda, Vouch design language per ADR-0018)
 
-- [ ] Build-time Cloudscape token extraction: token values from `@cloudscape-design/design-tokens` `index-visual-refresh.json` into a plain CSS custom-properties stylesheet (style-dictionary or small script); vendor the generated CSS into the admin Lambda — NO runtime npm dependency, NO React [F7.2, F7.5]
-- [ ] Single Axum Lambda (Rust, arm64, `provided.al2023`) serving the admin UI via askama compile-time templates; semantic HTML laid out to Cloudscape conventions (top nav, side nav, containers, tables, forms, status indicators) [F7.1, F7.2]
-- [ ] Reuse existing admin Lambda logic — UI is a thin server-rendered client over the SAME `/admin/*` actions; add no capability the API lacks [F7.3, F5.5]
-- [ ] SigV4 auth on every admin UI request, identical to the admin API; no second weaker auth path [F7.4]
-- [ ] HTML-form interactivity; core actions work with JS disabled; tiny vanilla-JS poller refreshes metrics within a 60s window [F7.5, F7.6]
+- [x] Vendor one plain-CSS stylesheet into the admin Lambda — NO runtime npm dependency, NO React [F7.2, F7.5]. ADR-0018 replaced the Cloudscape design tokens with the Vouch design language, so the vendored `tokens.css` and its `extract_tokens.py` build step are deleted and the stylesheet is self-contained
+- [x] Single Axum Lambda (Rust, arm64, `provided.al2023`) serving the admin UI via askama compile-time templates; semantic HTML laid out to the ADR-0018 conventions (top bar, content header, stat tiles, status pills, card grid, forms, a dominant emergency card for the andon cord) [F7.1, F7.2]
+- [x] Reuse existing admin Lambda logic — UI is a thin server-rendered client over the SAME `/admin/*` actions; add no capability the API lacks [F7.3, F5.5]
+- [x] One auth path on every admin UI request, with no second weaker one [F7.4]. ADR-0016 replaced SigV4 with an OIDC Authorization Code + PKCE login session, enforced in the admin Lambda and stored in DynamoDB; API Gateway auth is NONE because the Lambda is the enforcement point
+- [x] HTML-form interactivity; core actions work with JS disabled; tiny vanilla-JS poller refreshes metrics within a 60s window [F7.5, F7.6]
 - [ ] Admin dashboard view: live metrics (inflow, outflow, queue depth, admitted, no-show rate, expiry rate) as an HTML view over `/metrics` JSON + CloudWatch EMF [F7.6, F5.1]
-- [ ] askama template unit tests + rendered-HTML snapshot/accessibility check; verify no React/SPA bundle emitted
+- [x] askama template unit tests + rendered-HTML snapshot/accessibility check; verify no React/SPA bundle emitted
 
-**Exit:** all endpoints correct; every lifecycle phase serves its page; pre-queue assigns fairly and reproducibly; a visitor browses multiple pages on one session; standby activates on threshold; entry gating rejects unsigned identifiers; operator can see and steer a live event via both API and the Cloudscape-styled web interface; authorizer fails open.
+**Exit:** all endpoints correct; every lifecycle phase serves its page; pre-queue assigns fairly and reproducibly; a visitor browses multiple pages on one session; standby activates on threshold; entry gating rejects unsigned identifiers; operator can see and steer a live event via both API and the web interface; authorizer fails open.
 
 ---
 
 ## Phase 2 — Terraform module
 
-- [ ] `modules/core` — DynamoDB, SQS, Lambdas, IAM, regional REST API + validator [N5]
-- [ ] `modules/edge` — CloudFront with three cache behaviours per ADR-0013: polled endpoints (Min TTL 1 s, no cookie forwarding), write endpoints (uncached), protected origin (uncached, session cookie forwarded). Web Application Firewall (WAF) with Bot Control, Autonomous System Number (ASN) match and anti-DDoS in Count mode [N7, O5, C4]
-- [ ] `modules/authorizer` — origin authorizer plus optional CloudFront VPC origin. Note VPC origins require an internet gateway present but unused, forbid Lambda@Edge origin triggers, and are unavailable in GovCloud (DESIGN §12)
-- [ ] `var.enable_vpc` for ATO-constrained clients — design the seam now, do not retrofit
+- [x] `modules/core` — DynamoDB, SQS, Lambdas, IAM, regional REST API + validator [N5]
+- [ ] `modules/edge` — CloudFront with three cache behaviours per ADR-0013: polled endpoints (Min TTL 1 s, no cookie forwarding), write endpoints (uncached), protected origin (uncached, session cookie forwarded). Web Application Firewall (WAF) with Bot Control, Autonomous System Number (ASN) match and anti-DDoS in Count mode [N7, O5, C4] — Partial: the three cache behaviours are built; the WAF web ACL is not.
+- [x] `modules/authorizer` — origin authorizer plus optional CloudFront VPC origin. Note VPC origins require an internet gateway present but unused, forbid Lambda@Edge origin triggers, and are unavailable in GovCloud (DESIGN §12)
+- [x] `var.enable_vpc` for ATO-constrained clients — design the seam now, do not retrofit
 - [ ] Flat-rate plan subscription as a variable [O6]
-- [ ] Add the admin-UI Lambda + its route/cache behaviour to the module; confirm it stays within the ~80-resource budget [N6]
+- [x] Add the admin-UI Lambda + its route/cache behaviour to the module; confirm it stays within the ~80-resource budget [N6] — Note: the resource-count confirmation is the separate item below.
 - [ ] CloudWatch alarms and a shipped dashboard — the metrics an operator acts on, not every metric available
 - [ ] Publish the OpenAPI specification for public and admin surfaces [N8]
 - [ ] `examples/` and generated variable reference

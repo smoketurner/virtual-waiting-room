@@ -1,12 +1,12 @@
 # Virtual Waiting Room — deploy convenience targets.
 #
-# The Terraform root is infra/environments/dev. `build` cross-compiles the three
+# The Terraform root is infra/environments/dev. `build` cross-compiles the four
 # Rust Lambdas with cargo-lambda, which writes a ready-to-deploy zip per function
 # at $(ARTIFACTS)/<crate>/bootstrap.zip; plan/apply pass those zip paths as vars
 # and Terraform deploys them directly (no re-zip).
 #
 # Usage:
-#   make build                 # cross-compile the three functions to zips
+#   make build                 # cross-compile the four functions to zips
 #   make plan                  # terraform plan with the built artifacts
 #   make apply                 # terraform apply (real deploy — needs AWS creds)
 #   make destroy               # tear the stack down (prompts to confirm)
@@ -25,7 +25,7 @@ SHELL       := /usr/bin/env bash
 
 ROOT        := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 ENV_DIR     := $(ROOT)/infra/environments/dev
-CRATES_DIR  := $(ROOT)/crates
+MANIFEST    := $(ROOT)/Cargo.toml
 ARTIFACTS   := $(ROOT)/.artifacts
 
 ARCH        ?= x86_64
@@ -39,7 +39,7 @@ else
 ARCH_FLAG :=
 endif
 
-# Each crate is built separately (all three bins are named `bootstrap`, so a
+# Each crate is built separately (all four bins are named `bootstrap`, so a
 # single --output-format zip invocation would collide them under one dir). Each
 # per-crate build writes $(ARTIFACTS)/<crate>/bootstrap/bootstrap.zip.
 ASSIGN_ARTIFACT := $(ARTIFACTS)/assign_position/bootstrap/bootstrap.zip
@@ -61,11 +61,11 @@ help: ## Show this help.
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
 		| awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
 
-build: ## Cross-compile the three Lambdas to zips under .artifacts/<crate>/.
+build: ## Cross-compile the four Lambdas to zips under .artifacts/<crate>/.
 	@for crate in assign_position seal_event read admin; do \
 		cargo lambda build --release $(ARCH_FLAG) --output-format zip \
 			--lambda-dir $(ARTIFACTS)/$$crate \
-			-p $$crate --manifest-path $(CRATES_DIR)/Cargo.toml; \
+			-p $$crate --manifest-path $(MANIFEST); \
 	done
 	@echo "built: $(ASSIGN_ARTIFACT) $(SEAL_ARTIFACT) $(READ_ARTIFACT) $(ADMIN_ARTIFACT)"
 
