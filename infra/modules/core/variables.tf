@@ -72,7 +72,7 @@ variable "admin_artifact_path" {
 }
 
 variable "controller_artifact_path" {
-  description = "Path to the controller Lambda bootstrap zip (10s outflow controller, DESIGN section 7). Empty = vendored placeholder."
+  description = "Path to the controller Lambda bootstrap zip (10s outflow controller). Empty = vendored placeholder."
   type        = string
   default     = ""
 }

@@ -197,7 +197,7 @@ resource "aws_iam_role_policy" "seal_scheduler" {
 
 # --- controller ---------------------------------------------------------------
 #
-# The closed-loop outflow controller (DESIGN section 7, ADR-0006). It advances
+# The closed-loop outflow controller. It advances
 # serving_counter to meter admission against the operator's target rate while
 # compensating for no-shows, and expires positions past expires_at. Falls back
 # to the placeholder until its artifact is supplied.

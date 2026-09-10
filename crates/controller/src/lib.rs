@@ -1,11 +1,11 @@
-//! Closed-loop outflow controller (DESIGN §7, ADR-0006 position expiry).
+//! Closed-loop outflow controller with position expiry.
 //!
 //! Each interval the controller runs one pass over an event's `Counters` item:
 //! it measures the arrival rate against what it released last interval, derives
 //! the no-show rate, smooths it, and advances `serving_counter` by a bounded
 //! correction so the origin runs at the operator's target rate despite visitors
 //! who never click through. It then expires positions whose `expires_at` has
-//! passed and advances `max_expired_position` (ADR-0006).
+//! passed and advances `max_expired_position`.
 //!
 //! All arithmetic here is checked or saturating: the release profile has no
 //! overflow checks, so a bare subtraction that underflows would wrap to a huge
@@ -21,7 +21,7 @@ pub mod dynamo;
 /// The controller interval in seconds. The `EventBridge` Scheduler `rate()`
 /// minimum is one minute, so the schedule fires `rate(1 minute)` and the
 /// handler runs [`PASSES_PER_INVOKE`] passes this many seconds apart, giving the
-/// design's 10-second cadence (DESIGN §7) within the scheduler's floor.
+/// design's 10-second cadence within the scheduler's floor.
 pub const INTERVAL_SECS: u64 = 10;
 
 /// Passes per Lambda invoke. `INTERVAL_SECS * PASSES_PER_INVOKE == 60`, so one
@@ -31,13 +31,13 @@ pub const PASSES_PER_INVOKE: u32 = 6;
 /// EWMA smoothing factor for the no-show rate. The smoothed rate is
 /// `alpha * observed + (1 - alpha) * previous`; a smaller alpha reacts more
 /// slowly and damps oscillation harder. 0.3 tracks a real shift within a few
-/// intervals while absorbing single-interval measurement noise (DESIGN §7).
+/// intervals while absorbing single-interval measurement noise.
 pub const EWMA_ALPHA: f64 = 0.3;
 
 /// Upper bound on the correction: `release_next` is capped at this multiple of
 /// `target_rate`, so even a no-show rate measured near 1.0 (almost nobody
 /// arrived) cannot release more than this many times the target in one interval
-/// (DESIGN §7 "the correction is bounded").
+/// (the correction is bounded).
 pub const MAX_CORRECTION_MULTIPLE: f64 = 2.0;
 
 /// The controller's smoothed view of the no-show rate, carried across intervals
@@ -105,7 +105,7 @@ pub fn target_release_per_interval(target_rate: u32) -> u64 {
 /// release last interval there is nothing to measure, so the correction falls
 /// back to the raw target and the smoothed state is left unchanged. The smoothed
 /// rate is fed through an EWMA and the resulting `release_next` is bounded at
-/// [`MAX_CORRECTION_MULTIPLE`] times the target (DESIGN §7).
+/// [`MAX_CORRECTION_MULTIPLE`] times the target.
 ///
 /// Every subtraction is saturating: `arrivals` and `serving_counter` are read
 /// from separate updates and can momentarily read lower than the stored
@@ -246,7 +246,7 @@ pub trait Store {
 
     /// Returns positions whose `expires_at < now` and `status = issued`, applying
     /// a `FilterExpression` on `expires_at` so a TTL-pending-but-still-visible
-    /// item is never returned (ADR-0006).
+    /// item is never returned.
     fn query_expired(
         &self,
         now: u64,
@@ -278,7 +278,7 @@ pub enum PassOutcome {
 
 /// Runs one controller pass for the event: read state, gate on `Active`, compute
 /// and write the release, then expire due positions and advance
-/// `max_expired_position` (DESIGN §7, ADR-0006).
+/// `max_expired_position`.
 ///
 /// `now` is the current epoch-seconds, passed in so the logic is deterministic
 /// under test.

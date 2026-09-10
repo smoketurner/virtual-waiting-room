@@ -1,7 +1,7 @@
 //! Lambda entry point for the outflow controller.
 //!
 //! The `EventBridge` Scheduler `rate()` minimum is one minute, but the design's
-//! cadence is 10 seconds (DESIGN §7). The schedule fires `rate(1 minute)` and
+//! cadence is 10 seconds. The schedule fires `rate(1 minute)` and
 //! each invoke runs [`controller::PASSES_PER_INVOKE`] passes
 //! [`controller::INTERVAL_SECS`] seconds apart, so one invoke covers a full
 //! minute at the 10-second cadence. The function timeout must exceed
@@ -32,8 +32,7 @@ async fn main() -> Result<(), Error> {
 
     // Force one real read in the Init phase so the aws-lc-rs jitter-entropy seed
     // and the TLS handshake land on boosted Init CPU rather than the first
-    // invoke (tech.md cold-start mitigation). A failure here is not fatal: the
-    // scheduled invoke will retry.
+    // invoke. A failure here is not fatal: the scheduled invoke will retry.
     if let Err(e) = store.read_state(store.event_id()).await {
         tracing::warn!(error = %e, "init warm-up read failed; continuing");
     }

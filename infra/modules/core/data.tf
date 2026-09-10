@@ -195,7 +195,7 @@ data "aws_iam_policy_document" "admin" {
 
 # Execution-role permissions for the controller: read and advance the Counters
 # item (serving_counter, max_expired_position, smoothing state), scan Positions
-# for expiry and mark them expired, plus logs. DESIGN section 7, ADR-0006.
+# for expiry and mark them expired, plus logs.
 data "aws_iam_policy_document" "controller" {
   statement {
     sid    = "AdvanceCounters"

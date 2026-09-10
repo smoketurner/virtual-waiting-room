@@ -2,7 +2,7 @@
 //!
 //! `Positions` is keyed only by `request_id` with no secondary index, so the
 //! expiry read is a `Scan` with a `FilterExpression` on `expires_at` and
-//! `status` (ADR-0006: the filter also drops a TTL-pending-but-still-visible
+//! `status` (the filter also drops a TTL-pending-but-still-visible
 //! item). The `Counters` reads and writes are single-item `GetItem`/`UpdateItem`
 //! on the event key.
 
