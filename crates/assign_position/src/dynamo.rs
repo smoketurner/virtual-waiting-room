@@ -58,7 +58,8 @@ impl Store for DynamoStore {
         let now = now_epoch_secs();
         let item = PositionItem {
             request_id: write.request_id.clone(),
-            entry_time: write.position.to_string(),
+            queue_position: write.position,
+            entry_time: now,
             status: PositionStatus::Issued,
             expires_at: now + POSITION_EXPIRY_SECS,
             ttl: now + POSITION_EXPIRY_SECS + POSITION_TTL_GRACE_SECS,

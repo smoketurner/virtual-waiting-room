@@ -56,4 +56,3 @@ infra/modules/core/.artifacts/
 __pycache__/
 
 .claude/settings.local.json
-

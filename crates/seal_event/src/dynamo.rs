@@ -65,11 +65,8 @@ impl Store for DynamoStore {
             .update_item()
             .table_name(&self.counters_table)
             .key("event_id", AttributeValue::S(event_id.to_owned()))
-            .update_expression(
-                "SET shuffle_seed = :seed, participant_count = :n, \
-                 prequeue_offsets = :offsets, phase = :active",
-            )
-            .condition_expression("attribute_not_exists(shuffle_seed)")
+            .update_expression(wr_domain::expr::seal_update())
+            .condition_expression(wr_domain::expr::seal_guard())
             .expression_attribute_values(
                 ":seed",
                 AttributeValue::B(aws_sdk_dynamodb::primitives::Blob::new(values.seed)),

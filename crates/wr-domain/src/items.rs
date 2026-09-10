@@ -39,7 +39,14 @@ pub struct PreQueueItem {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PositionItem {
     pub request_id: String,
-    pub entry_time: String,
+    /// The queue position this request holds. For a live joiner it is the value
+    /// claimed from `queue_counter`; a pre-queue member's position is derived
+    /// from the seed on read and never written here.
+    pub queue_position: u64,
+    /// Server-stamped arrival time in epoch seconds. Authoritative: the
+    /// `UUIDv7` request id also carries a timestamp, but that one is
+    /// client-supplied and untrusted.
+    pub entry_time: u64,
     pub status: PositionStatus,
     /// Position expiry the controller acts on.
     pub expires_at: u64,
@@ -115,7 +122,8 @@ mod tests {
     fn position_item_round_trips_and_status_is_snake_case() {
         let item = PositionItem {
             request_id: "req-1".to_owned(),
-            entry_time: "2026-08-03T19:12:52.000Z".to_owned(),
+            queue_position: 4_242,
+            entry_time: 1_788_000_000,
             status: PositionStatus::Issued,
             expires_at: 1_800_000_000,
             ttl: 1_900_000_000,
@@ -130,6 +138,32 @@ mod tests {
         );
         let back: PositionItem = serde_dynamo::from_item(av).unwrap();
         assert_eq!(item, back);
+    }
+
+    #[test]
+    fn position_and_entry_time_are_separate_numeric_attributes() {
+        // The position must not ride in entry_time: a reader looking for a
+        // timestamp would parse a queue position, and a reader looking for a
+        // position would parse a timestamp.
+        use aws_sdk_dynamodb::types::AttributeValue;
+        let item = PositionItem {
+            request_id: "req-1".to_owned(),
+            queue_position: 7,
+            entry_time: 1_788_000_000,
+            status: PositionStatus::Issued,
+            expires_at: 1_800_000_000,
+            ttl: 1_900_000_000,
+        };
+        let av: std::collections::HashMap<String, AttributeValue> =
+            serde_dynamo::to_item(&item).unwrap();
+        assert_eq!(
+            av.get("queue_position"),
+            Some(&AttributeValue::N("7".to_owned()))
+        );
+        assert_eq!(
+            av.get("entry_time"),
+            Some(&AttributeValue::N("1788000000".to_owned()))
+        );
     }
 
     #[test]

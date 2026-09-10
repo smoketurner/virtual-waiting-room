@@ -7,6 +7,11 @@
 //! who never click through. It then expires positions whose `expires_at` has
 //! passed and advances `max_expired_position`.
 //!
+//! A pass runs only when the event is `Active` **and** the operator's
+//! [`AdmissionControl`] is `Open`. The phase says the event is running; the
+//! admission control says the operator is letting visitors through. Either gate
+//! closed means the pass returns without advancing `serving_counter`.
+//!
 //! All arithmetic here is checked or saturating: the release profile has no
 //! overflow checks, so a bare subtraction that underflows would wrap to a huge
 //! value and release a damaging burst. `no_show_state` and `release_next` never
@@ -14,7 +19,7 @@
 
 use std::future::Future;
 
-use wr_domain::{Phase, SHARDS};
+use wr_domain::{AdmissionControl, Phase, SHARDS};
 
 pub mod dynamo;
 
@@ -219,6 +224,11 @@ pub struct StoreError(pub String);
 #[derive(Debug, Clone, PartialEq)]
 pub struct ControllerState {
     pub phase: Phase,
+    /// The operator's live admission override. The phase says where the event is
+    /// on its timeline; this says whether the operator is letting visitors
+    /// through right now. Both must permit admission before the controller
+    /// advances `serving_counter`.
+    pub admission_control: AdmissionControl,
     pub inputs: ReleaseInputs,
     pub prev_no_show: Option<NoShowState>,
     pub max_expired_position: u64,
@@ -271,14 +281,18 @@ pub trait Store {
 pub enum PassOutcome {
     /// The event is not `Active`; the controller did nothing.
     NotActive(Phase),
+    /// The operator's admission override is not `Open`; the controller did
+    /// nothing. Distinct from [`PassOutcome::NotActive`]: the event is running
+    /// and only the operator's hold stops admission.
+    Held(AdmissionControl),
     /// The controller ran: it released `released` positions and expired
     /// `expired` positions.
     Ran { released: u64, expired: usize },
 }
 
-/// Runs one controller pass for the event: read state, gate on `Active`, compute
-/// and write the release, then expire due positions and advance
-/// `max_expired_position`.
+/// Runs one controller pass for the event: read state, gate on `Active` and on
+/// the operator's admission override, compute and write the release, then expire
+/// due positions and advance `max_expired_position`.
 ///
 /// `now` is the current epoch-seconds, passed in so the logic is deterministic
 /// under test.
@@ -295,6 +309,23 @@ pub async fn run_pass<S: Store>(
     if state.phase != Phase::Active {
         tracing::debug!(event_id, phase = ?state.phase, "controller skipped: not active");
         return Ok(PassOutcome::NotActive(state.phase));
+    }
+
+    // Any control other than Open returns the whole pass, so neither
+    // `serving_counter` nor the expiry cursor advances: a visitor cannot lose a
+    // position to expiry during a hold they had no way to act through. Under
+    // fail-open the waiting room is bypassed, so a release would meter nothing;
+    // leaving the counter put lets a recovery resume from it.
+    match state.admission_control {
+        AdmissionControl::Open => {}
+        control @ (AdmissionControl::Paused | AdmissionControl::FailOpen) => {
+            tracing::info!(
+                event_id,
+                control = control.as_wire_str(),
+                "controller held: admission is not open"
+            );
+            return Ok(PassOutcome::Held(control));
+        }
     }
 
     let decision = compute_release(state.inputs, state.prev_no_show);
@@ -517,6 +548,7 @@ mod tests {
     fn active_state(due_max_expired: u64) -> ControllerState {
         ControllerState {
             phase: Phase::Active,
+            admission_control: AdmissionControl::Open,
             inputs: inputs(250, 0, 1000, 500, 50),
             prev_no_show: None,
             max_expired_position: due_max_expired,
@@ -557,6 +589,57 @@ mod tests {
         assert_eq!(outcome, PassOutcome::NotActive(Phase::PreQueue));
         assert!(store.released.lock().unwrap().is_none());
         assert!(store.advanced.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn pause_stops_admission_entirely() {
+        // A paused event is still Active, so the phase gate lets the pass
+        // through and only the admission control stops it. Nothing may advance:
+        // not serving_counter, not the expiry cursor.
+        let mut state = active_state(10);
+        state.admission_control = AdmissionControl::Paused;
+        let due = vec![ExpiredPosition {
+            request_id: "r1".to_owned(),
+        }];
+        let store = FakeStore::new(state, due);
+        let outcome = run_pass(&store, "evt", 1_000).await.unwrap();
+        assert_eq!(outcome, PassOutcome::Held(AdmissionControl::Paused));
+        assert!(
+            store.released.lock().unwrap().is_none(),
+            "paused event released positions: pause is not holding admission"
+        );
+        assert!(
+            store.marked.lock().unwrap().is_empty(),
+            "paused event expired a position the visitor could not act on"
+        );
+        assert_eq!(*store.advanced.lock().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn fail_open_holds_the_controller_too() {
+        // Under fail-open the waiting room is bypassed, so metering releases
+        // nothing real; the counter stays put for recovery to resume from.
+        let mut state = active_state(0);
+        state.admission_control = AdmissionControl::FailOpen;
+        let store = FakeStore::new(state, Vec::new());
+        let outcome = run_pass(&store, "evt", 1_000).await.unwrap();
+        assert_eq!(outcome, PassOutcome::Held(AdmissionControl::FailOpen));
+        assert!(store.released.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn resuming_lets_the_controller_run_again() {
+        // The same state with the control back to Open runs a full pass, so a
+        // hold costs nothing but the intervals it covered.
+        let store = FakeStore::new(active_state(0), Vec::new());
+        let outcome = run_pass(&store, "evt", 1_000).await.unwrap();
+        assert_eq!(
+            outcome,
+            PassOutcome::Ran {
+                released: 1000,
+                expired: 0,
+            }
+        );
     }
 
     #[tokio::test]

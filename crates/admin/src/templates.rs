@@ -33,10 +33,12 @@ pub struct Dashboard {
     /// the JSON state view.
     #[serde(skip)]
     pub message_raw: String,
-    /// Andon cord (ADR-0017): whether admission is currently paused, and a
-    /// human "last changed by X at T" line for the audit trail.
-    pub admission_paused: bool,
-    /// The visitor-facing serving state (ADR-0019), derived from phase + the
+    /// The operator's admission override as its wire string — `open`, `paused`,
+    /// or `fail_open`. The template branches on it and the poller sends it back
+    /// as JSON, so all three states are visible rather than collapsing the two
+    /// non-open ones together.
+    pub admission_control: String,
+    /// The visitor-facing serving state, derived from the phase and the
     /// admission control. Human label for display: "Running" / "Paused" /
     /// "Closed" / "Fail open".
     pub serving_state: String,
@@ -68,17 +70,10 @@ impl Dashboard {
             target_rate: dash(state.target_rate.map(|n| n.to_string())),
             message: dash(state.message.clone()),
             message_raw: state.message.clone().unwrap_or_default(),
-            admission_paused: state.admission_paused,
+            admission_control: state.admission_control.as_wire_str().to_owned(),
             serving_state: {
                 use wr_domain::ServingState::{Closed, FailOpen, Paused, Running};
-                // Admin's ControlState still carries a bool; map it to the domain
-                // AdmissionControl. fail_open is not yet an admin control (post-MVP).
-                let control = if state.admission_paused {
-                    wr_domain::AdmissionControl::Paused
-                } else {
-                    wr_domain::AdmissionControl::Open
-                };
-                match wr_domain::serving_state(state.phase, control) {
+                match wr_domain::serving_state(state.phase, state.admission_control) {
                     Running => "Running",
                     Paused => "Paused",
                     Closed => "Closed",
@@ -138,7 +133,7 @@ mod tests {
             participant_count: Some(1000),
             target_rate: Some(500),
             message: Some("Doors open at noon".to_owned()),
-            admission_paused: false,
+            admission_control: wr_domain::AdmissionControl::Open,
             last_action: Some("set_rate".to_owned()),
             last_action_by: Some("op@example.com".to_owned()),
             last_action_at: Some("2026-09-09T22:00:00Z".to_owned()),
@@ -188,6 +183,44 @@ mod tests {
         s.message = None;
         let html = Dashboard::from_state(&s).render().unwrap();
         assert!(html.contains("not set"));
+    }
+
+    #[test]
+    fn each_admission_state_renders_its_own_banner_and_badge() {
+        use wr_domain::AdmissionControl::{FailOpen, Open, Paused};
+
+        let render = |control| {
+            let mut s = state();
+            s.admission_control = control;
+            Dashboard::from_state(&s).render().unwrap()
+        };
+
+        // Open: no banner, and the action offered is Pause.
+        let open = render(Open);
+        assert!(!open.contains("pause-banner"));
+        assert!(open.contains("action=\"/admin/pause\""));
+        assert!(open.contains(">open<"));
+
+        // Paused: banner, and the action offered is Resume, not Pause again.
+        let paused = render(Paused);
+        assert!(paused.contains("Admission is PAUSED"));
+        assert!(paused.contains("action=\"/admin/resume\""));
+        assert!(!paused.contains("action=\"/admin/pause\""));
+        assert!(paused.contains(">paused<"));
+
+        // Fail open: its own banner and badge, never rendered as the normal
+        // admitting state — the operator must see the room is being bypassed.
+        let failed_open = render(FailOpen);
+        assert!(failed_open.contains("FAIL OPEN"));
+        assert!(failed_open.contains(">fail open<"));
+        assert!(!failed_open.contains("Admission is PAUSED"));
+    }
+
+    #[test]
+    fn serving_state_reports_fail_open_to_the_operator() {
+        let mut s = state();
+        s.admission_control = wr_domain::AdmissionControl::FailOpen;
+        assert_eq!(Dashboard::from_state(&s).serving_state, "Fail open");
     }
 
     #[test]

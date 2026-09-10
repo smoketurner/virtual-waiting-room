@@ -10,7 +10,7 @@ use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
 use aws_sdk_dynamodb::types::AttributeValue;
-use wr_domain::{Phase, PositionStatus, SHARDS};
+use wr_domain::{AdmissionControl, Phase, PositionStatus, SHARDS};
 
 use crate::{
     ControllerState, ExpiredPosition, NoShowState, ReleaseDecision, ReleaseInputs, Store,
@@ -75,6 +75,16 @@ impl Store for DynamoStore {
             .and_then(|s| s.parse::<Phase>().ok())
             .unwrap_or(Phase::Idle);
 
+        // A stored control that is absent or fails to parse resolves to Open,
+        // matching every other reader (`read`, `admin`): "open" is the default
+        // an event is created in, and a garbage value must not silently hold
+        // admission for an event nobody paused.
+        let admission_control = item
+            .get("admission_control")
+            .and_then(|v| v.as_s().ok())
+            .and_then(|s| s.parse::<AdmissionControl>().ok())
+            .unwrap_or(AdmissionControl::Open);
+
         let mut arrivals = [0u64; SHARDS];
         for (shard, slot) in arrivals.iter_mut().enumerate() {
             *slot = num(item, &format!("arrivals#{shard}"));
@@ -93,6 +103,7 @@ impl Store for DynamoStore {
 
         Ok(ControllerState {
             phase,
+            admission_control,
             inputs: ReleaseInputs {
                 arrivals,
                 last_arrivals_total: num(item, "last_arrivals_total"),

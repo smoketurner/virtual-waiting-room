@@ -61,6 +61,28 @@ pub fn not_exists_condition(key_attr: &str) -> String {
     format!("attribute_not_exists({key_attr})")
 }
 
+/// The seal's single `SET` clause, writing every value the seal produces in one
+/// update.
+///
+/// `queue_counter` is set to the same `:n` as `participant_count`: the live-join
+/// sequence starts at the cohort size, so the first post-seal live joiner is
+/// numbered behind the whole pre-queue cohort rather than colliding with it.
+/// Without that clause `ADD queue_counter :n` would hand a live joiner position
+/// 1, already owned by a pre-queue member of `[0, N)`.
+#[must_use]
+pub fn seal_update() -> &'static str {
+    "SET shuffle_seed = :seed, participant_count = :n, queue_counter = :n, \
+     prequeue_offsets = :offsets, phase = :active"
+}
+
+/// `attribute_not_exists(shuffle_seed)` — the seal's once-only guard. The seed
+/// is written by the seal and nothing else, so its absence means "not yet
+/// sealed" and a double-fire or retry is rejected rather than reseeding.
+#[must_use]
+pub fn seal_guard() -> &'static str {
+    "attribute_not_exists(shuffle_seed)"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,5 +124,36 @@ mod tests {
     #[should_panic(expected = "out of range")]
     fn arrivals_attr_out_of_range_panics() {
         let _ = arrivals_shard_attr(SHARDS);
+    }
+
+    #[test]
+    fn seal_starts_the_live_join_sequence_at_the_cohort_size() {
+        // The one clause that keeps a post-seal live joiner off the pre-queue
+        // cohort's [0, N): queue_counter takes the same :n as participant_count,
+        // so `ADD queue_counter :1` next returns N + 1, not 1.
+        let update = seal_update();
+        assert!(
+            update.contains("queue_counter = :n"),
+            "seal must seed queue_counter; without it live joins collide with [0, N)"
+        );
+        assert!(update.contains("participant_count = :n"));
+        assert!(update.starts_with("SET "));
+    }
+
+    #[test]
+    fn seal_writes_every_value_in_one_guarded_update() {
+        // All four seal outputs plus the phase flip in a single SET, guarded on
+        // the seed's absence, so the seal is atomic and happens exactly once.
+        let update = seal_update();
+        for attr in [
+            "shuffle_seed = :seed",
+            "participant_count = :n",
+            "queue_counter = :n",
+            "prequeue_offsets = :offsets",
+            "phase = :active",
+        ] {
+            assert!(update.contains(attr), "seal update missing {attr}");
+        }
+        assert_eq!(seal_guard(), "attribute_not_exists(shuffle_seed)");
     }
 }

@@ -124,6 +124,101 @@ mod tests {
         (0..n).map(|i| prp(seed, i, n)).collect()
     }
 
+    /// Sequential seed `00..1f`: a change to the HMAC key handling — truncation,
+    /// reversal, using the seed as the message — moves every vector below.
+    const SEED_COUNTING: Seed = Seed([
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+        0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+        0x1e, 0x1f,
+    ]);
+
+    /// Uniform seed `0xab`: with every key byte identical, the vectors depend
+    /// only on the round index and message layout, so a change to either shows
+    /// up here even if the key handling is untouched.
+    const SEED_UNIFORM: Seed = Seed([0xab; 32]);
+
+    /// Frozen vectors pinning the wire encoding documented at the top of this
+    /// module.
+    ///
+    /// A published seed only lets a third party verify a position if their
+    /// recomputation of `(seed, i, N)` matches this code exactly, which makes the
+    /// byte encoding a compatibility contract rather than an implementation
+    /// detail. Every other test here is structural: bijectivity, domain, and
+    /// uniformity all still hold after a change to the round count, the
+    /// round-function byte order, the half-width rule, or the message layout, so
+    /// they stay green while the encoding silently moves. These vectors are what
+    /// fails.
+    ///
+    /// They were computed from a separate implementation of the documented
+    /// encoding, not captured from this code. Regenerate them the same way if a
+    /// change is ever deliberate — never by pasting back what this code returns.
+    #[test]
+    fn frozen_wire_encoding_vectors() {
+        /// One frozen case: the seed, the cohort size, and the
+        /// `(index, expected position)` pairs pinned for that pair.
+        type Vector = (&'static Seed, u64, &'static [(u64, u64)]);
+
+        let vectors: &[Vector] = &[
+            (&SEED_COUNTING, 2, &[(0, 0), (1, 1)]),
+            (&SEED_COUNTING, 3, &[(0, 0), (1, 2), (2, 1)]),
+            (&SEED_COUNTING, 7, &[(0, 2), (3, 3), (6, 6)]),
+            (&SEED_COUNTING, 16, &[(0, 2), (1, 11), (15, 7)]),
+            (&SEED_COUNTING, 17, &[(0, 12), (8, 16), (16, 6)]),
+            (
+                &SEED_COUNTING,
+                1000,
+                &[(0, 906), (1, 322), (500, 323), (999, 629)],
+            ),
+            (
+                &SEED_COUNTING,
+                1_000_000,
+                &[(0, 890_568), (12_345, 541_088), (999_999, 2_522)],
+            ),
+            (&SEED_UNIFORM, 2, &[(0, 0), (1, 1)]),
+            (&SEED_UNIFORM, 3, &[(0, 0), (1, 2), (2, 1)]),
+            (&SEED_UNIFORM, 7, &[(0, 3), (3, 5), (6, 2)]),
+            (&SEED_UNIFORM, 16, &[(0, 3), (1, 6), (15, 9)]),
+            (&SEED_UNIFORM, 17, &[(0, 11), (8, 16), (16, 12)]),
+            (
+                &SEED_UNIFORM,
+                1000,
+                &[(0, 266), (1, 89), (500, 909), (999, 288)],
+            ),
+            (
+                &SEED_UNIFORM,
+                1_000_000,
+                &[(0, 289_008), (12_345, 803_746), (999_999, 450_580)],
+            ),
+        ];
+
+        for (seed, n, cases) in vectors {
+            for &(i, expected) in *cases {
+                assert_eq!(
+                    prp(seed, i, *n),
+                    expected,
+                    "wire encoding changed: prp(seed, {i}, {n}) must stay {expected}"
+                );
+            }
+        }
+    }
+
+    /// The round function itself, pinned independently of the Feistel network so
+    /// a failure separates "the encoding of one round changed" from "the network
+    /// around it changed".
+    #[test]
+    fn frozen_round_function_encoding() {
+        let key = hmac::Key::new(hmac::HMAC_SHA256, &SEED_COUNTING.0);
+        // Full 32-bit mask, so the assertion is on the raw big-endian word taken
+        // from the first four tag bytes, with no masking to hide a byte-order
+        // change. Message is round 0 with right half 0: 00 00 00 00 00.
+        let full = u64::from(u32::MAX);
+        assert_eq!(round_function(&key, 0, 0, full), 0x8794_47e2);
+        // Round index is the first message byte: changing it changes the tag.
+        assert_eq!(round_function(&key, 1, 0, full), 0x1a24_cea7);
+        // The right half occupies the last four bytes, big-endian.
+        assert_eq!(round_function(&key, 0, 1, full), 0x6f5d_ecd8);
+    }
+
     #[test]
     fn degenerate_domains_are_identity() {
         let seed = seed_from(0x11);

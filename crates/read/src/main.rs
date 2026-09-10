@@ -115,9 +115,9 @@ async fn load_prequeue(ctx: &Ctx, request_id: &str) -> Result<Option<PreQueueIte
     }
 }
 
-/// Fetches a live joiner's position from the Positions table. The position is
-/// stored in `entry_time` (written by `assign_position`). Returns `None` when the
-/// request id has no Positions row.
+/// Fetches a live joiner's position from the `queue_position` attribute of their
+/// `Positions` row, written by `assign_position`. Returns `None` when the request
+/// id has no row.
 async fn load_position(ctx: &Ctx, request_id: &str) -> Result<Option<u64>, Error> {
     let out = ctx
         .client
@@ -126,11 +126,16 @@ async fn load_position(ctx: &Ctx, request_id: &str) -> Result<Option<u64>, Error
         .key("request_id", AttributeValue::S(request_id.to_owned()))
         .send()
         .await?;
-    Ok(out
-        .item()
-        .and_then(|item| item.get("entry_time"))
-        .and_then(|v| v.as_s().ok())
-        .and_then(|s| s.parse::<u64>().ok()))
+    Ok(out.item().and_then(position_from_item))
+}
+
+/// Reads `queue_position` off a `Positions` item. `None` when the attribute is
+/// absent or is not a number, so a row written in some other shape reads as "no
+/// position" rather than as position zero.
+fn position_from_item(item: &std::collections::HashMap<String, AttributeValue>) -> Option<u64> {
+    item.get("queue_position")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|s| s.parse::<u64>().ok())
 }
 
 /// Reads the flat `Counters` item, assembling the `prequeue_counter#0..9`
@@ -207,4 +212,48 @@ fn json<T: serde::Serialize>(status: u16, body: &T) -> Result<Response<Body>, Er
         .status(status)
         .header("content-type", "application/json")
         .body(Body::from(payload))?)
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
+
+    use wr_domain::{PositionItem, PositionStatus};
+
+    use super::*;
+
+    #[test]
+    fn reads_the_position_assign_position_wrote() {
+        // Round-trips a real PositionItem, so the reader and the writer cannot
+        // drift onto different attribute names or types.
+        let written = PositionItem {
+            request_id: "018f3a2b-7c9d-7e1f-abcd-0123456789ab".to_owned(),
+            queue_position: 4_242,
+            entry_time: 1_788_000_000,
+            status: PositionStatus::Issued,
+            expires_at: 1_788_000_300,
+            ttl: 1_788_086_700,
+        };
+        let item: std::collections::HashMap<String, AttributeValue> =
+            serde_dynamo::to_item(&written).unwrap();
+        assert_eq!(position_from_item(&item), Some(4_242));
+    }
+
+    #[test]
+    fn a_row_without_a_position_reads_as_none_not_zero() {
+        // Position zero is a real position at the head of the queue; a missing
+        // attribute must never be reported as one.
+        let mut item = std::collections::HashMap::new();
+        item.insert(
+            "request_id".to_owned(),
+            AttributeValue::S("req-1".to_owned()),
+        );
+        assert_eq!(position_from_item(&item), None);
+        // A timestamp-shaped string in the old attribute is not a position.
+        item.insert(
+            "entry_time".to_owned(),
+            AttributeValue::S("2026-08-03T19:12:52.000Z".to_owned()),
+        );
+        assert_eq!(position_from_item(&item), None);
+    }
 }

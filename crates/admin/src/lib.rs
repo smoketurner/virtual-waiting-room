@@ -5,7 +5,7 @@
 
 use std::future::Future;
 
-use wr_domain::Phase;
+use wr_domain::{AdmissionControl, IllegalControl, Phase};
 
 pub mod dynamo;
 pub mod oidc;
@@ -56,15 +56,17 @@ pub trait Store {
         now_ms: u64,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
-    /// Sets the andon-cord admission-pause flag (ADR-0017), guarded on the
-    /// expected current value (so pause-when-paused is a no-op `Conflict`, making
-    /// the toggle idempotent) and the debounce window; stamps audit atomically.
-    /// `target_rate` is untouched, so resuming restores the configured rate.
-    fn set_paused(
+    /// Moves the admission control from `from` to `to`, guarded on the stored
+    /// value still being `from` (so a transition that already happened is a
+    /// no-op `Conflict`, making the action idempotent) and on the debounce
+    /// window; stamps `action` and the audit fields atomically. `target_rate` is
+    /// untouched, so resuming restores the configured rate.
+    fn set_admission_control(
         &self,
         event_id: &str,
-        from: bool,
-        to: bool,
+        from: AdmissionControl,
+        to: AdmissionControl,
+        action: AdminAction,
         actor: &str,
         now_ms: u64,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
@@ -90,15 +92,16 @@ pub struct ControlState {
     pub participant_count: Option<u64>,
     pub target_rate: Option<u32>,
     pub message: Option<String>,
-    /// Andon cord (ADR-0017): when true the controller admits nobody while the
-    /// queue and positions stay intact. Preserves `target_rate` across a pause.
-    pub admission_paused: bool,
-    /// Audit (ADR-0017): the last mutating action, who performed it (OIDC email),
-    /// and when (RFC3339). Surfaced as "last changed by X at T".
+    /// The operator's admission override. While it is anything but `Open` the
+    /// controller admits nobody and the queue and positions stay intact;
+    /// `target_rate` is preserved across a hold.
+    pub admission_control: AdmissionControl,
+    /// The last mutating action, who performed it (OIDC email), and when
+    /// (RFC3339). Surfaced as "last changed by X at T".
     pub last_action: Option<String>,
     pub last_action_by: Option<String>,
     pub last_action_at: Option<String>,
-    /// Epoch-millis of the last mutation, for the debounce guard (ADR-0017).
+    /// Epoch-millis of the last mutation, for the debounce guard.
     pub last_action_epoch_ms: Option<u64>,
 }
 
@@ -317,50 +320,77 @@ pub async fn apply_rate<S: Store>(
     Ok(rate)
 }
 
-/// Pauses admission (andon cord, ADR-0017): guarded on not-already-paused
-/// (idempotent) and debounced.
+/// Holds admission: the queue keeps forming and nobody is admitted. Legal only
+/// from `Open`, and debounced.
 ///
 /// # Errors
 ///
-/// [`ActionError::NotFound`] / [`ActionError::TooFast`] / store errors.
+/// [`ActionError::NotFound`] / [`ActionError::TooFast`] / [`ActionError::Conflict`]
+/// when the control is not `Open` / store errors.
 pub async fn apply_pause<S: Store>(
     store: &S,
     event_id: &str,
     actor: &str,
     now_ms: u64,
 ) -> Result<(), ApplyError> {
-    let Some(state) = store.load(event_id).await? else {
-        return Err(ActionError::NotFound.into());
-    };
-    debounce_check(&state, now_ms)?;
-    // Guard requires currently NOT paused; pausing when already paused is a
-    // no-op Conflict (idempotent).
-    store
-        .set_paused(event_id, false, true, actor, now_ms)
-        .await?;
-    Ok(())
+    apply_control(
+        store,
+        event_id,
+        AdmissionControl::pause,
+        AdminAction::Pause,
+        actor,
+        now_ms,
+    )
+    .await
 }
 
-/// Resumes admission after a pause, restoring the configured `target_rate`.
-/// Guarded on currently-paused and debounced.
+/// Releases a hold, restoring the configured `target_rate`. Legal only from
+/// `Paused`, and debounced.
 ///
 /// # Errors
 ///
-/// [`ActionError::NotFound`] / [`ActionError::TooFast`] / store errors.
+/// [`ActionError::NotFound`] / [`ActionError::TooFast`] / [`ActionError::Conflict`]
+/// when the control is not `Paused` / store errors.
 pub async fn apply_resume<S: Store>(
     store: &S,
     event_id: &str,
     actor: &str,
     now_ms: u64,
 ) -> Result<(), ApplyError> {
+    apply_control(
+        store,
+        event_id,
+        AdmissionControl::resume,
+        AdminAction::Resume,
+        actor,
+        now_ms,
+    )
+    .await
+}
+
+/// Applies one admission-control transition. `transition` is the state
+/// machine's own method, so a move it refuses is rejected here before any write
+/// and the store's conditional update is left to catch only a lost race.
+async fn apply_control<S, T>(
+    store: &S,
+    event_id: &str,
+    transition: T,
+    action: AdminAction,
+    actor: &str,
+    now_ms: u64,
+) -> Result<(), ApplyError>
+where
+    S: Store,
+    T: Fn(AdmissionControl) -> Result<AdmissionControl, IllegalControl>,
+{
     let Some(state) = store.load(event_id).await? else {
         return Err(ActionError::NotFound.into());
     };
     debounce_check(&state, now_ms)?;
-    // Guard requires currently paused; resuming when not paused is a no-op
-    // Conflict (idempotent).
+    let from = state.admission_control;
+    let to = transition(from).map_err(|_| ActionError::Conflict)?;
     store
-        .set_paused(event_id, true, false, actor, now_ms)
+        .set_admission_control(event_id, from, to, action, actor, now_ms)
         .await?;
     Ok(())
 }
@@ -407,7 +437,9 @@ mod tests {
         phase: Mutex<Phase>,
         rate: Mutex<Option<u32>>,
         message: Mutex<Option<String>>,
-        paused: Mutex<bool>,
+        control: Mutex<AdmissionControl>,
+        /// The audit label the last control change recorded.
+        control_action: Mutex<Option<AdminAction>>,
         last_epoch: Mutex<Option<u64>>,
         missing: bool,
         /// When set, the next guarded write reports a lost race.
@@ -420,7 +452,8 @@ mod tests {
                 phase: Mutex::new(Phase::Idle),
                 rate: Mutex::new(None),
                 message: Mutex::new(None),
-                paused: Mutex::new(false),
+                control: Mutex::new(AdmissionControl::Open),
+                control_action: Mutex::new(None),
                 last_epoch: Mutex::new(None),
                 missing: false,
                 conflict: false,
@@ -453,7 +486,7 @@ mod tests {
                     participant_count: None,
                     target_rate: *self.rate.lock().unwrap(),
                     message: self.message.lock().unwrap().clone(),
-                    admission_paused: *self.paused.lock().unwrap(),
+                    admission_control: *self.control.lock().unwrap(),
                     last_action: None,
                     last_action_by: None,
                     last_action_at: None,
@@ -508,20 +541,23 @@ mod tests {
             std::future::ready(Ok(()))
         }
 
-        fn set_paused(
+        fn set_admission_control(
             &self,
             _event_id: &str,
-            from: bool,
-            to: bool,
+            from: AdmissionControl,
+            to: AdmissionControl,
+            action: AdminAction,
             _actor: &str,
             now_ms: u64,
         ) -> impl Future<Output = Result<(), StoreError>> + Send {
-            // Idempotency guard: pause-when-paused (from == to) is a Conflict.
-            let mut guard = self.paused.lock().unwrap();
+            // Mirrors the conditional write: the move applies only if the stored
+            // value is still the one the caller read.
+            let mut guard = self.control.lock().unwrap();
             let result = if self.conflict || *guard != from {
                 Err(StoreError::Conflict)
             } else {
                 *guard = to;
+                *self.control_action.lock().unwrap() = Some(action);
                 *self.last_epoch.lock().unwrap() = Some(now_ms);
                 Ok(())
             };
@@ -705,15 +741,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pause_and_resume_toggle_the_flag() {
+    async fn pause_and_resume_move_the_control_between_open_and_paused() {
         let store = FakeStore::with_phase(Phase::Active);
         apply_pause(&store, "evt", "op@x", 1000).await.unwrap();
-        assert!(*store.paused.lock().unwrap());
+        assert_eq!(*store.control.lock().unwrap(), AdmissionControl::Paused);
+        assert_eq!(
+            *store.control_action.lock().unwrap(),
+            Some(AdminAction::Pause)
+        );
         // Resume spaced beyond the debounce window.
         apply_resume(&store, "evt", "op@x", 1000 + DEBOUNCE_MS)
             .await
             .unwrap();
-        assert!(!*store.paused.lock().unwrap());
+        assert_eq!(*store.control.lock().unwrap(), AdmissionControl::Open);
+        assert_eq!(
+            *store.control_action.lock().unwrap(),
+            Some(AdminAction::Resume)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stored_fail_open_is_not_read_as_open() {
+        // A bool would collapse fail_open into "not paused" and show an operator
+        // a normal, admitting event while the waiting room is bypassed.
+        let store = FakeStore {
+            control: Mutex::new(AdmissionControl::FailOpen),
+            phase: Mutex::new(Phase::Active),
+            ..Default::default()
+        };
+        let state = store.load("evt").await.unwrap().unwrap();
+        assert_eq!(state.admission_control, AdmissionControl::FailOpen);
+        assert_eq!(
+            wr_domain::serving_state(state.phase, state.admission_control),
+            wr_domain::ServingState::FailOpen
+        );
+    }
+
+    #[tokio::test]
+    async fn pause_and_resume_are_refused_from_fail_open() {
+        // Fail-open is left by recovering, not by pausing or resuming; neither
+        // action may quietly overwrite it.
+        let store = FakeStore {
+            control: Mutex::new(AdmissionControl::FailOpen),
+            phase: Mutex::new(Phase::Active),
+            ..Default::default()
+        };
+        assert!(matches!(
+            apply_pause(&store, "evt", "op@x", 1000).await,
+            Err(ApplyError::Action(ActionError::Conflict))
+        ));
+        assert!(matches!(
+            apply_resume(&store, "evt", "op@x", 1000).await,
+            Err(ApplyError::Action(ActionError::Conflict))
+        ));
+        assert_eq!(*store.control.lock().unwrap(), AdmissionControl::FailOpen);
     }
 
     #[tokio::test]
@@ -752,15 +833,17 @@ mod tests {
     #[tokio::test]
     async fn pause_when_already_paused_is_a_conflict() {
         let store = FakeStore {
-            paused: Mutex::new(true),
+            control: Mutex::new(AdmissionControl::Paused),
             phase: Mutex::new(Phase::Active),
             ..Default::default()
         };
-        // Guarded on not-already-paused: pausing again is a no-op Conflict.
+        // The transition is illegal from Paused, so it is refused before any
+        // write is attempted.
         assert!(matches!(
             apply_pause(&store, "evt", "op@x", 1000).await,
-            Err(ApplyError::Store(StoreError::Conflict))
+            Err(ApplyError::Action(ActionError::Conflict))
         ));
+        assert_eq!(*store.control.lock().unwrap(), AdmissionControl::Paused);
     }
 
     #[tokio::test]

@@ -146,7 +146,11 @@ pub async fn process_batch<S: Store>(store: &S, records: &[BatchRecord]) -> Batc
             return outcome;
         }
     };
-    let start = end - n + 1;
+    // Saturating, not bare: the release profile has no overflow checks, and a
+    // wrapped start would hand out positions from the top of the u64 range.
+    // `end >= n` always holds for a counter that only moves forward, so this is
+    // a guard against a counter that was reset, never normal arithmetic.
+    let start = end.saturating_sub(n).saturating_add(1);
 
     for (offset, (message_id, msg)) in valid.into_iter().enumerate() {
         let write = PositionWrite {
@@ -180,6 +184,9 @@ mod tests {
         writes: Mutex<Vec<PositionWrite>>,
         seen: Mutex<Vec<String>>,
         claim_fails: bool,
+        /// Forces the block end the claim reports, standing in for a counter
+        /// that was reset below the block size.
+        claim_end: Option<u64>,
         fail_write_for: Option<String>,
     }
 
@@ -191,6 +198,8 @@ mod tests {
         ) -> impl std::future::Future<Output = Result<u64, StoreError>> + Send {
             let result = if self.claim_fails {
                 Err(StoreError("counter down".to_owned()))
+            } else if let Some(end) = self.claim_end {
+                Ok(end)
             } else {
                 let mut c = self.counter.lock().unwrap();
                 *c += n;
@@ -308,6 +317,61 @@ mod tests {
         let outcome = process_batch(&store, &records).await;
         assert_eq!(outcome.failures, vec!["m2".to_owned()]);
         assert_eq!(store.writes.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn live_joins_after_a_seal_land_above_the_pre_queue_cohort() {
+        // The seal starts queue_counter at the cohort size N. A live join
+        // arriving afterwards must be numbered outside the pre-queue cohort's
+        // [0, N), or two visitors hold the same position.
+        const COHORT: u64 = 1_000;
+        let store = FakeStore {
+            counter: Mutex::new(COHORT),
+            ..FakeStore::default()
+        };
+        let records = vec![
+            rec("m1", "018f3a2b-7c9d-7e1f-0001-0123456789ab"),
+            rec("m2", "018f3a2b-7c9d-7e1f-0002-0123456789ab"),
+        ];
+        let outcome = process_batch(&store, &records).await;
+        assert!(outcome.failures.is_empty());
+        let writes = store.writes.lock().unwrap();
+        let mut positions: Vec<u64> = writes.iter().map(|w| w.position).collect();
+        positions.sort_unstable();
+        assert_eq!(positions, vec![COHORT + 1, COHORT + 2]);
+        for position in positions {
+            assert!(
+                position >= COHORT,
+                "live position {position} collides with the pre-queue cohort [0, {COHORT})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_block_end_below_the_block_size_does_not_wrap() {
+        // A counter reset below the block it just claimed reports an end lower
+        // than n. `end - n + 1` would wrap into the top of the u64 range under
+        // the release profile's absent overflow checks, handing out positions
+        // near u64::MAX. Saturating keeps the block at the bottom instead.
+        let store = FakeStore {
+            claim_end: Some(1),
+            ..FakeStore::default()
+        };
+        let records = vec![
+            rec("m1", "018f3a2b-7c9d-7e1f-0001-0123456789ab"),
+            rec("m2", "018f3a2b-7c9d-7e1f-0002-0123456789ab"),
+            rec("m3", "018f3a2b-7c9d-7e1f-0003-0123456789ab"),
+        ];
+        let outcome = process_batch(&store, &records).await;
+        assert!(outcome.failures.is_empty());
+        let writes = store.writes.lock().unwrap();
+        for write in writes.iter() {
+            assert!(
+                write.position < 1_000,
+                "position {} wrapped instead of saturating",
+                write.position
+            );
+        }
     }
 
     #[tokio::test]
