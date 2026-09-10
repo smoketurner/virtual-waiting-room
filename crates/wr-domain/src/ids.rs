@@ -37,6 +37,112 @@ pub enum Phase {
     Maintenance,
 }
 
+/// The operator's live admission override, a small state machine (ADR-0019).
+/// This replaces the former `admission_paused` / `fail_open` boolean pair so an
+/// illegal combination (e.g. paused AND fail-open) is unrepresentable. Stored on
+/// the `Counters` item as one attribute; transitions are the methods below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AdmissionControl {
+    /// Admission proceeds normally (the default).
+    #[default]
+    Open,
+    /// Admission is held; the queue and positions are intact (andon cord).
+    Paused,
+    /// Break-glass: the waiting room is bypassed and arrivals go straight to the
+    /// origin (ADR-0009 fail-open). Enforcement is post-MVP.
+    FailOpen,
+}
+
+/// An admission-control transition that is not legal from the current state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("cannot {action} from {from:?}")]
+pub struct IllegalControl {
+    pub from: AdmissionControl,
+    pub action: &'static str,
+}
+
+impl AdmissionControl {
+    /// Pause admission. Legal only from `Open` (pausing when paused is a no-op
+    /// the caller treats as idempotent; from `FailOpen` it is refused).
+    ///
+    /// # Errors
+    /// [`IllegalControl`] if not currently `Open`.
+    pub fn pause(self) -> Result<Self, IllegalControl> {
+        match self {
+            Self::Open => Ok(Self::Paused),
+            Self::Paused | Self::FailOpen => Err(IllegalControl {
+                from: self,
+                action: "pause",
+            }),
+        }
+    }
+
+    /// Resume admission. Legal only from `Paused`.
+    ///
+    /// # Errors
+    /// [`IllegalControl`] if not currently `Paused`.
+    pub fn resume(self) -> Result<Self, IllegalControl> {
+        match self {
+            Self::Paused => Ok(Self::Open),
+            Self::Open | Self::FailOpen => Err(IllegalControl {
+                from: self,
+                action: "resume",
+            }),
+        }
+    }
+
+    /// Engage fail-open. Break-glass: legal from any state, always applies.
+    #[must_use]
+    pub fn fail_open(self) -> Self {
+        Self::FailOpen
+    }
+
+    /// Clear fail-open back to normal admission. Legal from any state.
+    #[must_use]
+    pub fn recover(self) -> Self {
+        Self::Open
+    }
+}
+
+/// What a visitor arriving right now experiences (ADR-0019). The visitor-facing
+/// projection published by `/status`, distinct from [`Phase`] (the timeline). It
+/// is derived from `(Phase, AdmissionControl)` by [`serving_state`], never
+/// stored, so it cannot drift. Steady states only: `Pausing`/`Resuming` are
+/// deferred until the outflow controller introduces a real drain interval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServingState {
+    /// Arrivals queue and are admitted at the target rate.
+    Running,
+    /// Arrivals queue but are held; already-queued visitors keep their place.
+    Paused,
+    /// Arrivals are told the event is not open; the queue is frozen, not lost.
+    Closed,
+    /// The waiting room is bypassed: arrivals go straight to the origin
+    /// (ADR-0009 fail-open). Enforcement is post-MVP.
+    FailOpen,
+}
+
+/// Projects the timeline and the operator override onto the single
+/// visitor-facing [`ServingState`] (ADR-0019). Total over every input, so a
+/// visitor never sees an undefined state.
+#[must_use]
+pub fn serving_state(phase: Phase, control: AdmissionControl) -> ServingState {
+    match control {
+        AdmissionControl::FailOpen => ServingState::FailOpen,
+        AdmissionControl::Paused if phase == Phase::Active => ServingState::Paused,
+        // Paused override while not active still reads as Closed to a visitor
+        // (there is nothing to admit yet, or the event is over/down).
+        AdmissionControl::Open | AdmissionControl::Paused => match phase {
+            Phase::Active => ServingState::Running,
+            Phase::Idle | Phase::PreQueue | Phase::PostEvent | Phase::Maintenance => {
+                ServingState::Closed
+            }
+        },
+    }
+}
+
 impl Phase {
     /// The stored `snake_case` wire string, matching the `serde` representation.
     /// The exhaustive `match` returns `&'static str` so callers building a
@@ -79,6 +185,65 @@ mod tests {
     #![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
 
     use super::*;
+
+    #[test]
+    fn serving_state_projects_the_visitor_experience() {
+        use AdmissionControl::{Open, Paused};
+        use Phase::{Active, Idle, Maintenance, PostEvent, PreQueue};
+        use ServingState::Paused as SPaused;
+        use ServingState::{Closed, Running};
+        // Active + open = Running; Active + paused = Paused.
+        assert_eq!(serving_state(Active, Open), Running);
+        assert_eq!(serving_state(Active, Paused), SPaused);
+        // Nothing to admit yet, over, or taken down: all Closed to a visitor.
+        assert_eq!(serving_state(Idle, Open), Closed);
+        assert_eq!(serving_state(PreQueue, Open), Closed);
+        assert_eq!(serving_state(PostEvent, Open), Closed);
+        assert_eq!(serving_state(Maintenance, Open), Closed);
+        // A paused override while not active still reads Closed (not Paused).
+        assert_eq!(serving_state(Idle, Paused), Closed);
+    }
+
+    #[test]
+    fn fail_open_overrides_every_phase() {
+        use AdmissionControl::FailOpen;
+        use Phase::{Active, Idle, Maintenance};
+        for phase in [Active, Idle, Maintenance] {
+            assert_eq!(serving_state(phase, FailOpen), ServingState::FailOpen);
+        }
+    }
+
+    #[test]
+    fn admission_control_transitions_are_legal_only_where_defined() {
+        use AdmissionControl::{FailOpen, Open, Paused};
+        // Open <-> Paused.
+        assert_eq!(Open.pause().unwrap(), Paused);
+        assert_eq!(Paused.resume().unwrap(), Open);
+        // Pausing when paused, or resuming when open, is refused.
+        assert!(Paused.pause().is_err());
+        assert!(Open.resume().is_err());
+        // Fail-open is break-glass from anywhere; recover clears it.
+        assert_eq!(Open.fail_open(), FailOpen);
+        assert_eq!(Paused.fail_open(), FailOpen);
+        assert_eq!(FailOpen.recover(), Open);
+        // Cannot pause/resume out of fail-open; recover first.
+        assert!(FailOpen.pause().is_err());
+        assert!(FailOpen.resume().is_err());
+    }
+
+    #[test]
+    fn serving_state_wire_string_round_trips() {
+        for st in [
+            ServingState::Running,
+            ServingState::Paused,
+            ServingState::Closed,
+            ServingState::FailOpen,
+        ] {
+            let json = serde_json::to_string(&st).unwrap();
+            let back: ServingState = serde_json::from_str(&json).unwrap();
+            assert_eq!(st, back);
+        }
+    }
 
     #[test]
     fn phase_wire_string_round_trips() {

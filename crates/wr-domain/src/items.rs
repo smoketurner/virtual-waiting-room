@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 use wr_permutation::{SHARDS, SealError, SealedOffsets};
 
-use crate::ids::Phase;
+use crate::ids::{AdmissionControl, Phase};
 
 /// The admission status of a written [`Position`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,9 +69,10 @@ pub struct Counters {
     /// Operator broadcast text shown to waiting visitors. Absent until an
     /// operator sets it; cleared by setting it empty.
     pub message: Option<String>,
-    /// Andon cord (ADR-0017): when true, the waiting page tells visitors
-    /// admission is paused. They keep their queue position.
-    pub admission_paused: bool,
+    /// The operator's live admission override (ADR-0019): `Open` / `Paused` /
+    /// `FailOpen`. Replaces the former `admission_paused` + `fail_open` booleans
+    /// so an illegal combination cannot be stored.
+    pub admission_control: AdmissionControl,
 }
 
 impl Counters {
@@ -138,7 +139,7 @@ mod tests {
             participant_count: None,
             prequeue_offsets: None,
             message: None,
-            admission_paused: false,
+            admission_control: AdmissionControl::Open,
         };
         let sealed = counters.seal().unwrap();
         assert_eq!(sealed.participant_count(), 15);

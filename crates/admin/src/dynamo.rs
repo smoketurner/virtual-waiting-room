@@ -63,10 +63,10 @@ impl Store for DynamoStore {
             target_rate: num("target_rate").and_then(|n| u32::try_from(n).ok()),
             message: item.get("message").and_then(|v| v.as_s().ok()).cloned(),
             admission_paused: item
-                .get("admission_paused")
-                .and_then(|v| v.as_bool().ok())
-                .copied()
-                .unwrap_or(false),
+                .get("admission_control")
+                .and_then(|v| v.as_s().ok())
+                .map(String::as_str)
+                == Some("paused"),
             last_action: str_attr("last_action"),
             last_action_by: str_attr("last_action_by"),
             last_action_at: str_attr("last_action_at"),
@@ -158,12 +158,17 @@ impl Store for DynamoStore {
         actor: &str,
         now_ms: u64,
     ) -> Result<(), StoreError> {
-        // Idempotency guard: stored admission_paused must equal `from`. When
-        // `from` is false, attribute_not_exists covers the never-paused default.
-        let paused_guard = if from {
-            "admission_paused = :from"
+        // Idempotency guard on the stored admission_control (ADR-0019): the
+        // toggle is legal only from the expected prior value. `open` is the
+        // default, so attribute_not_exists covers a never-written row.
+        let (from_str, to_str) = (
+            if from { "paused" } else { "open" },
+            if to { "paused" } else { "open" },
+        );
+        let control_guard = if from {
+            "admission_control = :from"
         } else {
-            "(attribute_not_exists(admission_paused) OR admission_paused = :from)"
+            "(attribute_not_exists(admission_control) OR admission_control = :from)"
         };
         let cutoff = now_ms.saturating_sub(crate::DEBOUNCE_MS).to_string();
         let mut req = self
@@ -172,13 +177,13 @@ impl Store for DynamoStore {
             .table_name(&self.counters_table)
             .key("event_id", AttributeValue::S(event_id.to_owned()))
             .update_expression(
-                "SET admission_paused = :to, last_action = :a, last_action_by = :by, \
+                "SET admission_control = :to, last_action = :a, last_action_by = :by, \
                  last_action_at = :at, last_action_epoch_ms = :ms",
             )
-            .expression_attribute_values(":to", AttributeValue::Bool(to))
-            .expression_attribute_values(":from", AttributeValue::Bool(from))
+            .expression_attribute_values(":to", AttributeValue::S(to_str.to_owned()))
+            .expression_attribute_values(":from", AttributeValue::S(from_str.to_owned()))
             .condition_expression(format!(
-                "{paused_guard} AND (attribute_not_exists(last_action_epoch_ms) \
+                "{control_guard} AND (attribute_not_exists(last_action_epoch_ms) \
                  OR last_action_epoch_ms < :cutoff)"
             ))
             .expression_attribute_values(":cutoff", AttributeValue::N(cutoff));

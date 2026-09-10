@@ -3,13 +3,22 @@
 //! they run without AWS; the handler fetches the items and calls these.
 
 use serde::Serialize;
-use wr_domain::{Assignment, Counters, Phase, PreQueueItem, SHARDS, SealedOffsets, Seed, prp};
+#[cfg(test)]
+use wr_domain::AdmissionControl;
+use wr_domain::{
+    Assignment, Counters, Phase, PreQueueItem, SHARDS, SealedOffsets, Seed, ServingState, prp,
+    serving_state,
+};
 
 /// The `/status` payload — one document the countdown and queue pages poll.
 /// Seal outputs appear only once the event is active.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StatusResponse {
     pub phase: Phase,
+    /// The visitor-facing serving state (ADR-0019): what an arriving visitor
+    /// experiences right now. Derived from the phase and the operator's
+    /// admission control. This is the authoritative visitor-facing signal.
+    pub serving_state: ServingState,
     pub serving_position: u64,
     /// Present once sealed: the cohort size.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -21,10 +30,6 @@ pub struct StatusResponse {
     /// Operator broadcast text for the waiting page. Absent when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
-    /// Andon cord (ADR-0017): true while admission is paused. The waiting page
-    /// tells visitors they keep their place. Always present so the page can
-    /// clear the notice on resume.
-    pub admission_paused: bool,
 }
 
 /// A resolved `/queue_num` response.
@@ -41,11 +46,11 @@ pub struct QueueNumResponse {
 pub fn status(counters: &Counters) -> StatusResponse {
     StatusResponse {
         phase: counters.phase,
+        serving_state: serving_state(counters.phase, counters.admission_control),
         serving_position: counters.serving_counter,
         participant_count: counters.participant_count,
         prequeue_offsets: counters.prequeue_offsets,
         message: counters.message.clone(),
-        admission_paused: counters.admission_paused,
     }
 }
 
@@ -132,7 +137,7 @@ mod tests {
             participant_count: Some(sealed.participant_count()),
             prequeue_offsets: Some(offsets),
             message: None,
-            admission_paused: false,
+            admission_control: AdmissionControl::Open,
         }
     }
 
@@ -157,7 +162,7 @@ mod tests {
             participant_count: None,
             prequeue_offsets: None,
             message: None,
-            admission_paused: false,
+            admission_control: AdmissionControl::Open,
         };
         let json = serde_json::to_value(status(&counters)).unwrap();
         assert_eq!(json["phase"], "pre_queue");
@@ -191,16 +196,33 @@ mod tests {
     }
 
     #[test]
-    fn status_surfaces_admission_paused() {
+    fn status_publishes_serving_state() {
+        // Active event -> running; pause it -> paused; fail-open -> fail_open.
         let mut counters = sealed_counters([1; SHARDS], [7u8; 32]);
         assert_eq!(
-            serde_json::to_value(status(&counters)).unwrap()["admission_paused"],
-            false
+            serde_json::to_value(status(&counters)).unwrap()["serving_state"],
+            "running"
         );
-        counters.admission_paused = true;
+        counters.admission_control = AdmissionControl::Paused;
         assert_eq!(
-            serde_json::to_value(status(&counters)).unwrap()["admission_paused"],
-            true
+            serde_json::to_value(status(&counters)).unwrap()["serving_state"],
+            "paused"
+        );
+        counters.admission_control = AdmissionControl::FailOpen;
+        assert_eq!(
+            serde_json::to_value(status(&counters)).unwrap()["serving_state"],
+            "fail_open"
+        );
+    }
+
+    #[test]
+    fn status_serving_state_is_closed_before_active() {
+        // An idle event with open admission reads Closed to a visitor.
+        let mut counters = sealed_counters([1; SHARDS], [7u8; 32]);
+        counters.phase = Phase::Idle;
+        assert_eq!(
+            serde_json::to_value(status(&counters)).unwrap()["serving_state"],
+            "closed"
         );
     }
 
@@ -216,7 +238,7 @@ mod tests {
             participant_count: None,
             prequeue_offsets: None,
             message: None,
-            admission_paused: false,
+            admission_control: AdmissionControl::Open,
         };
         assert_eq!(
             queue_num(&counters, &row(0, 0)),
