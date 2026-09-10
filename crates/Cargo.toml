@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["wr-permutation", "wr-domain", "assign_position", "seal_event", "read", "admin"]
+members = ["wr-permutation", "wr-domain", "wr-crypto", "assign_position", "seal_event", "read", "admin"]
 
 [workspace.package]
 edition = "2024"
@@ -11,6 +11,7 @@ repository = "https://github.com/smoketurner/virtual-waiting-room"
 [workspace.dependencies]
 wr-permutation = { path = "wr-permutation", version = "=0.1.0" }
 wr-domain = { path = "wr-domain", version = "=0.1.0" }
+wr-crypto = { path = "wr-crypto", version = "=0.1.0" }
 
 # Exact version pins only, default features disabled on everything; each member
 # crate opts into exactly the features it uses (conventions.md).

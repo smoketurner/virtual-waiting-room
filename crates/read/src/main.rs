@@ -150,6 +150,11 @@ fn counters_from_item(
         *slot = num(&format!("prequeue_counter#{shard}")).unwrap_or(0);
     }
 
+    let mut arrivals = [0u64; SHARDS];
+    for (shard, slot) in arrivals.iter_mut().enumerate() {
+        *slot = num(&format!("arrivals#{shard}")).unwrap_or(0);
+    }
+
     let shuffle_seed = item
         .get("shuffle_seed")
         .and_then(|v| v.as_b().ok())
@@ -178,6 +183,7 @@ fn counters_from_item(
         queue_counter: num("queue_counter").unwrap_or(0),
         serving_counter: num("serving_counter").unwrap_or(0),
         prequeue_counts,
+        arrivals,
         shuffle_seed,
         participant_count: num("participant_count"),
         prequeue_offsets,

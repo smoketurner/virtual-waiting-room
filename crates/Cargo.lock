@@ -3699,6 +3699,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
+name = "wr-crypto"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "proptest",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "wr-domain"
 version = "0.1.0"
 dependencies = [
