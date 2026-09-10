@@ -1,8 +1,10 @@
 # ADR-0021: Move the gate to a CloudFront Function
 
-**Status:** Proposed — spike complete. Every measurement that could have invalidated the approach
-has been taken and none did. The remaining items in §5 are design decisions, not unknowns: this is
-ready to be Accepted.
+**Status:** Accepted. The spike measured everything that could have invalidated the approach and
+none of it did: the runtime verifies an unchanged `wr_common::crypto` credential, the gate fits in
+4,759 of 10,240 bytes, the hot path costs 11 of 100 compute utilization, and a configuration change
+reaches an edge in a median of 31 seconds. What remains in §5 are design decisions — what trips
+fail-open, and which revocation design — not open questions about feasibility.
 
 **Supersedes if accepted:** [ADR-0020](0020-cloudfront-signed-cookie-gate.md) entirely. It does
 **not** restore [ADR-0009](0009-fail-open.md) on its own — see §5.1.

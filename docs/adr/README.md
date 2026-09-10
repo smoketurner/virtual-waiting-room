@@ -25,7 +25,7 @@ One record per decision. Each states the context, the decision, and its conseque
 | [0018](0018-admin-vouch-design-language.md) | Style the admin UI with the Vouch design language (supersedes 0014's styling) |
 | [0019](0019-visitor-facing-serving-state.md) | Express the visitor-facing serving state as one enum |
 | [0020](0020-cloudfront-signed-cookie-gate.md) | Gate the protected origin with CloudFront signed cookies |
-| [0021](0021-edge-function-gate.md) | Move the gate to a CloudFront Function — **Proposed**, pending four measurements |
+| [0021](0021-edge-function-gate.md) | Move the gate to a CloudFront Function (supersedes 0020) |
 | [0022](0022-durable-controller-cadence.md) | Build the controller's 10-second cadence from durable waits |
 
 ## Open

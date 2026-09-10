@@ -1,5 +1,14 @@
 # ADR-0022: Build the controller's 10-second cadence from durable waits
 
+> **Not yet delivering this in the deployed stack.** The durable configuration is applied and the
+> code uses `ctx.wait`, but `vwr-dev-controller` bills ~50 seconds per invocation: all six passes
+> run under one RequestId, so the waits are not suspending. The cause is the schedule, not this
+> decision — EventBridge Scheduler's templated Lambda target invokes synchronously, and a
+> synchronous durable invocation is held open for the whole execution. The target ARN is also
+> unqualified, which the durable functions documentation forbids. Tracked and diagnosed in
+> [#76](https://github.com/smoketurner/virtual-waiting-room/issues/76); the reasoning below stands
+> once that is fixed.
+
 **Status:** Accepted. The SDK it depends on is an experimental preview (§5).
 
 ## 1. Context
