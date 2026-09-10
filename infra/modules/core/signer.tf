@@ -81,8 +81,8 @@ resource "aws_lambda_function" "generate_token" {
   timeout       = 10
   memory_size   = 256
 
-  filename         = local.generate_token_zip
-  source_code_hash = local.generate_token_hash
+  filename         = local.lambda_zip["generate_token"]
+  source_code_hash = local.lambda_hash["generate_token"]
 
   environment {
     variables = merge(local.dynamo_lambda_env, {

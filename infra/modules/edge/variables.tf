@@ -40,11 +40,10 @@ variable "demo_origin_access_control_id" {
 }
 
 # --- Caching (ADR-0013, DESIGN §8) --------------------------------------------
-# Three behaviours: polled (Min TTL > 0, zero cookies forwarded so CloudFront
-# collapses simultaneous misses into one origin fetch), write (uncached), and
-# the protected default (uncached, session cookie forwarded to origin). Per-
-# endpoint cache keys differ (DESIGN §8): /status = path only; /queue_num &
-# /queue_pos_expiry = path + event_id + request_id; /public_key = path + event_id.
+# Polled behaviours use Min TTL > 0 and forward zero cookies, so CloudFront
+# collapses simultaneous misses into one origin fetch. Cache keys differ per
+# endpoint: /status is keyed on path alone; /queue_num adds event_id and
+# request_id because its answer is per visitor.
 
 variable "polled_min_ttl_seconds" {
   description = "Min TTL for the polled cache policies. Must be > 0 or CloudFront disables request collapsing and every poll hits origin (ADR-0013)."

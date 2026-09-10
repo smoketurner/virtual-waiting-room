@@ -38,10 +38,8 @@ locals {
   # the cache policy each uses. Grouped by cache key (DESIGN §8):
   #   status  - key is path only
   #   keyed   - key adds event_id + request_id (per-visitor answers)
-  #   pubkey  - key adds event_id only
   polled_status_path = "/v1/status"
-  polled_keyed_paths = ["/v1/queue_num", "/v1/queue_pos_expiry"]
-  polled_pubkey_path = "/v1/public_key"
+  polled_keyed_paths = ["/v1/queue_num"]
 
   # Uncached write behaviour path patterns: ingest and token minting.
   write_paths = ["/v1/join", "/v1/generate_token"]

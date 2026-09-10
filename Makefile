@@ -2,8 +2,9 @@
 #
 # The Terraform root is infra/environments/dev. `build` cross-compiles the Rust
 # Lambdas with cargo-lambda, which writes a ready-to-deploy zip per function at
-# $(ARTIFACTS)/<crate>/bootstrap.zip; plan/apply pass those zip paths as vars and
-# Terraform deploys them directly (no re-zip).
+# $(ARTIFACTS)/<crate>/bootstrap.zip, which the Terraform root reads from a fixed
+# path per crate and deploys directly (no re-zip). plan and apply build first,
+# because every function is required and there is no stub to fall back to.
 #
 # Usage:
 #   make build                 # cross-compile every function to a zip
@@ -13,8 +14,7 @@
 #
 # Deployment config (region, aws_profile, event_id, lambda_architecture,
 # seal_start_time) lives in infra/environments/dev/terraform.tfvars and is
-# authoritative — this Makefile does not pass those as -var (which would override
-# the file). Only the built artifact paths are passed.
+# authoritative — this Makefile passes no -var, which would override the file.
 
 SHELL       := /usr/bin/env bash
 .SHELLFLAGS := -eu -o pipefail -c
@@ -43,9 +43,8 @@ endif
 # --output-format zip invocation would collide them under one dir). Each
 # per-crate build writes $(ARTIFACTS)/<crate>/bootstrap/bootstrap.zip.
 #
-# controller and authorizer are built here but deploy only when their enable_*
-# variable is set: the controller needs a schedule to fire it, and the authorizer
-# is attached at the customer's origin rather than to anything in this account.
+# The authorizer is built and deployed like the rest, but nothing in this
+# account invokes it: it attaches at the customer's own origin.
 LAMBDA_CRATES := assign_position seal_event read admin controller authorizer generate_token
 
 ASSIGN_ARTIFACT     := $(ARTIFACTS)/assign_position/bootstrap/bootstrap.zip
@@ -55,14 +54,6 @@ ADMIN_ARTIFACT      := $(ARTIFACTS)/admin/bootstrap/bootstrap.zip
 CONTROLLER_ARTIFACT := $(ARTIFACTS)/controller/bootstrap/bootstrap.zip
 AUTHORIZER_ARTIFACT := $(ARTIFACTS)/authorizer/bootstrap/bootstrap.zip
 TOKEN_ARTIFACT      := $(ARTIFACTS)/generate_token/bootstrap/bootstrap.zip
-
-# All Terraform config — region, aws_profile, event_id, lambda_architecture,
-# seal_start_time, and the *_artifact_path values — lives in
-# infra/environments/dev/terraform.tfvars, which Terraform auto-loads from the
-# -chdir root and is the single source of truth. This Makefile passes no -var:
-# a command-line -var would override the file. See example.tfvars for the shape;
-# the artifact paths are the deterministic build outputs
-# (.artifacts/<crate>/bootstrap/bootstrap.zip), empty/unset -> placeholder Lambda.
 
 .PHONY: help build init plan apply destroy fmt validate clean
 
@@ -81,7 +72,7 @@ build: ## Cross-compile every Lambda to a zip under .artifacts/<crate>/.
 init: ## terraform init (safe, idempotent).
 	terraform -chdir=$(ENV_DIR) init -input=false
 
-plan: init ## terraform plan (config + artifact paths from terraform.tfvars).
+plan: build init ## Build the Lambdas then terraform plan.
 	terraform -chdir=$(ENV_DIR) plan -input=false
 
 apply: build init ## Build the Lambdas then terraform apply (needs AWS credentials).
@@ -93,8 +84,8 @@ destroy: init ## Tear the stack down (Terraform prompts for confirmation).
 fmt: ## terraform fmt across the infra tree.
 	terraform -chdir=$(ROOT)/infra fmt -recursive
 
-validate: init ## terraform validate the dev root.
+validate: build init ## Build the Lambdas then terraform validate the dev root.
 	terraform -chdir=$(ENV_DIR) validate
 
 clean: ## Remove staged Lambda artifacts.
-	rm -rf $(ARTIFACTS)
+	rm -rf -- $(ARTIFACTS)

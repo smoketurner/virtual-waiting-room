@@ -62,9 +62,8 @@ variable "origin_arn" {
 }
 
 variable "lambda_artifact_path" {
-  description = "Path to the built authorizer Lambda bootstrap zip (provided.al2023, arm64). Empty until the Rust crate is built (Phase 1/2)."
+  description = "Path to the built authorizer Lambda bootstrap zip (provided.al2023, arm64)."
   type        = string
-  default     = ""
 }
 
 variable "lambda_memory_size" {

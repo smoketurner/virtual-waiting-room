@@ -45,46 +45,6 @@ variable "client_origin_domain_name" {
   }
 }
 
-# --- Rust Lambda artifacts ----------------------------------------------------
-# Point these at the built bootstrap binaries to deploy the real functions.
-# Empty leaves each as the vendored placeholder (and the join ESM disabled).
-
-variable "assign_position_artifact_path" {
-  description = "Path to the built assign_position bootstrap binary."
-  type        = string
-  default     = ""
-}
-
-variable "seal_event_artifact_path" {
-  description = "Path to the built seal_event bootstrap binary."
-  type        = string
-  default     = ""
-}
-
-variable "read_artifact_path" {
-  description = "Path to the built read bootstrap binary."
-  type        = string
-  default     = ""
-}
-
-variable "admin_artifact_path" {
-  description = "Path to the built admin bootstrap binary."
-  type        = string
-  default     = ""
-}
-
-variable "controller_artifact_path" {
-  description = "Path to the built controller bootstrap binary. Supplying it also creates the schedule that meters admission and expires positions; empty leaves the controller on the placeholder and unscheduled."
-  type        = string
-  default     = ""
-}
-
-variable "generate_token_artifact_path" {
-  description = "Path to the built generate_token bootstrap binary. It mints the CloudFront admission cookies that let an admitted visitor reach the origin; empty leaves the endpoint on the placeholder and nobody can be admitted."
-  type        = string
-  default     = ""
-}
-
 variable "lambda_architecture" {
   description = "Lambda CPU architecture for every function: arm64 or x86_64. Must match the built artifacts."
   type        = string
@@ -100,12 +60,6 @@ variable "lambda_architecture" {
 #
 # The whole origin is protected. Narrowing that is a per-deployment decision made
 # at the origin, and defaulting to "gate everything" fails safe.
-
-variable "authorizer_artifact_path" {
-  description = "Path to the built authorizer bootstrap binary. Supplying it creates the function; empty creates only the execution role."
-  type        = string
-  default     = ""
-}
 
 variable "event_id" {
   description = "The single event id this MVP deployment serves."

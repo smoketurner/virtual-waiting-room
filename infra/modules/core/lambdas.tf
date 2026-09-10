@@ -6,8 +6,7 @@
 #   read        serves GET /v1/status and /v1/queue_num over API Gateway; the
 #               route wiring lives in api.tf.
 #
-# Both fall back to the shared placeholder until their artifact path is set, so
-# the plane can be created before the crates are built.
+# Every function deploys its own build; there is no stub fallback.
 
 # --- seal_event ---------------------------------------------------------------
 
@@ -32,8 +31,8 @@ resource "aws_lambda_function" "seal_event" {
   timeout       = 30
   memory_size   = 256
 
-  filename         = local.seal_event_zip
-  source_code_hash = local.seal_event_hash
+  filename         = local.lambda_zip["seal_event"]
+  source_code_hash = local.lambda_hash["seal_event"]
 
   environment {
     variables = merge(local.dynamo_lambda_env, {
@@ -67,8 +66,8 @@ resource "aws_lambda_function" "read" {
   timeout       = 10
   memory_size   = 256
 
-  filename         = local.read_zip
-  source_code_hash = local.read_hash
+  filename         = local.lambda_zip["read"]
+  source_code_hash = local.lambda_hash["read"]
 
   environment {
     variables = merge(local.dynamo_lambda_env, {
@@ -114,8 +113,8 @@ resource "aws_lambda_function" "admin" {
   timeout       = 10
   memory_size   = 256
 
-  filename         = local.admin_zip
-  source_code_hash = local.admin_hash
+  filename         = local.lambda_zip["admin"]
+  source_code_hash = local.lambda_hash["admin"]
 
   environment {
     variables = merge(local.dynamo_lambda_env, {
@@ -200,7 +199,7 @@ resource "aws_iam_role_policy" "seal_scheduler" {
 # The closed-loop outflow controller. It advances
 # serving_counter to meter admission against the operator's target rate while
 # compensating for no-shows, and expires positions past expires_at. Falls back
-# to the placeholder until its artifact is supplied.
+# from its own build.
 
 resource "aws_iam_role" "controller" {
   name               = "${local.controller_name}-role"
@@ -225,8 +224,8 @@ resource "aws_lambda_function" "controller" {
   timeout     = 90
   memory_size = 256
 
-  filename         = local.controller_zip
-  source_code_hash = local.controller_hash
+  filename         = local.lambda_zip["controller"]
+  source_code_hash = local.lambda_hash["controller"]
 
   environment {
     variables = merge(local.dynamo_lambda_env, {
@@ -241,12 +240,12 @@ resource "aws_lambda_function" "controller" {
 
 # --- controller schedule (EventBridge Scheduler) ------------------------------
 # The design cadence is 10s, but the Scheduler rate() minimum is 1 minute, so
-# the schedule fires every minute and each invoke runs six 10s passes. Off by
-# default; enabled ahead of an event via enable_controller.
+# the schedule fires every minute and each invoke runs six 10s passes. Always
+# created: a deployed controller nothing fires means the queue forms and never
+# drains, and an idle pass is one GetItem that returns early unless the event is
+# active and admitting.
 
 resource "aws_scheduler_schedule" "controller" {
-  count = var.enable_controller ? 1 : 0
-
   name = "${var.name_prefix}-controller"
 
   flexible_time_window {
@@ -258,22 +257,20 @@ resource "aws_scheduler_schedule" "controller" {
 
   target {
     arn      = aws_lambda_function.controller.arn
-    role_arn = aws_iam_role.controller_scheduler[0].arn
+    role_arn = aws_iam_role.controller_scheduler.arn
     input    = jsonencode({ event_id = var.event_id })
   }
 }
 
 resource "aws_iam_role" "controller_scheduler" {
-  count              = var.enable_controller ? 1 : 0
   name               = "${var.name_prefix}-controller-scheduler-role"
   assume_role_policy = data.aws_iam_policy_document.scheduler_assume_role.json
   tags               = var.tags
 }
 
 resource "aws_iam_role_policy" "controller_scheduler" {
-  count = var.enable_controller ? 1 : 0
-  name  = "${var.name_prefix}-controller-scheduler-policy"
-  role  = aws_iam_role.controller_scheduler[0].id
+  name = "${var.name_prefix}-controller-scheduler-policy"
+  role = aws_iam_role.controller_scheduler.id
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{

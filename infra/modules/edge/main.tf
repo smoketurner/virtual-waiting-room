@@ -1,11 +1,11 @@
 # modules/edge - CloudFront distribution with three cache behaviours (ADR-0013).
 #
-#   Polled   (/v1/status, /v1/queue_num, /v1/queue_pos_expiry, /v1/public_key)
+#   Polled   (/v1/status, /v1/queue_num)
 #            Min TTL > 0, zero cookies forwarded -> CloudFront collapses
 #            concurrent misses into one origin fetch, so origin load is
-#            independent of waiter count (C4). Cache keys differ per endpoint
-#            (DESIGN §8), so the polled endpoints split across three cache
-#            policies keyed by path / +event_id+request_id / +event_id.
+#            independent of waiter count (C4). Cache keys differ per endpoint,
+#            so the two split across cache policies keyed by path and by
+#            path + event_id + request_id.
 #   Write    (/v1/join, /v1/generate_token) - uncached (managed CachingDisabled).
 #   Default  (/*) - the protected origin: uncached, session cookie forwarded.
 #
@@ -55,31 +55,6 @@ resource "aws_cloudfront_cache_policy" "polled_keyed" {
       query_string_behavior = "whitelist"
       query_strings {
         items = ["event_id", "request_id"]
-      }
-    }
-    enable_accept_encoding_gzip   = true
-    enable_accept_encoding_brotli = true
-  }
-}
-
-resource "aws_cloudfront_cache_policy" "polled_pubkey" {
-  name        = "${var.name_prefix}-polled-pubkey"
-  comment     = "Polled /public_key: cache key adds event_id, no cookies."
-  min_ttl     = var.polled_min_ttl_seconds
-  default_ttl = local.polled_default_ttl
-  max_ttl     = local.polled_default_ttl
-
-  parameters_in_cache_key_and_forwarded_to_origin {
-    cookies_config {
-      cookie_behavior = "none"
-    }
-    headers_config {
-      header_behavior = "none"
-    }
-    query_strings_config {
-      query_string_behavior = "whitelist"
-      query_strings {
-        items = ["event_id"]
       }
     }
     enable_accept_encoding_gzip   = true
@@ -222,17 +197,6 @@ resource "aws_cloudfront_distribution" "this" {
       cache_policy_id        = aws_cloudfront_cache_policy.polled_keyed.id
       compress               = true
     }
-  }
-
-  # Polled: /public_key (cache key adds event_id).
-  ordered_cache_behavior {
-    path_pattern           = local.polled_pubkey_path
-    target_origin_id       = local.api_origin_id
-    viewer_protocol_policy = "redirect-to-https"
-    allowed_methods        = ["GET", "HEAD", "OPTIONS"]
-    cached_methods         = ["GET", "HEAD"]
-    cache_policy_id        = aws_cloudfront_cache_policy.polled_pubkey.id
-    compress               = true
   }
 
   # Write: /join, /generate_token (uncached).

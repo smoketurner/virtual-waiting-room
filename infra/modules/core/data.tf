@@ -7,19 +7,6 @@ data "aws_region" "current" {}
 
 data "aws_partition" "current" {}
 
-# Placeholder Lambda artifact. Always built: the token-minting and admin API
-# endpoints in api.tf are still fronted by it until those crates land, and each
-# real function falls back to it when its artifact path is empty. The vendored
-# source is a raw bootstrap binary, so Terraform zips it here; the real function
-# artifacts are already zips produced by `cargo lambda build --output-format
-# zip`, referenced directly (see locals), so they need no archive_file.
-data "archive_file" "placeholder" {
-  count       = 1
-  type        = "zip"
-  source_file = "${path.module}/placeholder-lambda/bootstrap"
-  output_path = "${path.module}/placeholder-lambda/placeholder.zip"
-}
-
 # Trust policy for the assign_position Lambda execution role.
 data "aws_iam_policy_document" "lambda_assume_role" {
   statement {

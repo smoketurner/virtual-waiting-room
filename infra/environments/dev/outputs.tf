@@ -48,13 +48,9 @@ output "controller_function_name" {
   value       = module.core.controller_function_name
 }
 
-output "controller_scheduled" {
-  description = "True when the controller is a real build and its schedule exists, so admission is being metered and positions expire. False means the queue forms and never drains."
-  value       = var.controller_artifact_path != ""
-}
 
 output "authorizer_function_arn" {
-  description = "ARN of the origin authorizer Lambda, or null until its artifact is built. Attach this at the protected origin: it is invoked with the ALB / API Gateway request shape and answers 200 to serve the request or 302 to send the visitor to wait."
+  description = "ARN of the origin authorizer Lambda. Attach it at a protected origin you control: it is invoked with the ALB / API Gateway request shape and answers 200 to serve or 302 to send the visitor to wait."
   value       = module.authorizer.authorizer_function_arn
 }
 

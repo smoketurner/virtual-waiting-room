@@ -42,45 +42,39 @@ variable "warm_throughput_read_units" {
   }
 }
 
-# --- Lambda artifacts (DESIGN §2.2, §5.3, §6) ---------------------------------
-# Each function is a Rust bootstrap zip. An empty path falls back to the vendored
-# placeholder so the plane can be created before the crates are built. The join
-# event-source mapping stays DISABLED whenever assign_position is a placeholder.
+# --- Lambda artifacts ---------------------------------------------------------
+# Each function is a Rust bootstrap zip produced by `make build`. All are
+# required: there is no stub fallback, so a stack cannot come up looking
+# deployed while serving nobody.
 
 variable "assign_position_artifact_path" {
-  description = "Path to the assign_position Lambda bootstrap zip. Empty = vendored placeholder (join ESM stays disabled)."
+  description = "Path to the assign_position Lambda bootstrap zip (the SQS live-join consumer)."
   type        = string
-  default     = ""
 }
 
 variable "seal_event_artifact_path" {
-  description = "Path to the seal_event Lambda bootstrap zip. Empty = vendored placeholder."
+  description = "Path to the seal_event Lambda bootstrap zip."
   type        = string
-  default     = ""
 }
 
 variable "read_artifact_path" {
-  description = "Path to the read Lambda bootstrap zip (serves /v1/status and /v1/queue_num). Empty = vendored placeholder."
+  description = "Path to the read Lambda bootstrap zip (serves /v1/status and /v1/queue_num)."
   type        = string
-  default     = ""
 }
 
 variable "admin_artifact_path" {
-  description = "Path to the admin Lambda bootstrap zip (SigV4 /admin control plane). Empty = vendored placeholder."
+  description = "Path to the admin Lambda bootstrap zip (the OIDC-gated operator control plane)."
   type        = string
-  default     = ""
 }
 
 variable "controller_artifact_path" {
-  description = "Path to the controller Lambda bootstrap zip (10s outflow controller). Empty = vendored placeholder."
+  description = "Path to the controller Lambda bootstrap zip (meters admission, expires positions)."
   type        = string
-  default     = ""
 }
 
 variable "generate_token_artifact_path" {
-  description = "Path to the generate_token Lambda bootstrap zip. It mints the CloudFront admission cookies and is the only writer of the arrivals counters. Empty = vendored placeholder."
+  description = "Path to the generate_token Lambda bootstrap zip (mints admission cookies, records arrivals)."
   type        = string
-  default     = ""
 }
 
 variable "admission_cookie_ttl_seconds" {
@@ -94,11 +88,6 @@ variable "admission_cookie_ttl_seconds" {
   }
 }
 
-variable "enable_controller" {
-  description = "Create the recurring controller schedule (rate(1 minute), six 10s passes per invoke). Off by default; enable ahead of an event so admission is metered and positions expire."
-  type        = bool
-  default     = false
-}
 
 variable "lambda_architecture" {
   description = "Lambda CPU architecture for every function: arm64 (design default) or x86_64. Must match the built artifacts."

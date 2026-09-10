@@ -14,21 +14,16 @@ module "core" {
   warm_throughput_write_units = var.warm_throughput_write_units
   warm_throughput_read_units  = var.warm_throughput_read_units
 
-  # Rust Lambda artifacts. Empty = vendored placeholder; set these to the built
-  # bootstrap zips to deploy the real functions and enable the join ESM.
-  assign_position_artifact_path = var.assign_position_artifact_path
-  seal_event_artifact_path      = var.seal_event_artifact_path
-  read_artifact_path            = var.read_artifact_path
-  admin_artifact_path           = var.admin_artifact_path
-  controller_artifact_path      = var.controller_artifact_path
-  # Schedule the controller whenever a real one is deployed, the same way the
-  # join event-source mapping follows assign_position. A deployed controller that
-  # nothing fires means the queue forms and never drains, and the schedule costs
-  # a GetItem every ten seconds while the event is idle.
-  enable_controller   = var.controller_artifact_path != ""
-  lambda_architecture = var.lambda_architecture
-  event_id            = var.event_id
-  seal_start_time     = var.seal_start_time
+  # Rust Lambda artifacts, built by `make build` to a fixed path per crate.
+  assign_position_artifact_path = local.artifact["assign_position"]
+  seal_event_artifact_path      = local.artifact["seal_event"]
+  read_artifact_path            = local.artifact["read"]
+  admin_artifact_path           = local.artifact["admin"]
+  controller_artifact_path      = local.artifact["controller"]
+  generate_token_artifact_path  = local.artifact["generate_token"]
+  lambda_architecture           = var.lambda_architecture
+  event_id                      = var.event_id
+  seal_start_time               = var.seal_start_time
 
   # Admin OIDC login (ADR-0016). Secret is an SSM SecureString written out of band.
   oidc_issuer         = var.oidc_issuer
@@ -94,5 +89,5 @@ module "authorizer" {
   tokens_table_arn           = module.core.table_arns.tokens
   event_id                   = var.event_id
   waiting_room_url           = local.waiting_room_url
-  lambda_artifact_path       = var.authorizer_artifact_path
+  lambda_artifact_path       = local.artifact["authorizer"]
 }

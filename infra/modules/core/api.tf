@@ -3,53 +3,9 @@
 # stage/deployment.
 #
 # /join lives in main.tf: it integrates DIRECTLY with SQS (no Lambda). Every
-# OTHER endpoint is fronted by a Lambda. Those Rust handlers are not built yet,
-# so all Lambda-fronted endpoints share ONE placeholder function via AWS_PROXY
-# until the real crates land (read handlers, generate_token, admin). Swapping in
-# the real functions is a later step; the API shape, stage, and auth model are
-# correct now.
-
-# --- Shared placeholder Lambda for the API-fronted endpoints ------------------
-
-resource "aws_iam_role" "api_placeholder" {
-  name               = "${var.name_prefix}-api-placeholder-role"
-  assume_role_policy = data.aws_iam_policy_document.lambda_assume_role.json
-  tags               = var.tags
-}
-
-resource "aws_iam_role_policy_attachment" "api_placeholder_logs" {
-  role       = aws_iam_role.api_placeholder.name
-  policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
-}
-
-resource "aws_lambda_function" "api_placeholder" {
-  function_name = "${var.name_prefix}-api-placeholder"
-  role          = aws_iam_role.api_placeholder.arn
-  runtime       = "provided.al2023"
-  architectures = [local.lambda_runtime_arch]
-  handler       = "bootstrap"
-  timeout       = 10
-  memory_size   = 256
-
-  filename         = data.archive_file.placeholder[0].output_path
-  source_code_hash = data.archive_file.placeholder[0].output_base64sha256
-
-  # The placeholder makes no AWS SDK calls, but carry the common env so every
-  # Lambda in the module is uniform (no "why is this one different" later).
-  environment {
-    variables = local.common_lambda_env
-  }
-
-  tags = var.tags
-}
-
-resource "aws_lambda_permission" "api_placeholder" {
-  statement_id  = "AllowAPIGatewayInvoke"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.api_placeholder.function_name
-  principal     = "apigateway.amazonaws.com"
-  source_arn    = "${aws_api_gateway_rest_api.this.execution_arn}/*/*"
-}
+# OTHER endpoint is fronted by the Lambda that implements it. An endpoint with
+# no implementation is not declared here: a route that answers from a stub is
+# indistinguishable from one that works until someone calls it.
 
 # --- Endpoint definitions -----------------------------------------------------
 # Public endpoints are PATH-VERSIONED under /v1 (the stage is the environment,
@@ -70,12 +26,9 @@ resource "aws_api_gateway_resource" "v1" {
 locals {
   api_endpoints = {
     # Public read under /v1 (DESIGN §8, F3.1) - /status is the one polled payload.
-    status           = { parent = "v1", path_part = "status", method = "GET", auth = "NONE" }
-    queue_num        = { parent = "v1", path_part = "queue_num", method = "GET", auth = "NONE", required_query = ["request_id"] }
-    queue_pos_expiry = { parent = "v1", path_part = "queue_pos_expiry", method = "GET", auth = "NONE", required_query = ["request_id"] }
-    public_key       = { parent = "v1", path_part = "public_key", method = "GET", auth = "NONE" }
-
-    # Public write under /v1 (F3.3) - single-use admission token.
+    status    = { parent = "v1", path_part = "status", method = "GET", auth = "NONE" }
+    queue_num = { parent = "v1", path_part = "queue_num", method = "GET", auth = "NONE", required_query = ["request_id"] }
+    # Public write under /v1: exchanges a reached position for admission cookies.
     generate_token = { parent = "v1", path_part = "generate_token", method = "POST", auth = "NONE" }
 
     # Admin control plane, unversioned. Auth is NONE at API Gateway because the
@@ -145,7 +98,7 @@ resource "aws_api_gateway_integration" "admin_proxy" {
   http_method             = aws_api_gateway_method.admin_proxy.http_method
   type                    = "AWS_PROXY"
   integration_http_method = "POST"
-  uri                     = local.admin_is_placeholder ? aws_lambda_function.api_placeholder.invoke_arn : aws_lambda_function.admin.invoke_arn
+  uri                     = aws_lambda_function.admin.invoke_arn
 }
 
 # Static assets (CSS) for the admin UI, served by the admin Lambda from its
@@ -176,7 +129,7 @@ resource "aws_api_gateway_integration" "static" {
   http_method             = aws_api_gateway_method.static_get.http_method
   type                    = "AWS_PROXY"
   integration_http_method = "POST"
-  uri                     = local.admin_is_placeholder ? aws_lambda_function.api_placeholder.invoke_arn : aws_lambda_function.admin.invoke_arn
+  uri                     = aws_lambda_function.admin.invoke_arn
 }
 
 locals {
@@ -215,15 +168,12 @@ resource "aws_api_gateway_integration" "endpoint" {
   http_method             = aws_api_gateway_method.endpoint[each.key].http_method
   type                    = "AWS_PROXY"
   integration_http_method = "POST"
-  # Route each endpoint to its backing Lambda: the read Lambda for the two
-  # public read endpoints, the admin Lambda for the OIDC-gated control plane
-  # (when its artifact is deployed), and the shared placeholder for everything
-  # else until its crate lands. Admin routing keys on the endpoint being an admin
-  # one, not on its auth type (auth is NONE — the Lambda enforces the session).
+  # Route each endpoint to its backing Lambda: the read Lambda for the public
+  # reads, generate_token for admission, and the admin Lambda for the OIDC-gated
+  # control plane. Admin routing keys on the endpoint being an admin one, not on
+  # its auth type (auth is NONE — the Lambda enforces the session).
   uri = contains(["status", "queue_num"], each.key) ? aws_lambda_function.read.invoke_arn : (
-    each.key == "generate_token" ? aws_lambda_function.generate_token.invoke_arn : (
-      local.is_admin_endpoint[each.key] && !local.admin_is_placeholder ? aws_lambda_function.admin.invoke_arn : aws_lambda_function.api_placeholder.invoke_arn
-    )
+    each.key == "generate_token" ? aws_lambda_function.generate_token.invoke_arn : aws_lambda_function.admin.invoke_arn
   )
 }
 
