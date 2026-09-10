@@ -186,14 +186,17 @@ pub fn transition_allowed(from: Phase, to: Phase) -> bool {
 /// like `idle -> active`.
 #[must_use]
 pub fn next_phases(from: Phase) -> Vec<Phase> {
-    use Phase::{Active, Idle, PostEvent, PreQueue};
+    use Phase::{Active, Idle, Maintenance, PostEvent, PreQueue};
     match from {
         Idle => vec![PreQueue],
         PreQueue => vec![Active],
         Active => vec![PostEvent],
-        // Terminal, or already halted: no forward step. Use Force maintenance
-        // or a new event.
-        PostEvent | Phase::Maintenance => vec![],
+        // Event over: no forward step; start a new event.
+        PostEvent => vec![],
+        // Maintenance is a recoverable stop, not a dead-end: offer a return to
+        // the running event or a reset to idle. `transition_allowed` permits
+        // maintenance -> anything, so both are legal.
+        Maintenance => vec![Active, Idle],
     }
 }
 
@@ -543,13 +546,22 @@ mod tests {
 
     #[test]
     fn next_phases_offers_only_the_single_forward_step() {
-        use Phase::{Active, Idle, Maintenance, PostEvent, PreQueue};
+        use Phase::{Active, Idle, PostEvent, PreQueue};
         assert_eq!(next_phases(Idle), vec![PreQueue]);
         assert_eq!(next_phases(PreQueue), vec![Active]);
         assert_eq!(next_phases(Active), vec![PostEvent]);
-        // Terminal / halted phases offer nothing (no idle -> active, no restart).
+        // Only the finished event is a dead end.
         assert_eq!(next_phases(PostEvent), Vec::<Phase>::new());
-        assert_eq!(next_phases(Maintenance), Vec::<Phase>::new());
+    }
+
+    #[test]
+    fn maintenance_is_recoverable_not_a_dead_end() {
+        use Phase::{Active, Idle, Maintenance};
+        // Force maintenance must be reversible from the UI: offer resume (active)
+        // and reset (idle), both of which transition_allowed permits.
+        assert_eq!(next_phases(Maintenance), vec![Active, Idle]);
+        assert!(transition_allowed(Maintenance, Active));
+        assert!(transition_allowed(Maintenance, Idle));
     }
 
     #[tokio::test]

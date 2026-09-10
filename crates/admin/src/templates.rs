@@ -30,6 +30,10 @@ pub struct Dashboard {
     /// Andon cord (ADR-0017): whether admission is currently paused, and a
     /// human "last changed by X at T" line for the audit trail.
     pub admission_paused: bool,
+    /// The visitor-facing serving state (ADR-0019), derived from phase + the
+    /// admission control. Human label for display: "Running" / "Paused" /
+    /// "Closed" / "Fail open".
+    pub serving_state: String,
     pub last_action_line: String,
     /// The phase transitions the operator may select right now (legal forward
     /// steps only). Empty when the event is in a terminal or halted phase.
@@ -58,6 +62,23 @@ impl Dashboard {
             target_rate: dash(state.target_rate.map(|n| n.to_string())),
             message: dash(state.message.clone()),
             admission_paused: state.admission_paused,
+            serving_state: {
+                use wr_domain::ServingState::{Closed, FailOpen, Paused, Running};
+                // Admin's ControlState still carries a bool; map it to the domain
+                // AdmissionControl. fail_open is not yet an admin control (post-MVP).
+                let control = if state.admission_paused {
+                    wr_domain::AdmissionControl::Paused
+                } else {
+                    wr_domain::AdmissionControl::Open
+                };
+                match wr_domain::serving_state(state.phase, control) {
+                    Running => "Running",
+                    Paused => "Paused",
+                    Closed => "Closed",
+                    FailOpen => "Fail open",
+                }
+                .to_owned()
+            },
             allowed_transitions: crate::next_phases(state.phase)
                 .into_iter()
                 .map(|p| PhaseOption {

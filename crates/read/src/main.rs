@@ -5,7 +5,7 @@ use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::types::AttributeValue;
 use lambda_http::{Body, Error, Request, RequestExt, Response, service_fn};
 use read::{QueueNumError, queue_num, status};
-use wr_domain::{Counters, Phase, PreQueueItem, SHARDS};
+use wr_domain::{AdmissionControl, Counters, Phase, PreQueueItem, SHARDS};
 
 struct Ctx {
     client: Client,
@@ -186,6 +186,16 @@ fn counters_from_item(
             .and_then(|v| v.as_s().ok())
             .filter(|s| !s.is_empty())
             .cloned(),
+        admission_control: match item
+            .get("admission_control")
+            .and_then(|v| v.as_s().ok())
+            .map(String::as_str)
+        {
+            Some("paused") => AdmissionControl::Paused,
+            Some("fail_open") => AdmissionControl::FailOpen,
+            // "open", missing, or unrecognized: normal admission.
+            _ => AdmissionControl::Open,
+        },
     }
 }
 
