@@ -35,9 +35,13 @@ variable "warm_throughput_read_units" {
 }
 
 variable "client_origin_domain_name" {
-  description = "Domain name of the client's protected origin (the CloudFront default behaviour). Empty means the edge/CloudFront module is not created - it cannot exist without a real origin."
+  description = "Bare domain name of the client's protected origin, used as the CloudFront default-behaviour origin (e.g. www.example.com). Required: a CloudFront origin cannot exist without one, and leaving it empty would silently tear the distribution down."
   type        = string
-  default     = ""
+
+  validation {
+    condition     = length(var.client_origin_domain_name) > 0 && !can(regex("://|/", var.client_origin_domain_name))
+    error_message = "client_origin_domain_name must be a non-empty bare domain (host only, no scheme and no path) - e.g. www.example.com, not https://www.example.com."
+  }
 }
 
 # --- Rust Lambda artifacts ----------------------------------------------------
