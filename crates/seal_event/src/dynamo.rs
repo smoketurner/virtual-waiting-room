@@ -31,12 +31,7 @@ impl Store for DynamoStore {
         // registration writes do not contend, which means the seal has to
         // gather them.
         let keys: Vec<_> = (0..SHARDS)
-            .map(|shard| {
-                std::collections::HashMap::from([(
-                    "event_id".to_owned(),
-                    AttributeValue::S(wr_common::expr::prequeue_shard_key(event_id, shard)),
-                )])
-            })
+            .map(|shard| wr_common::expr::prequeue_shard_key(event_id, shard))
             .collect();
 
         let request = aws_sdk_dynamodb::types::KeysAndAttributes::builder()
@@ -71,13 +66,9 @@ impl Store for DynamoStore {
             .map(Vec::as_slice)
             .unwrap_or_default()
         {
-            let Some(key) = item.get("event_id").and_then(|v| v.as_s().ok()) else {
-                continue;
-            };
-            // A shard that never took a registration has no item at all.
-            let Some(shard) =
-                (0..SHARDS).find(|&s| wr_common::expr::prequeue_shard_key(event_id, s) == *key)
-            else {
+            // The item says which shard it is, so a batch returned in arbitrary
+            // order needs no key parsing.
+            let Some(shard) = wr_common::expr::shard_index_of(item) else {
                 continue;
             };
             counts[shard] = item
@@ -100,10 +91,7 @@ impl Store for DynamoStore {
             .client
             .update_item()
             .table_name(&self.counters_table)
-            .key(
-                "event_id",
-                AttributeValue::S(wr_common::expr::event_key(event_id)),
-            )
+            .set_key(Some(wr_common::expr::event_key(event_id)))
             .update_expression(wr_common::expr::seal_update())
             .condition_expression(wr_common::expr::seal_guard())
             .expression_attribute_values(

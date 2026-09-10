@@ -57,10 +57,7 @@ impl Store for DynamoStore {
             .client
             .get_item()
             .table_name(&self.counters_table)
-            .key(
-                "event_id",
-                AttributeValue::S(wr_common::expr::event_key(event_id)),
-            )
+            .set_key(Some(wr_common::expr::event_key(event_id)))
             .consistent_read(true)
             .send()
             .await
@@ -127,10 +124,7 @@ impl Store for DynamoStore {
             .client
             .update_item()
             .table_name(&self.counters_table)
-            .key(
-                "event_id",
-                AttributeValue::S(wr_common::expr::event_key(event_id)),
-            )
+            .set_key(Some(wr_common::expr::event_key(event_id)))
             .update_expression(
                 "SET serving_counter = :next, last_serving_counter = :last_serving, \
                  last_arrivals_total = :arrivals_total, no_show_rate = :no_show",
@@ -266,10 +260,7 @@ impl Store for DynamoStore {
             .client
             .update_item()
             .table_name(&self.counters_table)
-            .key(
-                "event_id",
-                AttributeValue::S(wr_common::expr::event_key(event_id)),
-            )
+            .set_key(Some(wr_common::expr::event_key(event_id)))
             .update_expression("SET max_expired_position = :m")
             // Only ever move the cursor forward.
             .condition_expression(
@@ -301,12 +292,7 @@ impl DynamoStore {
     /// `BatchGetItem` rather than attributes already in hand.
     async fn read_arrivals(&self, event_id: &str) -> Result<[u64; SHARDS], StoreError> {
         let keys: Vec<_> = (0..SHARDS)
-            .map(|shard| {
-                std::collections::HashMap::from([(
-                    "event_id".to_owned(),
-                    AttributeValue::S(wr_common::expr::arrivals_shard_key(event_id, shard)),
-                )])
-            })
+            .map(|shard| wr_common::expr::arrivals_shard_key(event_id, shard))
             .collect();
 
         let request = aws_sdk_dynamodb::types::KeysAndAttributes::builder()
@@ -329,13 +315,9 @@ impl DynamoStore {
             .map(Vec::as_slice)
             .unwrap_or_default()
         {
-            let Some(key) = item.get("event_id").and_then(|v| v.as_s().ok()) else {
-                continue;
-            };
-            // A shard nobody has arrived on has no item; it stays zero.
-            let Some(shard) =
-                (0..SHARDS).find(|&s| wr_common::expr::arrivals_shard_key(event_id, s) == *key)
-            else {
+            // The item says which shard it is, so a batch returned in arbitrary
+            // order needs no key parsing.
+            let Some(shard) = wr_common::expr::shard_index_of(item) else {
                 continue;
             };
             arrivals[shard] = item

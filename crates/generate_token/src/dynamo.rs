@@ -42,10 +42,7 @@ impl Store for DynamoStore {
             // Consistent: a visitor polling for admission must not be told to
             // keep waiting because a replica lagged behind the controller.
             .consistent_read(true)
-            .key(
-                "event_id",
-                AttributeValue::S(wr_common::expr::event_key(event_id)),
-            )
+            .set_key(Some(wr_common::expr::event_key(event_id)))
             .send()
             .await
             .map_err(|e| StoreError(format!("get_item counters: {e}")))?;
@@ -94,12 +91,9 @@ impl Store for DynamoStore {
         self.client
             .update_item()
             .table_name(&self.counters_table)
-            .key(
-                "event_id",
-                AttributeValue::S(wr_common::expr::arrivals_shard_key(event_id, shard)),
-            )
+            .set_key(Some(wr_common::expr::arrivals_shard_key(event_id, shard)))
             .update_expression(wr_common::expr::increment_shard_update())
-            .expression_attribute_values(":one", AttributeValue::N("1".to_owned()))
+            .set_expression_attribute_values(Some(wr_common::expr::increment_shard_values(shard)))
             .send()
             .await
             .map_err(|e| StoreError(format!("update_item arrivals: {e}")))?;

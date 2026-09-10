@@ -11,7 +11,7 @@ use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::put_item::PutItemError;
 use aws_sdk_dynamodb::types::AttributeValue;
-use wr_common::expr::{arrivals_shard_key, increment_shard_update};
+use wr_common::expr::{arrivals_shard_key, increment_shard_update, increment_shard_values};
 
 /// A side-effect failure. The handler treats a failure to record an arrival as
 /// non-fatal (the visitor is still admitted; the controller tolerates a missed
@@ -65,12 +65,9 @@ impl Store for DynamoStore {
         self.client
             .update_item()
             .table_name(&self.counters_table)
-            .key(
-                "event_id",
-                AttributeValue::S(arrivals_shard_key(event_id, shard)),
-            )
+            .set_key(Some(arrivals_shard_key(event_id, shard)))
             .update_expression(increment_shard_update())
-            .expression_attribute_values(":one", AttributeValue::N("1".to_owned()))
+            .set_expression_attribute_values(Some(increment_shard_values(shard)))
             .send()
             .await
             .map_err(|e| StoreError::Backend(format!("record_arrival: {e}")))?;

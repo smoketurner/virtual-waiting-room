@@ -1,8 +1,25 @@
-//! `DynamoDB` update / condition expression fragments for the counter and
-//! position writes, kept in one place so the attribute names live beside the
-//! item shapes rather than scattered across handlers.
+//! `DynamoDB` keys, update expressions, and condition fragments, kept in one
+//! place so the key shape and the attribute names live beside the item shapes
+//! rather than scattered across handlers.
+//!
+//! The key builders return the complete primary key rather than a string or a
+//! bare value, so the key attribute's own name is written once too. Call sites
+//! pass the result straight to `set_key`, or to `BatchGetItem`, which takes
+//! exactly this type.
+
+use std::collections::HashMap;
+
+use aws_sdk_dynamodb::types::AttributeValue;
 
 use crate::permutation::SHARDS;
+
+/// The partition key attribute of the `Counters` table.
+const KEY_ATTR: &str = "event_id";
+
+/// The attribute a shard item records its own index in, so a reader that
+/// fetched a batch of shards knows which is which without taking the key apart
+/// again.
+pub const SHARD_INDEX_ATTR: &str = "s";
 
 /// The attribute a shard item holds its count in.
 ///
@@ -19,8 +36,16 @@ pub const SHARD_COUNT_ATTR: &str = "n";
 /// confused with the event id itself, and it keeps the key space
 /// self-describing if events ever share a table.
 #[must_use]
-pub fn event_key(event_id: &str) -> String {
-    format!("EVT#{event_id}")
+pub fn event_key(event_id: &str) -> HashMap<String, AttributeValue> {
+    key(format!("EVT#{event_id}"))
+}
+
+/// Wraps a key value as the complete primary key. Returning the whole key,
+/// rather than the string or a bare `AttributeValue`, means the attribute name
+/// is written once as well as the key shape — call sites pass this straight to
+/// `set_key` or to `BatchGetItem`.
+fn key(value: String) -> HashMap<String, AttributeValue> {
+    HashMap::from([(KEY_ATTR.to_owned(), AttributeValue::S(value))])
 }
 
 /// Partition key of one pre-queue registration shard.
@@ -36,9 +61,9 @@ pub fn event_key(event_id: &str) -> String {
 /// Panics if `shard >= SHARDS`; callers pick the shard with
 /// [`crate::permutation::shard_for`], which is always in range.
 #[must_use]
-pub fn prequeue_shard_key(event_id: &str, shard: usize) -> String {
+pub fn prequeue_shard_key(event_id: &str, shard: usize) -> HashMap<String, AttributeValue> {
     assert!(shard < SHARDS, "shard {shard} out of range 0..{SHARDS}");
-    format!("EVT#{event_id}#PQ#{shard}")
+    key(format!("EVT#{event_id}#PQ#{shard}"))
 }
 
 /// Partition key of one arrivals shard, incremented when a visitor claims
@@ -48,17 +73,57 @@ pub fn prequeue_shard_key(event_id: &str, shard: usize) -> String {
 ///
 /// Panics if `shard >= SHARDS`.
 #[must_use]
-pub fn arrivals_shard_key(event_id: &str, shard: usize) -> String {
+pub fn arrivals_shard_key(event_id: &str, shard: usize) -> HashMap<String, AttributeValue> {
     assert!(shard < SHARDS, "shard {shard} out of range 0..{SHARDS}");
-    format!("EVT#{event_id}#AR#{shard}")
+    key(format!("EVT#{event_id}#AR#{shard}"))
 }
 
-/// `ADD n :one` — adds one to a shard's count. With `ReturnValue::AllNew` the
-/// returned value is the count after the add, so a pre-queue registration's
-/// local index is `new - 1`.
+/// `SET s = :shard ADD n :one` — adds one to a shard's count and stamps which
+/// shard it is. With `ReturnValue::AllNew` the returned count is the value
+/// after the add, so a pre-queue registration's local index is `new - 1`.
 #[must_use]
 pub fn increment_shard_update() -> &'static str {
-    "ADD n :one"
+    "SET s = :shard ADD n :one"
+}
+
+/// The values [`increment_shard_update`] refers to.
+///
+/// Returned with the expression's placeholders already filled rather than left
+/// to the call site, because an expression naming a placeholder nothing binds
+/// compiles perfectly and fails only when it reaches `DynamoDB`.
+///
+/// # Panics
+///
+/// Panics if `shard >= SHARDS`.
+#[must_use]
+pub fn increment_shard_values(shard: usize) -> HashMap<String, AttributeValue> {
+    assert!(shard < SHARDS, "shard {shard} out of range 0..{SHARDS}");
+    HashMap::from([
+        (":one".to_owned(), AttributeValue::N("1".to_owned())),
+        (":shard".to_owned(), AttributeValue::N(shard.to_string())),
+    ])
+}
+
+/// Reads a shard item's own index, or `None` if it is missing or out of range.
+#[must_use]
+pub fn shard_index_of<S: std::hash::BuildHasher>(
+    item: &HashMap<String, AttributeValue, S>,
+) -> Option<usize> {
+    let shard = item
+        .get(SHARD_INDEX_ATTR)
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<usize>().ok())?;
+    (shard < SHARDS).then_some(shard)
+}
+
+/// Reads a shard item's count, defaulting to zero for a shard nothing has
+/// written yet.
+#[must_use]
+pub fn shard_count_of<S: std::hash::BuildHasher>(item: &HashMap<String, AttributeValue, S>) -> u64 {
+    item.get(SHARD_COUNT_ATTR)
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0)
 }
 
 /// `ADD queue_counter :n` — claims a contiguous block of `n` live-join
@@ -102,21 +167,60 @@ pub fn seal_guard() -> &'static str {
 mod tests {
     use super::*;
 
+    /// The single key value, for assertions.
+    fn key_string(k: &HashMap<String, AttributeValue>) -> String {
+        k.get(KEY_ATTR)
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_shard_item_reports_its_own_index() {
+        // Readers fetch shards in a batch and get them back in arbitrary order,
+        // so each item says which shard it is rather than having its key taken
+        // apart to find out.
+        let item = HashMap::from([
+            (
+                SHARD_INDEX_ATTR.to_owned(),
+                AttributeValue::N("7".to_owned()),
+            ),
+            (
+                SHARD_COUNT_ATTR.to_owned(),
+                AttributeValue::N("42".to_owned()),
+            ),
+        ]);
+        assert_eq!(shard_index_of(&item), Some(7));
+        assert_eq!(shard_count_of(&item), 42);
+
+        // Out of range or absent is None, never a wrong shard.
+        let bad = HashMap::from([(
+            SHARD_INDEX_ATTR.to_owned(),
+            AttributeValue::N(SHARDS.to_string()),
+        )]);
+        assert_eq!(shard_index_of(&bad), None);
+        assert_eq!(shard_index_of(&HashMap::new()), None);
+        // A shard nothing has written counts zero rather than failing.
+        assert_eq!(shard_count_of(&HashMap::new()), 0);
+    }
+
     #[test]
     fn shard_keys_are_distinct_partition_keys() {
         // The whole point: distinct KEYS, not distinct attributes on one item.
         // Ten attributes on a shared item share that item's 1,000 writes per
         // second; ten keys do not.
-        let keys: std::collections::BTreeSet<String> =
-            (0..SHARDS).map(|s| prequeue_shard_key("evt", s)).collect();
+        let keys: std::collections::BTreeSet<String> = (0..SHARDS)
+            .map(|s| key_string(&prequeue_shard_key("evt", s)))
+            .collect();
         assert_eq!(keys.len(), SHARDS);
         assert!(
             !keys.contains("evt"),
             "a shard must not collide with the Counters item"
         );
 
-        let arrivals: std::collections::BTreeSet<String> =
-            (0..SHARDS).map(|s| arrivals_shard_key("evt", s)).collect();
+        let arrivals: std::collections::BTreeSet<String> = (0..SHARDS)
+            .map(|s| key_string(&arrivals_shard_key("evt", s)))
+            .collect();
         assert_eq!(arrivals.len(), SHARDS);
         // The two counter families must not collide with each other either.
         assert!(keys.is_disjoint(&arrivals));
@@ -129,9 +233,9 @@ mod tests {
             prequeue_shard_key("evt-a", 3),
             prequeue_shard_key("evt-b", 3)
         );
-        assert_eq!(event_key("evt"), "EVT#evt");
-        assert_eq!(prequeue_shard_key("evt", 3), "EVT#evt#PQ#3");
-        assert_eq!(arrivals_shard_key("evt", 3), "EVT#evt#AR#3");
+        assert_eq!(key_string(&event_key("evt")), "EVT#evt");
+        assert_eq!(key_string(&prequeue_shard_key("evt", 3)), "EVT#evt#PQ#3");
+        assert_eq!(key_string(&arrivals_shard_key("evt", 3)), "EVT#evt#AR#3");
     }
 
     #[test]
@@ -156,11 +260,28 @@ mod tests {
     }
 
     #[test]
-    fn a_shard_increment_names_only_the_short_attribute() {
+    fn a_shard_increment_names_only_short_attributes() {
         // Attribute names are billed on every write, so the increment must not
-        // carry a long one.
-        assert_eq!(increment_shard_update(), "ADD n :one");
+        // carry long ones.
+        assert_eq!(increment_shard_update(), "SET s = :shard ADD n :one");
         assert_eq!(SHARD_COUNT_ATTR, "n");
+        assert_eq!(SHARD_INDEX_ATTR, "s");
+    }
+
+    #[test]
+    fn every_placeholder_in_the_increment_is_bound() {
+        // An expression referring to a placeholder nothing supplies is accepted
+        // by the compiler and rejected by DynamoDB at runtime, so the pairing
+        // is asserted here rather than discovered in a deploy.
+        let expression = increment_shard_update();
+        let values = increment_shard_values(3);
+        for placeholder in expression.split_whitespace().filter(|t| t.starts_with(':')) {
+            assert!(
+                values.contains_key(placeholder),
+                "{placeholder} is used but never bound"
+            );
+        }
+        assert_eq!(values[":shard"], AttributeValue::N("3".to_owned()));
     }
 
     #[test]

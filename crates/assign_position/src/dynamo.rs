@@ -37,10 +37,7 @@ impl Store for DynamoStore {
             .client
             .update_item()
             .table_name(&self.counters_table)
-            .key(
-                "event_id",
-                AttributeValue::S(wr_common::expr::event_key(event_id)),
-            )
+            .set_key(Some(wr_common::expr::event_key(event_id)))
             .update_expression(wr_common::expr::claim_live_block_update())
             .expression_attribute_values(":n", AttributeValue::N(n.to_string()))
             .return_values(ReturnValue::AllNew)
