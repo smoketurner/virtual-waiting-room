@@ -34,6 +34,12 @@ resource "aws_lambda_function" "api_placeholder" {
   filename         = data.archive_file.placeholder[0].output_path
   source_code_hash = data.archive_file.placeholder[0].output_base64sha256
 
+  # The placeholder makes no AWS SDK calls, but carry the common env so every
+  # Lambda in the module is uniform (no "why is this one different" later).
+  environment {
+    variables = local.common_lambda_env
+  }
+
   tags = var.tags
 }
 

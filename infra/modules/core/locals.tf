@@ -1,4 +1,15 @@
 locals {
+  # AWS SDK tuning applied to every Lambda in the module. Defined once and
+  # merged into each function's environment so the set cannot drift between
+  # functions. regional STS endpoints; the 2026 retry defaults (faster backoff
+  # + a retry quota that fails fast under sustained outage); and the in-region
+  # defaults mode (Lambda calls DynamoDB/SSM in the same region).
+  common_lambda_env = {
+    AWS_STS_REGIONAL_ENDPOINTS = "regional"
+    AWS_NEW_RETRIES_2026       = "true"
+    AWS_DEFAULTS_MODE          = "in-region"
+  }
+
   # Canonical table names. Every table is keyed by a single partition key and
   # carries no sort key (DESIGN §5.5); non-key attributes are schemaless and are
   # NOT declared here - DynamoDB only needs key attributes at create time.

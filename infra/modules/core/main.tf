@@ -221,10 +221,10 @@ resource "aws_lambda_function" "assign_position" {
   reserved_concurrent_executions = var.assign_position_reserved_concurrency
 
   environment {
-    variables = {
+    variables = merge(local.common_lambda_env, {
       COUNTERS_TABLE  = aws_dynamodb_table.counters.name
       POSITIONS_TABLE = aws_dynamodb_table.positions.name
-    }
+    })
   }
 
   tags = var.tags
