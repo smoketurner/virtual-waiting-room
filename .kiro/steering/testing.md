@@ -38,9 +38,32 @@ visible fairness failure at 1,000,000 people. Tests are the primary evidence.
   position; malformed joins consume none.
 - **Admission / session** — a captured admission token cannot be replayed as a session, or
   vice versa; a session survives a second page view without re-queueing.
-- **Fail-open** — with the waiting-room API returning 5xx, the origin stays reachable.
+- **CloudFront cookie encoding (ADR-0020)** — a second frozen wire contract, this one with the
+  edge rather than with an auditor. Pin it: custom-policy cookie set (`CloudFront-Policy`,
+  never `CloudFront-Expires`), whitespace-free policy JSON, the `+/=` → `-~_` base64 alphabet,
+  and `CloudFront-Hash-Algorithm=SHA256` present. Any drift presents as every admitted visitor
+  getting a 403, which no unit test would otherwise catch.
 - **No-show compensation** — with an injected no-show rate, measured origin arrivals converge
   on the target rate.
+
+## Not currently provable, and why
+
+- **Fail-open** — "with the waiting-room API returning 5xx, the origin stays reachable" holds
+  for the authorizer gate only. The CloudFront gate fails closed by construction (#58), so this
+  test must be scoped to the authorizer until that issue resolves. Do not write a test that
+  passes by asserting the weaker behaviour and calling it fail-open.
+
+## To prove when the corresponding gap closes
+
+Listed so they are not rediscovered late. Each is unbuilt today; do not write the test before
+the mechanism exists.
+
+- **One position per identity** (#59) — N registrations under one verified identifier yield one
+  position; a pre-queue registration classified as a bot at join is mitigated at seal.
+- **Credential scope** (#61) — cookies minted for one event are refused on another event's
+  behaviour in the same distribution.
+- **Concurrency control** (#65) — with injected session durations an order of magnitude apart,
+  measured active sessions converge on the ceiling in both cases.
 
 ## Load validation (Phase 3)
 

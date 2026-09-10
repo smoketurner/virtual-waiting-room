@@ -15,19 +15,19 @@ name = "seal_event"
 path = "src/lib.rs"
 
 [dependencies]
-wr-common = { workspace = true }
-lambda_runtime = { workspace = true }
+anyhow = { workspace = true, features = ["std"] }
 aws-config = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
-aws-sdk-dynamodb = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 aws-lc-rs = { workspace = true, features = ["aws-lc-sys"] }
+aws-sdk-dynamodb = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+lambda_runtime = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true, features = ["std"] }
 serde_dynamo = { workspace = true, features = ["aws-sdk-dynamodb+1"] }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+serde_json = { workspace = true, features = ["std"] }
 thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing = { workspace = true, default-features = true }
 tracing-subscriber = { workspace = true, features = ["fmt", "env-filter", "json"] }
-anyhow = { workspace = true, features = ["std"] }
+wr-common = { workspace = true }
 
 [lints]
 workspace = true

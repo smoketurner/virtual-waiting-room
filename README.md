@@ -65,8 +65,11 @@ origin never calls the waiting room on the hot path.
   touches a function, so there are no cold starts and no concurrency ceiling at the door.
 - **Closed-loop admission.** Some admitted visitors never arrive. The controller measures
   the no-show rate and compensates, so your origin runs at the capacity you paid for.
-- **Fails open.** If the waiting room is unavailable, visitors reach your site. A waiting
-  room that fails closed turns its own outage into yours.
+- **Fails open** — the intent, not yet the behaviour. A waiting room that fails closed turns
+  its own outage into yours. The authorizer gate does this; the CloudFront gate does not, and
+  an outage of the token path currently refuses every visitor
+  ([#58](https://github.com/smoketurner/virtual-waiting-room/issues/58)). Read that issue
+  before running an event on this.
 - **Near-zero idle cost.** No always-on compute or cache tier. Tables are pre-warmed before
   an event and cost nothing between them.
 - **Your account, your data.** Commercial regions or GovCloud. Nothing runs anywhere else.
@@ -81,11 +84,25 @@ first-in-first-out (FIFO) for threshold-triggered ones, a separately-signed sess
 the first token validation, closed-loop outflow control that compensates for no-shows, and
 failing open when the waiting room is unreachable.
 
-The difference is deployment model, not architecture. Queue-it is hosted SaaS with 25+
-platform connectors; that breadth is their moat and this does not attempt to match it. If
-you want a managed service with a service level agreement (SLA) and connectors for every stack, buy theirs. This is
-for the cases where the traffic cannot leave your account, or the price cannot be
-enterprise.
+Two things here are not theirs. Queue position is a keyed permutation computed on read, so a
+published seed lets anyone recompute every position and **prove the raffle was a raffle** —
+Queue-it materializes queue numbers and asks you to trust them. And the gate is CloudFront's
+own trusted key group rather than code on the request path, so admission costs nothing per
+request and works against an origin you cannot run code near.
+
+Two things of theirs are missing, and they are not breadth. **Identity**: they enforce one
+position per person (visitor identification keys, invite-only rooms, IP binding, proof of work,
+bot mitigation deferred until randomization). Randomization turns volume into expected share,
+so a raffle without identity is a raffle a bot farm wins
+([#59](https://github.com/smoketurner/virtual-waiting-room/issues/59)). And **a decision point
+in the request path**, which is what their connector is: removing it is what makes this free
+per request, and it is why fail-open, standby activation, admission revocation and per-request
+rules are all open issues.
+
+Their 25+ platform connectors are a real moat and this does not attempt to match them. If you
+want a managed service with a service level agreement (SLA) and connectors for every stack, buy
+theirs. This is for the cases where the traffic cannot leave your account, or the price cannot
+be enterprise.
 
 ## License
 

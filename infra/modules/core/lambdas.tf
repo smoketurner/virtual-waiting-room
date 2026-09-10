@@ -219,10 +219,26 @@ resource "aws_lambda_function" "controller" {
   runtime       = "provided.al2023"
   architectures = [local.lambda_runtime_arch]
   handler       = "bootstrap"
-  # One invoke runs six 10s passes, so the timeout must exceed a full minute of
-  # cadence plus the per-pass DynamoDB work.
-  timeout     = 90
+  # Each durable wait suspends the execution, so an invocation covers replay
+  # plus a single pass rather than a whole minute of cadence.
+  timeout     = 30
   memory_size = 256
+
+  # The 10s cadence is built from durable waits: the execution suspends between
+  # passes without incurring duration charges, instead of holding the invocation
+  # open across six passes. ExecutionTimeout bounds one minute of cadence with
+  # headroom for step retries; a stuck execution is abandoned rather than
+  # overlapping the next scheduled one.
+  durable_config {
+    execution_timeout = 120
+    retention_period  = 7
+  }
+
+  # Destroy stops in-flight durable executions first, which the provider
+  # documents as taking up to an hour.
+  timeouts {
+    delete = "60m"
+  }
 
   filename         = local.lambda_zip["controller"]
   source_code_hash = local.lambda_hash["controller"]

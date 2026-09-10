@@ -1,4 +1,11 @@
 locals {
+  # The deployment's own coordinates, resolved once from the provider rather
+  # than hardcoded, so every ARN this module builds is correct in any account,
+  # region, and partition.
+  aws_partition  = data.aws_partition.current.partition
+  aws_region     = data.aws_region.current.region
+  aws_account_id = data.aws_caller_identity.current.account_id
+
   # AWS SDK tuning applied to every Lambda in the module. Defined once and
   # merged into each function's environment so the set cannot drift between
   # functions. regional STS endpoints; the 2026 retry defaults (faster backoff
@@ -14,7 +21,7 @@ locals {
   # lets the SDK use account-based DynamoDB endpoints. Sourced from the caller
   # identity, never hardcoded, so it is correct in any account. The
   dynamo_lambda_env = merge(local.common_lambda_env, {
-    AWS_ACCOUNT_ID = data.aws_caller_identity.current.account_id
+    AWS_ACCOUNT_ID = local.aws_account_id
   })
 
   # Canonical table names. Every table is keyed by a single partition key and

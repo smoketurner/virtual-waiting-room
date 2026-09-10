@@ -1,5 +1,11 @@
 # Admin interface — design note (Stage 1)
 
+> **Superseded on two points.** Auth is no longer SigV4: ADR-0016 replaced it with an OIDC
+> Authorization Code + PKCE login session stored in the `Tokens` table, enforced in the admin
+> Lambda (API Gateway auth is `NONE`). Styling is no longer Cloudscape design tokens: ADR-0018
+> replaced them with the self-contained Vouch stylesheet. The action set, route→handler→state
+> mapping and crate shape below still describe what was built.
+
 Scope lock for the operator control plane: a single Axum Rust Lambda rendering
 server-side HTML, behind the SigV4 (`AWS_IAM`) admin routes already scaffolded
 in `infra/modules/core/api.tf`. This note fixes the action set, the
