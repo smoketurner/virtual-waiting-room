@@ -135,6 +135,13 @@ The event's own `Counters` item holds the sequences, phase, seed, rate, and mess
 `queue_counter` and `serving_counter` must stay on it — sharding a sequence destroys ordering —
 and both are low-rate: one claim per ingest batch, one advance per controller pass.
 
+Keys are tagged only where a table holds more than one kind of item. `Counters` holds the
+event plus its shards, and `Tokens` holds admission-token reservations (`TKN#`), operator OIDC
+sessions (`SESS#`), and pending PKCE logins (`PKCE#`) — without the tag a session id and a
+token for the same string would be one row. `Positions` and `PreQueue` hold one kind each and
+take bare ids: a tag there disambiguates nothing and costs bytes in the partition key of every
+row, of which there is one per visitor.
+
 `prequeue_counter` and `arrivals` are order-free and striped ×10, **as separate items** keyed
 `EVT#{event_id}#PQ#{shard}` and `EVT#{event_id}#AR#{shard}`, each holding one attribute `n`.
 The event's own item is `EVT#{event_id}`. Every key is built by `wr_common::expr`, never at

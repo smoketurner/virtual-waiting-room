@@ -16,6 +16,14 @@ use crate::permutation::SHARDS;
 /// The partition key attribute of the `Counters` table.
 const KEY_ATTR: &str = "event_id";
 
+/// The partition key attribute of the `Tokens` table.
+///
+/// Named `request_id` for the admission tokens it was built for, which is a
+/// misnomer for the other two things it now holds — an OIDC session id is not a
+/// request id, and neither is a PKCE state. Renaming it changes the table's hash
+/// key, which replaces the table.
+const TOKENS_KEY_ATTR: &str = "request_id";
+
 /// The attribute a shard item records its own index in, so a reader that
 /// fetched a batch of shards knows which is which without taking the key apart
 /// again.
@@ -46,6 +54,35 @@ pub fn event_key(event_id: &str) -> HashMap<String, AttributeValue> {
 /// `set_key` or to `BatchGetItem`.
 fn key(value: String) -> HashMap<String, AttributeValue> {
     HashMap::from([(KEY_ATTR.to_owned(), AttributeValue::S(value))])
+}
+
+/// Partition key of a single-use admission token reservation.
+///
+/// The `Tokens` table is the one table here holding more than one kind of item
+/// — token reservations, OIDC sessions, and PKCE transactions all share its key
+/// space — so the tag is what keeps a session id from colliding with a token.
+/// `Positions` and `PreQueue` hold one kind each and take bare ids: a tag there
+/// would disambiguate nothing while costing bytes in the partition key of every
+/// row, of which there is one per visitor.
+#[must_use]
+pub fn admission_token_key(request_id: &str) -> HashMap<String, AttributeValue> {
+    tokens_key(format!("TKN#{request_id}"))
+}
+
+/// Partition key of an operator's OIDC session.
+#[must_use]
+pub fn oidc_session_key(session_id: &str) -> HashMap<String, AttributeValue> {
+    tokens_key(format!("SESS#{session_id}"))
+}
+
+/// Partition key of a pending OIDC login, keyed by its CSRF state.
+#[must_use]
+pub fn pkce_transaction_key(state: &str) -> HashMap<String, AttributeValue> {
+    tokens_key(format!("PKCE#{state}"))
+}
+
+fn tokens_key(value: String) -> HashMap<String, AttributeValue> {
+    HashMap::from([(TOKENS_KEY_ATTR.to_owned(), AttributeValue::S(value))])
 }
 
 /// Partition key of one pre-queue registration shard.
@@ -169,7 +206,11 @@ mod tests {
 
     /// The single key value, for assertions.
     fn key_string(k: &HashMap<String, AttributeValue>) -> String {
-        k.get(KEY_ATTR)
+        key_string_of(k, KEY_ATTR)
+    }
+
+    fn key_string_of(k: &HashMap<String, AttributeValue>, attr: &str) -> String {
+        k.get(attr)
             .and_then(|v| v.as_s().ok())
             .cloned()
             .unwrap_or_default()
@@ -224,6 +265,24 @@ mod tests {
         assert_eq!(arrivals.len(), SHARDS);
         // The two counter families must not collide with each other either.
         assert!(keys.is_disjoint(&arrivals));
+    }
+
+    #[test]
+    fn the_tokens_table_key_space_does_not_collide_across_kinds() {
+        // Three kinds of item share this table's key. Without the tags an
+        // operator session id and an admission token reservation for the same
+        // string would be the same row.
+        let id = "abc";
+        let keys = [
+            key_string_of(&admission_token_key(id), TOKENS_KEY_ATTR),
+            key_string_of(&oidc_session_key(id), TOKENS_KEY_ATTR),
+            key_string_of(&pkce_transaction_key(id), TOKENS_KEY_ATTR),
+        ];
+        let distinct: std::collections::BTreeSet<&String> = keys.iter().collect();
+        assert_eq!(distinct.len(), 3, "two kinds share a key: {keys:?}");
+        assert_eq!(keys[0], "TKN#abc");
+        assert_eq!(keys[1], "SESS#abc");
+        assert_eq!(keys[2], "PKCE#abc");
     }
 
     #[test]
