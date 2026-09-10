@@ -39,8 +39,8 @@ output "event_id" {
 }
 
 output "cloudfront_domain_name" {
-  description = "CloudFront distribution domain name, when a client origin is supplied (edge created)."
-  value       = length(module.edge) > 0 ? module.edge[0].distribution_domain_name : null
+  description = "CloudFront distribution domain name — the waiting room's public host."
+  value       = module.edge.distribution_domain_name
 }
 
 output "controller_function_name" {
@@ -70,7 +70,7 @@ output "waiting_room_url" {
 
 output "waiting_room_page_url" {
   description = "The page an un-admitted visitor is shown. CloudFront serves it in place of the 403 it returns when admission cookies are missing."
-  value       = "https://${module.edge[0].distribution_domain_name}/_wr/waiting.html"
+  value       = "https://${module.edge.distribution_domain_name}/_wr/waiting.html"
 }
 
 output "admission_key_pair_id" {
