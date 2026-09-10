@@ -31,15 +31,20 @@ module "core" {
   oidc_allowed_emails = var.oidc_allowed_emails
 }
 
-# edge (CloudFront). Created once a client origin is supplied - the origin is the
-# customer's own site, so there is no sensible default and edge cannot exist
-# without it. The API origin points at core's REST API host, with the stage as
-# origin_path so /status is forwarded to /<env>/status. WAF is added to
-# modules/edge behind a single enable_waf toggle (off by default: the WAF web
-# ACL is the one component with a fixed monthly cost, breaking N1 idle).
+# edge (CloudFront). Always created: client_origin_domain_name is a required
+# variable (the customer's own site is the default-behaviour origin), so the
+# edge cannot be configured without one. The API origin points at core's REST
+# API host, with the stage as origin_path so /status is forwarded to
+# /<env>/status. WAF is added to modules/edge behind a single enable_waf toggle
+# (off by default: the WAF web ACL is the one component with a fixed monthly
+# cost, breaking N1 idle).
+#
+# count is kept (pinned to 1) so the module stays addressed as module.edge[0] in
+# state - dropping count would rename every edge resource and force a
+# destroy/recreate of the live distribution.
 module "edge" {
   source = "../../modules/edge"
-  count  = var.client_origin_domain_name != "" ? 1 : 0
+  count  = 1
 
   name_prefix = var.name_prefix
   tags        = local.common_tags

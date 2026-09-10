@@ -10,6 +10,11 @@ event_id            = "smoke"
 lambda_architecture = "arm64" # must match `make build ARCH=...`
 seal_start_time     = ""      # EventBridge at() value; "" = manual seal
 
+# REQUIRED (no default): bare domain of the protected origin CloudFront fronts as
+# its default behaviour. Host only - no scheme, no path. An empty or missing
+# value fails the plan rather than silently destroying the distribution.
+client_origin_domain_name = "www.example.com"
+
 # --- Built Lambda artifacts ---------------------------------------------------
 # Deterministic build outputs, relative to this directory. Leave empty ("") to
 # fall back to the vendored placeholder Lambda (lets `make plan` run pre-build).
