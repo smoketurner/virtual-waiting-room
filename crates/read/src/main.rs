@@ -92,7 +92,10 @@ async fn load_counters(ctx: &Ctx) -> Result<Option<Counters>, Error> {
         .client
         .get_item()
         .table_name(&ctx.counters_table)
-        .key("event_id", AttributeValue::S(ctx.event_id.clone()))
+        .key(
+            "event_id",
+            AttributeValue::S(wr_common::expr::event_key(&ctx.event_id)),
+        )
         .send()
         .await?;
     let Some(item) = out.item() else {

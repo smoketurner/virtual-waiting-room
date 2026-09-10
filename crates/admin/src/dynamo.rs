@@ -31,7 +31,10 @@ impl Store for DynamoStore {
             .client
             .get_item()
             .table_name(&self.counters_table)
-            .key("event_id", AttributeValue::S(event_id.to_owned()))
+            .key(
+                "event_id",
+                AttributeValue::S(wr_common::expr::event_key(event_id)),
+            )
             .send()
             .await
             .map_err(|e| StoreError::Backend(format!("get_item: {e}")))?;
@@ -78,7 +81,10 @@ impl Store for DynamoStore {
             .client
             .update_item()
             .table_name(&self.counters_table)
-            .key("event_id", AttributeValue::S(event_id.to_owned()))
+            .key(
+                "event_id",
+                AttributeValue::S(wr_common::expr::event_key(event_id)),
+            )
             .update_expression("SET phase = :to")
             .condition_expression("phase = :from")
             .expression_attribute_values(":to", AttributeValue::S(to.as_wire_str().to_owned()))
@@ -112,7 +118,10 @@ impl Store for DynamoStore {
             .client
             .update_item()
             .table_name(&self.counters_table)
-            .key("event_id", AttributeValue::S(event_id.to_owned()))
+            .key(
+                "event_id",
+                AttributeValue::S(wr_common::expr::event_key(event_id)),
+            )
             .update_expression(
                 "SET target_rate = :r, last_action = :a, last_action_by = :by, \
                  last_action_at = :at, last_action_epoch_ms = :ms",
@@ -135,7 +144,10 @@ impl Store for DynamoStore {
             .client
             .update_item()
             .table_name(&self.counters_table)
-            .key("event_id", AttributeValue::S(event_id.to_owned()))
+            .key(
+                "event_id",
+                AttributeValue::S(wr_common::expr::event_key(event_id)),
+            )
             .update_expression(
                 "SET message = :m, last_action = :a, last_action_by = :by, \
                  last_action_at = :at, last_action_epoch_ms = :ms",
@@ -169,7 +181,10 @@ impl Store for DynamoStore {
             .client
             .update_item()
             .table_name(&self.counters_table)
-            .key("event_id", AttributeValue::S(event_id.to_owned()))
+            .key(
+                "event_id",
+                AttributeValue::S(wr_common::expr::event_key(event_id)),
+            )
             .update_expression(
                 "SET admission_control = :to, last_action = :a, last_action_by = :by, \
                  last_action_at = :at, last_action_epoch_ms = :ms",
@@ -198,7 +213,10 @@ impl Store for DynamoStore {
             .client
             .update_item()
             .table_name(&self.counters_table)
-            .key("event_id", AttributeValue::S(event_id.to_owned()))
+            .key(
+                "event_id",
+                AttributeValue::S(wr_common::expr::event_key(event_id)),
+            )
             .update_expression(
                 "SET phase = :to, last_action = :a, last_action_by = :by, \
                  last_action_at = :at, last_action_epoch_ms = :ms",

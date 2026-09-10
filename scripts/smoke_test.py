@@ -153,7 +153,7 @@ def main() -> int:
     for s, total in sorted(shard_counts.items()):
         ddb.update_item(
             TableName=counters,
-            Key={"event_id": {"S": event_id}},
+            Key={"event_id": {"S": f"EVT#{event_id}"}},
             UpdateExpression="SET #c = :v",
             ExpressionAttributeNames={"#c": f"prequeue_counter#{s}"},
             ExpressionAttributeValues={":v": {"N": str(total)}},

@@ -11,6 +11,18 @@ use crate::permutation::SHARDS;
 /// increment, forever, for no benefit — nothing queries by attribute name.
 pub const SHARD_COUNT_ATTR: &str = "n";
 
+/// Partition key of the event's own item, holding the sequences, phase, seal
+/// outputs, and operator state.
+///
+/// Every key in this table is built here rather than at each call site. The
+/// uppercase `EVT#` tag marks the structural part of the key so it cannot be
+/// confused with the event id itself, and it keeps the key space
+/// self-describing if events ever share a table.
+#[must_use]
+pub fn event_key(event_id: &str) -> String {
+    format!("EVT#{event_id}")
+}
+
 /// Partition key of one pre-queue registration shard.
 ///
 /// A shard is its own ITEM, not an attribute on a shared one. `DynamoDB` caps
@@ -26,7 +38,7 @@ pub const SHARD_COUNT_ATTR: &str = "n";
 #[must_use]
 pub fn prequeue_shard_key(event_id: &str, shard: usize) -> String {
     assert!(shard < SHARDS, "shard {shard} out of range 0..{SHARDS}");
-    format!("{event_id}#pq#{shard}")
+    format!("EVT#{event_id}#PQ#{shard}")
 }
 
 /// Partition key of one arrivals shard, incremented when a visitor claims
@@ -38,7 +50,7 @@ pub fn prequeue_shard_key(event_id: &str, shard: usize) -> String {
 #[must_use]
 pub fn arrivals_shard_key(event_id: &str, shard: usize) -> String {
     assert!(shard < SHARDS, "shard {shard} out of range 0..{SHARDS}");
-    format!("{event_id}#ar#{shard}")
+    format!("EVT#{event_id}#AR#{shard}")
 }
 
 /// `ADD n :one` — adds one to a shard's count. With `ReturnValue::AllNew` the
@@ -117,8 +129,9 @@ mod tests {
             prequeue_shard_key("evt-a", 3),
             prequeue_shard_key("evt-b", 3)
         );
-        assert_eq!(prequeue_shard_key("evt", 3), "evt#pq#3");
-        assert_eq!(arrivals_shard_key("evt", 3), "evt#ar#3");
+        assert_eq!(event_key("evt"), "EVT#evt");
+        assert_eq!(prequeue_shard_key("evt", 3), "EVT#evt#PQ#3");
+        assert_eq!(arrivals_shard_key("evt", 3), "EVT#evt#AR#3");
     }
 
     #[test]
@@ -131,6 +144,15 @@ mod tests {
     #[should_panic(expected = "out of range")]
     fn arrivals_shard_key_out_of_range_panics() {
         let _ = arrivals_shard_key("evt", SHARDS);
+    }
+
+    #[test]
+    fn a_hash_in_an_event_id_would_collide_two_keys() {
+        // EVT#a#PQ#1 is both event "a"'s first pre-queue shard and event
+        // "a#PQ#1"'s own item. One event per deployment makes this
+        // unreachable today, and the Terraform variable rejects a '#' so it
+        // stays that way — this records why that validation exists.
+        assert_eq!(prequeue_shard_key("a", 1), event_key("a#PQ#1"));
     }
 
     #[test]

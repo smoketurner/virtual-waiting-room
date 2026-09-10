@@ -104,6 +104,10 @@ variable "event_id" {
   description = "The single event id this MVP deployment serves. The read Lambda scopes /status and /queue_num to it."
   type        = string
   default     = "default"
+  validation {
+    condition     = !can(regex("#", var.event_id))
+    error_message = "event_id must not contain '#': it is the separator in the DynamoDB key, so 'a#PQ#1' would collide with the first pre-queue shard of event 'a'."
+  }
 }
 
 variable "seal_start_time" {

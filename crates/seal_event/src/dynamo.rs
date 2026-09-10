@@ -100,7 +100,10 @@ impl Store for DynamoStore {
             .client
             .update_item()
             .table_name(&self.counters_table)
-            .key("event_id", AttributeValue::S(event_id.to_owned()))
+            .key(
+                "event_id",
+                AttributeValue::S(wr_common::expr::event_key(event_id)),
+            )
             .update_expression(wr_common::expr::seal_update())
             .condition_expression(wr_common::expr::seal_guard())
             .expression_attribute_values(

@@ -115,8 +115,10 @@ the arrivals counter alone runs at the admission rate, and it shared a budget
 with the live-join sequence on the same item.
 
 **The striping is now across partition keys.** Each shard is its own item, keyed
-`{event_id}#pq#{shard}` and `{event_id}#ar#{shard}`, holding a single attribute
-`n`. Ten shards are ten partition keys and ten budgets, and each item is small
+`EVT#{event_id}#PQ#{shard}` and `EVT#{event_id}#AR#{shard}`, holding a single
+attribute `n`. The event's own item is `EVT#{event_id}`; the uppercase tags mark
+the structural part of the key so it reads distinctly from the event id, and
+every key is built in one place rather than at each call site. Ten shards are ten partition keys and ten budgets, and each item is small
 enough that an increment always costs exactly one write unit rather than the
 size of a growing shared item.
 

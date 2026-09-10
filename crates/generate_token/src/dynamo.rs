@@ -42,7 +42,10 @@ impl Store for DynamoStore {
             // Consistent: a visitor polling for admission must not be told to
             // keep waiting because a replica lagged behind the controller.
             .consistent_read(true)
-            .key("event_id", AttributeValue::S(event_id.to_owned()))
+            .key(
+                "event_id",
+                AttributeValue::S(wr_common::expr::event_key(event_id)),
+            )
             .send()
             .await
             .map_err(|e| StoreError(format!("get_item counters: {e}")))?;

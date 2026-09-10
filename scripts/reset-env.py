@@ -68,7 +68,17 @@ PHASES = ("idle", "pre_queue", "active", "post_event", "maintenance")
 # leaves the shards behind, and a stale pre-queue count would be folded into
 # the next seal as a cohort of visitors who do not exist.
 SHARDS = 10
-SHARD_PREFIXES = ("pq", "ar")
+SHARD_TAGS = ("PQ", "AR")
+
+
+def event_key(event_id: str) -> str:
+    """Partition key of the event's own item. Mirrors wr_common::expr::event_key."""
+    return f"EVT#{event_id}"
+
+
+def shard_key(event_id: str, tag: str, shard: int) -> str:
+    """Partition key of one striped counter shard."""
+    return f"EVT#{event_id}#{tag}#{shard}"
 
 # DynamoDB caps a BatchWriteItem at 25 requests.
 BATCH_LIMIT = 25
@@ -197,7 +207,7 @@ def fresh_counters(event_id: str, phase: str, target_rate: int) -> dict:
     no_show_rate).
     """
     return {
-        "event_id": {"S": event_id},
+        "event_id": {"S": event_key(event_id)},
         "phase": {"S": phase},
         "admission_control": {"S": "open"},
         "queue_counter": {"N": "0"},
@@ -284,9 +294,7 @@ def main() -> int:
 
     say("Deleting the striped counter shards")
     shard_keys = [
-        f"{event_id}#{prefix}#{shard}"
-        for prefix in SHARD_PREFIXES
-        for shard in range(SHARDS)
+        shard_key(event_id, tag, shard) for tag in SHARD_TAGS for shard in range(SHARDS)
     ]
     batch = [{"DeleteRequest": {"Key": {"event_id": {"S": key}}}} for key in shard_keys]
     for start in range(0, len(batch), BATCH_LIMIT):
@@ -296,7 +304,7 @@ def main() -> int:
     say("Rewriting the Counters item")
     # Deleted first so no attribute from the previous run can survive: PutItem
     # replaces the item, but only for the attributes it names.
-    ddb.delete_item(TableName=tables["counters"], Key={"event_id": {"S": event_id}})
+    ddb.delete_item(TableName=tables["counters"], Key={"event_id": {"S": event_key(event_id)}})
     item = fresh_counters(event_id, args.phase, args.target_rate)
     ddb.put_item(TableName=tables["counters"], Item=item)
     for key in sorted(item):

@@ -136,7 +136,10 @@ The event's own `Counters` item holds the sequences, phase, seed, rate, and mess
 and both are low-rate: one claim per ingest batch, one advance per controller pass.
 
 `prequeue_counter` and `arrivals` are order-free and striped ×10, **as separate items** keyed
-`{event_id}#pq#{shard}` and `{event_id}#ar#{shard}`, each holding one attribute `n`. The write
+`EVT#{event_id}#PQ#{shard}` and `EVT#{event_id}#AR#{shard}`, each holding one attribute `n`.
+The event's own item is `EVT#{event_id}`. Every key is built by `wr_common::expr`, never at
+the call site, and `event_id` may not contain `#` — the separator would let one event's shard
+key collide with another event's item. The write
 ceiling is 1,000/s per partition key, so striping across attribute names on one item would
 share a single budget and distribute nothing (ADR-0015 amendment). Attribute names are billed
 on every write too, which is why the shard attribute is one letter.

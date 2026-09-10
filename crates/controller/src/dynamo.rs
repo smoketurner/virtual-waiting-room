@@ -57,7 +57,10 @@ impl Store for DynamoStore {
             .client
             .get_item()
             .table_name(&self.counters_table)
-            .key("event_id", AttributeValue::S(event_id.to_owned()))
+            .key(
+                "event_id",
+                AttributeValue::S(wr_common::expr::event_key(event_id)),
+            )
             .consistent_read(true)
             .send()
             .await
@@ -124,7 +127,10 @@ impl Store for DynamoStore {
             .client
             .update_item()
             .table_name(&self.counters_table)
-            .key("event_id", AttributeValue::S(event_id.to_owned()))
+            .key(
+                "event_id",
+                AttributeValue::S(wr_common::expr::event_key(event_id)),
+            )
             .update_expression(
                 "SET serving_counter = :next, last_serving_counter = :last_serving, \
                  last_arrivals_total = :arrivals_total, no_show_rate = :no_show",
@@ -260,7 +266,10 @@ impl Store for DynamoStore {
             .client
             .update_item()
             .table_name(&self.counters_table)
-            .key("event_id", AttributeValue::S(event_id.to_owned()))
+            .key(
+                "event_id",
+                AttributeValue::S(wr_common::expr::event_key(event_id)),
+            )
             .update_expression("SET max_expired_position = :m")
             // Only ever move the cursor forward.
             .condition_expression(
