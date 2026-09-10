@@ -36,9 +36,9 @@ resource "aws_lambda_function" "seal_event" {
   source_code_hash = local.seal_event_hash
 
   environment {
-    variables = {
+    variables = merge(local.common_lambda_env, {
       COUNTERS_TABLE = aws_dynamodb_table.counters.name
-    }
+    })
   }
 
   tags = var.tags
@@ -71,12 +71,12 @@ resource "aws_lambda_function" "read" {
   source_code_hash = local.read_hash
 
   environment {
-    variables = {
+    variables = merge(local.common_lambda_env, {
       COUNTERS_TABLE  = aws_dynamodb_table.counters.name
       PREQUEUE_TABLE  = aws_dynamodb_table.prequeue.name
       POSITIONS_TABLE = aws_dynamodb_table.positions.name
       EVENT_ID        = var.event_id
-    }
+    })
   }
 
   tags = var.tags
@@ -118,7 +118,7 @@ resource "aws_lambda_function" "admin" {
   source_code_hash = local.admin_hash
 
   environment {
-    variables = {
+    variables = merge(local.common_lambda_env, {
       COUNTERS_TABLE = aws_dynamodb_table.counters.name
       TOKENS_TABLE   = aws_dynamodb_table.tokens.name
       EVENT_ID       = var.event_id
@@ -134,7 +134,7 @@ resource "aws_lambda_function" "admin" {
       # Comma-separated allowlist of operator emails permitted to log in. Empty
       # = deny all (the admin Lambda fails closed).
       OIDC_ALLOWED_EMAILS = var.oidc_allowed_emails
-    }
+    })
   }
 
   tags = var.tags
