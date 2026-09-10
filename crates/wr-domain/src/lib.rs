@@ -8,6 +8,6 @@ pub mod expr;
 pub mod ids;
 pub mod items;
 
-pub use ids::{EventId, Phase, RequestId};
+pub use ids::{EventId, Phase, RequestId, UnknownPhase};
 pub use items::{Counters, PositionItem, PositionStatus, PreQueueItem};
 pub use wr_permutation::{Assignment, SHARDS, SealError, SealedOffsets, Seed, prp, shard_for};

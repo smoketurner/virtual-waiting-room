@@ -166,17 +166,11 @@ fn counters_from_item(
             <[u64; SHARDS]>::try_from(parsed).ok()
         });
 
-    let phase = match item
+    let phase = item
         .get("phase")
         .and_then(|v| v.as_s().ok())
-        .map(String::as_str)
-    {
-        Some("pre_queue") => Phase::PreQueue,
-        Some("active") => Phase::Active,
-        Some("post_event") => Phase::PostEvent,
-        Some("maintenance") => Phase::Maintenance,
-        _ => Phase::Idle,
-    };
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(Phase::Idle);
 
     Counters {
         event_id: event_id.to_owned(),

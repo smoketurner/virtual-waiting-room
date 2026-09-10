@@ -158,14 +158,7 @@ pub enum ActionError {
 ///
 /// [`ActionError::UnknownPhase`] for any string outside the known set.
 pub fn parse_phase(s: &str) -> Result<Phase, ActionError> {
-    match s {
-        "idle" => Ok(Phase::Idle),
-        "pre_queue" => Ok(Phase::PreQueue),
-        "active" => Ok(Phase::Active),
-        "post_event" => Ok(Phase::PostEvent),
-        "maintenance" => Ok(Phase::Maintenance),
-        _ => Err(ActionError::UnknownPhase),
-    }
+    s.parse().map_err(|_| ActionError::UnknownPhase)
 }
 
 /// Whether a phase transition is legal.

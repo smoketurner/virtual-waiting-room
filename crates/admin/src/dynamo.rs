@@ -25,27 +25,6 @@ impl DynamoStore {
     }
 }
 
-/// The wire string for a phase, matching `Phase`'s `snake_case` serialization.
-fn phase_str(phase: Phase) -> &'static str {
-    match phase {
-        Phase::Idle => "idle",
-        Phase::PreQueue => "pre_queue",
-        Phase::Active => "active",
-        Phase::PostEvent => "post_event",
-        Phase::Maintenance => "maintenance",
-    }
-}
-
-fn phase_from_str(s: Option<&str>) -> Phase {
-    match s {
-        Some("pre_queue") => Phase::PreQueue,
-        Some("active") => Phase::Active,
-        Some("post_event") => Phase::PostEvent,
-        Some("maintenance") => Phase::Maintenance,
-        _ => Phase::Idle,
-    }
-}
-
 impl Store for DynamoStore {
     async fn load(&self, event_id: &str) -> Result<Option<ControlState>, StoreError> {
         let out = self
@@ -66,11 +45,11 @@ impl Store for DynamoStore {
                 .and_then(|v| v.as_n().ok())
                 .and_then(|s| s.parse().ok())
         };
-        let phase = phase_from_str(
-            item.get("phase")
-                .and_then(|v| v.as_s().ok())
-                .map(String::as_str),
-        );
+        let phase = item
+            .get("phase")
+            .and_then(|v| v.as_s().ok())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(Phase::Idle);
 
         let str_attr =
             |key: &str| -> Option<String> { item.get(key).and_then(|v| v.as_s().ok()).cloned() };
@@ -106,8 +85,8 @@ impl Store for DynamoStore {
             .key("event_id", AttributeValue::S(event_id.to_owned()))
             .update_expression("SET phase = :to")
             .condition_expression("phase = :from")
-            .expression_attribute_values(":to", AttributeValue::S(phase_str(to).to_owned()))
-            .expression_attribute_values(":from", AttributeValue::S(phase_str(from).to_owned()))
+            .expression_attribute_values(":to", AttributeValue::S(to.as_wire_str().to_owned()))
+            .expression_attribute_values(":from", AttributeValue::S(from.as_wire_str().to_owned()))
             .send()
             .await;
 
@@ -227,10 +206,10 @@ impl Store for DynamoStore {
             )
             .expression_attribute_values(
                 ":to",
-                AttributeValue::S(phase_str(Phase::Maintenance).to_owned()),
+                AttributeValue::S(Phase::Maintenance.as_wire_str().to_owned()),
             )
             .condition_expression("phase = :from")
-            .expression_attribute_values(":from", AttributeValue::S(phase_str(from).to_owned()));
+            .expression_attribute_values(":from", AttributeValue::S(from.as_wire_str().to_owned()));
         req = apply_audit_values(req, "force_maintenance", actor, now_ms);
         send_guarded(req, "force_maintenance").await
     }
