@@ -91,6 +91,9 @@ data "aws_iam_policy_document" "seal_event" {
     effect = "Allow"
     actions = [
       "dynamodb:GetItem",
+      # The pre-queue shards are separate items, so the seal gathers them in one
+      # BatchGetItem. GetItem does not authorise it — it is its own action.
+      "dynamodb:BatchGetItem",
       "dynamodb:UpdateItem",
     ]
     resources = [aws_dynamodb_table.counters.arn]
@@ -189,6 +192,8 @@ data "aws_iam_policy_document" "controller" {
     effect = "Allow"
     actions = [
       "dynamodb:GetItem",
+      # Summing the arrivals shards is a BatchGetItem over their own items.
+      "dynamodb:BatchGetItem",
       "dynamodb:UpdateItem",
     ]
     resources = [aws_dynamodb_table.counters.arn]

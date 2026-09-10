@@ -328,6 +328,32 @@ mod tests {
     }
 
     #[test]
+    fn no_expression_inlines_an_attribute_name_containing_a_hash() {
+        // '#' opens an expression-attribute-name placeholder, so an attribute
+        // whose name contains one cannot be written into an expression
+        // literally: `ADD arrivals#4 :one` parses as the attribute `arrivals`
+        // plus an undefined placeholder `#4`, and DynamoDB rejects it. That is
+        // exactly how the arrivals counter failed on every admitted visitor
+        // while the handler logged a warning and admitted them anyway.
+        //
+        // Keys are values, not expression text, so EVT#... and TKN#... are
+        // unaffected — this is only about the expression strings.
+        for expression in [
+            increment_shard_update(),
+            claim_live_block_update(),
+            seal_update(),
+            seal_guard(),
+        ] {
+            assert!(
+                !expression.contains('#'),
+                "{expression:?} inlines an attribute name containing '#'; \
+                 it must use ExpressionAttributeNames or a name without one"
+            );
+        }
+        assert!(!not_exists_condition("request_id").contains('#'));
+    }
+
+    #[test]
     fn every_placeholder_in_the_increment_is_bound() {
         // An expression referring to a placeholder nothing supplies is accepted
         // by the compiler and rejected by DynamoDB at runtime, so the pairing
