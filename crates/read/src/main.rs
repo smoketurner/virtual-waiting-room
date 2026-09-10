@@ -138,8 +138,8 @@ fn position_from_item(item: &std::collections::HashMap<String, AttributeValue>) 
         .and_then(|s| s.parse::<u64>().ok())
 }
 
-/// Reads the flat `Counters` item, assembling the `prequeue_counter#0..9`
-/// attributes and the optional seal outputs.
+/// Reads the `Counters` item and its optional seal outputs. The striped
+/// counters are separate items and no read path here needs them.
 fn counters_from_item(
     event_id: &str,
     item: &std::collections::HashMap<String, AttributeValue>,
@@ -149,16 +149,6 @@ fn counters_from_item(
             .and_then(|v| v.as_n().ok())
             .and_then(|s| s.parse::<u64>().ok())
     };
-
-    let mut prequeue_counts = [0u64; SHARDS];
-    for (shard, slot) in prequeue_counts.iter_mut().enumerate() {
-        *slot = num(&format!("prequeue_counter#{shard}")).unwrap_or(0);
-    }
-
-    let mut arrivals = [0u64; SHARDS];
-    for (shard, slot) in arrivals.iter_mut().enumerate() {
-        *slot = num(&format!("arrivals#{shard}")).unwrap_or(0);
-    }
 
     let shuffle_seed = item
         .get("shuffle_seed")
@@ -187,8 +177,6 @@ fn counters_from_item(
         phase,
         queue_counter: num("queue_counter").unwrap_or(0),
         serving_counter: num("serving_counter").unwrap_or(0),
-        prequeue_counts,
-        arrivals,
         shuffle_seed,
         participant_count: num("participant_count"),
         prequeue_offsets,

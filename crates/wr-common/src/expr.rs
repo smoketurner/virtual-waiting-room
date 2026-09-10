@@ -4,46 +4,49 @@
 
 use crate::permutation::SHARDS;
 
-/// The `Counters` attribute name for a pre-queue shard counter,
-/// `prequeue_counter#<shard>`.
+/// The attribute a shard item holds its count in.
+///
+/// One letter on purpose. `UpdateItem` is billed on the size of the whole item
+/// including its attribute names, so a verbose name is paid for on every single
+/// increment, forever, for no benefit — nothing queries by attribute name.
+pub const SHARD_COUNT_ATTR: &str = "n";
+
+/// Partition key of one pre-queue registration shard.
+///
+/// A shard is its own ITEM, not an attribute on a shared one. `DynamoDB` caps
+/// throughput at 1,000 writes per second per partition key, so ten attributes
+/// on one item share one budget and distribute nothing; ten items are ten
+/// partition keys and ten budgets. The item is tiny, so every increment costs
+/// exactly one write unit rather than the size of a growing shared item.
 ///
 /// # Panics
 ///
 /// Panics if `shard >= SHARDS`; callers pick the shard with
-/// `crate::permutation::shard_for`, which is always in range.
+/// [`crate::permutation::shard_for`], which is always in range.
 #[must_use]
-pub fn prequeue_shard_attr(shard: usize) -> String {
+pub fn prequeue_shard_key(event_id: &str, shard: usize) -> String {
     assert!(shard < SHARDS, "shard {shard} out of range 0..{SHARDS}");
-    format!("prequeue_counter#{shard}")
+    format!("{event_id}#pq#{shard}")
 }
 
-/// `ADD <shard> :one` — claims one local index in a pre-queue shard. Paired
-/// with `ReturnValue::AllNew`, the returned counter value is the count after
-/// the add, so the claimed local index is `new - 1`.
-#[must_use]
-pub fn claim_local_index_update(shard: usize) -> String {
-    format!("ADD {} :one", prequeue_shard_attr(shard))
-}
-
-/// The `Counters` attribute name for an arrival shard counter,
-/// `arrivals#<shard>`, incremented by the authorizer and summed by the
-/// controller.
+/// Partition key of one arrivals shard, incremented when a visitor claims
+/// their admission and summed by the controller to measure the no-show rate.
 ///
 /// # Panics
 ///
-/// Panics if `shard >= SHARDS`; callers pick the shard with
-/// `crate::permutation::shard_for`, which is always in range.
+/// Panics if `shard >= SHARDS`.
 #[must_use]
-pub fn arrivals_shard_attr(shard: usize) -> String {
+pub fn arrivals_shard_key(event_id: &str, shard: usize) -> String {
     assert!(shard < SHARDS, "shard {shard} out of range 0..{SHARDS}");
-    format!("arrivals#{shard}")
+    format!("{event_id}#ar#{shard}")
 }
 
-/// `ADD arrivals#<shard> :one` — the authorizer's one write per admitted
-/// visitor, recording an arrival for the controller's no-show measurement.
+/// `ADD n :one` — adds one to a shard's count. With `ReturnValue::AllNew` the
+/// returned value is the count after the add, so a pre-queue registration's
+/// local index is `new - 1`.
 #[must_use]
-pub fn record_arrival_update(shard: usize) -> String {
-    format!("ADD {} :one", arrivals_shard_attr(shard))
+pub fn increment_shard_update() -> &'static str {
+    "ADD n :one"
 }
 
 /// `ADD queue_counter :n` — claims a contiguous block of `n` live-join
@@ -88,15 +91,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shard_attr_names_are_hash_suffixed() {
-        assert_eq!(prequeue_shard_attr(0), "prequeue_counter#0");
-        assert_eq!(prequeue_shard_attr(9), "prequeue_counter#9");
+    fn shard_keys_are_distinct_partition_keys() {
+        // The whole point: distinct KEYS, not distinct attributes on one item.
+        // Ten attributes on a shared item share that item's 1,000 writes per
+        // second; ten keys do not.
+        let keys: std::collections::BTreeSet<String> =
+            (0..SHARDS).map(|s| prequeue_shard_key("evt", s)).collect();
+        assert_eq!(keys.len(), SHARDS);
+        assert!(
+            !keys.contains("evt"),
+            "a shard must not collide with the Counters item"
+        );
+
+        let arrivals: std::collections::BTreeSet<String> =
+            (0..SHARDS).map(|s| arrivals_shard_key("evt", s)).collect();
+        assert_eq!(arrivals.len(), SHARDS);
+        // The two counter families must not collide with each other either.
+        assert!(keys.is_disjoint(&arrivals));
+    }
+
+    #[test]
+    fn shard_keys_are_scoped_to_their_event() {
+        // Two events in one table must not share a counter.
+        assert_ne!(
+            prequeue_shard_key("evt-a", 3),
+            prequeue_shard_key("evt-b", 3)
+        );
+        assert_eq!(prequeue_shard_key("evt", 3), "evt#pq#3");
+        assert_eq!(arrivals_shard_key("evt", 3), "evt#ar#3");
     }
 
     #[test]
     #[should_panic(expected = "out of range")]
-    fn shard_attr_out_of_range_panics() {
-        let _ = prequeue_shard_attr(SHARDS);
+    fn prequeue_shard_key_out_of_range_panics() {
+        let _ = prequeue_shard_key("evt", SHARDS);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn arrivals_shard_key_out_of_range_panics() {
+        let _ = arrivals_shard_key("evt", SHARDS);
+    }
+
+    #[test]
+    fn a_shard_increment_names_only_the_short_attribute() {
+        // Attribute names are billed on every write, so the increment must not
+        // carry a long one.
+        assert_eq!(increment_shard_update(), "ADD n :one");
+        assert_eq!(SHARD_COUNT_ATTR, "n");
     }
 
     #[test]
@@ -106,24 +148,6 @@ mod tests {
             not_exists_condition("request_id"),
             "attribute_not_exists(request_id)"
         );
-    }
-
-    #[test]
-    fn shard_add_update_names_the_shard() {
-        assert_eq!(claim_local_index_update(3), "ADD prequeue_counter#3 :one");
-    }
-
-    #[test]
-    fn arrivals_attr_names_are_hash_suffixed() {
-        assert_eq!(arrivals_shard_attr(0), "arrivals#0");
-        assert_eq!(arrivals_shard_attr(9), "arrivals#9");
-        assert_eq!(record_arrival_update(4), "ADD arrivals#4 :one");
-    }
-
-    #[test]
-    #[should_panic(expected = "out of range")]
-    fn arrivals_attr_out_of_range_panics() {
-        let _ = arrivals_shard_attr(SHARDS);
     }
 
     #[test]

@@ -5,9 +5,10 @@
 # ///
 """Reset a deployed Virtual Waiting Room environment back to a testable state.
 
-Empties the per-visitor tables and rewrites the event's `Counters` item from
-scratch, so the next test run starts from a known state instead of inheriting
-positions, seal outputs, and counters from the last one.
+Empties the per-visitor tables, deletes the striped counter shards, and
+rewrites the event's `Counters` item from scratch, so the next test run starts
+from a known state instead of inheriting positions, seal outputs, and counters
+from the last one.
 
 The `Counters` item is deleted and rewritten rather than patched. Stale
 attributes are the whole problem this script exists to solve: a leftover
@@ -60,6 +61,14 @@ VISITOR_TABLES = {
 }
 
 PHASES = ("idle", "pre_queue", "active", "post_event", "maintenance")
+
+# The striped counters live in the Counters table as their own items, one
+# partition key per shard, so that incrementing them never contends with the
+# sequences on the event's own item. That means deleting the event item alone
+# leaves the shards behind, and a stale pre-queue count would be folded into
+# the next seal as a cohort of visitors who do not exist.
+SHARDS = 10
+SHARD_PREFIXES = ("pq", "ar")
 
 # DynamoDB caps a BatchWriteItem at 25 requests.
 BATCH_LIMIT = 25
@@ -272,6 +281,17 @@ def main() -> int:
     for name, key_attr in VISITOR_TABLES.items():
         count = empty_table(ddb, tables[name], key_attr)
         print(f"{tables[name]}: deleted {count}")
+
+    say("Deleting the striped counter shards")
+    shard_keys = [
+        f"{event_id}#{prefix}#{shard}"
+        for prefix in SHARD_PREFIXES
+        for shard in range(SHARDS)
+    ]
+    batch = [{"DeleteRequest": {"Key": {"event_id": {"S": key}}}} for key in shard_keys]
+    for start in range(0, len(batch), BATCH_LIMIT):
+        flush(ddb, tables["counters"], batch[start : start + BATCH_LIMIT])
+    print(f"{tables['counters']}: deleted {len(shard_keys)} shard items")
 
     say("Rewriting the Counters item")
     # Deleted first so no attribute from the previous run can survive: PutItem

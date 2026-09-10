@@ -86,11 +86,16 @@ impl Store for DynamoStore {
     }
 
     async fn record_arrival(&self, event_id: &str, shard: usize) -> Result<(), StoreError> {
+        // The shard is its own item, so arrivals at the admission rate do not
+        // contend with the queue_counter claims on the Counters item.
         self.client
             .update_item()
             .table_name(&self.counters_table)
-            .key("event_id", AttributeValue::S(event_id.to_owned()))
-            .update_expression(wr_common::expr::record_arrival_update(shard))
+            .key(
+                "event_id",
+                AttributeValue::S(wr_common::expr::arrivals_shard_key(event_id, shard)),
+            )
+            .update_expression(wr_common::expr::increment_shard_update())
             .expression_attribute_values(":one", AttributeValue::N("1".to_owned()))
             .send()
             .await
@@ -129,15 +134,6 @@ fn counters_from_item(event_id: &str, item: &HashMap<String, AttributeValue>) ->
             .and_then(|s| s.parse::<u64>().ok())
     };
 
-    let mut prequeue_counts = [0u64; SHARDS];
-    for (shard, slot) in prequeue_counts.iter_mut().enumerate() {
-        *slot = num(&format!("prequeue_counter#{shard}")).unwrap_or(0);
-    }
-    let mut arrivals = [0u64; SHARDS];
-    for (shard, slot) in arrivals.iter_mut().enumerate() {
-        *slot = num(&format!("arrivals#{shard}")).unwrap_or(0);
-    }
-
     Counters {
         event_id: event_id.to_owned(),
         phase: item
@@ -147,8 +143,6 @@ fn counters_from_item(event_id: &str, item: &HashMap<String, AttributeValue>) ->
             .unwrap_or(Phase::Idle),
         queue_counter: num("queue_counter").unwrap_or(0),
         serving_counter: num("serving_counter").unwrap_or(0),
-        prequeue_counts,
-        arrivals,
         shuffle_seed: item
             .get("shuffle_seed")
             .and_then(|v| v.as_b().ok())

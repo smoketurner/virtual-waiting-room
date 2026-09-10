@@ -391,8 +391,6 @@ mod tests {
             phase: Phase::Active,
             queue_counter: sealed.participant_count(),
             serving_counter: serving,
-            prequeue_counts: counts,
-            arrivals: [0; SHARDS],
             shuffle_seed: Some([9u8; 32]),
             participant_count: Some(sealed.participant_count()),
             prequeue_offsets: Some(offsets),

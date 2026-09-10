@@ -1,12 +1,15 @@
 //! `DynamoDB` item shapes for the MVP tables, (de)serialized via `serde_dynamo`.
 //!
-//! Attribute names match the deployed tables. The pre-queue counter is striped
-//! across [`SHARDS`] shards named `prequeue_counter#0`..`prequeue_counter#9`;
-//! `serde` cannot express a `#`-suffixed field, so the `Counters` item keeps
-//! the shards in a flat `[u64; SHARDS]` and (de)serializes them with a manual
-//! bridge in [`Counters::shard_counts`] / [`Counters::from_item`].
+//! Attribute names match the deployed tables.
+//!
+//! The striped counters are deliberately NOT here. A shard is its own item
+//! under its own partition key (see [`crate::expr::prequeue_shard_key`]),
+//! because `DynamoDB` caps writes at 1,000 per second per partition key —
+//! holding the shards as attributes on this item would put all of them back
+//! under one budget and distribute nothing. Readers that need them fetch them
+//! explicitly.
 
-use crate::permutation::{Assignment, SHARDS, SealError, SealedOffsets, Seed};
+use crate::permutation::{Assignment, SHARDS, SealedOffsets, Seed};
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{AdmissionControl, Phase};
@@ -67,16 +70,9 @@ pub struct Counters {
     pub queue_counter: u64,
     /// Admission cursor advanced by the controller.
     pub serving_counter: u64,
-    /// Per-shard registration counts (`prequeue_counter#0..9`).
-    pub prequeue_counts: [u64; SHARDS],
-    /// Per-shard arrival counts (`arrivals#0..9`), incremented by the authorizer
-    /// when it converts an admission token into a session. The controller sums
-    /// these each interval to measure the no-show rate. Sharded for
-    /// the same single-item write-ceiling reason as the pre-queue counter.
-    pub arrivals: [u64; SHARDS],
     /// Set only at the seal, absent before: the 256-bit permutation seed.
     pub shuffle_seed: Option<[u8; 32]>,
-    /// Set at the seal: cohort size `N = Σ prequeue_counts`.
+    /// Set at the seal: cohort size `N`, the sum of the pre-queue shards.
     pub participant_count: Option<u64>,
     /// Set at the seal: prefix offsets `offset[s] = Σ counts[0..s)`.
     pub prequeue_offsets: Option<[u64; SHARDS]>,
@@ -90,15 +86,6 @@ pub struct Counters {
 }
 
 impl Counters {
-    /// Builds the sealed offsets from the stored per-shard counts.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SealError::Overflow`] if the summed cohort size exceeds `u64`.
-    pub fn seal(&self) -> Result<SealedOffsets, SealError> {
-        SealedOffsets::seal(self.prequeue_counts)
-    }
-
     /// Resolves a pre-queue registration to its queue position.
     ///
     /// Reconstructs the global index `i = offset[s] + l` from the sealed offsets
@@ -225,25 +212,5 @@ mod tests {
             av.get("entry_time"),
             Some(&AttributeValue::N("1788000000".to_owned()))
         );
-    }
-
-    #[test]
-    fn counters_seal_matches_direct_sealed_offsets() {
-        let counters = Counters {
-            event_id: "evt-1".to_owned(),
-            phase: Phase::PreQueue,
-            queue_counter: 0,
-            serving_counter: 0,
-            prequeue_counts: [3, 0, 5, 1, 0, 0, 2, 0, 0, 4],
-            arrivals: [0; SHARDS],
-            shuffle_seed: None,
-            participant_count: None,
-            prequeue_offsets: None,
-            message: None,
-            admission_control: AdmissionControl::Open,
-        };
-        let sealed = counters.seal().unwrap();
-        assert_eq!(sealed.participant_count(), 15);
-        assert_eq!(sealed.offset(3), 8);
     }
 }

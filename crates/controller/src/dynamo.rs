@@ -85,11 +85,6 @@ impl Store for DynamoStore {
             .and_then(|s| s.parse::<AdmissionControl>().ok())
             .unwrap_or(AdmissionControl::Open);
 
-        let mut arrivals = [0u64; SHARDS];
-        for (shard, slot) in arrivals.iter_mut().enumerate() {
-            *slot = num(item, &format!("arrivals#{shard}"));
-        }
-
         // target_rate absent (never set by the operator) means no admission
         // target yet; treat as 0 so the controller releases nothing.
         let target_rate = u32::try_from(num(item, "target_rate")).unwrap_or(0);
@@ -100,6 +95,8 @@ impl Store for DynamoStore {
             .and_then(|s| s.parse::<f64>().ok())
             .filter(|r| r.is_finite() && (0.0..=1.0).contains(r))
             .map(|smoothed_rate| NoShowState { smoothed_rate });
+
+        let arrivals = self.read_arrivals(event_id).await?;
 
         Ok(ControllerState {
             phase,
@@ -285,6 +282,69 @@ impl Store for DynamoStore {
             }
             Err(e) => Err(StoreError(format!("update_item max_expired: {e}"))),
         }
+    }
+}
+
+impl DynamoStore {
+    /// Sums the arrivals shards. They are separate items under their own
+    /// partition keys so that recording an arrival never contends with the
+    /// sequences on the `Counters` item, which means reading them is a
+    /// `BatchGetItem` rather than attributes already in hand.
+    async fn read_arrivals(&self, event_id: &str) -> Result<[u64; SHARDS], StoreError> {
+        let keys: Vec<_> = (0..SHARDS)
+            .map(|shard| {
+                std::collections::HashMap::from([(
+                    "event_id".to_owned(),
+                    AttributeValue::S(wr_common::expr::arrivals_shard_key(event_id, shard)),
+                )])
+            })
+            .collect();
+
+        let request = aws_sdk_dynamodb::types::KeysAndAttributes::builder()
+            .set_keys(Some(keys))
+            .build()
+            .map_err(|e| StoreError(format!("build arrivals keys: {e}")))?;
+
+        let out = self
+            .client
+            .batch_get_item()
+            .request_items(&self.counters_table, request)
+            .send()
+            .await
+            .map_err(|e| StoreError(format!("batch_get_item arrivals: {e}")))?;
+
+        let mut arrivals = [0u64; SHARDS];
+        for item in out
+            .responses()
+            .and_then(|r| r.get(&self.counters_table))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+        {
+            let Some(key) = item.get("event_id").and_then(|v| v.as_s().ok()) else {
+                continue;
+            };
+            // A shard nobody has arrived on has no item; it stays zero.
+            let Some(shard) =
+                (0..SHARDS).find(|&s| wr_common::expr::arrivals_shard_key(event_id, s) == *key)
+            else {
+                continue;
+            };
+            arrivals[shard] = item
+                .get(wr_common::expr::SHARD_COUNT_ATTR)
+                .and_then(|v| v.as_n().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+        }
+        // An incomplete batch under-counts arrivals, which reads as a higher
+        // no-show rate and releases more. Better to skip the pass than to
+        // over-release on a partial read.
+        if out
+            .unprocessed_keys()
+            .is_some_and(|u| u.contains_key(&self.counters_table))
+        {
+            return Err(StoreError("arrivals read incomplete; retry".to_owned()));
+        }
+        Ok(arrivals)
     }
 }
 

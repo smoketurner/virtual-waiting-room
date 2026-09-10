@@ -128,11 +128,18 @@ actions must work with JavaScript disabled, and the UI adds no capability the ad
 
 ### State
 
-Four DynamoDB tables, all on-demand with PITR: `Counters` (PK `event_id`; one item per event
-holding every sequence, phase, seed, rate, message), `PreQueue` (PK `r`), `Positions`
-(PK `request_id`), `Tokens` (PK `request_id`). `queue_counter` and `serving_counter` are
-sequences and must stay on a single item — sharding them destroys ordering. `prequeue_counter`
-and `arrivals` are order-free and are striped ×10.
+Four DynamoDB tables, all on-demand with PITR: `Counters` (PK `event_id`), `PreQueue` (PK `r`),
+`Positions` (PK `request_id`), `Tokens` (PK `request_id`).
+
+The event's own `Counters` item holds the sequences, phase, seed, rate, and message.
+`queue_counter` and `serving_counter` must stay on it — sharding a sequence destroys ordering —
+and both are low-rate: one claim per ingest batch, one advance per controller pass.
+
+`prequeue_counter` and `arrivals` are order-free and striped ×10, **as separate items** keyed
+`{event_id}#pq#{shard}` and `{event_id}#ar#{shard}`, each holding one attribute `n`. The write
+ceiling is 1,000/s per partition key, so striping across attribute names on one item would
+share a single budget and distribute nothing (ADR-0015 amendment). Attribute names are billed
+on every write too, which is why the shard attribute is one letter.
 
 ### Infrastructure
 

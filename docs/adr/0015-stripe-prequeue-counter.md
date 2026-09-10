@@ -1,6 +1,6 @@
 # ADR-0015: Stripe the pre-queue registration counter across 10 shards
 
-**Status:** Accepted
+**Status:** Accepted, amended — the original striping did not work (see Amendment)
 
 ## Context
 
@@ -87,3 +87,45 @@ not apply to them.
 - **Torn read at T−0 is impossible.** Seed, count, offsets and phase are set in one atomic
   single-item write, so a reader sees either the pre-`active` state (countdown) or all four
   together — never offsets without a count.
+
+
+## Amendment: striping by attribute name distributes nothing
+
+The decision above was implemented by striping across ten *attribute names*
+(`prequeue_counter#0`..`prequeue_counter#9`) on the single `Counters` item. That
+does not do what this record claims.
+
+`DynamoDB` enforces its write ceiling per **partition key**, not per attribute:
+"If your application drives consistently high traffic to a single item… DynamoDB
+can deliver throughput up to the partition maximum of 3,000 RCUs and 1,000 WCUs
+to that single item's primary key." Ten attributes on one item share one 1,000
+writes-per-second budget. The stripe count bought nothing.
+
+It was worse than neutral. `UpdateItem` is billed on the size of the whole item:
+"Even if you update a subset of the item's attributes, `UpdateItem` will still
+consume the full amount of provisioned throughput", rounded up to the next 1 KB.
+Attribute names count toward that size, and `prequeue_counter#0` is eighteen
+bytes of name before any value. Twenty such attributes — the pre-queue shards
+plus the arrivals shards — made every write to `Counters` more expensive,
+including the `queue_counter` claims and every controller pass, while
+distributing nothing.
+
+The same mistake was load-bearing at the target scale. At 10k joins per second
+the arrivals counter alone runs at the admission rate, and it shared a budget
+with the live-join sequence on the same item.
+
+**The striping is now across partition keys.** Each shard is its own item, keyed
+`{event_id}#pq#{shard}` and `{event_id}#ar#{shard}`, holding a single attribute
+`n`. Ten shards are ten partition keys and ten budgets, and each item is small
+enough that an increment always costs exactly one write unit rather than the
+size of a growing shared item.
+
+`queue_counter` and `serving_counter` stay on the event's own item. They are
+sequences whose ordering is the point, and they are low-rate: one claim per
+ingest batch, one advance per controller pass.
+
+The cost is on the read side, and it is small: the seal and the controller each
+gather their ten shards with one `BatchGetItem` instead of reading attributes
+from an item they had already fetched. Both treat an incomplete batch as a
+failure rather than a zero, because a missed shard would under-count the cohort
+or over-release admission.
