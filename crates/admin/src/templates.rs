@@ -61,7 +61,7 @@ impl Dashboard {
             allowed_transitions: crate::next_phases(state.phase)
                 .into_iter()
                 .map(|p| PhaseOption {
-                    value: phase_value(p).to_owned(),
+                    value: p.as_wire_str().to_owned(),
                     label: phase_label(p),
                 })
                 .collect(),
@@ -76,18 +76,6 @@ impl Dashboard {
             csp_nonce: String::new(),
             operator_email: String::new(),
         }
-    }
-}
-
-/// The stored `snake_case` value for a phase (matches what the handler parses).
-fn phase_value(p: wr_domain::Phase) -> &'static str {
-    use wr_domain::Phase::{Active, Idle, Maintenance, PostEvent, PreQueue};
-    match p {
-        Idle => "idle",
-        PreQueue => "pre_queue",
-        Active => "active",
-        PostEvent => "post_event",
-        Maintenance => "maintenance",
     }
 }
 
