@@ -187,6 +187,11 @@ fn counters_from_item(
         shuffle_seed,
         participant_count: num("participant_count"),
         prequeue_offsets,
+        message: item
+            .get("message")
+            .and_then(|v| v.as_s().ok())
+            .filter(|s| !s.is_empty())
+            .cloned(),
     }
 }
 

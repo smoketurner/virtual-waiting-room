@@ -66,6 +66,9 @@ pub struct Counters {
     pub participant_count: Option<u64>,
     /// Set at the seal: prefix offsets `offset[s] = Σ counts[0..s)`.
     pub prequeue_offsets: Option<[u64; SHARDS]>,
+    /// Operator broadcast text shown to waiting visitors. Absent until an
+    /// operator sets it; cleared by setting it empty.
+    pub message: Option<String>,
 }
 
 impl Counters {
@@ -131,6 +134,7 @@ mod tests {
             shuffle_seed: None,
             participant_count: None,
             prequeue_offsets: None,
+            message: None,
         };
         let sealed = counters.seal().unwrap();
         assert_eq!(sealed.participant_count(), 15);
