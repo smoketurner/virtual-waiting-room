@@ -58,6 +58,11 @@ output "admin_function_name" {
   value       = aws_lambda_function.admin.function_name
 }
 
+output "controller_function_name" {
+  description = "Name of the controller Lambda. The controller schedule fires it every minute when enable_controller is true."
+  value       = aws_lambda_function.controller.function_name
+}
+
 output "event_id" {
   description = "The single event id this deployment serves. The read Lambda scopes /status and /queue_num to it."
   value       = var.event_id
