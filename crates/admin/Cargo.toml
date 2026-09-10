@@ -23,9 +23,9 @@ tower-http = { workspace = true, features = ["normalize-path"] }
 askama = { workspace = true, features = ["std", "derive", "config"] }
 rust-embed = { workspace = true }
 mime_guess = { workspace = true }
-aws-config = { workspace = true, features = ["behavior-version-latest"] }
-aws-sdk-dynamodb = { workspace = true, features = ["default-https-client", "rt-tokio"] }
-aws-sdk-ssm = { workspace = true, features = ["default-https-client", "rt-tokio"] }
+aws-config = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+aws-sdk-dynamodb = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+aws-sdk-ssm = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 aws-smithy-types = { workspace = true }
 # OIDC admin login (ADR-0016). openidconnect provides only the reqwest transport
 # (its rustls-tls default forces reqwest's ring provider, forbidden by tech.md).
