@@ -194,3 +194,92 @@ resource "aws_iam_role_policy" "seal_scheduler" {
     }]
   })
 }
+
+# --- controller ---------------------------------------------------------------
+#
+# The closed-loop outflow controller. It advances
+# serving_counter to meter admission against the operator's target rate while
+# compensating for no-shows, and expires positions past expires_at. Falls back
+# to the placeholder until its artifact is supplied.
+
+resource "aws_iam_role" "controller" {
+  name               = "${local.controller_name}-role"
+  assume_role_policy = data.aws_iam_policy_document.lambda_assume_role.json
+  tags               = var.tags
+}
+
+resource "aws_iam_role_policy" "controller" {
+  name   = "${local.controller_name}-policy"
+  role   = aws_iam_role.controller.id
+  policy = data.aws_iam_policy_document.controller.json
+}
+
+resource "aws_lambda_function" "controller" {
+  function_name = local.controller_name
+  role          = aws_iam_role.controller.arn
+  runtime       = "provided.al2023"
+  architectures = [local.lambda_runtime_arch]
+  handler       = "bootstrap"
+  # One invoke runs six 10s passes, so the timeout must exceed a full minute of
+  # cadence plus the per-pass DynamoDB work.
+  timeout     = 90
+  memory_size = 256
+
+  filename         = local.controller_zip
+  source_code_hash = local.controller_hash
+
+  environment {
+    variables = merge(local.dynamo_lambda_env, {
+      COUNTERS_TABLE  = aws_dynamodb_table.counters.name
+      POSITIONS_TABLE = aws_dynamodb_table.positions.name
+      EVENT_ID        = var.event_id
+    })
+  }
+
+  tags = var.tags
+}
+
+# --- controller schedule (EventBridge Scheduler) ------------------------------
+# The design cadence is 10s, but the Scheduler rate() minimum is 1 minute, so
+# the schedule fires every minute and each invoke runs six 10s passes. Off by
+# default; enabled ahead of an event via enable_controller.
+
+resource "aws_scheduler_schedule" "controller" {
+  count = var.enable_controller ? 1 : 0
+
+  name = "${var.name_prefix}-controller"
+
+  flexible_time_window {
+    mode = "OFF"
+  }
+
+  schedule_expression          = "rate(1 minute)"
+  schedule_expression_timezone = "UTC"
+
+  target {
+    arn      = aws_lambda_function.controller.arn
+    role_arn = aws_iam_role.controller_scheduler[0].arn
+    input    = jsonencode({ event_id = var.event_id })
+  }
+}
+
+resource "aws_iam_role" "controller_scheduler" {
+  count              = var.enable_controller ? 1 : 0
+  name               = "${var.name_prefix}-controller-scheduler-role"
+  assume_role_policy = data.aws_iam_policy_document.scheduler_assume_role.json
+  tags               = var.tags
+}
+
+resource "aws_iam_role_policy" "controller_scheduler" {
+  count = var.enable_controller ? 1 : 0
+  name  = "${var.name_prefix}-controller-scheduler-policy"
+  role  = aws_iam_role.controller_scheduler[0].id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "lambda:InvokeFunction"
+      Resource = aws_lambda_function.controller.arn
+    }]
+  })
+}
