@@ -1,8 +1,8 @@
 # ADR-0021: Move the gate to a CloudFront Function
 
-**Status:** Proposed — spike output, revised after architecture review and measured against a real
-function and key value store. The direction is sound, §4.1 is settled and the gate is demonstrated
-to work; §4.2 and §5 carry the remaining open decisions, and §7 lists what is still unmeasured.
+**Status:** Proposed — spike complete. Every measurement that could have invalidated the approach
+has been taken and none did. The remaining items in §5 are design decisions, not unknowns: this is
+ready to be Accepted.
 
 **Supersedes if accepted:** [ADR-0020](0020-cloudfront-signed-cookie-gate.md) entirely. It does
 **not** restore [ADR-0009](0009-fail-open.md) on its own — see §5.1.
@@ -73,9 +73,10 @@ Sources: [CloudFront quotas](https://docs.aws.amazon.com/AmazonCloudFront/latest
 [KeyValueStore](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/kvs-with-functions.html),
 [Function restrictions](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/cloudfront-function-restrictions.html).
 
-**AWS publishes no propagation-time commitment for a KeyValueStore update.** That number is the
-standby activation latency (#60) and the revocation delay (#63) simultaneously, and it is the
-window during which the edge and DynamoDB disagree about serving state (§4.2).
+**AWS publishes no propagation-time commitment for a KeyValueStore update, so it was measured:
+a median of 31 seconds** (§6). That single number is the standby activation latency (#60), the
+revocation delay (#63), and the window during which the edge and DynamoDB disagree about serving
+state (§4.2).
 
 ## 3. Decision (proposed)
 
@@ -194,6 +195,13 @@ non-`Open` state — `crates/controller/src/lib.rs` returns `PassOutcome::Held` 
 `FailOpen` — which closes the hole once both sides agree, but not during the window. The ADR needs
 to say what the edge does when it cannot tell.
 
+**The window is now measured at ~31 seconds**, which makes the exposure concrete rather than
+open-ended: for roughly half a minute after an operator pauses, some edges still pass traffic while
+DynamoDB reads `Paused`. The controller holds in both non-`Open` states, so `serving_counter` does
+not run away; what is exposed is up to 31 seconds of admissions the controller is not counting. At
+a 500/min target that is around 250 visitors. That is a tolerable overshoot for a pause, and it is
+the number the runbook should quote rather than "shortly."
+
 With RustCrypto accepted (§4.1), the writer is settled: the **admin Lambda writes both** — DynamoDB
 first as the authority, then the KeyValueStore as the derived cache — so an operator action has one
 origin and the two copies converge within the propagation window rather than being reconciled by a
@@ -234,9 +242,11 @@ the deployment open indefinitely.
 
 Bearer credentials verified with no state are unrevocable by construction. The options are a
 generation counter in the credential plus a floor in the store, which revokes everyone at once; or
-a per-visitor deny list in the store, which is targeted and fits 5 MB but is gated by the same
-unmeasured propagation window. Neither is chosen, so #63 is listed in §1 as unresolved rather than
-claimed.
+a per-visitor deny list in the store, which is targeted and fits 5 MB. Both are gated by the
+31-second propagation floor, so revocation is honestly described as "takes effect within about a
+minute," never as immediate. That rules it out as a response to something happening right now, and
+it means a short credential TTL remains the primary defence with revocation as a second line.
+Neither design is chosen, so #63 is listed in §1 as unresolved rather than claimed.
 
 ## 6. Measured in the spike
 
@@ -283,11 +293,23 @@ and `x-wr-reason`, and a tampered credential is distinguishable from a missing o
 rules needs 3 keys. The encoding measured was hand-written; the committed format must be
 `ProtectionRule`'s own `serde_json` form, or Rust and JavaScript will drift.
 
+**KeyValueStore propagation to an edge is a median of 31 seconds** — 29.4s min, 32.4s max, five
+of five trials observed. Measured by publishing a probe function against a throwaway distribution
+and polling it over HTTPS after each write (`scripts/spike_edge_gate.py --propagation`).
+
+The tightness matters as much as the value: a three-second spread across five trials looks like a
+fixed sync interval rather than variable propagation, which makes it a number you can design
+against rather than a distribution with a bad tail.
+
+Two caveats bound it. One client observes one point of presence, so **31 seconds is a floor** —
+global convergence is at least that and probably longer. And propagation was measured on a
+single-key write; a multi-key ruleset (100 rules, 3 keys) writes atomically but may still be read
+partially at an edge mid-propagation.
+
 ## 7. What must still be measured
 
 1. ~~Compute utilization at real credential size.~~ **Answered in §6: 11 of 100 on the hot path.**
-2. **KeyValueStore propagation time**, end to end and at the tail: the standby activation latency,
-   the revocation delay, and the edge/DynamoDB disagreement window.
+2. ~~KeyValueStore propagation time.~~ **Answered in §6: 31s median to one edge.**
 3. ~~Ruleset shape against the 1 KB value ceiling.~~ **Answered in §6.**
 4. ~~Whether viewer-response runs after a generated viewer-request response.~~ **Moot.** With the
    exchange step gone (§3.1) and per-visitor session lifetime deferred to #65, the second function

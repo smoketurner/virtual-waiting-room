@@ -56,9 +56,44 @@ import time
 
 import boto3
 from botocore.exceptions import ClientError
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 KVS_NAME = "wr-spike-kvs"
 FUNCTION_NAME = "wr-spike-gate"
+PROBE_FUNCTION_NAME = "wr-spike-probe"
+PROBE_COMMENT = "ADR-0021 propagation probe, safe to delete"
+
+# CloudFront managed CachingDisabled policy. The probe function generates its
+# response at viewer-request, so the cache is bypassed anyway; this makes that
+# explicit rather than implicit.
+CACHING_DISABLED = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
+
+# The probe reports the current key value in a response header and never
+# contacts an origin, so the origin below is a placeholder that is never called.
+PROBE_JS = """import cf from 'cloudfront';
+var kvs = cf.kvs();
+
+async function handler(event) {
+    try {
+        var v = await kvs.get('probe', { format: 'string' });
+        return {
+            statusCode: 200,
+            statusDescription: 'OK',
+            headers: {
+                'x-wr-probe': { value: v },
+                'cache-control': { value: 'no-store' }
+            }
+        };
+    } catch (e) {
+        return {
+            statusCode: 500,
+            statusDescription: 'Error',
+            headers: { 'x-wr-probe': { value: 'error' } }
+        };
+    }
+}
+"""
 
 # Not a secret: the same throwaway key the Rust used to mint TEST_CREDENTIAL.
 SIGNING_KEY = "spike-key-0123456789-abcdefghijk"
@@ -478,6 +513,191 @@ def cleanup(cf, quiet=False):
         print(f"  deleted the {label}")
 
 
+
+def propagation(cf, kvs_data, trials):
+    """Time a key value store update from PutKey to visible at a real edge.
+
+    This is the number ADR-0021 leaves open, and it sets three commitments at
+    once: how fast standby can activate (#60), how fast an admission can be
+    revoked (#63), and how long the edge and DynamoDB disagree about serving
+    state (section 4.2). AWS publishes no commitment for it.
+
+    It cannot be measured through TestFunction, which does not run at an edge
+    location. So this builds the smallest thing that does: a throwaway
+    distribution whose viewer-request function returns the current key value in
+    a header and never contacts an origin.
+
+    One caveat that bounds the result. A client sees one edge location, so what
+    is measured is propagation to the nearest point of presence. Global
+    convergence - every visitor everywhere seeing fail-open - is at least this
+    and probably longer. Treat the figure as a floor, not a guarantee.
+    """
+    print("Creating key value store")
+    try:
+        created = cf.create_key_value_store(Name=KVS_NAME, Comment=PROBE_COMMENT)
+    except ClientError as err:
+        if err.response["Error"]["Code"] == "EntityAlreadyExists":
+            fatal(f"{KVS_NAME} already exists - run with --cleanup first")
+        fatal("could not create the key value store", err)
+    arn = created["KeyValueStore"]["ARN"]
+    wait_ready(cf, KVS_NAME)
+
+    etag = kvs_data.describe_key_value_store(KvsARN=arn)["ETag"]
+    etag = kvs_data.put_key(KvsARN=arn, Key="probe", Value="v0", IfMatch=etag)["ETag"]
+
+    print(f"Creating and publishing {PROBE_FUNCTION_NAME}")
+    fn = cf.create_function(
+        Name=PROBE_FUNCTION_NAME,
+        FunctionConfig={
+            "Comment": PROBE_COMMENT,
+            "Runtime": "cloudfront-js-2.0",
+            "KeyValueStoreAssociations": {
+                "Quantity": 1,
+                "Items": [{"KeyValueStoreARN": arn}],
+            },
+        },
+        FunctionCode=PROBE_JS.encode(),
+    )
+    published = cf.publish_function(Name=PROBE_FUNCTION_NAME, IfMatch=fn["ETag"])
+    fn_arn = published["FunctionSummary"]["FunctionMetadata"]["FunctionARN"]
+
+    print("Creating a throwaway distribution (this is the slow part)")
+    dist = cf.create_distribution(
+        DistributionConfig={
+            "CallerReference": f"wr-spike-{int(time.time())}",
+            "Comment": PROBE_COMMENT,
+            "Enabled": True,
+            "Origins": {
+                "Quantity": 1,
+                "Items": [
+                    {
+                        "Id": "placeholder",
+                        "DomainName": "example.com",
+                        "CustomOriginConfig": {
+                            "HTTPPort": 80,
+                            "HTTPSPort": 443,
+                            "OriginProtocolPolicy": "https-only",
+                        },
+                    }
+                ],
+            },
+            "DefaultCacheBehavior": {
+                "TargetOriginId": "placeholder",
+                "ViewerProtocolPolicy": "redirect-to-https",
+                "CachePolicyId": CACHING_DISABLED,
+                "FunctionAssociations": {
+                    "Quantity": 1,
+                    "Items": [
+                        {"EventType": "viewer-request", "FunctionARN": fn_arn}
+                    ],
+                },
+            },
+        }
+    )["Distribution"]
+    dist_id, domain = dist["Id"], dist["DomainName"]
+    print(f"  {dist_id} at {domain}")
+
+    print("  waiting for Deployed...")
+    cf.get_waiter("distribution_deployed").wait(
+        Id=dist_id, WaiterConfig={"Delay": 20, "MaxAttempts": 60}
+    )
+
+    url = f"https://{domain}/"
+
+    def observed():
+        try:
+            with urlopen(Request(url, headers={"cache-control": "no-cache"}), timeout=10) as r:
+                return r.headers.get("x-wr-probe")
+        except URLError:
+            return None
+
+    print("\n  settling before the first trial")
+    for _ in range(30):
+        if observed() == "v0":
+            break
+        time.sleep(2)
+
+    results = []
+    for trial in range(1, trials + 1):
+        want = f"t{trial}-{int(time.time())}"
+        etag = kvs_data.describe_key_value_store(KvsARN=arn)["ETag"]
+        start = time.time()
+        kvs_data.put_key(KvsARN=arn, Key="probe", Value=want, IfMatch=etag)
+
+        elapsed = None
+        while time.time() - start < 300:
+            if observed() == want:
+                elapsed = time.time() - start
+                break
+            time.sleep(1)
+        if elapsed is None:
+            print(f"  trial {trial}: NOT VISIBLE within 300s")
+            results.append(None)
+        else:
+            print(f"  trial {trial}: {elapsed:.1f}s")
+            results.append(elapsed)
+
+    print("\n" + "=" * 72)
+    print("KeyValueStore propagation to one edge location")
+    print("=" * 72)
+    good = [r for r in results if r is not None]
+    if good:
+        good_sorted = sorted(good)
+        median = good_sorted[len(good_sorted) // 2]
+        print(f"\n  trials: {len(good)}/{trials} observed")
+        print(f"  min {min(good):.1f}s   median {median:.1f}s   max {max(good):.1f}s")
+        print("\n  This bounds three commitments in ADR-0021: standby activation (#60),")
+        print("  revocation delay (#63), and the window in which the edge and DynamoDB")
+        print("  disagree about serving state (section 4.2).")
+        print("\n  It is a floor. One client sees one point of presence; global")
+        print("  convergence is at least this and probably longer.")
+    else:
+        print("\n  Nothing propagated within 300s. That is itself a finding - it would")
+        print("  make standby activation and revocation impractical at the edge.")
+
+    print("\nCleanup")
+    print(f"  The distribution {dist_id} is still enabled, and CloudFront will not")
+    print("  delete a function while a distribution references it. Disabling a")
+    print("  distribution and waiting for that to deploy takes longer than this")
+    print("  script should hold your terminal, so one command tears down all three:")
+    print(f"\n    scripts/spike_edge_gate.py --delete-distribution {dist_id}\n")
+
+
+def delete_distribution(cf, dist_id):
+    """Disable a distribution, wait for that to deploy, then delete it."""
+    current = cf.get_distribution_config(Id=dist_id)
+    config, etag = current["DistributionConfig"], current["ETag"]
+    if config["Enabled"]:
+        config["Enabled"] = False
+        etag = cf.update_distribution(Id=dist_id, DistributionConfig=config, IfMatch=etag)[
+            "ETag"
+        ]
+        print(f"  disabled {dist_id}, waiting for that to deploy (several minutes)")
+        cf.get_waiter("distribution_deployed").wait(
+            Id=dist_id, WaiterConfig={"Delay": 30, "MaxAttempts": 60}
+        )
+        etag = cf.get_distribution_config(Id=dist_id)["ETag"]
+    cf.delete_distribution(Id=dist_id, IfMatch=etag)
+    print(f"  deleted {dist_id}")
+
+    # Only now can the function go, and the store only after the function.
+    for name in (PROBE_FUNCTION_NAME, FUNCTION_NAME):
+        try:
+            cf.delete_function(Name=name, IfMatch=cf.describe_function(Name=name)["ETag"])
+            print(f"  deleted the function {name}")
+        except ClientError as err:
+            if err.response["Error"]["Code"] != "NoSuchFunctionExists":
+                fatal(f"could not delete the function {name}", err)
+    try:
+        cf.delete_key_value_store(
+            Name=KVS_NAME, IfMatch=cf.describe_key_value_store(Name=KVS_NAME)["ETag"]
+        )
+        print(f"  deleted the key value store {KVS_NAME}")
+    except ClientError as err:
+        if err.response["Error"]["Code"] != "EntityNotFound":
+            fatal("could not delete the key value store", err)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--profile", default="dev-admin")
@@ -492,15 +712,34 @@ def main():
         action="store_true",
         help="leave the function and store in place for further testing",
     )
+    parser.add_argument(
+        "--propagation",
+        action="store_true",
+        help="measure key value store propagation to a real edge (slow: builds a distribution)",
+    )
+    parser.add_argument("--trials", type=int, default=5)
+    parser.add_argument(
+        "--delete-distribution",
+        metavar="ID",
+        help="disable and delete a distribution left by --propagation",
+    )
     args = parser.parse_args()
 
     session = boto3.Session(profile_name=args.profile, region_name=args.region)
     cf = session.client("cloudfront")
     kvs_data = session.client("cloudfront-keyvaluestore")
 
+    if args.delete_distribution:
+        delete_distribution(cf, args.delete_distribution)
+        return
+
     if args.cleanup:
         print("Cleaning up")
         cleanup(cf)
+        return
+
+    if args.propagation:
+        propagation(cf, kvs_data, args.trials)
         return
 
     etag, code_size = create(cf, kvs_data)
