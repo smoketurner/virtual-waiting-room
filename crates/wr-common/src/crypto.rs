@@ -1,33 +1,47 @@
-//! Signed admission tokens and session cookies for the authorizer.
+//! Signed admission tokens and session cookies.
 //!
-//! Both credentials are minted from one per-deployment key with
-//! `HMAC-SHA256`, but over domain-separated messages so neither validates as
-//! the other: the message begins with a one-byte kind tag
-//! (`0x01` token, `0x02` session) that differs before any field, so a token's
-//! bytes can never reproduce a session's MAC or vice versa. The key is held in
-//! Secrets Manager and read at Lambda init; its compromise mints admission for
-//! every event in the deployment.
+//! Both are JSON Web Signatures in compact serialization — a JWT — signed
+//! `HS256` under a per-deployment key. An origin, a proxy or an operator can
+//! validate one with any JWT library; only the `CloudFront` Function hand-rolls
+//! verification, because its runtime has no library to call.
 //!
-//! # Wire encoding
+//! `HS256` is not a preference. The `CloudFront` Functions `crypto` module
+//! exposes `createHash` and `createHmac` over `md5`, `sha1` and `sha256` and
+//! nothing else, so `RS256`, `ES256`, `HS384` and `HS512` cannot be verified at
+//! the edge, and JWE cannot be decrypted there at all.
 //!
-//! A credential serializes to `base64url(payload) "." base64url(mac)` with no
-//! padding. The MAC covers the kind tag followed by the canonical field
-//! encoding below — not the base64url text — so a change in text encoding
-//! cannot alter what was signed. All integers are big-endian.
+//! # Claims
 //!
-//! - **Admission token** (kind `0x01`): `event_id` and `request_id` as
-//!   length-prefixed UTF-8 (`u16` length then bytes), then `expires_at` as an
-//!   8-byte epoch-seconds `u64`.
-//! - **Session cookie** (kind `0x02`): `event_id`, `request_id`,
-//!   `issued_at` (`u64`), `expires_at` (`u64`). The hard cap is `expires_at`;
-//!   a sliding window re-issues with a later `expires_at` on activity.
+//! `aud` the event id, `sub` the request id, `exp` the hard expiry, and for a
+//! session `iat` as well. All three are registered claims, so the payload reads
+//! the same to any JWT tool.
+//!
+//! # Domain separation
+//!
+//! A token must never validate as a session. That is enforced at the signature
+//! rather than by a claim: each kind signs under its own key, derived from the
+//! deployment secret by [`SigningKey`]. Presenting one kind as the other fails
+//! `BadSignature`, so there is no check a caller can forget to make. A `typ`
+//! claim would have to be read *after* verifying, and skipping it would admit
+//! the wrong credential.
 
 use aws_lc_rs::hmac;
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use serde::{Deserialize, Serialize};
 
-/// A credential kind tag, the first signed byte so the two credentials are
-/// domain-separated.
+/// The registered claims carried by both credentials. `iat` is absent on an
+/// admission token, which has no issue time to record.
+#[derive(Debug, Serialize, Deserialize)]
+struct Claims {
+    aud: String,
+    sub: String,
+    exp: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    iat: Option<u64>,
+}
+
+/// A credential kind. Each signs under its own derived key, so the two are
+/// separated by the signature rather than by a claim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Token,
@@ -35,25 +49,67 @@ enum Kind {
 }
 
 impl Kind {
-    /// The one-byte tag that leads the signed message.
-    const fn tag(self) -> u8 {
+    /// The derivation label for this kind's key. Distinct constant strings, so
+    /// the two derived keys cannot coincide. Versioned because changing a
+    /// label changes every credential it signs.
+    const fn label(self) -> &'static [u8] {
         match self {
-            Self::Token => 0x01,
-            Self::Session => 0x02,
+            Self::Token => b"vwr/jws/token/v1",
+            Self::Session => b"vwr/jws/session/v1",
         }
     }
 }
 
-/// The per-deployment signing key (Secrets Manager). A newtype so a raw byte
-/// slice is never mistaken for the key at a call site.
-pub struct SigningKey(hmac::Key);
+/// The per-deployment signing key, read from SSM at Lambda init. A newtype so
+/// a raw byte slice is never mistaken for the key at a call site.
+///
+/// The deployment secret is never used to sign directly. Each credential kind
+/// signs under `HMAC-SHA256(secret, label)`, so a credential of one kind cannot
+/// validate as the other. The edge derives the session key the same way from
+/// the same secret; it holds the secret, not a reduced key, because Terraform
+/// has no HMAC function to derive one with at apply time.
+pub struct SigningKey {
+    token: [u8; 32],
+    session: [u8; 32],
+}
 
 impl SigningKey {
-    /// Builds a signing key from the raw secret bytes.
+    /// Derives both per-kind keys from the deployment secret.
     #[must_use]
     pub fn new(secret: &[u8]) -> Self {
-        Self(hmac::Key::new(hmac::HMAC_SHA256, secret))
+        Self {
+            token: derive(secret, Kind::Token),
+            session: derive(secret, Kind::Session),
+        }
     }
+
+    const fn for_kind(&self, kind: Kind) -> &[u8; 32] {
+        match kind {
+            Kind::Token => &self.token,
+            Kind::Session => &self.session,
+        }
+    }
+}
+
+/// `HMAC-SHA256(secret, label)`. One pass is enough for a full-entropy secret
+/// and a fixed label; the labels are distinct constants, so the two outputs
+/// cannot collide.
+fn derive(secret: &[u8], kind: Kind) -> [u8; 32] {
+    let tag = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, secret), kind.label());
+    let mut out = [0u8; 32];
+    out.copy_from_slice(tag.as_ref());
+    out
+}
+
+/// Verification pins `HS256` and does its own expiry check against an injected
+/// `now`, so the result does not depend on the host clock and stays testable.
+/// `aud` carries the event id and is compared by the caller, which knows which
+/// event it is serving.
+fn validation() -> Validation {
+    let mut v = Validation::new(Algorithm::HS256);
+    v.validate_exp = false;
+    v.validate_aud = false;
+    v
 }
 
 /// A single-use admission token: proof a visitor reached the front of the
@@ -95,11 +151,19 @@ pub enum VerifyError {
 }
 
 impl AdmissionToken {
-    /// Serializes and signs the token into `base64url(payload).base64url(mac)`.
+    /// Signs the token as a compact JWS (`HS256`).
     #[must_use]
     pub fn sign(&self, key: &SigningKey) -> String {
-        let payload = encode_token(self);
-        sign_payload(key, Kind::Token, &payload)
+        sign_claims(
+            key,
+            Kind::Token,
+            &Claims {
+                aud: self.event_id.clone(),
+                sub: self.request_id.clone(),
+                exp: self.expires_at,
+                iat: None,
+            },
+        )
     }
 
     /// Verifies a signed token against `key` and checks it has not expired at
@@ -111,21 +175,32 @@ impl AdmissionToken {
     /// [`VerifyError::BadSignature`] if the MAC does not match under this kind;
     /// [`VerifyError::Expired`] if `now >= expires_at`.
     pub fn verify(token: &str, key: &SigningKey, now: u64) -> Result<Self, VerifyError> {
-        let payload = verify_payload(key, Kind::Token, token)?;
-        let token = decode_token(&payload).ok_or(VerifyError::Malformed)?;
-        if now >= token.expires_at {
+        let claims = verify_claims(key, Kind::Token, token)?;
+        if now >= claims.exp {
             return Err(VerifyError::Expired);
         }
-        Ok(token)
+        Ok(Self {
+            event_id: claims.aud,
+            request_id: claims.sub,
+            expires_at: claims.exp,
+        })
     }
 }
 
 impl Session {
-    /// Serializes and signs the session into `base64url(payload).base64url(mac)`.
+    /// Signs the session as a compact JWS (`HS256`).
     #[must_use]
     pub fn sign(&self, key: &SigningKey) -> String {
-        let payload = encode_session(self);
-        sign_payload(key, Kind::Session, &payload)
+        sign_claims(
+            key,
+            Kind::Session,
+            &Claims {
+                aud: self.event_id.clone(),
+                sub: self.request_id.clone(),
+                exp: self.expires_at,
+                iat: Some(self.issued_at),
+            },
+        )
     }
 
     /// Verifies a signed session against `key` and checks it has not expired at
@@ -137,136 +212,46 @@ impl Session {
     /// [`VerifyError::BadSignature`] if the MAC does not match under this kind;
     /// [`VerifyError::Expired`] if `now >= expires_at`.
     pub fn verify(session: &str, key: &SigningKey, now: u64) -> Result<Self, VerifyError> {
-        let payload = verify_payload(key, Kind::Session, session)?;
-        let session = decode_session(&payload).ok_or(VerifyError::Malformed)?;
-        if now >= session.expires_at {
+        let claims = verify_claims(key, Kind::Session, session)?;
+        if now >= claims.exp {
             return Err(VerifyError::Expired);
         }
-        Ok(session)
+        Ok(Self {
+            event_id: claims.aud,
+            request_id: claims.sub,
+            issued_at: claims.iat.ok_or(VerifyError::Malformed)?,
+            expires_at: claims.exp,
+        })
     }
 }
 
 /// Signs `kind || payload` and returns `base64url(payload).base64url(mac)`.
-fn sign_payload(key: &SigningKey, kind: Kind, payload: &[u8]) -> String {
-    let mut message = Vec::with_capacity(payload.len() + 1);
-    message.push(kind.tag());
-    message.extend_from_slice(payload);
-    let mac = hmac::sign(&key.0, &message);
-    format!("{}.{}", B64.encode(payload), B64.encode(mac.as_ref()))
+fn sign_claims(key: &SigningKey, kind: Kind, claims: &Claims) -> String {
+    jsonwebtoken::encode(
+        &Header::new(Algorithm::HS256),
+        claims,
+        &EncodingKey::from_secret(key.for_kind(kind)),
+    )
+    .unwrap_or_default()
 }
 
-/// Splits `payload.mac`, verifies the MAC over `kind || payload` in constant
-/// time, and returns the raw payload bytes on success.
-fn verify_payload(key: &SigningKey, kind: Kind, credential: &str) -> Result<Vec<u8>, VerifyError> {
-    let (payload_b64, mac_b64) = credential.split_once('.').ok_or(VerifyError::Malformed)?;
-    let payload = B64
-        .decode(payload_b64)
-        .map_err(|_| VerifyError::Malformed)?;
-    let mac = B64.decode(mac_b64).map_err(|_| VerifyError::Malformed)?;
+/// Verifies a compact JWS and returns its claims. Errors are collapsed to
+/// [`VerifyError`] so a caller learns only that the credential is invalid: a
+/// wrong key, a tampered payload and a credential of the other kind are
+/// indistinguishable.
+fn verify_claims(key: &SigningKey, kind: Kind, credential: &str) -> Result<Claims, VerifyError> {
+    use jsonwebtoken::errors::ErrorKind;
 
-    let mut message = Vec::with_capacity(payload.len() + 1);
-    message.push(kind.tag());
-    message.extend_from_slice(&payload);
-    // hmac::verify is constant-time over the tag length, so a wrong kind, wrong
-    // key, or tampered payload are indistinguishable and non-timing-leaking.
-    hmac::verify(&key.0, &message, &mac).map_err(|_| VerifyError::BadSignature)?;
-    Ok(payload)
-}
-
-/// `event_id ‖ request_id ‖ expires_at`.
-fn encode_token(t: &AdmissionToken) -> Vec<u8> {
-    let mut out = Vec::new();
-    put_str(&mut out, &t.event_id);
-    put_str(&mut out, &t.request_id);
-    out.extend_from_slice(&t.expires_at.to_be_bytes());
-    out
-}
-
-fn decode_token(payload: &[u8]) -> Option<AdmissionToken> {
-    let mut cursor = Cursor::new(payload);
-    let event_id = cursor.take_str()?;
-    let request_id = cursor.take_str()?;
-    let expires_at = cursor.take_u64()?;
-    if !cursor.at_end() {
-        return None;
-    }
-    Some(AdmissionToken {
-        event_id,
-        request_id,
-        expires_at,
+    jsonwebtoken::decode::<Claims>(
+        credential,
+        &DecodingKey::from_secret(key.for_kind(kind)),
+        &validation(),
+    )
+    .map(|data| data.claims)
+    .map_err(|e| match e.kind() {
+        ErrorKind::InvalidSignature => VerifyError::BadSignature,
+        _ => VerifyError::Malformed,
     })
-}
-
-/// `event_id ‖ request_id ‖ issued_at ‖ expires_at`.
-fn encode_session(s: &Session) -> Vec<u8> {
-    let mut out = Vec::new();
-    put_str(&mut out, &s.event_id);
-    put_str(&mut out, &s.request_id);
-    out.extend_from_slice(&s.issued_at.to_be_bytes());
-    out.extend_from_slice(&s.expires_at.to_be_bytes());
-    out
-}
-
-fn decode_session(payload: &[u8]) -> Option<Session> {
-    let mut cursor = Cursor::new(payload);
-    let event_id = cursor.take_str()?;
-    let request_id = cursor.take_str()?;
-    let issued_at = cursor.take_u64()?;
-    let expires_at = cursor.take_u64()?;
-    if !cursor.at_end() {
-        return None;
-    }
-    Some(Session {
-        event_id,
-        request_id,
-        issued_at,
-        expires_at,
-    })
-}
-
-/// Appends a `u16`-length-prefixed UTF-8 string. A value longer than
-/// `u16::MAX` is truncated at the prefix, which fails to round-trip and so is
-/// rejected on decode — event and request ids are far shorter.
-fn put_str(out: &mut Vec<u8>, s: &str) {
-    let bytes = s.as_bytes();
-    let len = u16::try_from(bytes.len()).unwrap_or(u16::MAX);
-    out.extend_from_slice(&len.to_be_bytes());
-    out.extend_from_slice(&bytes[..usize::from(len)]);
-}
-
-/// A forward-only reader over a signed payload.
-struct Cursor<'a> {
-    buf: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Cursor<'a> {
-    fn new(buf: &'a [u8]) -> Self {
-        Self { buf, pos: 0 }
-    }
-
-    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
-        let end = self.pos.checked_add(n)?;
-        let slice = self.buf.get(self.pos..end)?;
-        self.pos = end;
-        Some(slice)
-    }
-
-    fn take_u64(&mut self) -> Option<u64> {
-        let bytes: [u8; 8] = self.take(8)?.try_into().ok()?;
-        Some(u64::from_be_bytes(bytes))
-    }
-
-    fn take_str(&mut self) -> Option<String> {
-        let len_bytes: [u8; 2] = self.take(2)?.try_into().ok()?;
-        let len = usize::from(u16::from_be_bytes(len_bytes));
-        let bytes = self.take(len)?;
-        String::from_utf8(bytes.to_vec()).ok()
-    }
-
-    fn at_end(&self) -> bool {
-        self.pos == self.buf.len()
-    }
 }
 
 #[cfg(test)]
@@ -364,16 +349,49 @@ mod tests {
     #[test]
     fn tampered_payload_fails() {
         let signed = token().sign(&key());
-        let (payload, mac) = signed.split_once('.').unwrap();
-        // Flip a payload character; the MAC no longer matches.
-        let mut chars: Vec<char> = payload.chars().collect();
-        chars[0] = if chars[0] == 'A' { 'B' } else { 'A' };
+        let parts: Vec<&str> = signed.split('.').collect();
+        // Flip a character in the claims segment; the signature covers
+        // "header.payload", so it no longer matches.
+        let mut chars: Vec<char> = parts[1].chars().collect();
+        chars[0] = if chars[0] == 'e' { 'f' } else { 'e' };
         let tampered: String = chars.into_iter().collect();
-        let forged = format!("{tampered}.{mac}");
+        let forged = format!("{}.{tampered}.{}", parts[0], parts[2]);
         assert_eq!(
             AdmissionToken::verify(&forged, &key(), 1_500_000_000),
             Err(VerifyError::BadSignature)
         );
+    }
+
+    #[test]
+    fn a_credential_is_a_readable_jwt() {
+        use base64::Engine as _;
+
+        // The point of the format: any JWT tool can read the claims. Decode
+        // the payload segment and check the registered names are there.
+        let signed = session().sign(&key());
+        let parts: Vec<&str> = signed.split('.').collect();
+        assert_eq!(parts.len(), 3, "compact serialization is three segments");
+
+        let header = String::from_utf8(
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(parts[0])
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(header.contains(r#""alg":"HS256""#), "header was {header}");
+
+        let payload = String::from_utf8(
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(parts[1])
+                .unwrap(),
+        )
+        .unwrap();
+        for claim in ["aud", "sub", "exp", "iat"] {
+            assert!(
+                payload.contains(&format!("\"{claim}\"")),
+                "{claim} missing from {payload}"
+            );
+        }
     }
 
     #[test]
@@ -393,17 +411,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn base64url_round_trips_arbitrary_bytes() {
-        for len in 0..40usize {
-            let bytes: Vec<u8> = (0..len)
-                .map(|i| ((i * 7 + 3) % 256).to_le_bytes()[0])
-                .collect();
-            let encoded = B64.encode(&bytes);
-            assert_eq!(B64.decode(&encoded).unwrap(), bytes);
-        }
-    }
-
     proptest! {
         #[test]
         fn any_token_round_trips(
@@ -418,9 +425,13 @@ mod tests {
             prop_assert_eq!(back, t);
         }
 
+        /// Verification is a boundary: the string comes off a cookie or a URL
+        /// and is attacker-chosen. Any input must be rejected, never panic.
         #[test]
-        fn base64url_decode_never_panics(s in ".{0,64}") {
-            let _ = B64.decode(&s);
+        fn verify_never_panics_on_arbitrary_input(s in ".{0,120}") {
+            let k = key();
+            prop_assert!(Session::verify(&s, &k, 0).is_err());
+            prop_assert!(AdmissionToken::verify(&s, &k, 0).is_err());
         }
     }
 }

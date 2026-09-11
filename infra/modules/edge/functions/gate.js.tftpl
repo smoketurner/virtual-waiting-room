@@ -8,7 +8,6 @@ import cf from 'cloudfront';
 import crypto from 'crypto';
 
 var kvs = cf.kvs();
-var KIND_SESSION = 0x02;
 var EVENT_ID = '${event_id}';
 var SESSION_COOKIE = '${session_cookie_name}';
 var WAITING_PATH = '${waiting_path}';
@@ -28,64 +27,55 @@ function macEquals(secret, a, b) {
     return ha.digest('base64url') === hb.digest('base64url');
 }
 
-var BASE64URL_RE = /^[A-Za-z0-9_-]+$/;
-
-// Node accepts padding, junk bytes and '+'/'/'; Rust rejects all three.
-function strictBase64url(s) {
-    if (!BASE64URL_RE.test(s)) {
-        return null;
-    }
-    return Buffer.from(s, 'base64url');
+// wr_common::crypto derives a key per credential kind, so a token cannot
+// validate as a session. This function only ever checks sessions.
+function sessionKey(secret) {
+    var h = crypto.createHmac('sha256', secret);
+    h.update('vwr/jws/session/v1');
+    return h.digest();
 }
 
-// base64url(payload).base64url(mac), MAC over kind || payload. Mirrors
-// wr_common::crypto byte for byte.
-function verify(credential, kind, secret) {
-    var dot = credential.indexOf('.');
-    if (dot < 1) {
+var BASE64URL_RE = /^[A-Za-z0-9_-]+$/;
+
+function decodeJson(segment) {
+    try {
+        return JSON.parse(Buffer.from(segment, 'base64url').toString('utf8'));
+    } catch (e) {
         return null;
     }
-    var payload = strictBase64url(credential.substring(0, dot));
-    var mac = strictBase64url(credential.substring(dot + 1));
-    if (!payload || !mac || mac.length === 0) {
+}
+
+// Verifies a compact JWS (RFC 7515) and returns its claims. The signature
+// covers the ASCII "header.payload".
+//
+// "alg" is read only to be compared against the one value this deployment
+// issues, never to select a verifier, so alg:none and a downgrade are refused.
+// Matching the encoded header as a literal string would be smaller but ties
+// the gate to the exact field order the Rust side's JWT library emits.
+function verify(credential, secret) {
+    var parts = credential.split('.');
+    if (parts.length !== 3) {
+        return null;
+    }
+    if (!BASE64URL_RE.test(parts[1]) || !BASE64URL_RE.test(parts[2])) {
+        return null;
+    }
+    var header = decodeJson(parts[0]);
+    if (!header || header.alg !== 'HS256') {
         return null;
     }
 
-    var hmac = crypto.createHmac('sha256', secret);
-    hmac.update(Buffer.concat([Buffer.from([kind]), payload]));
-    if (!macEquals(secret, hmac.digest('base64url'), mac.toString('base64url'))) {
+    var mac = crypto.createHmac('sha256', sessionKey(secret));
+    mac.update(parts[0] + '.' + parts[1]);
+    if (!macEquals(secret, mac.digest('base64url'), parts[2])) {
         return null;
     }
 
-    var at = 0;
-    var len = payload.length;
-    if (at + 2 > len) { return null; }
-    var eventLen = payload.readUInt16BE(at);
-    at += 2;
-    if (at + eventLen > len) { return null; }
-    var eventId = payload.toString('utf8', at, at + eventLen);
-    at += eventLen;
-
-    if (at + 2 > len) { return null; }
-    var reqLen = payload.readUInt16BE(at);
-    at += 2;
-    if (at + reqLen > len) { return null; }
-    at += reqLen; // request_id: not read by the gate
-
-    if (at + 8 > len) { return null; }
-    if (payload.readUInt16BE(at) !== 0) { return null; }
-    at += 8; // issued_at: not read, but walked and range-checked
-
-    if (at + 8 > len) { return null; }
-    if (payload.readUInt16BE(at) !== 0) { return null; }
-    at += 2;
-    var expiresAt = payload.readUIntBE(at, 6);
-    at += 6;
-
-    if (at !== len) {
-        return null; // trailing bytes: Rust's decode_session rejects these
+    var claims = decodeJson(parts[1]);
+    if (!claims || typeof claims.aud !== 'string' || typeof claims.exp !== 'number') {
+        return null;
     }
-    return { eventId: eventId, expiresAt: expiresAt };
+    return { eventId: claims.aud, expiresAt: claims.exp };
 }
 
 // Own-property only: a rule named "constructor" would otherwise be truthy
@@ -219,7 +209,7 @@ async function handler(event) {
         }
 
         var secret = await kvs.get('k', { format: 'string' });
-        var session = verify(cookie.value, KIND_SESSION, secret);
+        var session = verify(cookie.value, secret);
         if (!session) {
             return refuse(request, 'signature');
         }

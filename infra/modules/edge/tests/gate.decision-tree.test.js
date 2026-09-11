@@ -21,27 +21,29 @@ const SECRET = "a-32-byte-test-signing-key-value";
 
 function validSessionCredential(overrides) {
   // Built via node:crypto directly rather than the gate's own verify(),
-  // mirroring wr_common::crypto's wire format independently — the same
-  // reasoning as crates/wr-common/tests/vectors.rs.
+  // mirroring wr_common::crypto's JWS independently — the same reasoning as
+  // crates/wr-common/tests/vectors.rs. Field order inside the header and the
+  // claims is deliberately not the order the Rust side emits: the gate must
+  // read them, not match an encoded string.
   const crypto = require("node:crypto");
   const fields = Object.assign(
     { eventId: EVENT_ID, requestId: "r1", issuedAt: 1_700_000_000, expiresAt: 1_700_003_600 },
     overrides
   );
-  const eventIdBuf = Buffer.from(fields.eventId, "utf8");
-  const requestIdBuf = Buffer.from(fields.requestId, "utf8");
-  const payload = Buffer.concat([
-    u16be(eventIdBuf.length),
-    eventIdBuf,
-    u16be(requestIdBuf.length),
-    requestIdBuf,
-    u64be(fields.issuedAt),
-    u64be(fields.expiresAt),
-  ]);
-  const hmac = crypto.createHmac("sha256", SECRET);
-  hmac.update(Buffer.concat([Buffer.from([0x02]), payload]));
-  const mac = hmac.digest();
-  return `${payload.toString("base64url")}.${mac.toString("base64url")}`;
+  const header = b64url({ alg: "HS256", typ: "JWT" });
+  const claims = b64url({
+    aud: fields.eventId,
+    sub: fields.requestId,
+    exp: fields.expiresAt,
+    iat: fields.issuedAt,
+  });
+  const key = crypto.createHmac("sha256", SECRET).update("vwr/jws/session/v1").digest();
+  const mac = crypto.createHmac("sha256", key).update(`${header}.${claims}`).digest("base64url");
+  return `${header}.${claims}.${mac}`;
+}
+
+function b64url(obj) {
+  return Buffer.from(JSON.stringify(obj), "utf8").toString("base64url");
 }
 
 function u16be(n) {

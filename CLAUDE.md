@@ -113,9 +113,8 @@ Regenerating the key invalidates every session cookie already issued.
 `authorizer` is the alternative gate for a customer who *does* control their origin and wants
 per-request rules the edge cannot express (header, cookie, user agent). It decides locally
 with no backend call: session cookie → admission token → protection-rule match → 302. Tokens
-and sessions are both HMAC-SHA256 from one per-deployment key but domain-separated by a
-leading kind byte (`0x01` token, `0x02` session), so neither validates as the other
-(ADR-0011). It is built and deployable but is not in the CloudFront path.
+and sessions are both `HS256` JWS credentials from one per-deployment key, domain-separated by
+signing under a per-kind derived key so neither validates as the other (ADR-0011, ADR-0024). It is built and deployable but is not in the CloudFront path.
 
 ### Crates
 
