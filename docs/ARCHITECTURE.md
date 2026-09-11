@@ -106,14 +106,16 @@ quiet queue. A lone join during testing can take about 20 seconds to get a posit
 `GetItem`. Every valid record in that batch then takes the same path:
 
 ```rust
-let live_path = counters
-    .as_ref()
-    .is_none_or(|c| c.sealed().is_some() || c.phase != Phase::PreQueue);
+let live_path = counters.sealed().is_some() || counters.phase != Phase::PreQueue;
 ```
 
-The branch is on the seal outputs, never on the phase alone. An operator can walk the phase back
-to `pre_queue` after a seal without unsealing the index space, and a record arriving then is
-still a live join. A missing `Counters` item takes the live path.
+The branch is on the seal outputs, never on the phase alone. An operator can walk the phase back to
+`pre_queue` after a seal without unsealing the index space, and a record arriving then is
+still a live join. A missing `Counters` item fails every valid record: the event has not been
+set up, and processing a join before setup would let a pre-seal live join increment
+`queue_counter` ahead of the seal, which the seal's unconditional `SET queue_counter = :n`
+would then overwrite — handing a cohort member (or a post-seal joiner) the same numeric
+position.
 
 ### 4.2 Pre-queue registration claims an index, not a position
 
