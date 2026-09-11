@@ -58,7 +58,10 @@ repos:
       # CI's pin.
       - id: node-test
         name: node --test (waiting.js)
-        entry: node --test infra/modules/edge/tests
+        # Through bash so the glob expands here rather than in Node: naming the
+        # files keeps the Node 20 floor, where a bare directory argument is not
+        # searched and native glob patterns are not understood.
+        entry: bash -c 'node --test infra/modules/edge/tests/*.test.js'
         language: system
         types: [javascript]
         pass_filenames: false

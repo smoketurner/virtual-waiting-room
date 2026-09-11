@@ -22,4 +22,7 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24.21.0"
-      - run: node --test infra/modules/edge/tests
+      # Name the files rather than the directory: a bare directory argument is
+      # only searched by newer Node than the version pinned above, which loads
+      # it as a module and fails.
+      - run: node --test infra/modules/edge/tests/*.test.js
