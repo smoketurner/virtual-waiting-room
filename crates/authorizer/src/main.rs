@@ -154,7 +154,15 @@ async fn handle(state: &AppState, http: HttpRequest) -> Result<Response<Body>, E
     );
 
     match decision {
-        Decision::Forward => Ok(forward()),
+        Decision::Forward {
+            refresh_cookie: None,
+        } => Ok(forward()),
+        Decision::Forward {
+            refresh_cookie: Some(set_cookie),
+        } => {
+            info!("sliding session re-issued on activity");
+            Ok(set_session(&set_cookie, req.path.as_str()))
+        }
         Decision::SetSessionAndForward {
             set_cookie,
             arrival_shard,
