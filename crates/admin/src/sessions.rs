@@ -60,9 +60,10 @@ fn now_secs() -> Result<u64, SessionError> {
 
 /// Decodes a consumed pending-login row from its `DynamoDB` attributes.
 ///
-/// Returns `None` when the row is absent, already past its `expires_at` TTL
-/// (`DynamoDB` TTL deletion is not instant, so the expiry is enforced on
-/// read), or missing the PKCE verifier / nonce. `now` is the current epoch
+/// Returns `None` when the row is absent, already past its
+/// [`TOKENS_TTL_ATTR`] deadline (`DynamoDB` TTL deletion is not instant, so the
+/// expiry is enforced on read), or missing the PKCE verifier / nonce. `now` is
+/// the current epoch
 /// second; a broken clock collapses it to the epoch so a clock failure never
 /// rejects a fresh login (mirroring `load_session`).
 ///
@@ -75,7 +76,7 @@ fn pending_login_from(
 ) -> Option<PendingLogin> {
     let item = attributes?;
     let expired = item
-        .get("expires_at")
+        .get(TOKENS_TTL_ATTR)
         .and_then(|v| v.as_n().ok())
         .and_then(|n| n.parse::<u64>().ok())
         .is_some_and(|exp| now >= exp);
@@ -261,6 +262,12 @@ mod tests {
     const NOW: u64 = 1_700_000_000;
 
     /// Builds a PKCE row shaped like the one `put_pending` writes.
+    ///
+    /// The attribute names are spelled out rather than taken from
+    /// `TOKENS_TTL_ATTR` on purpose: these rows stand in for what is already
+    /// stored in the table, so renaming the constant without migrating the data
+    /// makes these tests fail instead of quietly passing while the reader looks
+    /// at a name nothing writes.
     fn row(
         verifier: &str,
         nonce: &str,
