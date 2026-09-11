@@ -122,39 +122,40 @@ h1 {
    advancing, and make a small change between polls visible where a continuous
    bar of this length would not. */
 .bar {
-  margin: 0 0 20px;
-  height: 26px;
-  border-radius: 5px;
+  /* Top margin leaves room for the marker, which rides above the track. */
+  margin: 30px 0 20px;
+  height: 34px;
+  border-radius: 8px;
   background: var(--accent-soft);
   border: 1px solid var(--line);
-  padding: 3px;
+  padding: 4px;
 }
 
 .fill {
   position: relative;
   height: 100%;
   width: 0;
-  min-width: 3px;
-  border-radius: 2px;
-  background: repeating-linear-gradient(
-    90deg,
-    var(--accent) 0 9px,
-    transparent 9px 13px
-  );
-  /* Eases between polls so the queue reads as moving rather than jumping. */
-  transition: width 600ms ease;
+  /* Enough that the marker has something under it at the very start of a long
+     wait, where the real fraction rounds to nothing. */
+  min-width: 8px;
+  border-radius: 5px;
+  background: var(--accent);
+  /* Eases between polls so the queue reads as moving rather than jumping. Long
+     enough to be seen: the step between two polls is often a fraction of a
+     percent, and an instant repaint of that is invisible. */
+  transition: width 900ms cubic-bezier(0.4, 0, 0.2, 1);
 }
 
-/* Rides the leading edge, so it advances with the fill and needs no separate
-   position of its own. An emoji rather than a drawn glyph: it is one character
-   in a page that ships no fonts and no images, and it reads as a person at a
-   size a hand-drawn figure does not. */
+/* Above the track rather than on it: over the fill the emoji sits on a solid
+   block of the same colour and cannot be read. Horizontally it is centred on
+   the leading edge. Being inside .fill means it travels with the same
+   transition and needs no animation of its own. */
 .marker {
   position: absolute;
-  right: -10px;
-  top: 50%;
-  transform: translateY(-50%);
-  font-size: 17px;
+  right: 0;
+  bottom: calc(100% + 6px);
+  transform: translateX(50%);
+  font-size: 22px;
   line-height: 1;
 }
 
