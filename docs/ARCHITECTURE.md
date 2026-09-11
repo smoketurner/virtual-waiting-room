@@ -1,12 +1,11 @@
 # Architecture
 
 A virtual waiting room holds visitors during a traffic spike and releases them into an origin at
-a rate the origin can sustain. This document describes the system as the code builds it.
+a rate the origin can sustain. This document describes what the deployed system does, read from
+`crates/` and `infra/`.
 
-Everything here was read out of `crates/` and `infra/`. Where the narrative documents
-([`DESIGN.md`](./DESIGN.md), [`REQUIREMENTS.md`](./REQUIREMENTS.md)) describe something the code
-does not do, this document follows the code and §10 lists the differences.
-[`DYNAMODB.md`](./DYNAMODB.md) covers the data layer.
+Where [`DESIGN.md`](./DESIGN.md) and [`REQUIREMENTS.md`](./REQUIREMENTS.md) describe something the
+code does not do, §10 lists the difference. [`DYNAMODB.md`](./DYNAMODB.md) covers the data layer.
 
 ---
 
@@ -50,8 +49,8 @@ API, one CloudFront distribution.
 | `admin` | API Gateway | 10 s | Axum operator UI and control plane |
 
 Every function runs `provided.al2023` at 256 MB on the architecture named in
-`terraform.tfvars`. Every function deploys a real build — `locals.tf` states it plainly: "There
-is no placeholder fallback."
+`terraform.tfvars`. Every function deploys a real build. There is no placeholder artifact and no
+fallback path.
 
 `authorizer` is a seventh crate with its own Terraform module. It is an origin-side gate for a
 customer who controls their origin. It is built and deployable. Nothing in the CloudFront path
@@ -78,9 +77,8 @@ POST /v1/join
       FunctionResponseTypes: [ReportBatchItemFailures]
 ```
 
-The event source mapping is `enabled = true` unconditionally. A comment above it still says it is
-enabled only for a real artifact; the argument beneath the comment does not agree, and the
-locals removed placeholder artifacts entirely.
+The event source mapping is `enabled = true` unconditionally. The comment above it claims it is
+enabled only for a real artifact, which the argument beneath it contradicts.
 
 `assign_position` validates every record twice. The gateway's JSON Schema checks that
 `request_id` and `event_id` are present and that no extra field rides along. The function then
@@ -89,10 +87,10 @@ version nibble at position 14, and a variant nibble in `8..=b` — and checks `e
 its own `EVENT_ID`. A record that fails either check, or belongs to another event, is returned as
 a batch failure and never claims anything.
 
-The batch size of 100 is load-bearing. Each invocation makes exactly one `ADD queue_counter`
-call regardless of how many joins it carries, and that counter is a single DynamoDB item with a
-write ceiling near 1,000 per second. At 10,000 joins per second, batching by 100 costs 100 counter
-writes per second. Batching by 10 would cost 1,000 and sit on the ceiling.
+Each invocation makes exactly one `ADD queue_counter` call regardless of how many joins it
+carries, and that counter is a single DynamoDB item with a write ceiling near 1,000 per second. At
+10,000 joins per second, batching by 100 costs 100 counter writes per second. Batching by 10 costs
+1,000 and sits on the ceiling.
 
 The batch size costs latency. A batch size above 10 requires a batching window of at least one
 second, and AWS documents that any window lets Lambda wait up to 20 seconds before invoking on a
@@ -125,9 +123,9 @@ The function groups the batch by shard and issues one `SET s = :shard ADD n :cou
 It then writes one `PreQueue` row per record: `{r, s, l, t}` — request id, shard, local index,
 registration time.
 
-Hashing rather than round-robin is what makes a retry safe. A retried join lands on the same
-shard, the `attribute_not_exists(r)` guard rejects the row, and the burned index belongs to
-whichever invocation wrote the authoritative row.
+Hashing rather than round-robin makes a retry safe. A retried join lands on the same shard, the
+`attribute_not_exists(r)` guard rejects the row, and the burned index belongs to whichever
+invocation wrote the authoritative row.
 
 The block's first local index is `checked_sub`, not saturating. A saturated pre-queue index
 would be a duplicate global index that hands two visitors the same position, where a saturated
@@ -148,8 +146,8 @@ at all, and `BatchGetItem` returns nothing for it, so the fold counts it as zero
 that exists but whose index cannot be read raises an error, because zeroing it silently would
 unadmit every registrant in it.
 
-The guard is the seed's absence. A double-fire or a retry finds the seed present and returns
-`AlreadySealed` without changing anything.
+A double-fire or a retry finds the seed present, fails the condition, and returns `AlreadySealed`
+without changing anything.
 
 `queue_counter = :n` rides in the same update because a separate write could be lost between the
 seal and the first live join.
@@ -166,18 +164,17 @@ cycle-walking to restrict the output to `[0, N)`. The round function is
 `F(r, x) = be_u32(HMAC-SHA256(seed, r ‖ x)[0..4]) & mask`, with a 5-byte message: the round as one
 byte, then the right half as a 4-byte big-endian integer. `aws-lc-rs` supplies the HMAC.
 
-The encoding is a compatibility contract, not an implementation detail. Two frozen vector tests
-pin it. `frozen_wire_encoding_vectors` pins 14 `(seed, N) → [(index, position)]` cases, including
+A third party recomputing a position has to reproduce these bytes exactly, so two tests pin them.
+`frozen_wire_encoding_vectors` pins 14 `(seed, N) → [(index, position)]` cases, including
 `prp(SEED_COUNTING, 0, 1_000_000) == 890_568`. `frozen_round_function_encoding` pins three raw
 round-function outputs separately, so a failure separates a change in one round from a change in
 the network around it. The vectors were computed from a separate implementation of the documented
 encoding, not captured from this code.
 
-Four rounds is fewer than the ten that NIST Special Publication 800-38G specifies for FF1. That
-is sound here because the seed is not a long-term secret. It does not exist before the seal, which
-is what stops anyone predicting their position; after the seal it is published so a third party
-can recompute the ordering. The properties the construction must hold are bijectivity and
-uniformity, and both are tested directly.
+Four rounds is fewer than the ten that NIST Special Publication 800-38G specifies for FF1. The
+seed is not a long-term secret here. It does not exist before the seal, so nobody can predict
+their position; after the seal it is published so a third party can recompute the ordering. The
+construction has to be bijective and uniform, and both are tested directly.
 
 `prp` returns `i` unchanged when `i >= n` or `n <= 1`. It is never evaluated outside its domain.
 
@@ -208,11 +205,10 @@ the same `queue_counter`. Every failure inside that fix-up is swallowed rather t
 batch failure, because redelivery would take the live path and mint a second position for a
 visitor already counted into the cohort.
 
-One residual is documented in the code and left open. A pre-queue write that times out on the
-caller side but actually lands is indistinguishable from one that failed. It is reported as a
-batch failure, redelivery finds the event sealed, and the visitor can end up with a `Positions`
-row as well as a counted `PreQueue` row. Closing it would cost a `PreQueue` `GetItem` on every
-live join.
+One case is left open. A pre-queue write that times out on the caller side but actually lands is
+indistinguishable from one that failed. It is reported as a batch failure, redelivery finds the
+event sealed, and the visitor ends up with a `Positions` row as well as a counted `PreQueue` row.
+Closing it costs a `PreQueue` `GetItem` on every live join.
 
 ---
 
@@ -243,22 +239,20 @@ The seed is **not** published here. A client cannot compute its own position; it
 ### 5.2 The client asks for its number once
 
 `waiting.js` polls every 5,000 milliseconds plus up to 1,500 milliseconds of jitter. Each tick
-fetches `/v1/status`. It fetches `/v1/queue_num` only while it does not yet know its position:
+fetches `/v1/status`. It fetches `/v1/queue_num` only while it does not yet know its position.
 
-> A place in line, once known, never changes: it is derived from a sealed permutation for a
-> pre-queue registrant and from a claimed row for a live joiner. Only the serving cursor moves,
-> and `/status` carries that.
+A position never changes once known. A pre-queue registrant's comes from the sealed permutation
+and a live joiner's from a claimed row. Only the cursor moves, and `/v1/status` carries it.
 
-This is what keeps origin load flat. `/v1/status` is cached with a path-only key and no cookies
-forwarded, so CloudFront collapses concurrent misses into one origin fetch. `/v1/queue_num` is
-keyed on `event_id` and `request_id`, so it cannot collapse — and it is asked once per visitor
-rather than once per poll.
+`/v1/status` is cached with a path-only key and no cookies forwarded, so CloudFront collapses
+concurrent misses into one origin fetch. `/v1/queue_num` is keyed on `event_id` and `request_id`,
+so it cannot collapse — and it is asked once per visitor rather than once per poll. Origin load
+stays flat as the room grows.
 
-The first ask is spread deliberately. Everyone learns their number at the same moment, so the
-client waits a random slice of `min(60_000, participants / 5000 × 1000)` milliseconds before
-asking. At 1,000,000 participants the spread saturates at 60 seconds, which is about 16,700
-requests per second — above the default API Gateway account throttle of 10,000, and the code says
-so.
+Everyone learns their number at the same moment, so the client waits a random slice of
+`min(60_000, participants / 5000 × 1000)` milliseconds before asking. At 1,000,000 participants
+the spread saturates at 60 seconds, which is about 16,700 requests per second — above the default
+API Gateway account throttle of 10,000.
 
 A 404 from `/v1/queue_num` means the row has not landed. The client counts eight consecutive
 misses before dropping its joined flag and re-joining with the same request id. Eight is chosen to
@@ -272,15 +266,16 @@ clear the event source mapping's 20-second worst case, not its typical one.
 
 `EventBridge Scheduler` fires `rate(1 minute)` against the universal
 `arn:aws:scheduler:::aws-sdk:lambda:invoke` target with `InvocationType: Event` and a qualified
-function name. Both are required: the templated Lambda target would invoke synchronously and hold
-the invocation open through the waits, and a durable function cannot be invoked unqualified.
+function name. The templated Lambda target invokes synchronously, which holds the invocation open
+through the waits and bills the full minute of cadence. A durable function cannot be invoked
+through an unqualified name, because an execution is pinned to the version that started it.
 
 Each execution runs six passes ten seconds apart. The gaps are durable waits, so the execution
 suspends rather than holding an invocation open. `durable_config` sets `execution_timeout = 120`
 and `retention_period = 7`.
 
-The schedule is created unconditionally. The comment says why: "a deployed controller nothing
-fires means the queue forms and never drains."
+The schedule is created unconditionally. A controller nothing fires leaves the queue to form and
+never drain.
 
 A pass runs only when `phase == Active` **and** `admission_control == Open`. Any other admission
 control returns the whole pass, so neither the cursor nor the expiry advances — a visitor cannot
@@ -308,10 +303,10 @@ let next = inputs.serving_counter
     .max(inputs.serving_counter);
 ```
 
-Advancing past the end of the line would bank admission credit against an empty queue, and the
-next burst would walk straight through every position already released. The decision reports the
-distance the cursor actually moved, not the distance requested, so the next interval measures
-arrivals against people who were really let through.
+Advancing past the end of the line banks admission credit against an empty queue, and the next
+burst walks straight through every position already released. The decision reports the distance
+the cursor moved, not the distance requested, so the next interval measures arrivals against the
+people who were let through.
 
 The write is guarded on `serving_counter = :expected`, so two overlapping executions cannot
 double-advance. A failed condition is logged and skipped, not retried.
@@ -344,10 +339,10 @@ is `Spent` — permanent, so the client stops rather than keeps polling. The cur
 Refusals map to statuses the waiting page acts on: 425 still queued, 409 not admitting or not
 sealed, 404 not registered, 410 spent, 500 corrupt.
 
-The arrival is recorded before the cookies are signed. The order is deliberate — a visitor counted
-but not admitted understates the no-show rate, while one admitted but not counted makes the
-controller over-release for every later interval. A failed arrival write is logged at error under
-the stable event name `arrival_record_failed` and the visitor is admitted anyway.
+The arrival is recorded before the cookies are signed. A visitor counted but not admitted
+understates the no-show rate. One admitted but not counted makes the controller over-release for
+every later interval. A failed arrival write is logged at error under the stable event name
+`arrival_record_failed` and the visitor is admitted anyway.
 
 The cookies are a CloudFront **custom** policy over `https://*`, signed RSA PKCS#1 v1.5 over
 SHA-256, defaulting to a one-hour lifetime:
@@ -359,10 +354,10 @@ CloudFront-Key-Pair-Id=<id>; ...
 CloudFront-Hash-Algorithm=SHA256; ...
 ```
 
-Three details are required rather than stylistic. The base64 is CloudFront's variant, with `+/=`
-replaced by `-~_`. `CloudFront-Hash-Algorithm=SHA256` must be sent or CloudFront assumes SHA-1 and
-rejects every signature. `Path=/` with no `Domain` must be used or the browser never sends the
-cookies back on the protected request.
+The base64 is CloudFront's variant, with `+/=` replaced by `-~_`.
+`CloudFront-Hash-Algorithm=SHA256` must be sent or CloudFront assumes SHA-1 and rejects every
+signature. `Path=/` with no `Domain` must be used or the browser never sends the cookies back on
+the protected request.
 
 The signing key is read from SSM Parameter Store once at cold start, inside the boosted init
 phase, so neither the TLS handshake nor the RSA key parse lands on a visitor's request.
@@ -386,13 +381,13 @@ custom_error_response {
 }
 ```
 
-The 200 is deliberate: the waiting page is the correct answer to "you are not admitted yet", and a
-403 body keeps browsers from rendering it as a normal page. `error_caching_min_ttl` must stay 0,
-because CloudFront caches its own error responses and a cached refusal would keep showing the
-waiting page to a visitor who has since been admitted.
+The waiting page is the correct answer to "you are not admitted yet", and a 403 body keeps
+browsers from rendering it as a normal page. `error_caching_min_ttl` must stay 0: CloudFront
+caches its own error responses, and a cached refusal keeps showing the waiting page to a visitor
+who has since been admitted.
 
-`/_wr/*` is its own behaviour against a private S3 bucket, deliberately outside the gate. If it
-were gated, the refusal would loop.
+`/_wr/*` is its own behaviour against a private S3 bucket, outside the gate. Gating it would make
+the refusal loop.
 
 The client handles the loop that remains. A visitor holding cookies CloudFront refuses would
 bounce between the origin and the waiting page, so `waiting.js` counts bounces, retries the same
@@ -412,10 +407,9 @@ pass up to five times, and then stops with an explanation rather than cycling.
 `polled_min_ttl_seconds` is validated `> 0`. A minimum TTL of zero, or any forwarded cookie,
 disables request collapsing and every poll reaches the origin.
 
-The origin request policy on the write behaviours is load-bearing. A behaviour that forwards no
-cookies has its `Set-Cookie` response headers stripped by CloudFront. `/v1/generate_token`'s whole
-job is to return cookies, so without it the visitor is admitted, receives nothing, and waits
-forever.
+CloudFront strips `Set-Cookie` response headers from a behaviour that forwards no cookies.
+`/v1/generate_token`'s whole job is to return cookies, so the write behaviours carry an origin
+request policy. Without it the visitor is admitted, receives nothing, and waits forever.
 
 ---
 
@@ -447,17 +441,16 @@ Every mutation writes four audit attributes alongside the change — `last_actio
 Every mutation is guarded twice. An optimistic-concurrency guard on the expected prior value makes
 a transition another operator already applied a 409 rather than a second apply. A 2,000-millisecond
 debounce guard on `last_action_epoch_ms` makes a double-submitted form a no-op. Forcing maintenance
-mode is guarded on the expected phase but deliberately **not** debounced, because an emergency stop
-must always apply.
+mode is guarded on the expected phase but **not** debounced. An emergency stop must always apply.
 
 Rendering is askama compile-time templates with design-system tokens as plain CSS. There is no
 React, no bundler, and no runtime npm dependency.
 
 ---
 
-## 9. What the tests actually prove
+## 9. What the tests prove
 
-Read from the test bodies, not from a summary.
+Read from the test bodies.
 
 | Property | Test | What it asserts |
 |---|---|---|
@@ -485,10 +478,10 @@ uniformity test uses a different threshold and does not assert a specific χ².
 |---|---|
 | `/status` publishes `shuffle_seed` after the seal | `StatusResponse` has no seed field. Only `/v1/queue_num` resolves a position |
 | `target_rate` is admissions per minute | `target_rate` is visitors per **second**; the interval target is `rate × 10` |
-| `/queue_pos_expiry` and `/public_key` exist, unrouted | Neither is declared anywhere. `api.tf` states the rule: an endpoint with no implementation is not declared |
-| WAF with Bot Control and ASN matching is deployed by default | `modules/edge` creates no WAF. Its header says WAF is for "later steps" |
+| `/queue_pos_expiry` and `/public_key` exist, unrouted | Neither is declared. An endpoint with no implementation is not declared at all |
+| WAF with Bot Control and ASN matching is deployed by default | `modules/edge` creates no WAF |
 | Each event gets its own SQS queue and reserved concurrency | One queue, one event per deployment, no `reserved_concurrent_executions` anywhere |
-| An empty artifact path leaves a placeholder binary | `locals.tf`: "There is no placeholder fallback" |
+| An empty artifact path leaves a placeholder binary | Every artifact path points at a real build |
 | The join event source mapping is enabled when the artifact is real | `enabled = true`, unconditional. The comment above it is stale |
 | The controller schedule is created when the controller is | Always created |
 | The operator message attribute is `operator_message` | The attribute is `message` |
@@ -502,8 +495,8 @@ uniformity test uses a different threshold and does not assert a specific χ².
 **The gate verifies, it does not decide.** CloudFront checks a signature. It cannot be told to
 stand down when the backend is unreachable ([#58](https://github.com/smoketurner/virtual-waiting-room/issues/58))
 or to pass traffic through while the event is dormant ([#60](https://github.com/smoketurner/virtual-waiting-room/issues/60)).
-`AdmissionControl::FailOpen` exists in the type system and `ids.rs` marks its enforcement
-post-MVP.
+`AdmissionControl::FailOpen` is a storable state that holds the controller, but nothing enforces
+it at the edge.
 
 **The cookies are unbound bearer credentials.** The policy resource is `https://*` with no visitor
 binding ([#61](https://github.com/smoketurner/virtual-waiting-room/issues/61)) and no revocation
@@ -526,11 +519,9 @@ evaluation at all.
 variants that only the controller's expiry path and `generate_token`'s refusal ever read.
 `/update_session` returns 501, so nothing writes them.
 
-[ADR-0021](adr/0021-edge-function-gate.md) is accepted and addresses the first two. It replaces the
-key-group gate with a CloudFront Function that decides at the edge. No CloudFront Function or
-KeyValueStore exists in `infra/`. A spike measured what could have ruled it out: the gate occupies
-4,759 bytes of the 10,240-byte limit, the hot path costs 11 of 100 compute utilization, and a
-configuration change reaches one edge in a median of 31 seconds across five trials.
+[ADR-0021](adr/0021-edge-function-gate.md) is accepted and addresses the first two by replacing the
+key-group gate with a CloudFront Function that decides at the edge. `infra/` contains no CloudFront
+Function and no KeyValueStore, so none of it is deployed.
 
 ---
 

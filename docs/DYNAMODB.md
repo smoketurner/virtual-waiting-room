@@ -1,12 +1,11 @@
 # DynamoDB
 
 Amazon DynamoDB is the only datastore in this system. This document covers the table design, every
-access pattern, the scaling techniques, and the arithmetic behind each ceiling.
+access pattern, the scaling techniques, and the arithmetic behind each ceiling, read from
+`crates/*/src/dynamo.rs`, `crates/wr-common/src/expr.rs`, `crates/wr-common/src/items.rs`,
+`crates/admin/src/sessions.rs`, and `infra/modules/core/main.tf`.
 
-Everything here was read out of `crates/*/src/dynamo.rs`, `crates/wr-common/src/expr.rs`,
-`crates/wr-common/src/items.rs`, `crates/admin/src/sessions.rs`, and
-`infra/modules/core/main.tf`. [`ARCHITECTURE.md`](./ARCHITECTURE.md) describes the system around
-it.
+[`ARCHITECTURE.md`](./ARCHITECTURE.md) describes the system around it.
 
 Throughout: WCU is a write capacity unit, RCU a read capacity unit, WRU a write request unit, RRU
 a read request unit. On-demand tables bill in request units; the partition-level ceilings are
@@ -28,8 +27,8 @@ a global or local secondary index. No table has streams enabled, and none declar
 | `Positions` | `request_id` (S) | One row per live joiner | `ttl` |
 | `Tokens` | `request_id` (S) | Admission reservations, operator sessions, pending logins | `ttl` |
 
-Only key attributes are declared in Terraform. Everything else is schemaless, which is why
-`locals.tf` says so explicitly: DynamoDB needs key attributes at create time and nothing more.
+Only key attributes are declared in Terraform. DynamoDB needs nothing else at create time, and
+every other attribute is schemaless.
 
 ### 1.1 `Counters` holds three kinds of item
 
@@ -82,19 +81,17 @@ reader ever gathers, which loses registrations silently.
 ### 1.4 Two hazards the tests pin
 
 **An `event_id` containing `#` collides two keys.** `EVT#a#PQ#1` is both event `a`'s first
-pre-queue shard and event `a#PQ#1`'s own item. One event per deployment makes this unreachable
-today, and the Terraform variable rejects a `#`. `a_hash_in_an_event_id_would_collide_two_keys`
-asserts the collision so the reason for that validation survives.
+pre-queue shard and event `a#PQ#1`'s own item. The Terraform variable rejects a `#`, and one event
+per deployment puts the collision out of reach.
+`a_hash_in_an_event_id_would_collide_two_keys` asserts it.
 
 **No expression string may contain a `#`.** In a DynamoDB expression, `#` opens an
 expression-attribute-name placeholder, so an attribute whose name contains one cannot be written
 literally. `ADD arrivals#4 :one` parses as the attribute `arrivals` plus an undefined placeholder
 `#4`, and DynamoDB rejects the request.
 
-That is not hypothetical. The test comment records it: this is how the arrivals counter failed on
-every admitted visitor while the handler logged a warning and admitted them anyway.
-`no_expression_inlines_an_attribute_name_containing_a_hash` now asserts it across every expression
-fragment. Key values are unaffected, because a key is a value and not expression text.
+`no_expression_inlines_an_attribute_name_containing_a_hash` asserts the rule across every
+expression fragment. Key values are unaffected, because a key is a value and not expression text.
 
 Where a reserved word is unavoidable, the code uses a placeholder properly: the expiry scan and
 the expiry write both bind `#s` to `status`.
@@ -153,9 +150,8 @@ One increment per SQS batch of 100. At 10,000 joins per second that is 100 count
 second, 10% of the item ceiling. At 40,000 joins per second it is 400, 40%. The sequence stops
 being the binding constraint; the table-level quota binds first.
 
-The Terraform comment states the inverse case: batching by 10 would cost 1,000 counter writes per
-second at the 10,000 joins/s target and sit exactly on the ceiling. "Do not lower it to chase
-latency."
+Batching by 10 costs 1,000 counter writes per second at the same join rate and sits exactly on the
+ceiling. Lowering the batch size to chase latency breaks the counter.
 
 `n` is the count of **valid** records, never `records.len()`. Malformed payloads are rejected
 before the claim, so they consume no positions.
@@ -170,26 +166,19 @@ for a counter that only moves forward, so the guard is against a counter that wa
 
 ### 4.1 The ceiling applies per partition key
 
-AWS documents the limit per item's primary key: up to 3,000 RCUs and 1,000 WCUs to a single
-item. Ten attributes on one item share one budget. Ten items are ten partition keys and ten
-budgets.
+AWS documents the limit per item's primary key: up to 3,000 RCUs and 1,000 WCUs to a single item.
+Ten attributes on one item share one budget. Ten items are ten partition keys and ten budgets.
 
-### 4.2 This was implemented wrong once, and the record says so
+Each shard is therefore its own item — `EVT#{event_id}#PQ#{s}` and `EVT#{event_id}#AR#{s}` — and
+not an attribute on the event item.
 
-[ADR-0015](adr/0015-stripe-prequeue-counter.md) originally striped across ten *attribute names* —
-`prequeue_counter#0` through `prequeue_counter#9` — on the single `Counters` item. That
-distributed nothing.
+`UpdateItem` bills the whole item rounded up to the next kilobyte even when it writes one
+attribute, and attribute names count toward that size. Ten shard attributes on the event item
+would make every write to it more expensive — including the `queue_counter` claims and every
+controller pass — while distributing nothing. An attribute name of the form `prequeue_counter#0`
+also cannot be written into an expression at all (§1.4).
 
-It was worse than neutral. `UpdateItem` bills the size of the whole item, rounded up to the next
-kilobyte, even when it writes one attribute, and attribute names count toward that size.
-`prequeue_counter#0` is eighteen bytes of name before any value. Twenty such attributes made every
-write to `Counters` more expensive — including the `queue_counter` claims and every controller
-pass — while distributing nothing. It also produced the `#`-in-an-expression bug in §1.4.
-
-The amendment moved the striping to partition keys. `items.rs` now carries the rule at the top of
-the file, so the next person to add a counter finds it before they add it as an attribute.
-
-### 4.3 Which counters are striped
+### 4.2 Which counters are striped
 
 | Counter | Kind | Striped | Why |
 |---|---|---|---|
@@ -198,15 +187,14 @@ the file, so the next person to add a counter finds it before they add it as an 
 | Pre-queue index | Index | Yes, ×10 | The permutation needs indices unique and inside `[0, N)`, not ordered |
 | `arrivals` | Statistic | Yes, ×10 | Runs at the admission rate; order carries no information |
 
-The pre-queue counter is the interesting case. Striping a sequence is forbidden; striping this one
-is safe because `PRP(seed, i, N)` needs `i` to be unique and in range and nothing else. The prefix
-offsets written at the seal reassemble ten shards into exactly `[0, N)`, so the permutation domain
-is unchanged.
+Striping a sequence is forbidden. Striping the pre-queue counter is safe because `PRP(seed, i, N)`
+needs `i` to be unique and in range and nothing else. The prefix offsets written at the seal
+reassemble ten shards into exactly `[0, N)`, so the permutation domain is unchanged.
 
-`SHARDS` is `pub const SHARDS: usize = 10`. It is not configurable. The comment gives the reason:
-an unused configuration variable is attack surface and cognitive load for no active need.
+`SHARDS` is `pub const SHARDS: usize = 10` and is not configurable. An unused configuration
+variable is attack surface and cognitive load for no active need.
 
-### 4.4 Shard by hash, not round-robin
+### 4.3 Shard by hash, not round-robin
 
 ```rust
 pub fn shard_for(request_id: &[u8]) -> usize {
@@ -226,7 +214,7 @@ but a second index would already be burned.
 The hash need not be cryptographic. It need only spread request ids uniformly modulo 10, and
 UUIDv7 identifiers do.
 
-### 4.5 The batched claim moves the ceiling further out
+### 4.4 The batched claim moves the ceiling further out
 
 `assign_position` groups a batch by shard and issues one claim per non-empty group. With a batch
 of 100 spread over 10 shards, each shard takes one write per batch. At a registration rate of
@@ -234,15 +222,15 @@ R per second, each shard sees R/100 writes per second, so a shard reaches 1,000 
 R = 100,000. The shard counters are not the binding constraint at this batch size; the 40,000
 WRU per second table quota is.
 
-### 4.6 The pre-queue claim errors rather than saturates
+### 4.5 The pre-queue claim errors rather than saturates
 
 ```rust
 shard_count_after_add.checked_sub(count).ok_or_else(...)
 ```
 
-The live-join block claim saturates in the same situation. The asymmetry is deliberate and the
-comment says why: a saturated live-join position is a gap, which is permitted, while a saturated
-pre-queue local index is a duplicate global index that hands two visitors the same position.
+The live-join block claim saturates in the same situation. A saturated live-join position is a
+gap, which is permitted. A saturated pre-queue local index is a duplicate global index that hands
+two visitors the same position.
 
 The function is pulled out of the store method so it is unit-tested directly — the `Store` fake in
 `lib.rs` computes the block start a different way, so the real subtraction would otherwise have no
@@ -266,16 +254,16 @@ test seam.
 | Admission control | `admission_control = :from`, widened to allow absence when `:from` is `open` | Same, and absence reads as `open` |
 | Every debounced admin write | `attribute_not_exists(last_action_epoch_ms) OR last_action_epoch_ms < :cutoff` | A double-submitted form is a no-op for 2,000 ms |
 
-Forcing maintenance mode is guarded on the expected phase but deliberately **not** debounced. The
-comment is explicit: the emergency stop must always apply.
+Forcing maintenance mode is guarded on the expected phase but **not** debounced. An emergency stop
+must always apply.
 
 Every guarded write handles `ConditionalCheckFailedException` by name, and none treats it as an
 error. `assign_position` reports a duplicate, `seal_event` returns `AlreadySealed`, the controller
 logs the lost race and continues, and `admin` maps it to a conflict for the operator.
 
-This is what makes SQS standard queues acceptable at ingest. They deliver at least once with
-best-effort ordering. Duplicates fail the condition and cost one rejected write. Ordering does not
-matter, because positions come from a counter and not from message sequence.
+These guards are what let ingest run on an SQS standard queue, which delivers at least once with
+best-effort ordering. A duplicate fails the condition and costs one rejected write. Ordering does
+not matter, because positions come from a counter and not from message sequence.
 
 ---
 
@@ -308,15 +296,10 @@ The same discipline applies to `serving_state`, which `/v1/status` publishes: it
 `UpdateItem` bills the full item size rounded up to the next kilobyte, including attribute names,
 on every write.
 
-A shard item's attributes are `s` and `n`. `expr.rs` states the reason at the constant:
-
-> One letter on purpose. `UpdateItem` is billed on the size of the whole item including its
-> attribute names, so a verbose name is paid for on every single increment, forever, for no
-> benefit — nothing queries by attribute name.
-
-`a_shard_increment_names_only_short_attributes` asserts it, so a refactor cannot lengthen them
-quietly. A shard item stays far below 1 KB, so an increment always costs exactly one write unit
-rather than the size of a growing shared item.
+A shard item's attributes are `s` and `n`. A verbose name is paid for on every increment, forever,
+and nothing queries by attribute name. `a_shard_increment_names_only_short_attributes` asserts the
+two names, so a refactor cannot lengthen them quietly. A shard item stays far below 1 KB, so an
+increment always costs exactly one write unit rather than the size of a growing shared item.
 
 `PreQueue` uses short names for a different reason. Its attributes are `r`, `s`, `l`, `t`, and the
 table is read across the whole cohort during an audit. A row is about 60 bytes.
@@ -359,10 +342,9 @@ There are exactly five `consistent_read(true)` call sites.
   a stale read produces a conflict rather than a wrong write.
 
 **A partial batch is a failure, not a zero.** Both `BatchGetItem` call sites check
-`unprocessed_keys` and return an error. The reasons differ and both are in the code: a missed
-pre-queue shard under-counts the cohort and strands every registration in it, and a missed arrival
-shard under-counts arrivals, which reads as a higher no-show rate and releases more people than
-the operator asked for.
+`unprocessed_keys` and return an error. A missed pre-queue shard under-counts the cohort and
+strands every registration in it. A missed arrival shard under-counts arrivals, which reads as a
+higher no-show rate and releases more people than the operator asked for.
 
 **A missing shard is zero; a corrupt shard is an error.** A shard with no writes has no item, and
 `BatchGetItem` returns nothing for it, so the fold counts zero and
@@ -408,19 +390,12 @@ pre-warming and a quota increase.
 
 ---
 
-## 10. The read path, and why it is shaped this way
-
-The client design is what keeps read load flat, and it is worth stating precisely because the
-obvious alternative does not work.
+## 10. The read path
 
 ### 10.1 The client asks for its number once
 
 `waiting.js` fetches `/v1/queue_num` only while `knownPosition` is null. Every later poll fetches
-`/v1/status` alone. The comment in the client explains it:
-
-> A place in line, once known, never changes... Re-fetching it each poll instead would put one
-> request per visitor per interval on an endpoint that cannot collapse, because its answer is per
-> visitor.
+`/v1/status` alone. A position never changes once known, so there is nothing to re-fetch.
 
 `/v1/status` is cached with a path-only key and no cookies, so CloudFront collapses concurrent
 misses into roughly one origin fetch per second. `/v1/queue_num` is keyed on `event_id` and
@@ -441,8 +416,8 @@ PreQueue GetItem  = 16,700 × 0.5 RRU                ≈  8,350 RRU/s   (21% of 
 
 Those reads land on 1,000,000 distinct partition keys, so there is no hot partition. DynamoDB is
 not the constraint here — API Gateway is. 16,700 requests per second exceeds the default account
-throttle of 10,000, and the client code says so: past roughly `FIRST_ASK_TARGET_RPS` times the
-cap, "the spread alone stops being enough and the account's API Gateway throttle... has to go up."
+throttle of 10,000. Past `FIRST_ASK_TARGET_RPS` times the 60-second cap, the spread stops being
+enough on its own and the account throttle has to be raised.
 
 ### 10.3 The in-process cache protects the one hot item
 
@@ -463,22 +438,18 @@ at 16,700 /s and 20 ms    →   ~334 environments  →  ~167 RCU/s   (6% of the 
 at 16,700 /s and 100 ms   →  ~1,670 environments →  ~835 RCU/s   (28%)
 ```
 
-Without the cache, every one of those 16,700 requests would read the item directly — about 8,350
-RCU per second against a 3,000 RCU per second ceiling. The cache is load-bearing, not an
-optimisation.
+Without the cache, every one of those 16,700 requests reads the item directly — about 8,350 RCU
+per second against a 3,000 RCU per second ceiling.
 
-### 10.4 What the earlier design would have cost
+### 10.4 What a per-poll position fetch would cost
 
-Had the client re-fetched `/v1/queue_num` on every poll, at 1,000,000 waiters and a mean interval
-of 5.75 seconds:
+Re-fetching `/v1/queue_num` on every poll, at 1,000,000 waiters and a mean interval of 5.75
+seconds, puts the read path outside quota:
 
 ```
 requests          = 1,000,000 / 5.75        ≈ 174,000 /s
 PreQueue GetItem  = 174,000 × 0.5 RRU       ≈  87,000 RRU/s   (2.2× the default quota)
 ```
-
-That is the number the ask-once design avoids. It is recorded here because it is the failure mode
-a future change to the client would reintroduce.
 
 ---
 
@@ -510,10 +481,9 @@ sustained    = 14,080 × 6 / 60       ≈  1,408 RCU/s
 pages        = 110 MB / 1 MB         ≈    110 sequential pages per pass
 ```
 
-Two things bound this in practice. `Positions` holds live joiners only — a pure pre-queue cohort
-writes no rows there at all — so a scheduled event with few live joins scans a nearly empty table.
-And the reads spread across every partition, so it consumes table quota rather than hitting a
-partition ceiling.
+`Positions` holds live joiners only — a pure pre-queue cohort writes no rows there at all — so a
+scheduled event with few live joins scans a nearly empty table. The reads spread across every
+partition, so the scan consumes table quota rather than hitting a partition ceiling.
 
 `mark_expired` then issues one guarded `UpdateItem` per expired position, sequentially:
 
@@ -539,14 +509,13 @@ Position expiry is driven by the controller against the admission cursor. TTL on
 storage hygiene, set 86,400 seconds after the row is written by
 `const POSITION_TTL_SECS: u64 = 86_400`.
 
-There is deliberately no per-row deadline stamped at issue time. `items.rs` gives the reason: a
-deadline set when the position is issued expires people for waiting the length of the queue they
-are waiting in. The controller instead expires a position once the cursor has passed it by more
-than the 120-second grace window.
+No per-row deadline is stamped at issue time. A deadline set when the position is issued expires
+people for waiting the length of the queue they are waiting in. The controller expires a position
+once the cursor has passed it by more than the 120-second grace window.
 
-The admin session store applies the same caution in the other direction. `load_session` checks
-`expires_at` on read rather than trusting deletion, because "DynamoDB TTL deletion is not
-instant."
+`load_session` applies the same caution in the other direction: it checks `expires_at` on read
+rather than trusting deletion, so an expired session is never served while its row is still
+waiting to be reclaimed.
 
 ---
 
