@@ -188,7 +188,7 @@ fn resolve_position(
         Ok(ResolvedPosition::PreQueue(position)) => Ok(position),
         // Raced the seal, so a live-join row should exist; without one there is
         // no claimed position to admit against.
-        Ok(ResolvedPosition::LiveJoin { .. }) => Err(Denied::NotRegistered),
+        Ok(ResolvedPosition::LiveJoin) => Err(Denied::NotRegistered),
         Err(ResolveError::NotSealed) => Err(Denied::NotSealed),
         Err(ResolveError::BadShard) => Err(Denied::Corrupt),
     }
@@ -486,7 +486,7 @@ mod tests {
             r: REQ.to_owned(),
             s: 3,
             l: 1,
-            t: "t".to_owned(),
+            t: 1_788_000_000,
         };
         let grant = decide(&c, REQ, Some(&row), None).unwrap();
         // Inside the sealed cohort.
@@ -503,7 +503,7 @@ mod tests {
             r: REQ.to_owned(),
             s: 0,
             l: 0,
-            t: "t".to_owned(),
+            t: 1_788_000_000,
         };
         assert_eq!(
             decide(&c, REQ, Some(&row), None).unwrap_err(),
@@ -518,7 +518,7 @@ mod tests {
             r: REQ.to_owned(),
             s: 0,
             l: 0,
-            t: "t".to_owned(),
+            t: 1_788_000_000,
         };
         let grant = decide(
             &counters(100),

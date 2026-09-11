@@ -7,7 +7,7 @@ use aws_sdk_dynamodb::types::AttributeValue;
 use wr_common::expr::{
     arrivals_shard_key, event_key, increment_shard_update, increment_shard_values,
 };
-use wr_common::{AdmissionControl, Counters, Phase, PositionStatus, PreQueueItem, SHARDS};
+use wr_common::{Counters, PositionStatus, PreQueueItem};
 
 use crate::{Store, StoreError};
 
@@ -50,7 +50,7 @@ impl Store for DynamoStore {
             .await
             .map_err(|e| StoreError(format!("get_item counters: {e}")))?;
 
-        Ok(out.item().map(|item| counters_from_item(event_id, item)))
+        Ok(out.item().map(|item| Counters::from_item(event_id, item)))
     }
 
     async fn load_prequeue(&self, request_id: &str) -> Result<Option<PreQueueItem>, StoreError> {
@@ -125,52 +125,6 @@ fn position_from_item(item: &HashMap<String, AttributeValue>) -> Option<(u64, Po
     Some((position, status))
 }
 
-/// Assembles the flat `Counters` item, including the `#`-suffixed shard
-/// attributes `serde` cannot express as fields.
-fn counters_from_item(event_id: &str, item: &HashMap<String, AttributeValue>) -> Counters {
-    let num = |key: &str| -> Option<u64> {
-        item.get(key)
-            .and_then(|v| v.as_n().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-    };
-
-    Counters {
-        event_id: event_id.to_owned(),
-        phase: item
-            .get("phase")
-            .and_then(|v| v.as_s().ok())
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(Phase::Idle),
-        queue_counter: num("queue_counter").unwrap_or(0),
-        serving_counter: num("serving_counter").unwrap_or(0),
-        shuffle_seed: item
-            .get("shuffle_seed")
-            .and_then(|v| v.as_b().ok())
-            .and_then(|b| <[u8; 32]>::try_from(b.as_ref()).ok()),
-        participant_count: num("participant_count"),
-        prequeue_offsets: item
-            .get("prequeue_offsets")
-            .and_then(|v| v.as_l().ok())
-            .and_then(|list| {
-                let parsed: Vec<u64> = list
-                    .iter()
-                    .filter_map(|e| e.as_n().ok().and_then(|s| s.parse().ok()))
-                    .collect();
-                <[u64; SHARDS]>::try_from(parsed).ok()
-            }),
-        message: item
-            .get("message")
-            .and_then(|v| v.as_s().ok())
-            .filter(|s| !s.is_empty())
-            .cloned(),
-        admission_control: item
-            .get("admission_control")
-            .and_then(|v| v.as_s().ok())
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(AdmissionControl::Open),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,15 +168,5 @@ mod tests {
         assert_eq!(position_from_item(&no_status), None);
 
         assert_eq!(position_from_item(&position_item("7", "nonsense")), None);
-    }
-
-    #[test]
-    fn counters_default_to_a_closed_event() {
-        // An item with nothing set must not read as an active, admitting event.
-        let counters = counters_from_item("evt", &HashMap::new());
-        assert_eq!(counters.phase, Phase::Idle);
-        assert_eq!(counters.serving_counter, 0);
-        assert_eq!(counters.admission_control, AdmissionControl::Open);
-        assert!(counters.shuffle_seed.is_none());
     }
 }

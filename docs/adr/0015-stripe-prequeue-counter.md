@@ -27,10 +27,12 @@ striping the others is not.
 
 Stripe `prequeue_counter` across a fixed **K = 10** shards, by design, for every deployment.
 
-- **Registration.** Each `POST /join` during the pre-queue picks a shard
-  `s = hash(request_id) % 10`, does `ADD prequeue_counter#s :1` / `ALL_NEW` to claim a
-  **local index** within that shard, and writes `PreQueue {r, s, l, t}` — the shard `s` and
-  the local index `l`, not a global index. Ceiling rises to ~10,000 registrations/second.
+- **Registration.** Each request during the pre-queue hashes to a shard
+  `s = hash(request_id) % 10`. `assign_position` groups a batch's requests by shard and issues
+  one `SET s = :shard ADD n :count` / `ALL_NEW` per non-empty shard group — one round trip
+  claims a whole group's **local indices** within that shard, not one round trip per
+  registrant — then writes `PreQueue {r, s, l, t}` per request: the shard `s` and the local
+  index `l`, not a global index. Ceiling rises to ~10,000 registrations/second.
 - **Seal (T−0).** The seal `UpdateItem` reads the 10 shard counts, computes **prefix offsets**
   `offset[s] = Σ counts[0..s)`, sets `participant_count = Σ counts` (= N), and stores the 10
   offsets on the `Counters` item — all in the same conditional write that sets `shuffle_seed`
@@ -76,14 +78,22 @@ not apply to them.
 ## Failure modes
 
 - **Straggler join racing the seal.** The seal reads the 10 shard counts, then writes
-  seed + offsets + `active` in one conditional `UpdateItem`. A `POST /join` in flight can
-  increment a shard *after* the seal read it, producing a local index beyond the counted range,
-  so its reconstructed `i ≥ participant_count` falls outside the permutation domain. `/queue_num`
-  MUST treat any reconstructed `i ≥ participant_count` as "registered too late" and return a
-  live-join position (via `queue_counter`, behind the whole pre-queue cohort) rather than
-  calling `PRP` out of range. This degrades a straggler to exactly the live joiner it would have
-  been a moment later, and keeps the seal a single write. (This race also exists for a single
-  counter racing `participant_count`; it is not introduced by striping.)
+  seed + offsets + `active` in one conditional `UpdateItem`. A registration in flight can
+  claim a local index in a shard *after* the seal read that shard's count, so its local index
+  is beyond the range the seal counted for that shard. The straggler test MUST be **per
+  shard**, not a global `i ≥ participant_count`: a shard's own issued count is
+  `offset[s+1] - offset[s]` (or `N - offset[s]` for the last shard), and a local index at or
+  past it is the straggler, regardless of where the reconstructed global index `i = offset[s] +
+  l` lands. A global `i ≥ N` test is not equivalent — an over-count on an interior shard can
+  reconstruct to an `i` that still falls inside `[0, N)`, because that index belongs to a
+  *later* shard, and resolving it as pre-queue hands two visitors the same position. `/queue_num`
+  falls through to the straggler's `Positions` row rather than calling `PRP` out of range —
+  answering with that row's live-join position, or 404 when none has landed yet so the client
+  recovers by re-joining; `assign_position` applies the same check
+  once its own writes land, to catch the case where the seal lands mid-batch. This degrades a
+  straggler to exactly the live joiner it would have been a moment later, and keeps the seal a
+  single write. (This race also exists for a single counter racing `participant_count`; it is
+  not introduced by striping.)
 - **Torn read at T−0 is impossible.** Seed, count, offsets and phase are set in one atomic
   single-item write, so a reader sees either the pre-`active` state (countdown) or all four
   together — never offsets without a count.

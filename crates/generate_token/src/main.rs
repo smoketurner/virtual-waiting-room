@@ -14,7 +14,7 @@ use std::env;
 use generate_token::dynamo::DynamoStore;
 use generate_token::{DEFAULT_COOKIE_TTL_SECS, Denied, RESOURCE_WILDCARD, Signer, Store, decide};
 use lambda_http::{Body, Error, Request, RequestExt, Response, run, service_fn};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 /// Resolved once at cold start and shared across invocations.
 struct AppState {
@@ -110,9 +110,14 @@ async fn handle(state: &AppState, req: Request) -> Result<Response<Body>, Error>
         .record_arrival(&state.event_id, grant.arrival_shard)
         .await
     {
-        // Non-fatal. The controller tolerates a missed arrival better than the
-        // visitor tolerates being refused at their turn.
-        warn!(error = %e, "failed to record arrival; admitting anyway");
+        // Non-fatal for this visitor: the controller tolerates a missed
+        // arrival better than the visitor tolerates being refused at their
+        // turn. Logged at error with a stable event name because the damage is
+        // cumulative and silent — every uncounted arrival inflates the measured
+        // no-show rate, and the controller answers that by releasing more
+        // people than the origin agreed to serve. Attach a metric filter to
+        // `arrival_record_failed` to alarm on it.
+        error!(error = %e, event = "arrival_record_failed", "failed to record arrival; admitting anyway");
     }
 
     let expires_at = now_secs().saturating_add(state.cookie_ttl_secs);

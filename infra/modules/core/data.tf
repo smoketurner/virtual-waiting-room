@@ -35,17 +35,31 @@ data "aws_iam_policy_document" "assign_position" {
   }
 
   statement {
-    sid    = "WritePositionsAndCounters"
+    sid    = "WritePositions"
+    effect = "Allow"
+    actions = [
+      "dynamodb:PutItem",
+    ]
+    resources = [aws_dynamodb_table.positions.arn]
+  }
+
+  statement {
+    sid    = "ReadAndClaimCounters"
     effect = "Allow"
     actions = [
       "dynamodb:UpdateItem",
-      "dynamodb:PutItem",
       "dynamodb:GetItem",
     ]
-    resources = [
-      aws_dynamodb_table.positions.arn,
-      aws_dynamodb_table.counters.arn,
+    resources = [aws_dynamodb_table.counters.arn]
+  }
+
+  statement {
+    sid    = "WritePrequeue"
+    effect = "Allow"
+    actions = [
+      "dynamodb:PutItem",
     ]
+    resources = [aws_dynamodb_table.prequeue.arn]
   }
 
   statement {

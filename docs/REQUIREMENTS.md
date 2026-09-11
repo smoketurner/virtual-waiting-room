@@ -27,8 +27,8 @@ activation queues first-in, first-out (FIFO).
 
 | ID | Requirement | Acceptance |
 |---|---|---|
-| F1.1 | During the pre-queue phase, visitors MUST be held on a countdown page rather than assigned a position. | A visitor arriving at T−10min sees a countdown; no `Positions` item is written. |
-| F1.2 | The pre-queue page MUST be servable entirely from content delivery network (CDN) cache, making zero calls to API Gateway, DynamoDB, or Simple Queue Service (SQS) per view. | Origin request count during the pre-queue phase is independent of visitor count. |
+| F1.1 | During the pre-queue phase, visitors MUST be held on a countdown page rather than assigned a queue position. Registering a visitor's place MUST cost one row write per visitor, plus a share of one amortised shard-counter claim per batch. | A visitor arriving at T−10min sees a countdown and is registered; no `Positions` item — and no queue position — exists until the event opens. |
+| F1.2 | The pre-queue countdown page MUST be servable entirely from content delivery network (CDN) cache, so that repeated page views make zero calls to API Gateway, DynamoDB, or Simple Queue Service (SQS). Registration MUST be a separate, one-time direct write from the edge to the ingest queue, with no compute in the path. | Origin request count from page views during the pre-queue phase is independent of visitor count; each visitor registers exactly once, deduplicated across reloads wherever the browser permits persistent client-side storage (a browser that denies it, e.g. private browsing, re-registers on every reload — a known gap, not a guarantee this requirement makes), with no Lambda in that write's path. |
 | F1.3 | At T−0 the system MUST assign queue positions to pre-queue participants in **randomized** order, and the ordering MUST NOT be predictable before that moment. | Assigned position shows no correlation with registration time; positions are uniformly distributed; the permutation key does not exist before T−0. |
 | F1.4 | Position assignment for pre-queue participants MUST complete promptly at the scheduled start. | 1,000,000 participants assigned in one write; elapsed time independent of cohort size. |
 | F1.5 | The randomization MUST be auditable after the fact. | A third party given the published seed, participant count, and registration indices recomputes every position and reproduces the ordering exactly. |
@@ -66,7 +66,7 @@ activation queues first-in, first-out (FIFO).
 | F4.1 | If the waiting room is unavailable, visitors MUST proceed to the origin rather than being blocked. | With the waiting room API returning 5xx, the origin remains reachable. |
 | F4.2 | The fail-open bypass MUST be time-limited and the client MUST retry in the background. | Bypass cookie expires; normal queueing resumes without user action. |
 | F4.3 | Fail-open MUST be overridable per client. | A client requiring fail-closed can configure it, with the tradeoff documented. |
-| F4.4 | A join lost downstream MUST be recoverable by the client. | `GET /queue_num` returns 404; the client re-joins with a fresh UUIDv7. |
+| F4.4 | A join lost downstream MUST be recoverable by the client. | `GET /queue_num` returns 404; the client re-joins with the same request id, and the retry succeeds because no row exists for it yet. |
 | F4.5 | The client MUST treat HTTP 429 as expected and retry with jittered backoff. | Under gateway throttling, no user-visible error; joins succeed on retry. |
 
 ### 1.6 Operator experience

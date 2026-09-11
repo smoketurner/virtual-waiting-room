@@ -145,9 +145,25 @@ variable "oidc_allowed_emails" {
 }
 
 variable "assign_position_reserved_concurrency" {
-  description = "Reserved concurrency on the assign_position function. Mandatory for event isolation (ADR-0008): without it a runaway event starves the others. -1 leaves it unreserved (single-event dev only)."
+  description = <<-EOT
+    Reserved concurrency on the assign_position function. Mandatory for event
+    isolation (ADR-0008): without it a runaway event starves the others. -1
+    leaves it unreserved (single-event dev only).
+
+    Sized so the ingest queue drains faster than registrations arrive at the
+    ~10,000/s target, with headroom: a batch is 100 records and up to ~112
+    sequential DynamoDB calls, so the per-call latency sets the drain rate, and
+    it is not measured. Headroom is free — this is a ceiling, not a
+    reservation that bills when idle — and running short is not merely slow: a
+    registrant still queued when the event seals is demoted to the back of the
+    live-join queue.
+
+    Raising this alone does not raise the ceiling on `PreQueue` writes. Set
+    `warm_throughput_write_units` on that table before a large-cohort
+    rehearsal, or its on-demand ramp becomes the new bottleneck.
+  EOT
   type        = number
-  default     = 10
+  default     = 150
 }
 
 variable "env" {

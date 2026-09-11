@@ -30,8 +30,12 @@ visible fairness failure at 1,000,000 people. Tests are the primary evidence.
   - **Burned slot** — with an injected registration-write failure (counter incremented, no
     `PreQueue` row), the space stays contiguous, `PRP` stays bijective, and the burned index
     resolves to a position that maps to no one (absorbed like a live-join gap, F2.3).
-  - **Straggler race** — a join that raced the seal reconstructs `i ≥ participant_count`;
-    `/queue_num` returns a live-join position and never calls `PRP` out of domain.
+  - **Straggler race** — a join that raced the seal claims a local index at or past its own
+    shard's issued count (a **per-shard** test, not a global `i ≥ participant_count`: an
+    over-count on a shard that is not the last one can still reconstruct to an `i` inside
+    `[0, N)`, because that index belongs to a later shard); `/queue_num` never calls `PRP` out
+    of domain for it, falling through to the `Positions` row instead (a live-join position if
+    one has landed, 404 — recoverable by re-join — if not).
 - **Atomic counter (design §5).** Under concurrent load, the set of issued positions has
   **zero duplicates**; gaps are permitted and their rate is measured, not eliminated.
 - **Idempotent join** — repeating a join with the same `request_id` consumes no extra

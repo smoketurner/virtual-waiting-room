@@ -4,9 +4,9 @@
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::types::AttributeValue;
 use lambda_http::{Body, Error, Request, RequestExt, Response, service_fn};
-use read::{QueueNumError, queue_num, status};
+use read::{QueueNumError, ResolvedQueueNum, queue_num, status};
 use wr_common::expr::event_key;
-use wr_common::{AdmissionControl, Counters, Phase, PreQueueItem, SHARDS};
+use wr_common::{Counters, PreQueueItem};
 
 struct Ctx {
     client: Client,
@@ -68,23 +68,45 @@ async fn handle_queue_num(ctx: &Ctx, req: &Request) -> Result<Response<Body>, Er
     let Some(row) = load_prequeue(ctx, request_id).await? else {
         // No pre-queue row: this may be a live joiner, whose position lives in
         // the Positions table (written by assign_position), not the pre-queue.
-        return match load_position(ctx, request_id).await? {
-            Some(position) => json(
-                200,
-                &serde_json::json!({ "position": position, "live_join": true }),
-            ),
-            None => json(404, &serde_json::json!({ "error": "not registered" })),
-        };
+        return respond_from_position(ctx, request_id).await;
     };
 
     match queue_num(&counters, &row) {
-        Ok(resp) => json(200, &resp),
+        Ok(ResolvedQueueNum::PreQueue(resp)) => json(200, &resp),
+        // The row raced the seal: it holds no real position, so fall through
+        // to the same Positions lookup a live joiner uses. A row there means
+        // this visitor re-joined and already holds a live position; no row
+        // means "not registered yet" — a 404 the straggler's client treats as
+        // a miss and eventually recovers from by re-joining.
+        Ok(ResolvedQueueNum::Straggler) => respond_from_position(ctx, request_id).await,
         Err(QueueNumError::NotSealed) => {
             json(409, &serde_json::json!({ "error": "event not yet open" }))
         }
         Err(QueueNumError::BadShard) => {
             json(500, &serde_json::json!({ "error": "corrupt registration" }))
         }
+    }
+}
+
+/// Answers from the `Positions` table alone: 200 with the live-join position
+/// if a row exists, 404 otherwise. Shared by the two callers with no
+/// `PreQueue` row to resolve — a genuine live joiner, and a pre-queue
+/// straggler falling back to the same lookup to recover.
+async fn respond_from_position(ctx: &Ctx, request_id: &str) -> Result<Response<Body>, Error> {
+    let (status, body) = position_response(load_position(ctx, request_id).await?);
+    json(status, &body)
+}
+
+/// The pure decision `respond_from_position` answers with: 200 and the
+/// live-join position if `Positions` holds a row, 404 otherwise. Split out so
+/// the straggler's recovery branch is testable without a `DynamoDB` client.
+fn position_response(position: Option<u64>) -> (u16, serde_json::Value) {
+    match position {
+        Some(position) => (
+            200,
+            serde_json::json!({ "position": position, "live_join": true }),
+        ),
+        None => (404, serde_json::json!({ "error": "not registered" })),
     }
 }
 
@@ -99,7 +121,7 @@ async fn load_counters(ctx: &Ctx) -> Result<Option<Counters>, Error> {
     let Some(item) = out.item() else {
         return Ok(None);
     };
-    Ok(Some(counters_from_item(&ctx.event_id, item)))
+    Ok(Some(Counters::from_item(&ctx.event_id, item)))
 }
 
 async fn load_prequeue(ctx: &Ctx, request_id: &str) -> Result<Option<PreQueueItem>, Error> {
@@ -137,62 +159,6 @@ fn position_from_item(item: &std::collections::HashMap<String, AttributeValue>) 
     item.get("queue_position")
         .and_then(|v| v.as_n().ok())
         .and_then(|s| s.parse::<u64>().ok())
-}
-
-/// Reads the `Counters` item and its optional seal outputs. The striped
-/// counters are separate items and no read path here needs them.
-fn counters_from_item(
-    event_id: &str,
-    item: &std::collections::HashMap<String, AttributeValue>,
-) -> Counters {
-    let num = |key: &str| -> Option<u64> {
-        item.get(key)
-            .and_then(|v| v.as_n().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-    };
-
-    let shuffle_seed = item
-        .get("shuffle_seed")
-        .and_then(|v| v.as_b().ok())
-        .and_then(|b| <[u8; 32]>::try_from(b.as_ref()).ok());
-
-    let prequeue_offsets = item
-        .get("prequeue_offsets")
-        .and_then(|v| v.as_l().ok())
-        .and_then(|list| {
-            let parsed: Vec<u64> = list
-                .iter()
-                .filter_map(|e| e.as_n().ok().and_then(|s| s.parse().ok()))
-                .collect();
-            <[u64; SHARDS]>::try_from(parsed).ok()
-        });
-
-    let phase = item
-        .get("phase")
-        .and_then(|v| v.as_s().ok())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(Phase::Idle);
-
-    Counters {
-        event_id: event_id.to_owned(),
-        phase,
-        queue_counter: num("queue_counter").unwrap_or(0),
-        serving_counter: num("serving_counter").unwrap_or(0),
-        shuffle_seed,
-        participant_count: num("participant_count"),
-        prequeue_offsets,
-        message: item
-            .get("message")
-            .and_then(|v| v.as_s().ok())
-            .filter(|s| !s.is_empty())
-            .cloned(),
-        admission_control: item
-            .get("admission_control")
-            .and_then(|v| v.as_s().ok())
-            .and_then(|s| s.parse().ok())
-            // "open", missing, or unrecognized: normal admission (safe default).
-            .unwrap_or(AdmissionControl::Open),
-    }
 }
 
 fn json<T: serde::Serialize>(status: u16, body: &T) -> Result<Response<Body>, Error> {
@@ -249,5 +215,29 @@ mod tests {
             AttributeValue::S("2026-08-03T19:12:52.000Z".to_owned()),
         );
         assert_eq!(position_from_item(&item), None);
+    }
+
+    #[test]
+    fn a_straggler_with_no_positions_row_answers_404_not_registered() {
+        // A PreQueue row that raced the seal falls through to this lookup; no
+        // Positions row means the re-join hasn't landed yet, not an error.
+        assert_eq!(
+            position_response(None),
+            (404, serde_json::json!({ "error": "not registered" }))
+        );
+    }
+
+    #[test]
+    fn a_straggler_with_a_positions_row_answers_200_as_a_live_join() {
+        // The re-join succeeded (attribute_not_exists(request_id) passed
+        // because the straggler held no Positions row), so it now resolves
+        // exactly like any other live joiner.
+        assert_eq!(
+            position_response(Some(4_242)),
+            (
+                200,
+                serde_json::json!({ "position": 4_242, "live_join": true })
+            )
+        );
     }
 }

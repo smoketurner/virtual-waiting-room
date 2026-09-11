@@ -175,27 +175,44 @@ under two minutes; scheduled mode exists for events with a known start time.
 
 ### 4.1 Registration
 
-A visitor arriving during the pre-queue calls `POST /join`, which follows the same path as a
-live join (§6). The handler claims a per-shard local registration index from a striped atomic
-counter and writes one `PreQueue` item
+A visitor arriving during the pre-queue calls `POST /join` — the same ingest path as a live
+join (§6): API Gateway writes the request straight to SQS, and `assign_position` consumes the
+batch. It reads the event's `Counters` item once per batch to decide which path the whole batch
+takes: sealed, or any phase but pre-queue, takes the live-join path below (§4.5); otherwise it
+groups the batch's valid records by shard and claims one contiguous block of local indices per
+shard, then writes one `PreQueue` item per record
 ([ADR-0015](../../../docs/adr/0015-stripe-prequeue-counter.md)):
 
 | Attribute | Value |
 |---|---|
 | `r` (partition key) | `request_id`, a client-supplied universally unique identifier, version 7 (UUIDv7) |
 | `s` | shard, `hash(request_id) % 10` |
-| `l` | local index within shard `s`, from `ADD prequeue_counter#s :1` / `ALL_NEW` |
+| `l` | local index within shard `s`, claimed from the shard's own item |
 | `t` | server-stamped registration time |
 
 Written with `ConditionExpression: attribute_not_exists(r)`, so a duplicate join consumes no
-index. `prequeue_counter` is striped across 10 shards (`prequeue_counter#0`–`#9`), raising the
-registration ceiling from the ~1,000/s single-item limit to ~10,000/s. Each shard counts its
-own local indices `0..count_s`; the contiguous global index `i` is assembled at T−0 (§4.2), not
-at registration. Registration writes spread across the pre-queue window — minutes to hours —
-rather than concentrating at T−0.
+index. `prequeue_counter` is striped across 10 shards, each its **own item** (partition key
+`EVT#{event_id}#PQ#{s}`, count held in attribute `n`) rather than 10 attributes on one shared
+item — a striped item shares nothing, where striped attributes would still share that item's
+single 1,000-write/s ceiling. One `UpdateItem SET s = :shard ADD n :count` claims a whole
+shard's share of a batch in a single round trip, raising the registration ceiling from the
+~1,000/s single-item limit to ~10,000/s. Each shard counts its own local indices `0..count_s`;
+the contiguous global index `i` is assembled at T−0 (§4.2), not at registration. Registration
+writes spread across the pre-queue window — minutes to hours — rather than concentrating at
+T−0.
 
-The countdown page is static HTML and JavaScript in S3 behind CloudFront, polling `/status`.
-Page views generate no origin requests.
+A registration that lands after `seal_event` has already read that shard's count is a
+straggler: it is invisible to the seal, so nothing assigns it a pre-queue position. The batch
+that wrote it checks for this once its writes land (one more consistent read of `Counters`) and,
+if the event sealed underneath it, gives it a real live-join position instead. `/queue_num` (§4.2)
+falls back to the same live-join lookup for any straggler that step missed, so a visitor is
+never stuck polling a row that will never resolve.
+
+The countdown page is static HTML and JavaScript in S3 behind CloudFront, polling `/status` every
+few seconds throughout the countdown. Page views generate no origin requests — that poll and every
+page load are served from cache. Registration is the one write in the whole countdown: a single
+`POST /join`, made once per visitor and deduplicated client-side across reloads, wherever the
+browser permits persistent storage (see F1.1/F1.2's acceptance note on private browsing).
 
 ### 4.2 Assignment
 
@@ -203,19 +220,23 @@ Queue order is a bijection from registration index to queue position, realised a
 **pseudorandom permutation (PRP)** rather than stored rows
 ([ADR-0002](../../../docs/adr/0002-seeded-permutation-not-materialised-shuffle.md)).
 
-At T−0 `seal_event` performs one `UpdateItem` on `Counters`. It reads the 10 shard counts
-(`prequeue_counter#0`–`#9`), computes the prefix offsets `offset[s] = Σ counts[0..s)` and the
-cohort size `N = Σ counts`, and writes them alongside the seed and phase in the same conditional
-write ([ADR-0015](../../../docs/adr/0015-stripe-prequeue-counter.md)):
+At T−0 `seal_event` performs one `UpdateItem` on `Counters`. It reads the 10 shard count items
+(`EVT#{event_id}#PQ#0`–`#9`), computes the prefix offsets `offset[s] = Σ counts[0..s)` and the
+cohort size `N = Σ counts`, and writes them alongside the seed, phase, and the live-join
+sequence's starting value in the same conditional write
+([ADR-0015](../../../docs/adr/0015-stripe-prequeue-counter.md)):
 
 ```
 UpdateExpression: SET shuffle_seed = :seed, participant_count = :n,
-                      prequeue_offsets = :offsets, phase = :active
+                      queue_counter = :n, prequeue_offsets = :offsets, phase = :active
 ConditionExpression: attribute_not_exists(shuffle_seed)
 ```
 
-Nothing else is written. Assignment is complete when that single conditional write succeeds,
-so there is no interval during which some participants hold positions and others do not.
+`queue_counter = :n` is in the same write for a reason, not an afterthought: the live-join
+sequence has to start at the cohort size, or the first post-seal live joiner collides with
+position 0 of the pre-queue cohort. Nothing else is written. Assignment is complete when this
+single conditional write succeeds, so there is no interval during which some participants hold
+positions and others do not.
 
 A participant's **global registration index** is `i = offset[s] + l`, where `s` and `l` are the
 shard and local index in their `PreQueue` item. Because the shards partition the cohort and the
@@ -230,10 +251,18 @@ queue_position = PRP(shuffle_seed, i, participant_count)     // i = offset[s] + 
 
 `/queue_num` reads the visitor's `PreQueue` item for `(s, l)` and the seed, count, and offsets
 from `/status`; it reconstructs `i` with one addition. All three are already being fetched. A
-join that raced the seal can produce `i ≥ participant_count` (a local index claimed after the
-seal counted its shard); `/queue_num` treats that as "registered too late" and returns a
-live-join position behind the whole pre-queue cohort, rather than evaluating `PRP` out of
-domain.
+join that raced the seal is a **straggler**, but that is a per-shard fact, not a global one:
+`l` is checked against shard `s`'s own issued count (`offset[s+1] - offset[s]`, or `N -
+offset[s]` for the last shard), and only a local index at or past that count is a straggler.
+Testing the reconstructed `i ≥ N` instead would miss it — an over-count on an interior shard can
+reconstruct to an `i` that still lands inside `[0, N)`, because that index range legitimately
+belongs to a *later* shard, and treating it as pre-queue would resolve two visitors to the same
+position. `/queue_num` never evaluates `PRP` out of domain for a straggler: `assign_position`'s
+own fix-up (§4.1) already gives most stragglers a real live-join position by the time anyone
+polls, so `/queue_num` falls through to that `Positions` row — 200 with the live-join position
+if the fix-up (or a subsequent re-join) has landed one, 404 if it has not yet. The 404 is not
+final: the client treats it as a miss and, after enough consecutive misses, re-joins with the
+same request id, which then does get a live-join position.
 
 ### 4.3 The permutation
 
@@ -473,21 +502,25 @@ skipped number.
 
 ### 5.5 Tables
 
-**`Counters`** — partition key `event_id`. One item per event:
+**`Counters`** — partition key `event_id`. One item per event, `EVT#{event_id}`:
 
 | Attribute | Type | Purpose |
 |---|---|---|
 | `queue_counter` | N | Live-join position sequence |
-| `prequeue_counter#0`–`#9` | N | Sharded registration index (local per shard; ADR-0015) |
 | `prequeue_offsets` | L | Per-shard prefix offsets, written at T−0 to assemble `[0, N)` |
 | `serving_counter` | N | Admission high-water mark |
 | `max_expired_position` | N | Highest expired position |
-| `arrivals#0`–`arrivals#9` | N | Sharded arrival count |
 | `phase` | S | `idle` / `pre_queue` / `active` / `post_event` / `maintenance` |
 | `admission_control` | S | Operator's live intent: `open` / `paused` / `fail_open` (ADR-0019), which with `phase` derives the visitor-facing `ServingState` |
 | `target_rate` | N | Operator-set admissions per minute |
 | `shuffle_seed` | B | 256-bit permutation key, written once at T−0 |
 | `participant_count` | N | Pre-queue cohort size, the permutation domain |
+
+The two striped counters — the pre-queue registration index and the arrivals count — are
+**not** attributes on this item. Each shard is its own item in the same table, keyed
+`EVT#{event_id}#PQ#{shard}` and `EVT#{event_id}#AR#{shard}` respectively, holding one attribute
+`n` (ADR-0015 Amendment). Striping across attribute names on one item would put all ten shards
+back under that item's single 1,000-write/s ceiling and distribute nothing.
 | `operator_message` | S | Delivered in `/status` |
 
 **`PreQueue`** — partition key `r`. Attributes `s` (shard), `l` (local index), `t`. Short
@@ -543,9 +576,12 @@ checking the version nibble, which JSON Schema cannot express.
 ### Recovery
 
 Invalid records reach the DLQ. The client's subsequent `GET /queue_num` returns 404, which
-the client treats as "re-join with a fresh UUIDv7". API Gateway returning 200 means *accepted
-into the queue*, not *position assigned*; the 404-and-rejoin loop makes that asymmetry safe
-and is part of the client contract.
+the client treats as "re-join with the same request id" — deliberately the same id, not a fresh
+one: the retried join's `attribute_not_exists` guard passes precisely because no row exists yet
+for it, and a fresh id would abandon whatever the first attempt eventually resolves to. API
+Gateway returning 200 means *accepted into the queue*, not *position assigned*; the 404-and-rejoin
+loop makes that asymmetry safe and is part of the client contract. The straggler self-heal
+(§4.1, §8) rides on the same recovery loop and the same "same id" re-join.
 
 ---
 

@@ -45,6 +45,22 @@ pub struct QueueNumResponse {
     pub live_join: bool,
 }
 
+/// A resolved pre-queue registration, distinguishing a counted registrant
+/// from a straggler whose `PreQueue` row raced the seal.
+///
+/// The handler needs this distinction, not just a response body: a
+/// [`ResolvedQueueNum::Straggler`] has no real position of its own yet and
+/// must fall through to the same `Positions` lookup a live joiner uses,
+/// answering 404 when no row is there — the 404 is what a client stuck on a
+/// stale `PreQueue` row needs in order to recover by re-joining. A
+/// [`ResolvedQueueNum::PreQueue`] answers directly and never reaches that
+/// lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedQueueNum {
+    PreQueue(QueueNumResponse),
+    Straggler,
+}
+
 /// Builds the `/status` payload from the counters item.
 #[must_use]
 pub fn status(counters: &Counters) -> StatusResponse {
@@ -74,9 +90,11 @@ pub enum QueueNumError {
 ///
 /// Reconstructs the global index `i = offset[s] + l` from the sealed offsets
 /// and the visitor's `PreQueue` row, then derives the position with the
-/// permutation. A row whose reconstructed `i >= N` (a join that raced the seal)
-/// resolves to a live-join position instead — the permutation is never
-/// evaluated out of domain.
+/// permutation. A row whose local index is at or past its shard's own issued
+/// count (a join that raced the seal) resolves to
+/// [`ResolvedQueueNum::Straggler`] instead — the permutation is never
+/// evaluated out of domain, and the caller falls through to a `Positions`
+/// lookup rather than answering with a position this function does not have.
 ///
 /// # Errors
 ///
@@ -85,16 +103,15 @@ pub enum QueueNumError {
 pub fn queue_num(
     counters: &Counters,
     row: &PreQueueItem,
-) -> Result<QueueNumResponse, QueueNumError> {
+) -> Result<ResolvedQueueNum, QueueNumError> {
     match counters.resolve_prequeue(row) {
-        Ok(ResolvedPosition::PreQueue(position)) => Ok(QueueNumResponse {
-            position,
-            live_join: false,
-        }),
-        Ok(ResolvedPosition::LiveJoin { base }) => Ok(QueueNumResponse {
-            position: base,
-            live_join: true,
-        }),
+        Ok(ResolvedPosition::PreQueue(position)) => {
+            Ok(ResolvedQueueNum::PreQueue(QueueNumResponse {
+                position,
+                live_join: false,
+            }))
+        }
+        Ok(ResolvedPosition::LiveJoin) => Ok(ResolvedQueueNum::Straggler),
         Err(ResolveError::NotSealed) => Err(QueueNumError::NotSealed),
         Err(ResolveError::BadShard) => Err(QueueNumError::BadShard),
     }
@@ -105,6 +122,7 @@ mod tests {
     #![expect(
         clippy::unwrap_used,
         clippy::cast_possible_truncation,
+        clippy::panic,
         reason = "test code panics on setup failure; shard/len casts are provably small"
     )]
 
@@ -136,7 +154,7 @@ mod tests {
             r: "req-1".to_owned(),
             s,
             l,
-            t: "2026-08-03T19:12:52.000Z".to_owned(),
+            t: 1_788_000_000,
         }
     }
 
@@ -254,23 +272,42 @@ mod tests {
         let mut positions = std::collections::BTreeSet::new();
         for (shard, &count) in counts.iter().enumerate() {
             for l in 0..count {
-                let resp = queue_num(&counters, &row(shard as u8, l)).unwrap();
-                assert!(!resp.live_join);
-                assert!(resp.position < n);
-                assert!(positions.insert(resp.position), "duplicate position");
+                match queue_num(&counters, &row(shard as u8, l)).unwrap() {
+                    ResolvedQueueNum::PreQueue(resp) => {
+                        assert!(!resp.live_join);
+                        assert!(resp.position < n);
+                        assert!(positions.insert(resp.position), "duplicate position");
+                    }
+                    ResolvedQueueNum::Straggler => panic!("issued index resolved as a straggler"),
+                }
             }
         }
         assert_eq!(positions.len() as u64, n);
     }
 
     #[test]
-    fn queue_num_straggler_is_live_join() {
-        let counts = [3, 0, 5, 1, 0, 0, 2, 0, 0, 4]; // N = 15, last offset 11
+    fn queue_num_straggler_is_reported_distinctly() {
+        let counts = [3, 0, 5, 1, 0, 0, 2, 0, 0, 4]; // last shard's own count is 4
         let counters = sealed_counters(counts, [42u8; 32]);
-        // Last shard local index 4 -> i = 15 >= N: a straggler.
-        let resp = queue_num(&counters, &row(9, 4)).unwrap();
-        assert!(resp.live_join);
-        assert_eq!(resp.position, 15);
+        // Last shard local index 4 is past its own count: a straggler.
+        assert_eq!(
+            queue_num(&counters, &row(9, 4)).unwrap(),
+            ResolvedQueueNum::Straggler
+        );
+    }
+
+    #[test]
+    fn queue_num_straggler_on_an_interior_shard_is_reported_too() {
+        // The case the old global i >= N rule missed: an over-count on a
+        // shard that is NOT the last one. Shard 2's own count is 5 (offsets
+        // [0,3,3,8,...]), so local 5 is past it even though offset[2] + 5 =
+        // 8 still lands inside [0, N).
+        let counts = [3, 0, 5, 1, 0, 0, 2, 0, 0, 4];
+        let counters = sealed_counters(counts, [42u8; 32]);
+        assert_eq!(
+            queue_num(&counters, &row(2, 5)).unwrap(),
+            ResolvedQueueNum::Straggler
+        );
     }
 
     #[test]
@@ -280,7 +317,7 @@ mod tests {
             r: "req-1".to_owned(),
             s: SHARDS as u8,
             l: 0,
-            t: "t".to_owned(),
+            t: 1_788_000_000,
         };
         assert_eq!(queue_num(&counters, &bad), Err(QueueNumError::BadShard));
     }
