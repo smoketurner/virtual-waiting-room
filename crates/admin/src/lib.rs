@@ -908,6 +908,21 @@ pub enum ApplyError {
     Store(#[from] StoreError),
 }
 
+/// Whether an `If-None-Match` header value matches `etag`, so a caller can
+/// answer 304 rather than resend the body.
+///
+/// RFC 9110: the value is a comma-separated list, `*` matches anything, and a
+/// `W/` prefix marks a weak validator. Weak comparison is the right one here —
+/// the assets are byte-identical embedded files, so a weak match is a match.
+#[must_use]
+pub fn if_none_match(header_value: &str, etag: &str) -> bool {
+    let strip = |s: &str| s.trim().trim_start_matches("W/").to_owned();
+    let wanted = strip(etag);
+    header_value
+        .split(',')
+        .any(|candidate| candidate.trim() == "*" || strip(candidate) == wanted)
+}
+
 #[cfg(test)]
 mod tests {
     #![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
@@ -2119,5 +2134,22 @@ mod tests {
             encode_gate_config(&cfg).unwrap(),
             r#"{"v":1,"s":0,"f":0,"r":[["p","/checkout"]]}"#
         );
+    }
+
+    #[test]
+    fn if_none_match_handles_the_shapes_a_browser_sends() {
+        let tag = "\"abc123\"";
+        assert!(if_none_match(tag, tag));
+        assert!(if_none_match("*", tag), "* matches anything");
+        assert!(
+            if_none_match("\"other\", \"abc123\"", tag),
+            "a comma-separated list matches on any member"
+        );
+        assert!(
+            if_none_match("W/\"abc123\"", tag),
+            "a weak validator matches a byte-identical asset"
+        );
+        assert!(!if_none_match("\"stale\"", tag));
+        assert!(!if_none_match("", tag));
     }
 }

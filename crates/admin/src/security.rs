@@ -7,7 +7,7 @@
 //! Everything else is denied.
 
 use axum::http::HeaderValue;
-use axum::http::header::{HeaderMap, HeaderName};
+use axum::http::header::{self, HeaderMap, HeaderName};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
@@ -91,7 +91,27 @@ pub fn apply_hardening(headers: &mut HeaderMap, nonce: &str) {
     {
         headers.insert(csp_name, v);
     }
-    let pairs: [(HeaderName, &str); 8] = [
+    // The control plane serves sensitive per-operator state, so no-store is the
+    // default. A handler that has already set its own cache-control has made a
+    // deliberate choice — the embedded static assets carry a validator so a
+    // reload is a 304 rather than 88 KB of fonts — so leave it, the same way the
+    // CSP above yields to a handler's own policy.
+    if !headers.contains_key(header::CACHE_CONTROL) {
+        for (name, value) in [
+            (
+                HeaderName::from_static("cache-control"),
+                "no-cache, no-store, must-revalidate",
+            ),
+            (HeaderName::from_static("pragma"), "no-cache"),
+            (HeaderName::from_static("expires"), "0"),
+        ] {
+            if let Ok(v) = HeaderValue::from_str(value) {
+                headers.insert(name, v);
+            }
+        }
+    }
+
+    let pairs: [(HeaderName, &str); 5] = [
         // Belt-and-braces clickjacking defense alongside frame-ancestors.
         (HeaderName::from_static("x-frame-options"), "DENY"),
         (HeaderName::from_static("x-content-type-options"), "nosniff"),
@@ -105,14 +125,6 @@ pub fn apply_hardening(headers: &mut HeaderMap, nonce: &str) {
             HeaderName::from_static("permissions-policy"),
             "geolocation=(), microphone=(), camera=(), usb=(), payment=()",
         ),
-        // The control plane serves sensitive per-operator state — never cache it
-        // in the browser, API Gateway, or any intermediary.
-        (
-            HeaderName::from_static("cache-control"),
-            "no-cache, no-store, must-revalidate",
-        ),
-        (HeaderName::from_static("pragma"), "no-cache"),
-        (HeaderName::from_static("expires"), "0"),
     ];
     for (name, value) in pairs {
         if let Ok(v) = HeaderValue::from_str(value) {
@@ -124,7 +136,8 @@ pub fn apply_hardening(headers: &mut HeaderMap, nonce: &str) {
 #[cfg(test)]
 mod tests {
     use super::{NonceRng, apply_hardening, nonce, nonce_from};
-    use axum::http::HeaderMap;
+    use axum::http::HeaderValue;
+    use axum::http::header::{self, HeaderMap};
 
     /// A source that always reports an unavailable entropy source. Forces the
     /// failure path the production `SystemRandom` never hits on Lambda.
@@ -217,5 +230,48 @@ mod tests {
         assert!(csp.contains("connect-src 'self'"));
         assert!(csp.contains("frame-ancestors 'none'"));
         assert!(csp.contains("object-src 'none'"));
+    }
+
+    #[test]
+    fn no_store_is_the_default_but_a_handler_may_keep_its_own() {
+        // Every control-plane response must be uncacheable.
+        let mut headers = HeaderMap::new();
+        apply_hardening(&mut headers, "n");
+        assert_eq!(
+            headers
+                .get(header::CACHE_CONTROL)
+                .map(HeaderValue::as_bytes),
+            Some(&b"no-cache, no-store, must-revalidate"[..])
+        );
+        assert!(headers.contains_key("pragma"));
+        assert!(headers.contains_key("expires"));
+
+        // The embedded static assets set their own, so a reload revalidates to
+        // a 304 instead of resending the fonts. Overwriting it here would make
+        // the validator useless: no-store stops the browser sending
+        // If-None-Match at all.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=300, must-revalidate"),
+        );
+        apply_hardening(&mut headers, "n");
+        assert_eq!(
+            headers
+                .get(header::CACHE_CONTROL)
+                .map(HeaderValue::as_bytes),
+            Some(&b"public, max-age=300, must-revalidate"[..])
+        );
+        assert!(
+            !headers.contains_key("pragma"),
+            "pragma would contradict it"
+        );
+        assert!(!headers.contains_key("expires"));
+
+        // The hardening headers still apply either way.
+        assert_eq!(
+            headers.get("x-frame-options").map(HeaderValue::as_bytes),
+            Some(&b"DENY"[..])
+        );
     }
 }

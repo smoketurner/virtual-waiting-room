@@ -29,6 +29,8 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use lambda_http::Error;
 use openidconnect::core::CoreResponseType;
 use openidconnect::{
@@ -602,19 +604,56 @@ async fn deferred() -> Response {
 }
 
 /// Serves an embedded static asset (`/static/<path>`) with a guessed
-/// content-type. Public (CSS carries no secrets). Unknown paths 404.
-async fn static_asset(Path(path): Path<String>) -> Response {
-    match StaticAssets::get(&path) {
-        Some(file) => {
-            let mime = mime_guess::from_path(&path).first_or_octet_stream();
-            (
-                [(header::CONTENT_TYPE, mime.as_ref().to_owned())],
-                file.data.into_owned(),
-            )
-                .into_response()
-        }
-        None => (StatusCode::NOT_FOUND, "not found").into_response(),
+/// content-type. Public (CSS and fonts carry no secrets). Unknown paths 404.
+///
+/// The assets are compiled into the binary, so their content changes only when
+/// the Lambda is redeployed. The `ETag` is the embedded file's own hash, which
+/// makes a repeat request a 304 with no body — the fonts are the bulk of the
+/// page weight, and the admin behaviour is uncached at the edge, so without a
+/// validator every dashboard load pulls them through the Lambda again.
+///
+/// `max-age` is deliberately short. The URL carries no content hash, so a long
+/// one would serve a stale stylesheet after a deploy; revalidation is what
+/// keeps it correct, and the 304 is what makes it cheap.
+async fn static_asset(headers: HeaderMap, Path(path): Path<String>) -> Response {
+    let Some(file) = StaticAssets::get(&path) else {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    };
+
+    // The hash is over the file's own bytes, computed when it is embedded, so
+    // editing an asset and redeploying changes the tag. base64url rather than
+    // hex because an ETag is an opaque string and this is one call.
+    let etag = format!(
+        "\"{}\"",
+        URL_SAFE_NO_PAD.encode(file.metadata.sha256_hash())
+    );
+    let cache_control = "public, max-age=300, must-revalidate";
+
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| admin::if_none_match(v, &etag))
+    {
+        return (
+            StatusCode::NOT_MODIFIED,
+            [
+                (header::ETAG, etag),
+                (header::CACHE_CONTROL, cache_control.to_owned()),
+            ],
+        )
+            .into_response();
     }
+
+    let mime = mime_guess::from_path(&path).first_or_octet_stream();
+    (
+        [
+            (header::CONTENT_TYPE, mime.as_ref().to_owned()),
+            (header::ETAG, etag),
+            (header::CACHE_CONTROL, cache_control.to_owned()),
+        ],
+        file.data.into_owned(),
+    )
+        .into_response()
 }
 
 impl AppState {
