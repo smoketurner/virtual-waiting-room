@@ -63,3 +63,4 @@ __pycache__/
 # macOS Finder metadata.
 .DS_Store
 /.local
+/.claude/worktrees
