@@ -182,7 +182,7 @@ pub fn decide(
         && session.event_id == cfg.event_id
     {
         let refresh_cookie =
-            slide(&session, cfg.session_mode, now).map(|s| session_cookie(&s.sign(key), cfg, now));
+            slide(&session, cfg.session_mode, now).map(|s| session_cookie(&s.sign(key), cfg));
         return Decision::Forward { refresh_cookie };
     }
 
@@ -195,7 +195,7 @@ pub fn decide(
         && admitted.event_id == cfg.event_id
     {
         let session = mint_session(&admitted.request_id, cfg, now);
-        let set_cookie = session_cookie(&session.sign(key), cfg, now);
+        let set_cookie = session_cookie(&session.sign(key), cfg);
         let arrival_shard = wr_common::shard_for(admitted.request_id.as_bytes());
         let stripped_path = strip_token(&req.path);
         return Decision::SetSessionAndForward {
@@ -219,7 +219,7 @@ pub fn decide(
     //    the visitor to wait.
     match (reachability, cfg.unreachable_policy) {
         (Reachability::Unreachable, UnreachablePolicy::FailOpen) => Decision::FailOpenBypass {
-            set_cookie: bypass_cookie(cfg, now),
+            set_cookie: bypass_cookie(cfg),
         },
         (Reachability::Unreachable, UnreachablePolicy::FailClosed)
         | (Reachability::Reachable, _) => Decision::Redirect {
@@ -278,12 +278,11 @@ pub fn slide(session: &Session, mode: SessionMode, now: u64) -> Option<Session> 
 
 /// A `Set-Cookie` header value for the session, scoped per event, `HttpOnly`,
 /// `Secure`, `SameSite=Lax`, with a `Max-Age` matching the session expiry.
-fn session_cookie(value: &str, cfg: &Config, now: u64) -> String {
+fn session_cookie(value: &str, cfg: &Config) -> String {
     let max_age = match cfg.session_mode {
         SessionMode::Fixed { ttl_secs } => ttl_secs,
         SessionMode::Sliding { idle_secs, .. } => idle_secs,
     };
-    let _ = now;
     format!(
         "{}={value}; Max-Age={max_age}; Path=/; HttpOnly; Secure; SameSite=Lax",
         cfg.session_cookie_name
@@ -291,8 +290,7 @@ fn session_cookie(value: &str, cfg: &Config, now: u64) -> String {
 }
 
 /// A `Set-Cookie` header value for the time-limited fail-open bypass.
-fn bypass_cookie(cfg: &Config, now: u64) -> String {
-    let _ = now;
+fn bypass_cookie(cfg: &Config) -> String {
     format!(
         "{}=1; Max-Age={}; Path=/; HttpOnly; Secure; SameSite=Lax",
         cfg.bypass_cookie_name, cfg.bypass_ttl_secs
