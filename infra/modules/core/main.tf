@@ -81,8 +81,9 @@ resource "aws_dynamodb_table" "positions" {
   }
 
   # TTL is post-event storage reclamation ONLY, never the expiry mechanism
-  # (ADR-0006). The controller expires positions on a schedule; reads apply a
-  # FilterExpression on expires_at so a TTL-pending item is never served.
+  # (ADR-0006): the controller expires positions on a schedule, scanning on
+  # status rather than on a deadline, so a row still present past its ttl is
+  # never mistaken for a live position. The name matches PositionItem::ttl.
   ttl {
     attribute_name = "ttl"
     enabled        = true
@@ -99,6 +100,7 @@ resource "aws_dynamodb_table" "positions" {
   tags = var.tags
 }
 
+# Admission-token reservations, operator OIDC sessions, and pending PKCE logins.
 resource "aws_dynamodb_table" "tokens" {
   name         = local.table_names.tokens
   billing_mode = "PAY_PER_REQUEST"
@@ -113,8 +115,13 @@ resource "aws_dynamodb_table" "tokens" {
     enabled = true
   }
 
+  # Must stay equal to wr_common::expr::TOKENS_TTL_ATTR, which every writer of
+  # this table takes its expiry attribute name from. DynamoDB reclaims a row
+  # only when the attribute named here is the one the writers set; a name that
+  # matches nothing is accepted silently and expires nothing, so the two layers
+  # are changed together or not at all.
   ttl {
-    attribute_name = "ttl"
+    attribute_name = "expires_at"
     enabled        = true
   }
 

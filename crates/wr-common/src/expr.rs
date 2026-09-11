@@ -24,6 +24,21 @@ const KEY_ATTR: &str = "event_id";
 /// key, which replaces the table.
 const TOKENS_KEY_ATTR: &str = "request_id";
 
+/// The expiry attribute of every `Tokens` row — admission-token reservations,
+/// operator OIDC sessions, and pending PKCE logins alike.
+///
+/// This name is the `Tokens` table's `ttl { attribute_name }` in
+/// `infra/modules/core/main.tf`: `DynamoDB` reclaims a row only when the
+/// attribute it was told to watch is the one the writers actually set. The two
+/// sides are a single name in two layers that nothing checks against each
+/// other, so every writer takes it from here rather than spelling it out, and
+/// the Terraform side carries a comment pointing back at this constant.
+///
+/// Reclamation is lazy: an expired row keeps being returned by reads and writes
+/// until the background sweep removes it, so a reader that cares whether the
+/// row is still valid compares this attribute to the current time itself.
+pub const TOKENS_TTL_ATTR: &str = "expires_at";
+
 /// The attribute a shard item records its own index in, so a reader that
 /// fetched a batch of shards knows which is which without taking the key apart
 /// again.
@@ -355,6 +370,18 @@ mod tests {
         assert_eq!(increment_shard_update(), "SET s = :shard ADD n :one");
         assert_eq!(SHARD_COUNT_ATTR, "n");
         assert_eq!(SHARD_INDEX_ATTR, "s");
+    }
+
+    #[test]
+    fn the_tokens_ttl_attribute_is_the_name_terraform_enables_ttl_on() {
+        // The value itself is the contract: it is repeated in the Tokens
+        // table's `ttl { attribute_name }` in infra/modules/core/main.tf, which
+        // no compiler checks against this constant. DynamoDB accepts a TTL
+        // configured on an attribute nothing writes without complaint and then
+        // reclaims nothing, so the mismatch is invisible until a table has
+        // grown for months. Changing this value means changing that block in
+        // the same commit.
+        assert_eq!(TOKENS_TTL_ATTR, "expires_at");
     }
 
     #[test]
