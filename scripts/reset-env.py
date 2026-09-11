@@ -192,7 +192,7 @@ def invalidate(cf, distribution_id: str, wait: bool) -> str:
     return invalidation_id
 
 
-def fresh_counters(event_id: str, phase: str, target_rate: int) -> dict:
+def fresh_counters(event_id: str, phase: str, target_rate: int, queue_ahead: int) -> dict:
     """The `Counters` item for an event that has never run.
 
     Only the attributes a fresh event genuinely has. The sequences are written
@@ -200,6 +200,13 @@ def fresh_counters(event_id: str, phase: str, target_rate: int) -> dict:
     counter to zero, so the two are equivalent to the code, but an explicit zero
     is the difference between "this event has not started" and "somebody deleted
     an attribute".
+
+    `queue_ahead` starts `queue_counter` above zero so the next live joiner
+    claims a position that far back, while the cursor still starts at zero. The
+    queue is real: the visitor waits for the controller to travel the distance,
+    with a live position, a moving bar and an ETA. No rows are invented for the
+    people ahead, because a position is computed from the counter rather than
+    stored — what a test needs is the distance, not the bodies.
 
     Deliberately absent: shuffle_seed, participant_count, and prequeue_offsets
     (written only by the seal), the prequeue_counter and arrivals shards, and
@@ -210,7 +217,7 @@ def fresh_counters(event_id: str, phase: str, target_rate: int) -> dict:
         "event_id": {"S": event_key(event_id)},
         "phase": {"S": phase},
         "admission_control": {"S": "open"},
-        "queue_counter": {"N": "0"},
+        "queue_counter": {"N": str(queue_ahead)},
         "serving_counter": {"N": "0"},
         "target_rate": {"N": str(target_rate)},
     }
@@ -231,6 +238,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=5,
         help="Visitors per second the controller meters at. Default 5, so a pass releases 50.",
+    )
+    p.add_argument(
+        "--queue-ahead",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "Start the queue N places deep, so the next visitor joins at N+1 and "
+            "waits for the cursor to reach them. Default 0, which admits the first "
+            "visitor on the next controller pass. Roughly N / (rate * 10) passes to "
+            "clear, one every 10s."
+        ),
     )
     p.add_argument(
         "--yes",
@@ -305,7 +324,7 @@ def main() -> int:
     # Deleted first so no attribute from the previous run can survive: PutItem
     # replaces the item, but only for the attributes it names.
     ddb.delete_item(TableName=tables["counters"], Key={"event_id": {"S": event_key(event_id)}})
-    item = fresh_counters(event_id, args.phase, args.target_rate)
+    item = fresh_counters(event_id, args.phase, args.target_rate, args.queue_ahead)
     ddb.put_item(TableName=tables["counters"], Item=item)
     for key in sorted(item):
         print(f"  {key:18} {next(iter(item[key].values()))}")
