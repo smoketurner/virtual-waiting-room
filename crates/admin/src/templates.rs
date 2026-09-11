@@ -21,6 +21,11 @@ pub struct PhaseOption {
 #[template(path = "dashboard.html")]
 pub struct Dashboard {
     pub event_id: String,
+    /// The current phase as its wire string — `idle`, `pre_queue`, `active`,
+    /// `post_event`, or `maintenance`. The badge renders it as both the label
+    /// and the `status-{phase}` CSS class, and the poller sends it back as
+    /// JSON to re-render the same badge, so it must be the canonical form the
+    /// stylesheet and the dropdown values already use.
     pub phase: String,
     pub serving_counter: u64,
     pub queue_counter: u64,
@@ -63,7 +68,7 @@ impl Dashboard {
         let dash = |s: Option<String>| s.unwrap_or_else(|| "not set".to_owned());
         Self {
             event_id: state.event_id.clone(),
-            phase: format!("{:?}", state.phase).to_lowercase(),
+            phase: state.phase.as_wire_str().to_owned(),
             serving_counter: state.serving_counter,
             queue_counter: state.queue_counter,
             participant_count: dash(state.participant_count.map(|n| n.to_string())),
@@ -148,6 +153,37 @@ mod tests {
         assert!(html.contains(">active<"));
         assert!(html.contains("Doors open at noon"));
         assert!(html.contains("500"));
+    }
+
+    #[test]
+    fn phase_renders_as_its_wire_string() {
+        // The badge label, the `status-{phase}` CSS class, and the /admin/state
+        // JSON all read this one field, so it must be the wire string the
+        // stylesheet and the transition dropdown already use. A `Debug`-derived
+        // lowercase form drops the underscore on the two-word variants, giving
+        // "prequeue"/"postevent" — a misnamed label and a class no rule matches.
+        let mut s = state();
+        for (phase, wire) in [
+            (Phase::Idle, "idle"),
+            (Phase::PreQueue, "pre_queue"),
+            (Phase::Active, "active"),
+            (Phase::PostEvent, "post_event"),
+            (Phase::Maintenance, "maintenance"),
+        ] {
+            s.phase = phase;
+            assert_eq!(Dashboard::from_state(&s).phase, wire);
+        }
+    }
+
+    #[test]
+    fn the_phase_badge_class_matches_a_stylesheet_rule() {
+        // The rendered badge carries `status-pre_queue`, the selector
+        // admin.css defines; `status-prequeue` would render unstyled.
+        let mut s = state();
+        s.phase = Phase::PreQueue;
+        let html = Dashboard::from_state(&s).render().unwrap();
+        assert!(html.contains("status-pre_queue"), "{html}");
+        assert!(html.contains(">pre_queue<"), "{html}");
     }
 
     #[test]
