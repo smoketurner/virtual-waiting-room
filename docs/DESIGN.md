@@ -124,10 +124,13 @@ is down.
 
 **Dormancy (#60) is delivered.** An empty ruleset (`r: []` in the KeyValueStore config, which is
 also what a fresh stack is seeded with) matches no request, so every visitor passes straight
-through — standby mode. Scheduled activation into enforcement uses `enforce_from`, a timestamp
-every edge compares against its own clock, so propagation skew can only delay enforcement, never
-skip it; there is no `/admin` route yet that writes a ruleset or `enforce_from`, so an operator
-edits the KeyValueStore directly to leave dormancy.
+through — standby mode. `/admin/rules` writes the ruleset (validated per-field and re-encoded
+through `wr_common::rules::validate_rule_fields` + `encode_gate_config`, audited on `Counters` as
+`rules_digest`/`rules_count`), so an operator leaves dormancy from the dashboard. Scheduled
+activation into enforcement uses `enforce_from`, a timestamp every edge compares against its own
+clock, so propagation skew can only delay enforcement, never skip it; there is no `/admin` route
+yet that writes `enforce_from` itself, so an operator edits the KeyValueStore directly for that
+one field.
 
 ---
 
