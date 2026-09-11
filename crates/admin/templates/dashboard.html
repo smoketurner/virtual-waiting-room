@@ -57,12 +57,13 @@
     </section>
 
     <!-- Emergency / andon cord -->
-    <section class="card emergency">
+    <section class="card emergency span-2">
       <div class="card-header">
         <h2>Emergency</h2>
         <p class="sub">Andon cord. Pull it to stop the line.</p>
       </div>
-      <div class="card-body">
+      <div class="card-body controls-row">
+        <div class="control">
         {% if admission_control == "paused" %}
         <p class="deferred">Admission is paused. Waiting visitors see a "you keep your place" notice and nobody new is let through.</p>
         <form method="post" action="/admin/resume">
@@ -75,7 +76,8 @@
         </form>
         <p class="help" style="margin-top:12px;color:var(--gray-500);"><strong>Pause holds the line.</strong> Waiting visitors see a "you keep your place" notice, the queue keeps forming, and nobody new is admitted. A Resume button appears here to clear it. Reversible.</p>
         {% endif %}
-        <hr class="divider">
+        </div>
+        <div class="control">
         {% if admission_control == "fail_open" %}
         <p class="deferred">FAIL OPEN for {{ fail_open_remaining_secs }}s more, then <strong>{{ queued_control }}</strong>. The waiting room is bypassed; every arrival goes straight to the origin.</p>
         <form method="post" action="/admin/recover" data-confirm="Clear fail-open now? Admission lands in {{ queued_control }} immediately.">
@@ -91,7 +93,8 @@
           <button class="danger" type="submit" title="Bypass the waiting room for the given duration.">Fail open</button>
         </form>
         {% endif %}
-        <hr class="divider">
+        </div>
+        <div class="control">
         {% if phase == "maintenance" %}
         <p class="deferred">The event is in maintenance. Waiting visitors see an "event is temporarily down" page. Recover from the Phase control: return to <code>active</code> to resume, or <code>idle</code> to reset.</p>
         {% else %}
@@ -100,6 +103,7 @@
         </form>
         <p class="help" style="margin-top:12px;color:var(--gray-500);"><strong>Force maintenance takes the whole event down.</strong> Waiting visitors see an "event is temporarily down" page, not a queue. Use it for an outage, not a routine hold. Recover from the Phase control (return to <code>active</code> or <code>idle</code>). Pause only holds admission; this stops everything.</p>
         {% endif %}
+        </div>
       </div>
     </section>
 
@@ -171,7 +175,17 @@
       </div>
     </section>
 
-    <!-- Edge gate protection rules (issue #71) -->
+    <!-- Deferred plane -->
+    <section class="card">
+      <div class="card-header"><h2>Sessions</h2></div>
+      <div class="card-body">
+        <p class="deferred">Not yet available. The session-management plane ships after the MVP.</p>
+      </div>
+    </section>
+
+    <!-- Edge gate protection rules (issue #71). Last because a full-width card
+         cannot share a row: placed earlier it splits the single-column cards
+         above it onto rows of their own. -->
     <section class="card span-2">
       <div class="card-header">
         <h2>Protection rules</h2>
@@ -196,14 +210,6 @@
           <button type="submit" title="Replace the edge gate's ruleset with what is in the box above.">Set rules</button>
         </form>
         {% endif %}
-      </div>
-    </section>
-
-    <!-- Deferred plane -->
-    <section class="card">
-      <div class="card-header"><h2>Sessions</h2></div>
-      <div class="card-body">
-        <p class="deferred">Not yet available. The session-management plane ships after the MVP.</p>
       </div>
     </section>
   </div>
