@@ -16,6 +16,7 @@
 
   var STORAGE_KEY = "vwr_request_id";
   var JOINED_KEY = "vwr_joined";
+  var AHEAD_AT_START_KEY = "vwr_ahead_at_start";
 
   // Adaptive poll interval (#69). No policy published ⇒ behave
   // exactly as this client always has: floor === ceiling === 5000ms, divisor
@@ -284,6 +285,11 @@
     // in line needs a new starting point — keeping the old one would show
     // progress already made towards a position they no longer hold.
     aheadAtStart = null;
+    try {
+      window.localStorage.removeItem(AHEAD_AT_START_KEY);
+    } catch (e) {
+      // Storage unavailable; the in-memory reset above is what matters.
+    }
     // A new place is further back, so the honest estimate jumps up. Clearing
     // this lets it: the rise band exists to absorb noise, and holding a wait
     // from the abandoned place would suppress a real and much longer one.
@@ -474,7 +480,13 @@
     renderEta(ahead, targetRate);
 
     if (aheadAtStart === null) {
-      aheadAtStart = ahead;
+      // Recovered across a reload, so closing the tab and reopening it does not
+      // reset the bar to empty on a visitor who has already waited. A stored
+      // value below the current distance belongs to a place this visitor no
+      // longer holds, so it is discarded rather than shown as progress.
+      var stored = Number(readStored(AHEAD_AT_START_KEY));
+      aheadAtStart = stored >= ahead && stored > 0 ? stored : ahead;
+      writeStored(AHEAD_AT_START_KEY, String(aheadAtStart));
     }
     // A visitor already at the front has nothing to travel, so any fraction
     // would be arbitrary; show the bar full rather than empty.
