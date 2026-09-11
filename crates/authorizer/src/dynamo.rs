@@ -12,7 +12,8 @@ use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::put_item::PutItemError;
 use aws_sdk_dynamodb::types::AttributeValue;
 use wr_common::expr::{
-    admission_token_key, arrivals_shard_key, increment_shard_update, increment_shard_values,
+    TOKENS_TTL_ATTR, admission_token_key, arrivals_shard_key, increment_shard_update,
+    increment_shard_values,
 };
 
 /// A side-effect failure. The handler treats a failure to record an arrival as
@@ -82,7 +83,7 @@ impl Store for DynamoStore {
             .put_item()
             .table_name(&self.tokens_table)
             .set_item(Some(admission_token_key(request_id)))
-            .item("expires_at", AttributeValue::N(expires_at.to_string()))
+            .item(TOKENS_TTL_ATTR, AttributeValue::N(expires_at.to_string()))
             .condition_expression("attribute_not_exists(request_id)")
             .send()
             .await;

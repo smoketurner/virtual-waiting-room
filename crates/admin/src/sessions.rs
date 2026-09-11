@@ -1,7 +1,9 @@
 //! DynamoDB-backed login-transaction and session store for the admin OIDC flow
 //! (ADR-0016). Both record kinds live in the existing `Tokens` table (PK
-//! `request_id`) with a `DynamoDB` TTL attribute (`expires_at`, epoch seconds) so
-//! they self-expire — no cleanup job.
+//! `request_id`) and set the table's TTL attribute
+//! ([`wr_common::expr::TOKENS_TTL_ATTR`], epoch seconds) so they self-expire —
+//! no cleanup job. Reclamation is lazy, so a reader that must not accept a
+//! stale row also compares the attribute to the current time.
 //!
 //! * Login transaction: PK `pkce#<csrf_state>`, holds the PKCE verifier + nonce
 //!   for the ~10 min between `/admin/login` and `/admin/callback`. On Lambda the
@@ -14,7 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::types::AttributeValue;
-use wr_common::expr::{oidc_session_key, pkce_transaction_key};
+use wr_common::expr::{TOKENS_TTL_ATTR, oidc_session_key, pkce_transaction_key};
 
 /// TTL for a pending login transaction (PKCE verifier + nonce).
 const PKCE_TTL_SECS: u64 = 600;
@@ -82,7 +84,7 @@ impl SessionStore {
                 AttributeValue::S(pending.pkce_verifier.clone()),
             )
             .item("nonce", AttributeValue::S(pending.nonce.clone()))
-            .item("expires_at", AttributeValue::N(expires.to_string()))
+            .item(TOKENS_TTL_ATTR, AttributeValue::N(expires.to_string()))
             .send()
             .await
             .map_err(|e| SessionError::Backend(format!("put_pending: {e}")))?;
@@ -135,7 +137,7 @@ impl SessionStore {
             .set_item(Some(oidc_session_key(&id)))
             .item("subject", AttributeValue::S(session.subject.clone()))
             .item("email", AttributeValue::S(session.email.clone()))
-            .item("expires_at", AttributeValue::N(expires.to_string()))
+            .item(TOKENS_TTL_ATTR, AttributeValue::N(expires.to_string()))
             .send()
             .await
             .map_err(|e| SessionError::Backend(format!("create_session: {e}")))?;
@@ -162,7 +164,7 @@ impl SessionStore {
             return Ok(None);
         };
         let expired = item
-            .get("expires_at")
+            .get(TOKENS_TTL_ATTR)
             .and_then(|v| v.as_n().ok())
             .and_then(|n| n.parse::<u64>().ok())
             .is_some_and(|exp| now_secs().is_ok_and(|now| now >= exp));
