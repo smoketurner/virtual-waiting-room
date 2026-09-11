@@ -6,3 +6,4 @@
 # everyone who runs the test benefits from these saved cases.
 cc 24d14f5432863ea6774d98d0fa282efa80956d2be4c636737b4948cc5d5f396a # shrinks to arrivals = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0], last_arrivals = 0, serving = 9553939901541941664, last_serving = 0, queue = 0, rate = 1, prev_rate = None
 cc 8fa2068d4162b91b98cea8159bfdd730d2c5e43411bb246c1c67f79928731ca4 # shrinks to arrivals = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0], last_arrivals = 0, serving = 0, last_serving = 0, queue = 0, rate = 1, prev_rate = None
+cc cb9fdb5ff98c33a48a9dcd8f5cdf2acb670dfe77ad7c764ffc3976d8e9ca3b0f # shrinks to arrivals = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0], last_arrivals = 0, serving = 0, last_serving = 0, queue = 0, rate = 1, prev_rate = Some(NoShowState { smoothed_rate: 5e-131 })

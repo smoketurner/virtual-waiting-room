@@ -5,9 +5,11 @@
 //! `API-Gateway`/ALB HTTP request shape via `lambda_http`. It reads the signing
 //! key from SSM once at cold start, then decides every request locally.
 //!
-//! The one hot-path write is recording an arrival when a token becomes a
-//! session; a failure to record is logged and swallowed so a transient
-//! `DynamoDB` blip never blocks an already-admitted visitor.
+//! The hot-path writes when a token converts to a session are reserving the
+//! single-use admission token (denying any replay) and recording the arrival;
+//! a failure to record is logged and swallowed so a transient `DynamoDB` blip
+//! never blocks an already-admitted visitor, while a failure to reserve denies
+//! by redirecting to the waiting room.
 
 use std::env;
 
@@ -153,6 +155,26 @@ async fn handle(state: &AppState, http: HttpRequest) -> Result<Response<Body>, E
         Reachability::Reachable,
     );
 
+    carry_out(&state.store, &state.cfg, &req.path, decision).await
+}
+
+/// Performs the side effects of a [`Decision`] and builds the response.
+///
+/// Generic over [`Store`] so the reservation and arrival writes are exercised
+/// in tests with a fake store; the live handler calls it with [`DynamoStore`].
+///
+/// Token admission reserves the single-use admission token *before* minting a
+/// session. A replay (reservation returns `false`) or a store failure both
+/// deny by redirecting to the waiting room — fail closed on the credential
+/// rather than mint a second session from one admission. A failure to record
+/// the subsequent arrival is non-fatal: the controller tolerates a missed
+/// arrival count better than we tolerate blocking an already-admitted visitor.
+async fn carry_out<S: Store>(
+    store: &S,
+    cfg: &Config,
+    path: &str,
+    decision: Decision,
+) -> Result<Response<Body>, Error> {
     match decision {
         Decision::Forward {
             refresh_cookie: None,
@@ -161,18 +183,27 @@ async fn handle(state: &AppState, http: HttpRequest) -> Result<Response<Body>, E
             refresh_cookie: Some(set_cookie),
         } => {
             info!("sliding session re-issued on activity");
-            Ok(set_session(&set_cookie, req.path.as_str()))
+            Ok(set_session(&set_cookie, path))
         }
         Decision::SetSessionAndForward {
             set_cookie,
             arrival_shard,
+            request_id,
+            expires_at,
             stripped_path,
         } => {
-            if let Err(e) = state
-                .store
-                .record_arrival(&state.cfg.event_id, arrival_shard)
-                .await
-            {
+            match store.reserve_token(&request_id, expires_at).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    warn!(request_id, "admission token already consumed; redirecting");
+                    return Ok(redirect(&cfg.waiting_room_url));
+                }
+                Err(e) => {
+                    warn!(error = %e, "reserve_token failed; denying replay-ambiguous token");
+                    return Ok(redirect(&cfg.waiting_room_url));
+                }
+            }
+            if let Err(e) = store.record_arrival(&cfg.event_id, arrival_shard).await {
                 // Non-fatal: admit the visitor; the controller tolerates a
                 // missed arrival count better than we tolerate blocking them.
                 warn!(error = %e, "failed to record arrival; admitting anyway");
@@ -182,7 +213,7 @@ async fn handle(state: &AppState, http: HttpRequest) -> Result<Response<Body>, E
         }
         Decision::FailOpenBypass { set_cookie } => {
             warn!("waiting room unreachable; failing open with bypass cookie");
-            Ok(set_session(&set_cookie, req.path.as_str()))
+            Ok(set_session(&set_cookie, path))
         }
         Decision::Redirect { location } => Ok(redirect(&location)),
     }
@@ -266,4 +297,258 @@ fn build(status: u16, set_cookie: Option<&str>, location: Option<&str>) -> Respo
         *fallback.status_mut() = lambda_http::http::StatusCode::INTERNAL_SERVER_ERROR;
         fallback
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        reason = "test code panics on setup and assertion failure"
+    )]
+
+    use std::future::Future;
+    use std::sync::Mutex;
+
+    use super::carry_out;
+    use authorizer::dynamo::{Store, StoreError};
+    use authorizer::{Config, Decision, ProtectionRule, SessionMode, UnreachablePolicy};
+    use lambda_http::{Body, Response};
+
+    /// What [`FakeStore::reserve_token`] returns, to drive each replay branch.
+    #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+    enum ReserveResult {
+        /// `Ok(true)` — first use, admission proceeds.
+        #[default]
+        FirstUse,
+        /// `Ok(false)` — token already consumed (a replay).
+        Consumed,
+        /// `Err` — the `Tokens` write failed.
+        Fail,
+    }
+
+    /// A fake [`Store`] that records every call and returns a configurable
+    /// reservation outcome. Arrivals succeed unless `arrival_err` is set.
+    #[derive(Default)]
+    struct FakeStore {
+        reserve: Mutex<ReserveResult>,
+        reservations: Mutex<Vec<(String, u64)>>,
+        arrivals: Mutex<Vec<(String, usize)>>,
+        arrival_err: Mutex<bool>,
+    }
+
+    impl FakeStore {
+        fn new() -> Self {
+            Self::default()
+        }
+    }
+
+    impl Store for FakeStore {
+        fn record_arrival(
+            &self,
+            event_id: &str,
+            shard: usize,
+        ) -> impl Future<Output = Result<(), StoreError>> + Send {
+            self.arrivals
+                .lock()
+                .unwrap()
+                .push((event_id.to_owned(), shard));
+            let err = *self.arrival_err.lock().unwrap();
+            std::future::ready(if err {
+                Err(StoreError::Backend("injected arrival failure".to_owned()))
+            } else {
+                Ok(())
+            })
+        }
+
+        fn reserve_token(
+            &self,
+            request_id: &str,
+            expires_at: u64,
+        ) -> impl Future<Output = Result<bool, StoreError>> + Send {
+            self.reservations
+                .lock()
+                .unwrap()
+                .push((request_id.to_owned(), expires_at));
+            match *self.reserve.lock().unwrap() {
+                ReserveResult::FirstUse => std::future::ready(Ok(true)),
+                ReserveResult::Consumed => std::future::ready(Ok(false)),
+                ReserveResult::Fail => std::future::ready(Err(StoreError::Backend(
+                    "injected reserve failure".to_owned(),
+                ))),
+            }
+        }
+    }
+
+    fn cfg() -> Config {
+        Config {
+            event_id: "smoke".to_owned(),
+            session_cookie_name: "vwr_session".to_owned(),
+            bypass_cookie_name: "vwr_bypass".to_owned(),
+            session_mode: SessionMode::Fixed { ttl_secs: 3600 },
+            unreachable_policy: UnreachablePolicy::FailOpen,
+            bypass_ttl_secs: 300,
+            waiting_room_url: "https://wait.example/".to_owned(),
+            rules: vec![ProtectionRule::PathPrefix("/".to_owned())],
+        }
+    }
+
+    const REQ: &str = "018f3a2b-7c9d-7e1f-abcd-0123456789ab";
+    const TOKEN_EXPIRES: u64 = 10_000;
+
+    fn token_decision() -> Decision {
+        Decision::SetSessionAndForward {
+            set_cookie: "vwr_session=abc; Max-Age=3600; HttpOnly".to_owned(),
+            arrival_shard: 3,
+            request_id: REQ.to_owned(),
+            expires_at: TOKEN_EXPIRES,
+            stripped_path: "/tickets".to_owned(),
+        }
+    }
+
+    async fn run(store: &FakeStore, decision: Decision) -> Response<Body> {
+        let cfg = cfg();
+        carry_out(store, &cfg, "/tickets", decision).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn first_token_use_is_admitted_and_recorded() {
+        let store = FakeStore::new();
+        let resp = run(&store, token_decision()).await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers().get("set-cookie").unwrap().to_str().unwrap(),
+            "vwr_session=abc; Max-Age=3600; HttpOnly"
+        );
+        // The reservation claimed the token's exact request id and expiry.
+        assert_eq!(
+            store.reservations.lock().unwrap().as_slice(),
+            &[(REQ.to_owned(), TOKEN_EXPIRES)]
+        );
+        // The arrival was recorded for the event and shard after the reservation.
+        assert_eq!(
+            store.arrivals.lock().unwrap().as_slice(),
+            &[("smoke".to_owned(), 3)]
+        );
+    }
+
+    #[tokio::test]
+    async fn token_replay_is_redirected_and_not_recorded() {
+        let store = FakeStore {
+            reserve: Mutex::new(ReserveResult::Consumed),
+            ..FakeStore::new()
+        };
+        let resp = run(&store, token_decision()).await;
+        assert_eq!(resp.status(), 302);
+        assert_eq!(
+            resp.headers().get("location").unwrap().to_str().unwrap(),
+            "https://wait.example/"
+        );
+        // A replay mints no session.
+        assert!(resp.headers().get("set-cookie").is_none());
+        // reserve_token was consulted exactly once; no arrival was recorded.
+        assert_eq!(store.reservations.lock().unwrap().len(), 1);
+        assert!(store.arrivals.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reserve_token_error_denies_and_skips_arrival() {
+        let store = FakeStore {
+            reserve: Mutex::new(ReserveResult::Fail),
+            ..FakeStore::new()
+        };
+        let resp = run(&store, token_decision()).await;
+        assert_eq!(resp.status(), 302);
+        assert_eq!(
+            resp.headers().get("location").unwrap().to_str().unwrap(),
+            "https://wait.example/"
+        );
+        assert!(resp.headers().get("set-cookie").is_none());
+        assert_eq!(store.reservations.lock().unwrap().len(), 1);
+        assert!(store.arrivals.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn arrival_failure_still_admits() {
+        let store = FakeStore {
+            arrival_err: Mutex::new(true),
+            ..FakeStore::new()
+        };
+        let resp = run(&store, token_decision()).await;
+        // Reservation succeeded; the arrival failure is non-fatal.
+        assert_eq!(resp.status(), 200);
+        assert!(resp.headers().get("set-cookie").is_some());
+        assert_eq!(store.reservations.lock().unwrap().len(), 1);
+        assert_eq!(store.arrivals.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn forward_decision_makes_no_store_calls() {
+        let store = FakeStore::new();
+        let resp = run(
+            &store,
+            Decision::Forward {
+                refresh_cookie: None,
+            },
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        assert!(resp.headers().get("set-cookie").is_none());
+        assert!(store.reservations.lock().unwrap().is_empty());
+        assert!(store.arrivals.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sliding_refresh_sets_the_cookie_and_makes_no_store_calls() {
+        // A sliding session re-issued on activity carries its own `Set-Cookie`
+        // but is already admitted: it reserves no token and records no arrival.
+        let store = FakeStore::new();
+        let resp = run(
+            &store,
+            Decision::Forward {
+                refresh_cookie: Some("vwr_session=refreshed; Max-Age=1800".to_owned()),
+            },
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers().get("set-cookie").unwrap().to_str().unwrap(),
+            "vwr_session=refreshed; Max-Age=1800"
+        );
+        assert!(store.reservations.lock().unwrap().is_empty());
+        assert!(store.arrivals.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn fail_open_bypass_sets_bypass_cookie() {
+        let store = FakeStore::new();
+        let decision = Decision::FailOpenBypass {
+            set_cookie: "vwr_bypass=1; Max-Age=300".to_owned(),
+        };
+        let resp = run(&store, decision).await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers().get("set-cookie").unwrap().to_str().unwrap(),
+            "vwr_bypass=1; Max-Age=300"
+        );
+        // The bypass path makes no reservation or arrival writes.
+        assert!(store.reservations.lock().unwrap().is_empty());
+        assert!(store.arrivals.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn redirect_decision_redirects() {
+        let store = FakeStore::new();
+        let resp = run(
+            &store,
+            Decision::Redirect {
+                location: "https://wait.example/".to_owned(),
+            },
+        )
+        .await;
+        assert_eq!(resp.status(), 302);
+        assert_eq!(
+            resp.headers().get("location").unwrap().to_str().unwrap(),
+            "https://wait.example/"
+        );
+    }
 }

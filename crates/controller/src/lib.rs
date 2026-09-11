@@ -43,6 +43,19 @@ pub const PASSES_PER_INVOKE: u32 = 6;
 /// intervals while absorbing single-interval measurement noise.
 pub const EWMA_ALPHA: f64 = 0.3;
 
+/// `DynamoDB`'s documented positive `Number` minimum magnitude.
+///
+/// The smoothed no-show rate is persisted to the event's `Counters` item as a
+/// `DynamoDB` `Number`. A persist of a positive value below this floor is
+/// rejected with a `ValidationException` (Number underflow), which is not the
+/// lost-race path the [`dynamo::DynamoStore::write_release`] match swallows,
+/// so it halts the pass and leaves `serving_counter` stuck. Under sustained
+/// zero observed no-show the EWMA decays geometrically and crosses this floor
+/// after ~836 intervals; [`compute_release`] then floors any such value to
+/// `0.0`, which is operationally indistinguishable (the release correction is
+/// identical at `1 - 0.7^836` and at `0`) but storable as a `DynamoDB` `Number`.
+pub const DDB_NUMBER_MIN_POSITIVE: f64 = 1e-130;
+
 /// How long a visitor has to claim a position after the cursor reaches it,
 /// before the controller treats them as a no-show and expires it.
 ///
@@ -155,11 +168,14 @@ pub fn compute_release(inputs: ReleaseInputs, prev: Option<NoShowState>) -> Rele
 
     let target = target_release_per_interval(inputs.target_rate);
 
-    let (release, no_show) = if released_last == 0 {
+    let (release, smoothed) = if released_last == 0 {
         // No release last interval: nothing to measure, hold the target and keep
         // the prior smoothed state.
-        let carried = prev.unwrap_or(NoShowState { smoothed_rate: 0.0 });
-        (target, carried)
+        (
+            target,
+            prev.unwrap_or(NoShowState { smoothed_rate: 0.0 })
+                .smoothed_rate,
+        )
     } else {
         // observed / released clamps to [0, 1]; more arrivals than releases
         // (a straggler race) reads as a 0 no-show rate, never negative.
@@ -176,12 +192,27 @@ pub fn compute_release(inputs: ReleaseInputs, prev: Option<NoShowState>) -> Rele
         }
         .clamp(0.0, 1.0);
 
-        (
-            bounded_release(target, smoothed),
-            NoShowState {
-                smoothed_rate: smoothed,
-            },
-        )
+        (bounded_release(target, smoothed), smoothed)
+    };
+
+    // DynamoDB rejects a persisted `Number` below its positive minimum
+    // (`DDB_NUMBER_MIN_POSITIVE`) with a `ValidationException` (Number underflow)
+    // that the `write_release` error match does not treat as a benign race, so
+    // it halts the pass and leaves `serving_counter` stuck. The EWMA reaches
+    // such a value only by decaying geometrically under sustained zero observed
+    // no-show (~836 intervals); a rate this small is indistinguishable from
+    // `0.0` for the release correction (`bounded_release` returns the target
+    // either way), so floor it — the freshly-smoothed value or the carried
+    // forward one — to `0.0` before it is persisted or carried into the next
+    // pass.
+    let smoothed = if smoothed > 0.0 && smoothed < DDB_NUMBER_MIN_POSITIVE {
+        0.0
+    } else {
+        smoothed
+    };
+
+    let no_show = NoShowState {
+        smoothed_rate: smoothed,
     };
 
     // The cursor is exclusive — position p is admitted once p < serving_counter —
@@ -270,6 +301,44 @@ pub struct ExpiredPosition {
 #[error("controller store error: {0}")]
 pub struct StoreError(pub String);
 
+/// The outcome of a guarded [`Store::write_release`]: either the release
+/// landed, or a concurrent invoke advanced the cursor first and this pass's
+/// release was a no-op.
+///
+/// `run_pass` derives the expiry cutoff from `decision.next_serving_counter`,
+/// which only reflects the persisted cursor when the release landed. On
+/// [`ReleaseOutcome::LostRace`] that value was never written, so using it for
+/// expiry would mark positions `expired` against a phantom cursor — positions
+/// whose owners were offered a place fewer than [`ADMISSION_GRACE_SECS`] ago.
+/// The next pass reads the persisted cursor with a consistent read and emits
+/// the correct cutoff, so the lost pass skips expiry entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseOutcome {
+    /// The `UpdateItem` landed: `serving_counter` advanced to
+    /// `decision.next_serving_counter`, and the carried-forward smoothing
+    /// state is persisted. The decision's `next_serving_counter` is the real
+    /// cursor and is safe to derive an expiry cutoff from.
+    Advanced,
+    /// Another invoke advanced the cursor first; this pass's release is stale
+    /// and did not persist. `decision.next_serving_counter` is **not** the
+    /// persisted cursor — deriving an expiry cutoff from it would over-expire
+    /// positions still inside the grace window. Expiry must be skipped on this
+    /// pass.
+    LostRace,
+}
+
+impl ReleaseOutcome {
+    /// Returns `true` when the guarded write lost its race and did not land.
+    ///
+    /// Equivalent to `*self == ReleaseOutcome::LostRace`; named for readability
+    /// at the call site, where the branch's meaning is "the release did not
+    /// persist," not "compare two enums."
+    #[must_use]
+    pub fn is_lost(self) -> bool {
+        matches!(self, Self::LostRace)
+    }
+}
+
 /// The current `Counters` state the controller needs before it acts.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ControllerState {
@@ -297,12 +366,20 @@ pub trait Store {
     /// persists the carried-forward smoothing state in one `UpdateItem`, guarded
     /// so a lost race against another controller invoke or an operator rate
     /// change does not double-advance.
+    ///
+    /// Returns [`ReleaseOutcome::Advanced`] when the write landed and
+    /// [`ReleaseOutcome::LostRace`] when a concurrent invoke advanced first and
+    /// this pass's `UpdateItem` failed its `serving_counter = :expected`
+    /// condition. A lost race is **not** an error: the winner persisted a
+    /// consistent cursor. But the caller must not derive an expiry cutoff from
+    /// the (non-persisted) `decision.next_serving_counter` on a lost race, so
+    /// the outcome distinguishes the two cases that [`Ok`] used to collapse.
     fn write_release(
         &self,
         event_id: &str,
         decision: &ReleaseDecision,
         expected_serving_counter: u64,
-    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+    ) -> impl Future<Output = Result<ReleaseOutcome, StoreError>> + Send;
 
     /// Returns positions below `cutoff` whose status is still `issued` — those
     /// the cursor passed more than the grace window ago and nobody claimed.
@@ -339,13 +416,24 @@ pub enum PassOutcome {
     /// and only the operator's hold stops admission.
     Held(AdmissionControl),
     /// The controller ran: it released `released` positions and expired
-    /// `expired` positions.
+    /// `expired` positions. When the release lost its race against a concurrent
+    /// invoke, both are `0`: no release persisted and expiry was skipped rather
+    /// than run against a non-persisted cursor.
     Ran { released: u64, expired: usize },
 }
 
 /// Runs one controller pass for the event: read state, gate on `Active` and on
 /// the operator's admission override, compute and write the release, then expire
 /// due positions and advance `max_expired_position`.
+///
+/// If the guarded `write_release` loses its race against a concurrent invoke,
+/// the release did not persist and `decision.next_serving_counter` is a
+/// phantom the guard refused to land. Expiry is skipped on that pass: the
+/// cutoff is derived from the persisted cursor, and a non-persisted cursor
+/// would over-expire positions still inside the grace window. The next pass
+/// reads the persisted cursor with a consistent read and emits the correct
+/// cutoff, so the pass reports `Ran { released: 0, expired: 0 }` only when it
+/// did nothing observable.
 ///
 /// # Errors
 ///
@@ -375,9 +463,32 @@ pub async fn run_pass<S: Store>(store: &S, event_id: &str) -> Result<PassOutcome
     }
 
     let decision = compute_release(state.inputs, state.prev_no_show);
-    store
+    let race = store
         .write_release(event_id, &decision, state.inputs.serving_counter)
         .await?;
+
+    // The expiry cutoff is derived from `decision.next_serving_counter`, which
+    // is the persisted cursor only when the release landed. On a lost race the
+    // guarded `UpdateItem` did not write, so that value is a phantom the
+    // condition specifically refused to land — using it for expiry would mark
+    // positions `expired` whose owners were offered a place fewer than
+    // `ADMISSION_GRACE_SECS` ago, and the flip is one-way. Skip the whole
+    // expiry phase: the next pass reads the persisted cursor with a consistent
+    // read and computes the correct cutoff, so expiries that should have run
+    // this pass arrive one pass late — within the positional approximation the
+    // design already accepts — and no position is wrongly expired.
+    if race.is_lost() {
+        tracing::info!(
+            event_id,
+            stale_serving_counter = state.inputs.serving_counter,
+            stale_next_serving_counter = decision.next_serving_counter,
+            "controller pass skipped expiry: release lost the race"
+        );
+        return Ok(PassOutcome::Ran {
+            released: 0,
+            expired: 0,
+        });
+    }
 
     let expired = expire_due(
         store,
@@ -525,6 +636,101 @@ mod tests {
     }
 
     #[test]
+    fn a_stuck_sub_floor_rate_recovers_to_zero_in_one_pass() {
+        // An event already stuck with a `no_show_rate` just above the floor
+        // (the last value DynamoDB accepted, ~1.36e-130) decays below it on
+        // the next zero-no-show pass. The fix floors that to 0.0 so the
+        // `write_release` is accepted and the event self-heals instead of
+        // re-failing forever on the re-read value.
+        let prev = NoShowState {
+            smoothed_rate: 1.36e-130,
+        };
+        // Released 500, all 500 arrived -> observed_no_show 0 -> 0.7 * prev.
+        let d = compute_release(inputs(500, 0, 1000, 500, 50), Some(prev));
+        // 0.7 * 1.36e-130 ~= 9.5e-131, below the floor -> floored to 0.0.
+        assert_eq!(
+            d.no_show.smoothed_rate.to_bits(),
+            0.0f64.to_bits(),
+            "sub-floor decay must be floored to exactly +0.0, got {:e}",
+            d.no_show.smoothed_rate
+        );
+        assert_eq!(d.no_show.smoothed_rate.to_string(), "0");
+        // The release correction is the target either way (1 / (1 - 0) == 1),
+        // so flooring does not change the cursor advance.
+        assert_eq!(d.release, 500);
+    }
+
+    #[test]
+    fn a_rate_above_the_dynamodb_floor_is_not_floored() {
+        // A smoothed rate that stays above the floor must be carried through
+        // unchanged, so the fix does not perturb normal operation.
+        let prev = NoShowState {
+            smoothed_rate: 2e-130,
+        };
+        let d = compute_release(inputs(500, 0, 1000, 500, 50), Some(prev));
+        // 0.7 * 2e-130 = 1.4e-130, still above 1e-130 -> preserved.
+        assert!(
+            d.no_show.smoothed_rate > DDB_NUMBER_MIN_POSITIVE,
+            "an above-floor rate must not be collapsed, got {:e}",
+            d.no_show.smoothed_rate
+        );
+        let expected = 1.4e-130;
+        assert!(
+            (d.no_show.smoothed_rate - expected).abs() < expected * 1e-6,
+            "above-floor rate should be {expected:e}, got {:e}",
+            d.no_show.smoothed_rate
+        );
+    }
+
+    #[test]
+    fn the_carried_forward_rate_is_also_floored() {
+        // When nothing was released last interval the smoothed state is held
+        // unchanged — but a (synthetic or recover-from-stuck) sub-floor value
+        // must still not be carried into a persist. Both branches floor, so
+        // the DynamoDB-storable invariant holds for every input.
+        let prev = NoShowState {
+            smoothed_rate: 5e-131,
+        };
+        // released_last = 0 -> hold-the-state branch carries `prev` forward.
+        let d = compute_release(inputs(0, 0, 1000, 1000, 50), Some(prev));
+        assert_eq!(
+            d.no_show.smoothed_rate.to_bits(),
+            0.0f64.to_bits(),
+            "carried sub-floor rate must be floored to exactly +0.0, got {:e}",
+            d.no_show.smoothed_rate
+        );
+        assert_eq!(d.no_show.smoothed_rate.to_string(), "0");
+    }
+
+    #[test]
+    fn a_rate_exactly_at_the_dynamodb_floor_is_preserved() {
+        // The floor is exclusive: exactly 1e-130 — the smallest positive
+        // DynamoDB does accept — must be carried through unchanged, not
+        // collapsed to 0.0. This pins the boundary so a regression that widens
+        // the floor to `<=` (folding the storable boundary value away) fails.
+        let prev = NoShowState {
+            smoothed_rate: DDB_NUMBER_MIN_POSITIVE,
+        };
+        // released_last = 0 -> hold-the-state branch carries `prev` forward.
+        let d = compute_release(inputs(0, 0, 1000, 1000, 50), Some(prev));
+        assert_eq!(
+            d.no_show.smoothed_rate.to_bits(),
+            DDB_NUMBER_MIN_POSITIVE.to_bits(),
+            "the exact floor (1e-130) is DynamoDB-storable and must be preserved, got {:e}",
+            d.no_show.smoothed_rate
+        );
+        // The persisted string is the fixed-decimal form of 1e-130 ("0." +
+        // 129 zeros + "1"); parse it back to confirm it round-trips to the
+        // exact storable magnitude rather than pinning the zero count.
+        let parsed: f64 = d.no_show.smoothed_rate.to_string().parse().unwrap();
+        assert_eq!(
+            parsed.to_bits(),
+            DDB_NUMBER_MIN_POSITIVE.to_bits(),
+            "persisted boundary string must round-trip to exactly 1e-130"
+        );
+    }
+
+    #[test]
     fn arrivals_reading_below_baseline_does_not_underflow() {
         // last_arrivals_total > sum(arrivals): eventually-consistent low read.
         let d = compute_release(inputs(100, 500, 1000, 500, 50), None);
@@ -663,6 +869,10 @@ mod tests {
         marked: Mutex<Vec<String>>,
         released: Mutex<Option<ReleaseDecision>>,
         advanced: Mutex<Option<u64>>,
+        /// When true, `write_release` reports a lost race without recording —
+        /// mirroring `DynamoStore` returning `LostRace` on
+        /// `ConditionalCheckFailedException`.
+        lose_release: bool,
     }
 
     impl FakeStore {
@@ -673,7 +883,17 @@ mod tests {
                 marked: Mutex::new(Vec::new()),
                 released: Mutex::new(None),
                 advanced: Mutex::new(None),
+                lose_release: false,
             }
+        }
+
+        /// Returns a fake whose `write_release` loses the race on every call,
+        /// mirroring a real store hitting `ConditionalCheckFailedException`
+        /// after a concurrent invoke advanced `serving_counter` first.
+        fn losing_race(state: ControllerState, due: Vec<ExpiredPosition>) -> Self {
+            let mut s = Self::new(state, due);
+            s.lose_release = true;
+            s
         }
     }
 
@@ -690,9 +910,17 @@ mod tests {
             _event_id: &str,
             decision: &ReleaseDecision,
             _expected: u64,
-        ) -> impl Future<Output = Result<(), StoreError>> + Send {
-            *self.released.lock().unwrap() = Some(*decision);
-            std::future::ready(Ok(()))
+        ) -> impl Future<Output = Result<ReleaseOutcome, StoreError>> + Send {
+            if self.lose_release {
+                // Mirrors `DynamoStore` returning `LostRace` on
+                // `ConditionalCheckFailedException`: the release did not
+                // persist, so `decision.next_serving_counter` is a phantom the
+                // guard refused and `run_pass` must skip `expire_due`.
+                std::future::ready(Ok(ReleaseOutcome::LostRace))
+            } else {
+                *self.released.lock().unwrap() = Some(*decision);
+                std::future::ready(Ok(ReleaseOutcome::Advanced))
+            }
         }
 
         fn query_expired(
@@ -850,6 +1078,220 @@ mod tests {
         assert_eq!(*store.advanced.lock().unwrap(), None);
     }
 
+    #[tokio::test]
+    async fn a_stuck_sub_floor_event_recovers_in_one_pass() {
+        // End-to-end: an event whose persisted `no_show_rate` sits just above
+        // the DynamoDB floor (the stuck value) reads it back, recomputes a
+        // sub-floor EWMA on a zero-no-show interval, and must persist the
+        // floored 0.0 — the pass succeeds and `serving_counter` advances,
+        // rather than the pass failing (or, on the live store, the
+        // `UpdateItem` being rejected) every minute until the next no-show.
+        let mut state = active_state(0);
+        // Released 500 last interval, all 500 arrived -> observed_no_show 0,
+        // so the only thing pulling the EWMA is the carried 1.36e-130.
+        state.inputs = {
+            let mut i = inputs(500, 0, 20_000, 19_500, 50);
+            i.queue_counter = u64::MAX;
+            i
+        };
+        state.prev_no_show = Some(NoShowState {
+            smoothed_rate: 1.36e-130,
+        });
+        let store = FakeStore::new(state, Vec::new());
+
+        let outcome = run_pass(&store, "evt").await.unwrap();
+        assert!(
+            matches!(outcome, PassOutcome::Ran { .. }),
+            "a stuck event must recover, not fail the pass: {outcome:?}"
+        );
+
+        let recorded = *store.released.lock().unwrap();
+        let written = recorded.unwrap();
+        assert_eq!(
+            written.no_show.smoothed_rate.to_bits(),
+            0.0f64.to_bits(),
+            "the persisted no_show_rate must be floored to exactly +0.0, got {:e}",
+            written.no_show.smoothed_rate
+        );
+        assert_eq!(written.no_show.smoothed_rate.to_string(), "0");
+    }
+
+    // --- Lost release race: expiry must skip, not run against a phantom cursor
+
+    /// State mirroring the bug report's realistic orientation: a staler arrivals
+    /// read (200 vs the winner's 250) yields a larger bounded release, so a
+    /// losing pass computes `next_serving_counter = 20_610` against the winner's
+    /// persisted `20_588`. `prev_no_show = Some(0.0)` makes the EWMA produce the
+    /// reported figures rather than the raw observed rate.
+    fn stale_loser_state(due_max_expired: u64) -> ControllerState {
+        let mut state = active_state(due_max_expired);
+        // Arrivals 200 (stale) vs the winner's 250 (fresh); the loser reads
+        // fewer arrivals -> higher no-show -> larger release (610 vs 588).
+        state.inputs.arrivals[0] = 200;
+        state.prev_no_show = Some(NoShowState { smoothed_rate: 0.0 });
+        state
+    }
+
+    #[tokio::test]
+    async fn lost_release_race_skips_expiry_so_grace_window_positions_survive() {
+        // The harmful orientation: the staler/larger-release invoke loses the
+        // guarded write. Its `decision.next_serving_counter = 20_610` was never
+        // persisted (the winner persisted 20_588), so the cutoff derived from it
+        // (14_610) is ahead of the real cursor's cutoff (14_588). Running
+        // `expire_due` against 14_610 would mark positions 14_588..14_609
+        // `expired` — still inside the 120s grace window — and the flip is
+        // one-way, so those visitors are permanently denied.
+        //
+        // The fix: on a lost race `run_pass` skips `expire_due` entirely. The
+        // next pass reads the persisted cursor with a consistent read and emits
+        // the correct cutoff, so expiries that should run this pass arrive one
+        // pass late — within the positional ±one-pass tolerance the design
+        // accepts — and no position is wrongly expired.
+        let due = vec![
+            ExpiredPosition {
+                request_id: "r_correct".to_owned(),
+                position: 14_500,
+            },
+            ExpiredPosition {
+                request_id: "r_in_window_a".to_owned(),
+                position: 14_589,
+            },
+            ExpiredPosition {
+                request_id: "r_in_window_b".to_owned(),
+                position: 14_600,
+            },
+            ExpiredPosition {
+                request_id: "r_in_window_c".to_owned(),
+                position: 14_609,
+            },
+        ];
+        let store = FakeStore::losing_race(stale_loser_state(10), due);
+        let outcome = run_pass(&store, "evt").await.unwrap();
+        assert_eq!(
+            outcome,
+            PassOutcome::Ran {
+                released: 0,
+                expired: 0,
+            },
+            "a lost-race pass must report it released and expired nothing"
+        );
+        assert!(
+            store.released.lock().unwrap().is_none(),
+            "the release did not persist; FakeStore must not record it"
+        );
+        assert!(
+            store.marked.lock().unwrap().is_empty(),
+            "lost-race pass expired positions whose owners were offered a place \
+             fewer than 120s ago — the grace-window over-expiry"
+        );
+        assert_eq!(
+            *store.advanced.lock().unwrap(),
+            None,
+            "max_expired_position must not advance when no positions were expired"
+        );
+    }
+
+    #[tokio::test]
+    async fn lost_release_race_then_a_won_pass_expires_the_correct_positions() {
+        // The skip is a one-pass delay, not a permanent loss of the expiry: the
+        // next pass reads the persisted cursor and emits the correct cutoff.
+        // Here the same fake loses the first pass, then a second fake bound to
+        // the winner's persisted state (`serving_counter = 20_588`) wins its
+        // release and expires the truly-due position, demonstrating the system
+        // self-corrects within one pass — the tolerance the positional design
+        // already accepts.
+        let due = vec![
+            ExpiredPosition {
+                request_id: "r_correct".to_owned(),
+                position: 14_500,
+            },
+            ExpiredPosition {
+                request_id: "r_in_window".to_owned(),
+                position: 14_589,
+            },
+        ];
+        // First pass: loses the race; expiry skipped, nothing marked.
+        let loser = FakeStore::losing_race(stale_loser_state(10), due.clone());
+        let first = run_pass(&loser, "evt").await.unwrap();
+        assert_eq!(
+            first,
+            PassOutcome::Ran {
+                released: 0,
+                expired: 0,
+            }
+        );
+        assert!(loser.released.lock().unwrap().is_none());
+        assert!(loser.marked.lock().unwrap().is_empty());
+
+        // Second pass: reads the winner's persisted cursor (20_588). With
+        // `last_serving_counter = 20_588` (released_last = 0), the no-show
+        // correction falls back to the raw target (500) and carries the prior
+        // smoothed state, so `release = 500`, `next_serving_counter = 21_088`,
+        // and `expiry_cutoff(21_088, 50) = 15_088`. Both due positions (14_500,
+        // 14_589) are below 15_088 and correctly expire — the lost pass skipped
+        // them, and the won pass picked them up one pass later.
+        let mut won_state = active_state(10);
+        won_state.inputs.serving_counter = 20_588;
+        won_state.inputs.last_serving_counter = 20_588;
+        won_state.prev_no_show = Some(NoShowState {
+            smoothed_rate: 0.15,
+        });
+        let winner = FakeStore::new(won_state, due);
+        let second = run_pass(&winner, "evt").await.unwrap();
+        assert_eq!(
+            second,
+            PassOutcome::Ran {
+                released: 500,
+                expired: 2,
+            }
+        );
+        assert!(winner.released.lock().unwrap().is_some());
+        assert_eq!(winner.marked.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_won_release_race_expires_positions_below_the_persisted_cutoff() {
+        // Regression guard for the non-race path: when the release lands
+        // (`Advanced`), `run_pass` must still derive the cutoff from the just-
+        // persisted `next_serving_counter` and expire positions below it. The
+        // lost-race skip must not swallow the normal expiry.
+        //
+        // Loser's inputs but the release *lands*: `next_serving_counter =
+        // 20_610` is now the real cursor, so `expiry_cutoff(20_610, 50) =
+        // 14_610` is the correct cutoff and all four due positions (below
+        // 14_610) are correctly expired.
+        let due = vec![
+            ExpiredPosition {
+                request_id: "r1".to_owned(),
+                position: 14_500,
+            },
+            ExpiredPosition {
+                request_id: "r2".to_owned(),
+                position: 14_589,
+            },
+            ExpiredPosition {
+                request_id: "r3".to_owned(),
+                position: 14_600,
+            },
+            ExpiredPosition {
+                request_id: "r4".to_owned(),
+                position: 14_609,
+            },
+        ];
+        let store = FakeStore::new(stale_loser_state(10), due);
+        let outcome = run_pass(&store, "evt").await.unwrap();
+        assert_eq!(
+            outcome,
+            PassOutcome::Ran {
+                released: 610,
+                expired: 4,
+            }
+        );
+        assert!(store.released.lock().unwrap().is_some());
+        assert_eq!(store.marked.lock().unwrap().len(), 4);
+        assert_eq!(*store.advanced.lock().unwrap(), Some(14_609));
+    }
+
     // --- Property tests: no input underflows/overflows or panics -------------
 
     use proptest::prelude::{
@@ -869,7 +1311,16 @@ mod tests {
             last_serving in any::<u64>(),
             queue in any::<u64>(),
             rate in 1u32..=100_000,
-            prev_rate in prop_oneof![Just(None), (0.0f64..1.0).prop_map(|r| Some(NoShowState { smoothed_rate: r }))],
+            prev_rate in prop_oneof![
+                Just(None),
+                (0.0f64..1.0).prop_map(|r| Some(NoShowState { smoothed_rate: r })),
+                // Sub-floor and exact-floor carried state so the
+                // DynamoDB-storable invariant is exercised on both sides of the
+                // bound; the random [0,1) tail almost never lands at or below
+                // 1e-130.
+                Just(Some(NoShowState { smoothed_rate: 5e-131 })),
+                Just(Some(NoShowState { smoothed_rate: 1e-130 })),
+            ],
         ) {
             let d = compute_release(
                 ReleaseInputs {
@@ -899,6 +1350,16 @@ mod tests {
             // smoothed rate stays a valid probability.
             prop_assert!(d.no_show.smoothed_rate >= 0.0 && d.no_show.smoothed_rate <= 1.0);
             prop_assert!(d.no_show.smoothed_rate.is_finite());
+            // The persisted smoothed rate is always DynamoDB-storable: exactly
+            // 0.0 or at least the positive `Number` minimum, so the
+            // `write_release` UpdateItem is never rejected for underflow —
+            // both the measured-EWMA branch and the hold-the-state branch floor.
+            prop_assert!(
+                d.no_show.smoothed_rate == 0.0
+                    || d.no_show.smoothed_rate >= DDB_NUMBER_MIN_POSITIVE,
+                "smoothed rate {:e} is below the DynamoDB positive Number floor",
+                d.no_show.smoothed_rate
+            );
         }
 
         #[test]

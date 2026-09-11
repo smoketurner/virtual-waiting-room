@@ -2,9 +2,10 @@
 //!
 //! Every authorizer decision is local: the request carries its own credentials
 //! (a session cookie, or an admission token on the URL), and the authorizer
-//! validates them against the per-deployment signing key without a backend call
-//! on the hot path. The one write it makes is recording an arrival when it
-//! converts a token into a session.
+//! validates them against the per-deployment signing key without a store read
+//! on the hot path. When a token converts to a session the caller makes two
+//! writes: reserving the single-use admission token (so a replay is denied
+//! before a second session is minted) and recording the arrival.
 //!
 //! This module is AWS-free. [`decide`] is a pure function from the parsed
 //! request and the current state to a [`Decision`]; the handler in `main.rs`
@@ -135,12 +136,21 @@ pub enum Decision {
     /// caller must set on the response (sliding-window refresh on activity);
     /// `None` carries no `Set-Cookie`.
     Forward { refresh_cookie: Option<String> },
-    /// A valid admission token was converted to a session. Set this signed
-    /// session cookie, record an arrival for this shard, strip the token from
-    /// the URL, and forward.
+    /// A valid admission token was converted to a session. Reserve the
+    /// single-use admission token first (denying any replay), then set this
+    /// signed session cookie, record an arrival for this shard, strip the token
+    /// from the URL, and forward.
     SetSessionAndForward {
         set_cookie: String,
         arrival_shard: usize,
+        /// The single-use admission token's request id, which the handler
+        /// reserves in the `Tokens` table before admitting. Surfaced here so
+        /// the reservation can run in the handler, after the pure decision.
+        request_id: String,
+        /// The token's hard expiry (epoch seconds), recorded as the reservation
+        /// row's `DynamoDB` TTL so it self-expires once the token can no longer
+        /// be replayed.
+        expires_at: u64,
         /// The path with the admission token removed, for the forwarded request.
         stripped_path: String,
     },
@@ -188,8 +198,10 @@ pub fn decide(
         return Decision::Forward { refresh_cookie };
     }
 
-    // 2. A valid admission token becomes a session: mint the cookie, mark the
-    //    arrival, strip the token from the URL.
+    // 2. A valid admission token becomes a session: mint the cookie, surface the
+    //    reservation inputs (request id + expiry), record the arrival, and strip
+    //    the token from the URL. The single-use reservation is performed by the
+    //    handler from the surfaced fields; this function stays pure.
     if let Some(token) = &req.url_token
         && let Ok(admitted) = wr_common::AdmissionToken::verify(token, key, now)
         && admitted.event_id == cfg.event_id
@@ -201,6 +213,8 @@ pub fn decide(
         return Decision::SetSessionAndForward {
             set_cookie,
             arrival_shard,
+            request_id: admitted.request_id.clone(),
+            expires_at: admitted.expires_at,
             stripped_path,
         };
     }
@@ -430,15 +444,46 @@ mod tests {
             Decision::SetSessionAndForward {
                 set_cookie,
                 arrival_shard,
+                request_id,
+                expires_at,
                 ..
             } => {
                 assert!(set_cookie.starts_with("vwr_session="));
                 assert!(set_cookie.contains("HttpOnly"));
                 assert!(arrival_shard < wr_common::SHARDS);
+                // The reservation inputs are surfaced to the handler so it can
+                // enforce single-use before minting the session.
+                assert_eq!(request_id, "018f3a2b-7c9d-7e1f-abcd-0123456789ab");
+                assert_eq!(expires_at, 5000);
                 // The minted cookie must verify as a session for this event.
                 let value = set_cookie.split(['=', ';']).nth(1).unwrap();
                 let s = Session::verify(value, &key(), 2000).unwrap();
                 assert_eq!(s.event_id, "smoke");
+            }
+            other => panic!("expected SetSessionAndForward, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decide_surfaces_the_token_request_id_and_expiry_for_reservation() {
+        // The admission token's request id and expiry must reach the handler so
+        // it can run the single-use reservation on these exact values — not a
+        // re-derived or defaulted copy.
+        let token = AdmissionToken {
+            event_id: "smoke".to_owned(),
+            request_id: "018f3a2b-7c9d-7e1f-abcd-0123456789ab".to_owned(),
+            expires_at: 7777,
+        };
+        let mut req = req_to("/tickets");
+        req.url_token = Some(token.sign(&key()));
+        match decide(&req, &cfg(), &key(), 2000, Reachability::Reachable) {
+            Decision::SetSessionAndForward {
+                request_id,
+                expires_at,
+                ..
+            } => {
+                assert_eq!(request_id, "018f3a2b-7c9d-7e1f-abcd-0123456789ab");
+                assert_eq!(expires_at, 7777);
             }
             other => panic!("expected SetSessionAndForward, got {other:?}"),
         }

@@ -8,6 +8,8 @@
 //! shards are separate items under their own partition keys, so summing them
 //! is a `BatchGetItem` rather than attributes already in hand.
 
+use std::collections::HashMap;
+
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
@@ -16,8 +18,8 @@ use wr_common::expr::{arrivals_shard_key, event_key, shard_count_of, shard_index
 use wr_common::{AdmissionControl, Phase, PositionStatus, SHARDS};
 
 use crate::{
-    ControllerState, ExpiredPosition, NoShowState, ReleaseDecision, ReleaseInputs, Store,
-    StoreError,
+    ControllerState, ExpiredPosition, NoShowState, ReleaseDecision, ReleaseInputs, ReleaseOutcome,
+    Store, StoreError,
 };
 
 /// A live `DynamoDB` store bound to the counters and positions tables.
@@ -122,7 +124,7 @@ impl Store for DynamoStore {
         event_id: &str,
         decision: &ReleaseDecision,
         expected_serving_counter: u64,
-    ) -> Result<(), StoreError> {
+    ) -> Result<ReleaseOutcome, StoreError> {
         let result = self
             .client
             .update_item()
@@ -165,7 +167,7 @@ impl Store for DynamoStore {
             .await;
 
         match result {
-            Ok(_) => Ok(()),
+            Ok(_) => Ok(ReleaseOutcome::Advanced),
             Err(SdkError::ServiceError(se))
                 if matches!(
                     se.err(),
@@ -173,8 +175,13 @@ impl Store for DynamoStore {
                 ) =>
             {
                 // Another invoke advanced first; this pass's release is stale.
+                // The release did not persist, so `decision.next_serving_counter`
+                // is *not* the live cursor — the caller must not derive an expiry
+                // cutoff from it. Returning `LostRace` lets `run_pass` skip
+                // expiry on this pass; the next pass's consistent read of
+                // `serving_counter` produces the correct cutoff.
                 tracing::info!(event_id, "release write lost the race; skipping");
-                Ok(())
+                Ok(ReleaseOutcome::LostRace)
             }
             Err(e) => Err(StoreError(format!("update_item release: {e}"))),
         }
@@ -311,20 +318,12 @@ impl DynamoStore {
             .await
             .map_err(|e| StoreError(format!("batch_get_item arrivals: {e}")))?;
 
-        let mut arrivals = [0u64; SHARDS];
-        for item in out
+        let items = out
             .responses()
             .and_then(|r| r.get(&self.counters_table))
             .map(Vec::as_slice)
-            .unwrap_or_default()
-        {
-            // The item says which shard it is, so a batch returned in arbitrary
-            // order needs no key parsing.
-            let Some(shard) = shard_index_of(item) else {
-                continue;
-            };
-            arrivals[shard] = shard_count_of(item);
-        }
+            .unwrap_or_default();
+        let arrivals = arrivals_from_shard_items(items)?;
         // An incomplete batch under-counts arrivals, which reads as a higher
         // no-show rate and releases more. Better to skip the pass than to
         // over-release on a partial read.
@@ -336,6 +335,34 @@ impl DynamoStore {
         }
         Ok(arrivals)
     }
+}
+
+/// Folds a batch-get response's arrivals shard items into per-shard counts.
+///
+/// The arrivals shards mirror the pre-queue shards the seal reads: each is its
+/// own item under its own partition key, so a `BatchGetItem` response only
+/// contains one when something has written it. A present item whose count
+/// attribute (`n`) cannot be read is therefore corruption, not an empty shard
+/// — reading it as zero would under-count that shard's arrivals, which reads
+/// as a higher no-show rate and over-releases, exactly the outcome the
+/// `unprocessed_keys` check guards against for the partial-read case. An
+/// unreadable count is a hard error rather than a silent zero.
+///
+/// An item whose shard index (`s`) cannot be read still has no home in
+/// `[0, SHARDS)`; it is skipped as before, since there is no count to
+/// misattribute it to.
+fn arrivals_from_shard_items(
+    items: &[HashMap<String, AttributeValue>],
+) -> Result<[u64; SHARDS], StoreError> {
+    let mut arrivals = [0u64; SHARDS];
+    for item in items {
+        let Some(shard) = shard_index_of(item) else {
+            continue;
+        };
+        arrivals[shard] = shard_count_of(item)
+            .ok_or_else(|| StoreError("arrivals item has an unreadable count".to_owned()))?;
+    }
+    Ok(arrivals)
 }
 
 /// The stored wire string for a [`PositionStatus`], matching its `serde`
@@ -355,5 +382,64 @@ impl DynamoStore {
     #[must_use]
     pub fn event_id(&self) -> &str {
         &self.event_id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
+
+    use wr_common::expr::{SHARD_COUNT_ATTR, SHARD_INDEX_ATTR};
+
+    use super::*;
+
+    fn shard_item(shard: usize, count: u64) -> HashMap<String, AttributeValue> {
+        HashMap::from([
+            (
+                SHARD_INDEX_ATTR.to_owned(),
+                AttributeValue::N(shard.to_string()),
+            ),
+            (
+                SHARD_COUNT_ATTR.to_owned(),
+                AttributeValue::N(count.to_string()),
+            ),
+        ])
+    }
+
+    #[test]
+    fn a_shard_with_no_arrivals_item_counts_zero() {
+        // `BatchGetItem` returns no item for an arrivals shard nothing has
+        // written; the fold must still report zero for it, not fail.
+        let items = vec![shard_item(0, 3), shard_item(2, 5)];
+        let arrivals = arrivals_from_shard_items(&items).unwrap();
+        assert_eq!(arrivals, [3, 0, 5, 0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn an_arrivals_item_with_an_unreadable_count_is_an_error_not_a_zero_count() {
+        // A present item with a readable index `s` but a missing count `n` is
+        // corruption — the item exists, so something wrote both — yet the
+        // silent default would zero `arrivals[shard]`, under-count arrivals for
+        // that shard, read it as a higher no-show rate, and over-release.
+        let corrupt = HashMap::from([(
+            SHARD_INDEX_ATTR.to_owned(),
+            AttributeValue::N("3".to_owned()),
+        )]);
+        let items = vec![shard_item(0, 3), corrupt];
+        assert!(arrivals_from_shard_items(&items).is_err());
+    }
+
+    #[test]
+    fn an_arrivals_item_with_an_unreadable_index_is_skipped_not_an_error() {
+        // An item with an unreadable shard index has no home in
+        // `[0, SHARDS)`; it is skipped rather than failing the whole batch,
+        // matching the prior `continue`.
+        let corrupt = HashMap::from([(
+            SHARD_COUNT_ATTR.to_owned(),
+            AttributeValue::N("9".to_owned()),
+        )]);
+        let items = vec![shard_item(0, 3), corrupt];
+        let arrivals = arrivals_from_shard_items(&items).unwrap();
+        assert_eq!(arrivals, [3, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
     }
 }

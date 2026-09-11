@@ -119,12 +119,14 @@ impl Store for DynamoStore {
 
 /// Folds a batch-get response's shard items into per-shard counts.
 ///
-/// An item whose shard index cannot be read is a corrupt row, not an empty
-/// shard: a shard with no registrations has no item at all (`BatchGetItem`
-/// never returns one), so it never reaches this loop and correctly counts
-/// zero. An item that exists with an unreadable `s` would otherwise zero that
-/// shard's count silently, and under the per-shard straggler rule that
-/// unadmits every registrant in it.
+/// An item that reached this fold exists, so it is corruption rather than an
+/// empty shard whenever either of its attributes cannot be read: a shard with
+/// no registrations has no item at all (`BatchGetItem` never returns one), so
+/// it never reaches this loop and correctly counts zero. An item with an
+/// unreadable shard index `s` would zero the count for the wrong shard, and
+/// one with an unreadable count `n` would silently zero its own; under the
+/// per-shard straggler rule either failure unadmits every registrant in the
+/// affected shard, so both are hard errors rather than silent zeros.
 fn counts_from_shard_items(
     items: &[HashMap<String, AttributeValue>],
 ) -> Result<[u64; SHARDS], StoreError> {
@@ -134,7 +136,8 @@ fn counts_from_shard_items(
         // order needs no key parsing.
         let shard = shard_index_of(item)
             .ok_or_else(|| StoreError("shard item has an unreadable shard index".to_owned()))?;
-        counts[shard] = shard_count_of(item);
+        counts[shard] = shard_count_of(item)
+            .ok_or_else(|| StoreError("shard item has an unreadable count".to_owned()))?;
     }
     Ok(counts)
 }
@@ -174,6 +177,21 @@ mod tests {
         let corrupt = HashMap::from([(
             SHARD_COUNT_ATTR.to_owned(),
             AttributeValue::N("9".to_owned()),
+        )]);
+        let items = vec![shard_item(0, 3), corrupt];
+        assert!(counts_from_shard_items(&items).is_err());
+    }
+
+    #[test]
+    fn a_shard_item_with_an_unreadable_count_is_an_error_not_a_zero_count() {
+        // Symmetric with the test above: a present item with a readable index
+        // `s` but a missing count `n` is corruption — the item exists, so at
+        // least one registration wrote both — yet the fold would have silently
+        // zeroed its count and, under the per-shard straggler rule, demoted
+        // every registrant in that shard to the back of the live-join queue.
+        let corrupt = HashMap::from([(
+            SHARD_INDEX_ATTR.to_owned(),
+            AttributeValue::N("3".to_owned()),
         )]);
         let items = vec![shard_item(0, 3), corrupt];
         assert!(counts_from_shard_items(&items).is_err());
