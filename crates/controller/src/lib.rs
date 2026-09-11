@@ -43,6 +43,19 @@ pub const PASSES_PER_INVOKE: u32 = 6;
 /// intervals while absorbing single-interval measurement noise.
 pub const EWMA_ALPHA: f64 = 0.3;
 
+/// `DynamoDB`'s documented positive `Number` minimum magnitude.
+///
+/// The smoothed no-show rate is persisted to the event's `Counters` item as a
+/// `DynamoDB` `Number`. A persist of a positive value below this floor is
+/// rejected with a `ValidationException` (Number underflow), which is not the
+/// lost-race path the [`dynamo::DynamoStore::write_release`] match swallows,
+/// so it halts the pass and leaves `serving_counter` stuck. Under sustained
+/// zero observed no-show the EWMA decays geometrically and crosses this floor
+/// after ~836 intervals; [`compute_release`] then floors any such value to
+/// `0.0`, which is operationally indistinguishable (the release correction is
+/// identical at `1 - 0.7^836` and at `0`) but storable as a `DynamoDB` `Number`.
+pub const DDB_NUMBER_MIN_POSITIVE: f64 = 1e-130;
+
 /// How long a visitor has to claim a position after the cursor reaches it,
 /// before the controller treats them as a no-show and expires it.
 ///
@@ -155,11 +168,14 @@ pub fn compute_release(inputs: ReleaseInputs, prev: Option<NoShowState>) -> Rele
 
     let target = target_release_per_interval(inputs.target_rate);
 
-    let (release, no_show) = if released_last == 0 {
+    let (release, smoothed) = if released_last == 0 {
         // No release last interval: nothing to measure, hold the target and keep
         // the prior smoothed state.
-        let carried = prev.unwrap_or(NoShowState { smoothed_rate: 0.0 });
-        (target, carried)
+        (
+            target,
+            prev.unwrap_or(NoShowState { smoothed_rate: 0.0 })
+                .smoothed_rate,
+        )
     } else {
         // observed / released clamps to [0, 1]; more arrivals than releases
         // (a straggler race) reads as a 0 no-show rate, never negative.
@@ -176,12 +192,27 @@ pub fn compute_release(inputs: ReleaseInputs, prev: Option<NoShowState>) -> Rele
         }
         .clamp(0.0, 1.0);
 
-        (
-            bounded_release(target, smoothed),
-            NoShowState {
-                smoothed_rate: smoothed,
-            },
-        )
+        (bounded_release(target, smoothed), smoothed)
+    };
+
+    // DynamoDB rejects a persisted `Number` below its positive minimum
+    // (`DDB_NUMBER_MIN_POSITIVE`) with a `ValidationException` (Number underflow)
+    // that the `write_release` error match does not treat as a benign race, so
+    // it halts the pass and leaves `serving_counter` stuck. The EWMA reaches
+    // such a value only by decaying geometrically under sustained zero observed
+    // no-show (~836 intervals); a rate this small is indistinguishable from
+    // `0.0` for the release correction (`bounded_release` returns the target
+    // either way), so floor it — the freshly-smoothed value or the carried
+    // forward one — to `0.0` before it is persisted or carried into the next
+    // pass.
+    let smoothed = if smoothed > 0.0 && smoothed < DDB_NUMBER_MIN_POSITIVE {
+        0.0
+    } else {
+        smoothed
+    };
+
+    let no_show = NoShowState {
+        smoothed_rate: smoothed,
     };
 
     // The cursor is exclusive — position p is admitted once p < serving_counter —
@@ -525,6 +556,101 @@ mod tests {
     }
 
     #[test]
+    fn a_stuck_sub_floor_rate_recovers_to_zero_in_one_pass() {
+        // An event already stuck with a `no_show_rate` just above the floor
+        // (the last value DynamoDB accepted, ~1.36e-130) decays below it on
+        // the next zero-no-show pass. The fix floors that to 0.0 so the
+        // `write_release` is accepted and the event self-heals instead of
+        // re-failing forever on the re-read value.
+        let prev = NoShowState {
+            smoothed_rate: 1.36e-130,
+        };
+        // Released 500, all 500 arrived -> observed_no_show 0 -> 0.7 * prev.
+        let d = compute_release(inputs(500, 0, 1000, 500, 50), Some(prev));
+        // 0.7 * 1.36e-130 ~= 9.5e-131, below the floor -> floored to 0.0.
+        assert_eq!(
+            d.no_show.smoothed_rate.to_bits(),
+            0.0f64.to_bits(),
+            "sub-floor decay must be floored to exactly +0.0, got {:e}",
+            d.no_show.smoothed_rate
+        );
+        assert_eq!(d.no_show.smoothed_rate.to_string(), "0");
+        // The release correction is the target either way (1 / (1 - 0) == 1),
+        // so flooring does not change the cursor advance.
+        assert_eq!(d.release, 500);
+    }
+
+    #[test]
+    fn a_rate_above_the_dynamodb_floor_is_not_floored() {
+        // A smoothed rate that stays above the floor must be carried through
+        // unchanged, so the fix does not perturb normal operation.
+        let prev = NoShowState {
+            smoothed_rate: 2e-130,
+        };
+        let d = compute_release(inputs(500, 0, 1000, 500, 50), Some(prev));
+        // 0.7 * 2e-130 = 1.4e-130, still above 1e-130 -> preserved.
+        assert!(
+            d.no_show.smoothed_rate > DDB_NUMBER_MIN_POSITIVE,
+            "an above-floor rate must not be collapsed, got {:e}",
+            d.no_show.smoothed_rate
+        );
+        let expected = 1.4e-130;
+        assert!(
+            (d.no_show.smoothed_rate - expected).abs() < expected * 1e-6,
+            "above-floor rate should be {expected:e}, got {:e}",
+            d.no_show.smoothed_rate
+        );
+    }
+
+    #[test]
+    fn the_carried_forward_rate_is_also_floored() {
+        // When nothing was released last interval the smoothed state is held
+        // unchanged — but a (synthetic or recover-from-stuck) sub-floor value
+        // must still not be carried into a persist. Both branches floor, so
+        // the DynamoDB-storable invariant holds for every input.
+        let prev = NoShowState {
+            smoothed_rate: 5e-131,
+        };
+        // released_last = 0 -> hold-the-state branch carries `prev` forward.
+        let d = compute_release(inputs(0, 0, 1000, 1000, 50), Some(prev));
+        assert_eq!(
+            d.no_show.smoothed_rate.to_bits(),
+            0.0f64.to_bits(),
+            "carried sub-floor rate must be floored to exactly +0.0, got {:e}",
+            d.no_show.smoothed_rate
+        );
+        assert_eq!(d.no_show.smoothed_rate.to_string(), "0");
+    }
+
+    #[test]
+    fn a_rate_exactly_at_the_dynamodb_floor_is_preserved() {
+        // The floor is exclusive: exactly 1e-130 — the smallest positive
+        // DynamoDB does accept — must be carried through unchanged, not
+        // collapsed to 0.0. This pins the boundary so a regression that widens
+        // the floor to `<=` (folding the storable boundary value away) fails.
+        let prev = NoShowState {
+            smoothed_rate: DDB_NUMBER_MIN_POSITIVE,
+        };
+        // released_last = 0 -> hold-the-state branch carries `prev` forward.
+        let d = compute_release(inputs(0, 0, 1000, 1000, 50), Some(prev));
+        assert_eq!(
+            d.no_show.smoothed_rate.to_bits(),
+            DDB_NUMBER_MIN_POSITIVE.to_bits(),
+            "the exact floor (1e-130) is DynamoDB-storable and must be preserved, got {:e}",
+            d.no_show.smoothed_rate
+        );
+        // The persisted string is the fixed-decimal form of 1e-130 ("0." +
+        // 129 zeros + "1"); parse it back to confirm it round-trips to the
+        // exact storable magnitude rather than pinning the zero count.
+        let parsed: f64 = d.no_show.smoothed_rate.to_string().parse().unwrap();
+        assert_eq!(
+            parsed.to_bits(),
+            DDB_NUMBER_MIN_POSITIVE.to_bits(),
+            "persisted boundary string must round-trip to exactly 1e-130"
+        );
+    }
+
+    #[test]
     fn arrivals_reading_below_baseline_does_not_underflow() {
         // last_arrivals_total > sum(arrivals): eventually-consistent low read.
         let d = compute_release(inputs(100, 500, 1000, 500, 50), None);
@@ -850,6 +976,44 @@ mod tests {
         assert_eq!(*store.advanced.lock().unwrap(), None);
     }
 
+    #[tokio::test]
+    async fn a_stuck_sub_floor_event_recovers_in_one_pass() {
+        // End-to-end: an event whose persisted `no_show_rate` sits just above
+        // the DynamoDB floor (the stuck value) reads it back, recomputes a
+        // sub-floor EWMA on a zero-no-show interval, and must persist the
+        // floored 0.0 — the pass succeeds and `serving_counter` advances,
+        // rather than the pass failing (or, on the live store, the
+        // `UpdateItem` being rejected) every minute until the next no-show.
+        let mut state = active_state(0);
+        // Released 500 last interval, all 500 arrived -> observed_no_show 0,
+        // so the only thing pulling the EWMA is the carried 1.36e-130.
+        state.inputs = {
+            let mut i = inputs(500, 0, 20_000, 19_500, 50);
+            i.queue_counter = u64::MAX;
+            i
+        };
+        state.prev_no_show = Some(NoShowState {
+            smoothed_rate: 1.36e-130,
+        });
+        let store = FakeStore::new(state, Vec::new());
+
+        let outcome = run_pass(&store, "evt").await.unwrap();
+        assert!(
+            matches!(outcome, PassOutcome::Ran { .. }),
+            "a stuck event must recover, not fail the pass: {outcome:?}"
+        );
+
+        let recorded = *store.released.lock().unwrap();
+        let written = recorded.unwrap();
+        assert_eq!(
+            written.no_show.smoothed_rate.to_bits(),
+            0.0f64.to_bits(),
+            "the persisted no_show_rate must be floored to exactly +0.0, got {:e}",
+            written.no_show.smoothed_rate
+        );
+        assert_eq!(written.no_show.smoothed_rate.to_string(), "0");
+    }
+
     // --- Property tests: no input underflows/overflows or panics -------------
 
     use proptest::prelude::{
@@ -869,7 +1033,16 @@ mod tests {
             last_serving in any::<u64>(),
             queue in any::<u64>(),
             rate in 1u32..=100_000,
-            prev_rate in prop_oneof![Just(None), (0.0f64..1.0).prop_map(|r| Some(NoShowState { smoothed_rate: r }))],
+            prev_rate in prop_oneof![
+                Just(None),
+                (0.0f64..1.0).prop_map(|r| Some(NoShowState { smoothed_rate: r })),
+                // Sub-floor and exact-floor carried state so the
+                // DynamoDB-storable invariant is exercised on both sides of the
+                // bound; the random [0,1) tail almost never lands at or below
+                // 1e-130.
+                Just(Some(NoShowState { smoothed_rate: 5e-131 })),
+                Just(Some(NoShowState { smoothed_rate: 1e-130 })),
+            ],
         ) {
             let d = compute_release(
                 ReleaseInputs {
@@ -899,6 +1072,16 @@ mod tests {
             // smoothed rate stays a valid probability.
             prop_assert!(d.no_show.smoothed_rate >= 0.0 && d.no_show.smoothed_rate <= 1.0);
             prop_assert!(d.no_show.smoothed_rate.is_finite());
+            // The persisted smoothed rate is always DynamoDB-storable: exactly
+            // 0.0 or at least the positive `Number` minimum, so the
+            // `write_release` UpdateItem is never rejected for underflow —
+            // both the measured-EWMA branch and the hold-the-state branch floor.
+            prop_assert!(
+                d.no_show.smoothed_rate == 0.0
+                    || d.no_show.smoothed_rate >= DDB_NUMBER_MIN_POSITIVE,
+                "smoothed rate {:e} is below the DynamoDB positive Number floor",
+                d.no_show.smoothed_rate
+            );
         }
 
         #[test]
