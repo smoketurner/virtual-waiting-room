@@ -9,10 +9,13 @@
 //! under one budget and distribute nothing. Readers that need them fetch them
 //! explicitly.
 
-use crate::permutation::{Assignment, SHARDS, SealedOffsets, Seed};
+use std::collections::HashMap;
+
+use aws_sdk_dynamodb::types::AttributeValue;
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{AdmissionControl, Phase};
+use crate::permutation::{Assignment, SHARDS, SealedOffsets, Seed};
 
 /// The admission status of a written [`Position`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,8 +37,8 @@ pub struct PreQueueItem {
     pub s: u8,
     /// Local index within the shard.
     pub l: u64,
-    /// Registration timestamp (RFC 3339).
-    pub t: String,
+    /// Registration timestamp, epoch seconds.
+    pub t: u64,
 }
 
 /// A `Positions` row, written lazily when a visitor is admitted.
@@ -85,14 +88,44 @@ pub struct Counters {
     pub admission_control: AdmissionControl,
 }
 
+/// The sealed pre-queue index space and permutation seed, once the seal has
+/// written them.
+///
+/// No `Debug`/`PartialEq`: [`Seed`] carries the permutation key and
+/// deliberately implements neither, so it cannot end up in a log line or a
+/// careless equality check at a call site.
+#[derive(Clone, Copy)]
+pub struct Sealed {
+    pub offsets: SealedOffsets,
+    pub seed: Seed,
+}
+
 impl Counters {
+    /// `Some` once the seal has written the seed, cohort size, and offsets;
+    /// `None` before.
+    ///
+    /// Callers branch on this rather than on [`Phase`]: an operator can walk
+    /// the phase back through `Maintenance` to `PreQueue` after a seal
+    /// (recovering from an operator error) without unsealing the index
+    /// space, so `phase == PreQueue` alone does not mean unsealed.
+    #[must_use]
+    pub fn sealed(&self) -> Option<Sealed> {
+        let seed_bytes = self.shuffle_seed?;
+        let offsets = self.prequeue_offsets?;
+        let participant_count = self.participant_count?;
+        Some(Sealed {
+            offsets: SealedOffsets::from_parts(offsets, participant_count),
+            seed: Seed(seed_bytes),
+        })
+    }
+
     /// Resolves a pre-queue registration to its queue position.
     ///
     /// Reconstructs the global index `i = offset[s] + l` from the sealed offsets
     /// and the row, then derives the position with the permutation. A row whose
-    /// reconstructed `i` lands at or past the cohort size raced the seal and
-    /// belongs to the live-join sequence instead, so the permutation is never
-    /// evaluated outside its domain.
+    /// local index is at or past its shard's own issued count raced the seal
+    /// and belongs to the live-join sequence instead, so the permutation is
+    /// never evaluated outside its domain.
     ///
     /// # Errors
     ///
@@ -100,30 +133,81 @@ impl Counters {
     /// size, and offsets; [`ResolveError::BadShard`] if the row's shard is
     /// outside `0..SHARDS`.
     pub fn resolve_prequeue(&self, row: &PreQueueItem) -> Result<ResolvedPosition, ResolveError> {
-        let (Some(seed_bytes), Some(offsets)) = (self.shuffle_seed, self.prequeue_offsets) else {
-            return Err(ResolveError::NotSealed);
-        };
-        let participant_count = self.participant_count.ok_or(ResolveError::NotSealed)?;
+        let Sealed { offsets, seed } = self.sealed().ok_or(ResolveError::NotSealed)?;
 
         let shard = usize::from(row.s);
         if shard >= SHARDS {
             return Err(ResolveError::BadShard);
         }
 
-        let sealed = SealedOffsets::from_parts(offsets, participant_count);
-        Ok(match sealed.assign(shard, row.l) {
-            Assignment::PreQueue { index } => ResolvedPosition::PreQueue(crate::permutation::prp(
-                &Seed(seed_bytes),
-                index,
-                participant_count,
-            )),
-            // The live sequence starts at the cohort size, so a straggler is
-            // served behind the whole cohort. The exact position is claimed by
-            // the live-join path; this is the base it counts from.
-            Assignment::LiveJoin => ResolvedPosition::LiveJoin {
-                base: participant_count,
-            },
+        let participant_count = offsets.participant_count();
+        Ok(match offsets.assign(shard, row.l) {
+            Assignment::PreQueue { index } => {
+                ResolvedPosition::PreQueue(crate::permutation::prp(&seed, index, participant_count))
+            }
+            // The exact live-join position is claimed by the live-join path,
+            // not reconstructed here — every caller falls through to a
+            // `Positions` lookup for one, so no value carried on this variant
+            // would ever be read.
+            Assignment::LiveJoin => ResolvedPosition::LiveJoin,
         })
+    }
+
+    /// Assembles the item from its raw attributes, defaulting every field a
+    /// fresh event has never written.
+    ///
+    /// The one parser for the `Counters` item shape — `assign_position`,
+    /// `generate_token`, and `read` all call this rather than each keeping its
+    /// own copy, so a stored value cannot be interpreted two different ways by
+    /// two Lambdas.
+    #[must_use]
+    pub fn from_item(event_id: &str, item: &HashMap<String, AttributeValue>) -> Self {
+        let num = |key: &str| -> Option<u64> {
+            item.get(key)
+                .and_then(|v| v.as_n().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+        };
+
+        let shuffle_seed = item
+            .get("shuffle_seed")
+            .and_then(|v| v.as_b().ok())
+            .and_then(|b| <[u8; 32]>::try_from(b.as_ref()).ok());
+
+        let prequeue_offsets = item
+            .get("prequeue_offsets")
+            .and_then(|v| v.as_l().ok())
+            .and_then(|list| {
+                let parsed: Vec<u64> = list
+                    .iter()
+                    .filter_map(|e| e.as_n().ok().and_then(|s| s.parse().ok()))
+                    .collect();
+                <[u64; SHARDS]>::try_from(parsed).ok()
+            });
+
+        Self {
+            event_id: event_id.to_owned(),
+            phase: item
+                .get("phase")
+                .and_then(|v| v.as_s().ok())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(Phase::Idle),
+            queue_counter: num("queue_counter").unwrap_or(0),
+            serving_counter: num("serving_counter").unwrap_or(0),
+            shuffle_seed,
+            participant_count: num("participant_count"),
+            prequeue_offsets,
+            message: item
+                .get("message")
+                .and_then(|v| v.as_s().ok())
+                .filter(|s| !s.is_empty())
+                .cloned(),
+            admission_control: item
+                .get("admission_control")
+                .and_then(|v| v.as_s().ok())
+                .and_then(|s| s.parse().ok())
+                // Missing, empty, or unrecognized: normal admission (safe default).
+                .unwrap_or_default(),
+        }
     }
 }
 
@@ -132,9 +216,9 @@ impl Counters {
 pub enum ResolvedPosition {
     /// A position inside the sealed cohort's `[0, N)`, derived from the seed.
     PreQueue(u64),
-    /// The registration raced the seal and is numbered by the live-join
-    /// sequence, which starts at `base`.
-    LiveJoin { base: u64 },
+    /// The registration raced the seal; it has no pre-queue position and is
+    /// instead a live joiner, whose actual position lives in `Positions`.
+    LiveJoin,
 }
 
 /// Why a pre-queue registration cannot be resolved to a position.
@@ -160,7 +244,7 @@ mod tests {
             r: "018f3a2b-7c9d-7e1f-abcd-0123456789ab".to_owned(),
             s: 7,
             l: 42,
-            t: "2026-08-03T19:12:52.000Z".to_owned(),
+            t: 1_788_000_000,
         };
         let av: std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue> =
             serde_dynamo::to_item(&item).unwrap();
@@ -212,5 +296,97 @@ mod tests {
             av.get("entry_time"),
             Some(&AttributeValue::N("1788000000".to_owned()))
         );
+    }
+
+    fn unsealed_counters(phase: Phase) -> Counters {
+        Counters {
+            event_id: "evt-1".to_owned(),
+            phase,
+            queue_counter: 0,
+            serving_counter: 0,
+            shuffle_seed: None,
+            participant_count: None,
+            prequeue_offsets: None,
+            message: None,
+            admission_control: AdmissionControl::Open,
+        }
+    }
+
+    #[test]
+    fn sealed_is_none_before_every_seal_output_is_present() {
+        assert!(unsealed_counters(Phase::PreQueue).sealed().is_none());
+
+        // Missing just the seed, or just the offsets, or just the count: still
+        // not sealed. Every field must be present.
+        let mut partial = unsealed_counters(Phase::Active);
+        partial.shuffle_seed = Some([1u8; 32]);
+        assert!(partial.sealed().is_none());
+        partial.participant_count = Some(10);
+        assert!(partial.sealed().is_none());
+    }
+
+    #[test]
+    fn sealed_is_some_once_every_seal_output_is_present_regardless_of_phase() {
+        // The operator can walk the phase back to PreQueue after a seal
+        // (Active -> Maintenance -> Idle -> PreQueue) without unsealing the
+        // index space, so `sealed()` must not gate on phase.
+        let mut counters = unsealed_counters(Phase::PreQueue);
+        counters.shuffle_seed = Some([9u8; 32]);
+        counters.participant_count = Some(3);
+        counters.prequeue_offsets = Some([0, 0, 0, 1, 1, 1, 2, 2, 2, 2]);
+        let sealed = counters.sealed().unwrap();
+        assert_eq!(sealed.offsets.participant_count(), 3);
+    }
+
+    #[test]
+    fn from_item_defaults_a_fresh_event_to_idle_and_open() {
+        // An item with nothing set must not read as a sealed, admitting event.
+        let counters = Counters::from_item("evt-1", &HashMap::new());
+        assert_eq!(counters.phase, Phase::Idle);
+        assert_eq!(counters.queue_counter, 0);
+        assert_eq!(counters.serving_counter, 0);
+        assert!(counters.shuffle_seed.is_none());
+        assert!(counters.participant_count.is_none());
+        assert!(counters.prequeue_offsets.is_none());
+        assert!(counters.message.is_none());
+        assert_eq!(counters.admission_control, AdmissionControl::Open);
+    }
+
+    #[test]
+    fn from_item_round_trips_the_seal_outputs() {
+        let mut item = HashMap::new();
+        item.insert("phase".to_owned(), AttributeValue::S("active".to_owned()));
+        item.insert(
+            "queue_counter".to_owned(),
+            AttributeValue::N("15".to_owned()),
+        );
+        item.insert(
+            "shuffle_seed".to_owned(),
+            AttributeValue::B(aws_sdk_dynamodb::primitives::Blob::new([7u8; 32])),
+        );
+        item.insert(
+            "participant_count".to_owned(),
+            AttributeValue::N("15".to_owned()),
+        );
+        item.insert(
+            "prequeue_offsets".to_owned(),
+            AttributeValue::L(
+                [0, 3, 3, 8, 9, 9, 9, 11, 11, 11]
+                    .into_iter()
+                    .map(|o: u64| AttributeValue::N(o.to_string()))
+                    .collect(),
+            ),
+        );
+
+        let counters = Counters::from_item("evt-1", &item);
+        assert_eq!(counters.phase, Phase::Active);
+        assert_eq!(counters.queue_counter, 15);
+        assert_eq!(counters.shuffle_seed, Some([7u8; 32]));
+        assert_eq!(counters.participant_count, Some(15));
+        assert_eq!(
+            counters.prequeue_offsets,
+            Some([0, 3, 3, 8, 9, 9, 9, 11, 11, 11])
+        );
+        assert!(counters.sealed().is_some());
     }
 }

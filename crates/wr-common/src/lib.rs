@@ -24,6 +24,6 @@ pub use ids::{
     UnknownPhase, serving_state,
 };
 pub use items::{
-    Counters, PositionItem, PositionStatus, PreQueueItem, ResolveError, ResolvedPosition,
+    Counters, PositionItem, PositionStatus, PreQueueItem, ResolveError, ResolvedPosition, Sealed,
 };
 pub use permutation::{Assignment, SHARDS, SealError, SealedOffsets, Seed, prp, shard_for};

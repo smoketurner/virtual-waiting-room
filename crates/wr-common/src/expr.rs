@@ -171,6 +171,36 @@ pub fn claim_live_block_update() -> &'static str {
     "ADD queue_counter :n"
 }
 
+/// `SET s = :shard ADD n :count` — claims a contiguous block of `count` local
+/// indices within one pre-queue shard, stamping which shard it is. With
+/// `ReturnValue::AllNew` the returned `n` is the shard's count after the add;
+/// the block is `[n - count, n - 1]`.
+///
+/// Distinct from [`increment_shard_update`] (the arrivals `+1`, used by
+/// `generate_token` and `authorizer`) rather than a shared generalisation of
+/// it: this claims a caller-supplied count in one round trip per batch shard
+/// group, not one per record, and a saturated block here is a duplicate
+/// global index, not a harmless gap — callers must `checked_sub`, never
+/// saturate, when turning the returned `n` into the block's first index.
+#[must_use]
+pub fn claim_prequeue_block_update() -> &'static str {
+    "SET s = :shard ADD n :count"
+}
+
+/// The values [`claim_prequeue_block_update`] refers to.
+///
+/// # Panics
+///
+/// Panics if `shard >= SHARDS`.
+#[must_use]
+pub fn claim_prequeue_block_values(shard: usize, count: u64) -> HashMap<String, AttributeValue> {
+    assert!(shard < SHARDS, "shard {shard} out of range 0..{SHARDS}");
+    HashMap::from([
+        (":count".to_owned(), AttributeValue::N(count.to_string())),
+        (":shard".to_owned(), AttributeValue::N(shard.to_string())),
+    ])
+}
+
 /// `attribute_not_exists(<key>)` — the idempotency guard on every position and
 /// pre-queue write, so a retried request id is rejected rather than duplicated.
 #[must_use]
@@ -341,6 +371,7 @@ mod tests {
         for expression in [
             increment_shard_update(),
             claim_live_block_update(),
+            claim_prequeue_block_update(),
             seal_update(),
             seal_guard(),
         ] {
@@ -367,6 +398,26 @@ mod tests {
             );
         }
         assert_eq!(values[":shard"], AttributeValue::N("3".to_owned()));
+    }
+
+    #[test]
+    fn every_placeholder_in_the_prequeue_block_claim_is_bound() {
+        let expression = claim_prequeue_block_update();
+        let values = claim_prequeue_block_values(3, 42);
+        for placeholder in expression.split_whitespace().filter(|t| t.starts_with(':')) {
+            assert!(
+                values.contains_key(placeholder),
+                "{placeholder} is used but never bound"
+            );
+        }
+        assert_eq!(values[":shard"], AttributeValue::N("3".to_owned()));
+        assert_eq!(values[":count"], AttributeValue::N("42".to_owned()));
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn claim_prequeue_block_values_out_of_range_panics() {
+        let _ = claim_prequeue_block_values(SHARDS, 1);
     }
 
     #[test]

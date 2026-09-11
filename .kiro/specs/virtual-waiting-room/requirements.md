@@ -57,13 +57,13 @@ activation queues first-in, first-out (FIFO).
 
 ### 1.2 Pre-queue (scheduled events)
 
-**F1.1** — As a visitor arriving early, I want a countdown rather than a position so that no state is written before the event opens.
-- WHILE an event is in the pre-queue phase, THE SYSTEM SHALL hold visitors on a countdown page rather than assign a position.
-- Acceptance: A visitor arriving at T−10min sees a countdown; no `Positions` item is written.
+**F1.1** — As a visitor arriving early, I want a countdown rather than a queued position so that registering costs nothing more than a bounded write.
+- WHILE an event is in the pre-queue phase, THE SYSTEM SHALL hold visitors on a countdown page rather than assign a queue position, and SHALL register each visitor's place with one row write, plus a share of one amortised shard-counter claim per batch.
+- Acceptance: A visitor arriving at T−10min sees a countdown and is registered; no `Positions` item — and no queue position — exists until the event opens.
 
-**F1.2** — As an operator, I want the pre-queue served from cache so that origin load is independent of visitor count.
-- WHILE an event is in the pre-queue phase, THE SYSTEM SHALL serve the pre-queue page entirely from content delivery network (CDN) cache, making zero calls to API Gateway, DynamoDB, or Simple Queue Service (SQS) per view.
-- Acceptance: Origin request count during the pre-queue phase is independent of visitor count.
+**F1.2** — As an operator, I want page views served from cache so that origin load from browsing is independent of visitor count, with registration kept to one bounded write per visitor.
+- WHILE an event is in the pre-queue phase, THE SYSTEM SHALL serve the countdown page entirely from content delivery network (CDN) cache, so page views make zero calls to API Gateway, DynamoDB, or Simple Queue Service (SQS); registering a visitor's place SHALL be a separate, single direct write from the edge to the ingest queue, with no compute in the path.
+- Acceptance: Origin request count from page views is independent of visitor count; each visitor registers exactly once, deduplicated across reloads wherever the browser permits persistent client-side storage (a browser that denies it, e.g. private browsing, re-registers on every reload — a known gap, not a guarantee this requirement makes), with no Lambda in that write's path.
 
 **F1.3** — As an operator, I want fair, unpredictable ordering so that early registration confers no advantage.
 - WHEN the scheduled start (T−0) is reached, THE SYSTEM SHALL assign queue positions to pre-queue participants in **randomized** order, and THE SYSTEM SHALL NOT make the ordering predictable before that moment.
@@ -161,7 +161,7 @@ activation queues first-in, first-out (FIFO).
 
 **F4.4** — As a client, I want to recover a lost join so that a downstream drop is not user-visible.
 - IF a join is lost downstream, THEN THE SYSTEM SHALL allow the client to recover it.
-- Acceptance: `GET /queue_num` returns 404; the client re-joins with a fresh UUIDv7.
+- Acceptance: `GET /queue_num` returns 404; the client re-joins with the same request id, and the retry succeeds because no row exists for it yet.
 
 **F4.5** — As a client, I want throttling handled gracefully so that joins succeed on retry.
 - WHEN the client receives HTTP 429, THE SYSTEM (client) SHALL treat it as expected and retry with jittered backoff.

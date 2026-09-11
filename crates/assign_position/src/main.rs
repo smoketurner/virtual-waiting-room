@@ -19,11 +19,13 @@ async fn main() -> Result<(), Error> {
     let config = aws_config::load_from_env().await;
     let client = aws_sdk_dynamodb::Client::new(&config);
     let counters_table = std::env::var("COUNTERS_TABLE")?;
+    let prequeue_table = std::env::var("PREQUEUE_TABLE")?;
     let positions_table = std::env::var("POSITIONS_TABLE")?;
-    let store = DynamoStore::new(client, counters_table, positions_table);
+    let event_id = std::env::var("EVENT_ID")?;
+    let store = DynamoStore::new(client, counters_table, prequeue_table, positions_table);
 
     lambda_runtime::run(service_fn(|event: LambdaEvent<SqsEvent>| {
-        handle(&store, event)
+        handle(&store, &event_id, event)
     }))
     .await
 }
@@ -33,6 +35,7 @@ async fn main() -> Result<(), Error> {
 // Default + field assignment is the only construction path.
 async fn handle(
     store: &DynamoStore,
+    event_id: &str,
     event: LambdaEvent<SqsEvent>,
 ) -> Result<SqsBatchResponse, Error> {
     let records: Vec<BatchRecord> = event
@@ -42,7 +45,7 @@ async fn handle(
         .filter_map(record_from_sqs)
         .collect();
 
-    let outcome = process_batch(store, &records).await;
+    let outcome = process_batch(store, event_id, &records).await;
 
     let batch_item_failures = outcome
         .failures

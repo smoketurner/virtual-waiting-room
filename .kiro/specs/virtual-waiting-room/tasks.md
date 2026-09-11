@@ -35,14 +35,14 @@ Throwaway code. Measures what documentation cannot settle.
 
 ### 1c. Pre-queue
 
-- [ ] Static countdown page, CDN-cached, zero origin calls per view [F1.1, F1.2]
-- [ ] Pre-queue registration (identity only, spread across the window); striped counter for ~10,000/s registration ceiling [C1]
+- [ ] Static countdown page, CDN-cached, zero origin calls per *view* — registration (one `POST /join` per visitor) is separate from viewing and is not zero-call; see the amended F1.1/F1.2 acceptance [F1.1, F1.2]
+- [x] Pre-queue registration (identity only, spread across the window); striped counter for ~10,000/s registration ceiling [C1]
 - [x] `/status` carries phase, so the countdown page polls one endpoint (Min TTL 1 s, no cookies forwarded — DESIGN §8); after T−0 also carries `shuffle_seed`, `participant_count`, `prequeue_offsets`
-- [ ] Registration writes `PreQueue {r, s, l, t}` with `attribute_not_exists(r)`; shard `s = hash(request_id) % 10`, local index `l` from `ADD prequeue_counter#s :1` / `ALL_NEW` (DESIGN §4.1, ADR-0015) [F2.5]
+- [x] Registration writes `PreQueue {r, s, l, t}` with `attribute_not_exists(r)`; shard `s = hash(request_id) % 10`, local index `l` claimed per-shard with one `SET s = :shard ADD n :count` per batch shard group (DESIGN §4.1, ADR-0015) [F2.5]
 - [x] Seeded permutation (DESIGN §4.2, ADR-0002): at T−0 one `UpdateItem` on `Counters` that reads the 10 shard counts, computes `prequeue_offsets` (prefix sums) and `participant_count = ΣΣcounts`, and sets `shuffle_seed`, `participant_count`, `prequeue_offsets`, `phase`, guarded by `attribute_not_exists(shuffle_seed)`. Global index `i = offset[s] + l`; position derived on read as `PRP(seed, i, N)` [F1.3, F1.4, F1.5, C2]
 - [x] Pseudorandom permutation (PRP): 4-round balanced Feistel, `HMAC-SHA256(seed, round || x)` round function, cycle-walking into `[0, N)`. Property tests for bijectivity over the full domain at N ≤ 10⁶, uniformity by chi-square, determinism across processes; assert the assembled global index space is exactly contiguous `[0, N)` across all 10 shards [F1.5] — Note: proptest bijectivity covers N < 2000 exhaustively; the 10⁶ cohort is Phase 3.
 - [x] Property test — **burned slot** (ADR-0015, F2.3): with an injected registration-write failure rate (counter incremented, `PreQueue` row absent), assert (a) the assembled index space is still a contiguous `[0, N)` where `N` = Σ shard counts, (b) `PRP` remains bijective over `[0, N)`, (c) a burned index resolves to a valid position that maps to no `PreQueue` row, and (d) the serving counter advancing past it admits nobody — no duplicate, no panic, no gap in the permutation [F1.5, F2.3]
-- [x] Property test — **straggler join racing the seal** (ADR-0015): for a join whose local index was claimed after the seal counted its shard, assert its reconstructed `i ≥ participant_count` and that `/queue_num` returns a live-join position behind the whole pre-queue cohort rather than evaluating `PRP` out of domain (never calls `PRP` with `i ≥ N`) [F1.5]
+- [x] Property test — **straggler join racing the seal** (ADR-0015): for a join whose local index was claimed after the seal counted its shard, assert it is a straggler **by that shard's own issued count** (not by the reconstructed global index `i = offset[s] + l`, which can still land inside `[0, N)` on an interior shard) and that `/queue_num` never evaluates `PRP` out of domain for it, falling through to the `Positions` row instead — a live-join position if one has landed, 404 if not [F1.5]
 
 ### 1d. Live join
 

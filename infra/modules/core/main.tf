@@ -223,7 +223,9 @@ resource "aws_lambda_function" "assign_position" {
   environment {
     variables = merge(local.dynamo_lambda_env, {
       COUNTERS_TABLE  = aws_dynamodb_table.counters.name
+      PREQUEUE_TABLE  = aws_dynamodb_table.prequeue.name
       POSITIONS_TABLE = aws_dynamodb_table.positions.name
+      EVENT_ID        = var.event_id
     })
   }
 
@@ -294,7 +296,7 @@ resource "aws_api_gateway_model" "join" {
     required             = ["request_id", "event_id"]
     additionalProperties = false
     properties = {
-      request_id = { type = "string", minLength = 1 }
+      request_id = { type = "string", minLength = 1, maxLength = 36 } # canonical UUIDv7 length
       event_id   = { type = "string", minLength = 1 }
     }
   })

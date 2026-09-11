@@ -1,5 +1,7 @@
 //! The `aws-sdk-dynamodb`-backed [`Store`] for the seal.
 
+use std::collections::HashMap;
+
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
@@ -62,21 +64,12 @@ impl Store for DynamoStore {
             return Err(StoreError("shard read incomplete; retry".to_owned()));
         }
 
-        let mut counts = [0u64; SHARDS];
-        for item in out
+        let items = out
             .responses()
             .and_then(|r| r.get(&self.counters_table))
             .map(Vec::as_slice)
-            .unwrap_or_default()
-        {
-            // The item says which shard it is, so a batch returned in arbitrary
-            // order needs no key parsing.
-            let Some(shard) = shard_index_of(item) else {
-                continue;
-            };
-            counts[shard] = shard_count_of(item);
-        }
-        Ok(counts)
+            .unwrap_or_default();
+        counts_from_shard_items(items)
     }
 
     async fn write_seal(&self, event_id: &str, values: &SealValues) -> Result<bool, StoreError> {
@@ -121,5 +114,68 @@ impl Store for DynamoStore {
             }
             Err(e) => Err(StoreError(format!("update_item: {e}"))),
         }
+    }
+}
+
+/// Folds a batch-get response's shard items into per-shard counts.
+///
+/// An item whose shard index cannot be read is a corrupt row, not an empty
+/// shard: a shard with no registrations has no item at all (`BatchGetItem`
+/// never returns one), so it never reaches this loop and correctly counts
+/// zero. An item that exists with an unreadable `s` would otherwise zero that
+/// shard's count silently, and under the per-shard straggler rule that
+/// unadmits every registrant in it.
+fn counts_from_shard_items(
+    items: &[HashMap<String, AttributeValue>],
+) -> Result<[u64; SHARDS], StoreError> {
+    let mut counts = [0u64; SHARDS];
+    for item in items {
+        // The item says which shard it is, so a batch returned in arbitrary
+        // order needs no key parsing.
+        let shard = shard_index_of(item)
+            .ok_or_else(|| StoreError("shard item has an unreadable shard index".to_owned()))?;
+        counts[shard] = shard_count_of(item);
+    }
+    Ok(counts)
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
+
+    use wr_common::expr::{SHARD_COUNT_ATTR, SHARD_INDEX_ATTR};
+
+    use super::*;
+
+    fn shard_item(shard: usize, count: u64) -> HashMap<String, AttributeValue> {
+        HashMap::from([
+            (
+                SHARD_INDEX_ATTR.to_owned(),
+                AttributeValue::N(shard.to_string()),
+            ),
+            (
+                SHARD_COUNT_ATTR.to_owned(),
+                AttributeValue::N(count.to_string()),
+            ),
+        ])
+    }
+
+    #[test]
+    fn a_shard_with_no_registrations_has_no_item_and_counts_zero() {
+        // BatchGetItem never returns an item for a shard nothing has written;
+        // the fold must still report zero for it, not fail.
+        let items = vec![shard_item(0, 3), shard_item(2, 5)];
+        let counts = counts_from_shard_items(&items).unwrap();
+        assert_eq!(counts, [3, 0, 5, 0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_shard_item_with_an_unreadable_index_is_an_error_not_a_zero_count() {
+        let corrupt = HashMap::from([(
+            SHARD_COUNT_ATTR.to_owned(),
+            AttributeValue::N("9".to_owned()),
+        )]);
+        let items = vec![shard_item(0, 3), corrupt];
+        assert!(counts_from_shard_items(&items).is_err());
     }
 }

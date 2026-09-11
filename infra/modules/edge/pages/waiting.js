@@ -351,6 +351,16 @@
             "The event isn't open yet",
             "This page updates on its own when it opens."
           );
+          if (s.phase === "pre_queue") {
+            // Registration during the countdown is a single direct write
+            // (join() no-ops on reload via JOINED_KEY), not a poll: the
+            // /queue_num call below stays skipped, since that endpoint
+            // answers 409 until the seal and a poll against it would only
+            // churn the catch handler. Must return the promise chain, or a
+            // rejected join never reaches tick()'s catch and schedule()
+            // never runs again.
+            return join().then(schedule);
+          }
           return schedule();
         }
         if (s.serving_state === "paused") {
