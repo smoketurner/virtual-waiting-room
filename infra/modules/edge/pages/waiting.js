@@ -278,6 +278,15 @@
   // noise. See settleWait.
   var shownWait = null;
 
+  // Stamped from the client's own clock on every successful /status, whether or
+  // not this visitor has a number yet. It reports that the page is still
+  // talking to the room — which is most in doubt before a position arrives and
+  // the rest of the page is still showing dashes.
+  function markUpdated() {
+    el.updated.hidden = false;
+    el.updatedAt.textContent = new Date().toLocaleTimeString();
+  }
+
   function forgetPosition() {
     knownPosition = null;
     knownLiveJoin = false;
@@ -499,14 +508,6 @@
       el.fill.style.width = "100.0%";
     }
 
-    // Stamped from the client's own clock on each successful poll. It answers
-    // "is this page still live, or has it silently stopped updating" — the
-    // question a visitor watching an unchanging number actually has.
-    if (!el.bar.hidden) {
-      el.updated.hidden = false;
-      el.updatedAt.textContent = new Date().toLocaleTimeString();
-    }
-
     // The headline follows the admission rule, not `ahead`. A visitor is
     // admitted once position < serving, but `ahead` reaches zero one release
     // earlier — so keying the headline off `ahead` promises entry while the
@@ -637,6 +638,7 @@
           throw new Error("status " + res.status);
         }
         var s = res.body;
+        markUpdated();
         showBroadcast(s.message);
         // Sampled from every poll, including the ones before this visitor knows
         // their own number, so an estimate is ready the moment there is
@@ -656,7 +658,9 @@
         if (s.serving_state === "closed") {
           el.stats.hidden = true;
           el.bar.hidden = true;
-          el.updated.hidden = true;
+          // The freshness line stays: a closed event keeps polling for the
+          // opening, which is exactly when a visitor wants to know the page is
+          // still watching rather than dead.
           // A closed event has not dealt this visitor a number, and if one was
           // held from an earlier run of the same page it belongs to a cohort
           // that no longer exists — an operator who resets an event seals a new

@@ -428,3 +428,24 @@ test("the progress baseline survives a reload", async () => {
   const width = parseFloat(second.elements.fill.style.width);
   assert.ok(width > 0, `progress carried over, got ${second.elements.fill.style.width}`);
 });
+
+test("the freshness stamp updates on every status poll, number or not", async () => {
+  // It reports that the page is talking to the room. Before a position lands
+  // every other value is a dash, which is precisely when a visitor doubts it.
+  const client = loadClient({
+    route: (url) =>
+      url.includes("/v1/status")
+        ? jsonResponse(200, { event_id: "e", phase: "pre_queue", serving_state: "closed" })
+        : jsonResponse(404, {}),
+  });
+  await client.flush();
+
+  assert.equal(client.elements.updated.hidden, false, "shown on a closed event");
+  const first = client.elements["updated-at"].textContent;
+  assert.notEqual(first, "—");
+
+  client.clock.now += 60_000;
+  client.fireLastTimer();
+  await client.flush();
+  assert.notEqual(client.elements["updated-at"].textContent, first, "moves on the next poll");
+});
