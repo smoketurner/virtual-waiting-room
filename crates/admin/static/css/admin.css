@@ -167,7 +167,14 @@ body {
 }
 
 .controls-row .control > form {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.controls-row .control > form > button {
   margin-top: auto;
+  align-self: flex-start;
 }
 
 .controls-row .control + .control {
@@ -220,10 +227,19 @@ body {
   flex-direction: column;
 }
 
-/* The last form in a card is its submit. Pushing it down is what puts the
-   buttons on a shared baseline; anything above it keeps its natural height. */
+/* Fields sit at the top, submits at the bottom. The form fills the rest of the
+   card and pushes its own button down, rather than the whole form dropping —
+   that left each card's label at a different height, since the help text
+   above it differs in length. */
 .card > .card-body > form:last-of-type {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.card > .card-body > form:last-of-type > button {
   margin-top: auto;
+  align-self: flex-start;
 }
 
 /* The emergency card body lays its controls out in columns, not a stack. */
@@ -447,12 +463,6 @@ button.danger {
 button.danger:hover {
   opacity: 0.9;
   background: var(--vouch-error);
-}
-
-button.big {
-  width: 100%;
-  padding: 14px;
-  font-size: 15px;
 }
 
 /* --- Utility -------------------------------------------------------------- */

@@ -68,12 +68,12 @@
         <p class="deferred">Admission is paused. Waiting visitors see a "you keep your place" notice and nobody new is let through.</p>
         <p class="help">Resume clears the notice and starts admitting again. Every visitor kept their queue position through the pause.</p>
         <form method="post" action="/admin/resume">
-          <button class="normal big" type="submit" title="Start admitting visitors again. The notice clears.">Resume admission</button>
+          <button class="normal" type="submit" title="Start admitting visitors again. The notice clears.">Resume admission</button>
         </form>
         {% else %}
         <p class="help"><strong>Pause holds the line.</strong> Waiting visitors see a "you keep your place" notice, the queue keeps forming, and nobody new is admitted. A Resume button appears here to clear it. Reversible.</p>
         <form method="post" action="/admin/pause">
-          <button class="danger big" type="submit" title="Pause admission. Waiting visitors see a 'you keep your place' notice; nobody new is let through.">Pause admission</button>
+          <button class="danger" type="submit" title="Pause admission. Waiting visitors see a 'you keep your place' notice; nobody new is let through.">Pause admission</button>
         </form>
         {% endif %}
         </div>
