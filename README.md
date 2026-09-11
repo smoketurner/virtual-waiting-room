@@ -7,9 +7,11 @@ into your origin at a rate it can survive.
 **Status: MVP.** The scheduled pre-queue and live-join happy paths are implemented and
 deployable — see [`docs/DEPLOY.md`](./docs/DEPLOY.md).
 
+- [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) — start here: the shape of the system and why
 - [`docs/DEPLOY.md`](./docs/DEPLOY.md) — build → package → deploy, and the `make` targets
 - [`docs/REQUIREMENTS.md`](./docs/REQUIREMENTS.md) — numbered, testable requirements
 - [`docs/DESIGN.md`](./docs/DESIGN.md) — how the system works, with sourced constraints
+- [`docs/DYNAMODB.md`](./docs/DYNAMODB.md) — the data layer: key design, scaling techniques, ceilings
 - [`docs/adr/`](./docs/adr/) — architecture decision records: why it works that way
 - [`docs/PLAN.md`](./docs/PLAN.md) — phased implementation plan
 
