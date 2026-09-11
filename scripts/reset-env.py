@@ -202,11 +202,16 @@ def fresh_counters(event_id: str, phase: str, target_rate: int, queue_ahead: int
     an attribute".
 
     `queue_ahead` starts `queue_counter` above zero so the next live joiner
-    claims a position that far back, while the cursor still starts at zero. The
-    queue is real: the visitor waits for the controller to travel the distance,
-    with a live position, a moving bar and an ETA. No rows are invented for the
-    people ahead, because a position is computed from the counter rather than
-    stored — what a test needs is the distance, not the bodies.
+    claims a position that far back, while the cursor still starts at zero. No
+    rows are invented for the people ahead: a position is computed from the
+    counter rather than stored, so a test needs the distance, not the bodies.
+
+    It also pauses admission, which is the part that makes the queue hold.
+    Nobody occupies those positions, so the controller measures no arrivals,
+    reads a 100% no-show rate, releases at its cap of twice the target every
+    pass, and reaches `queue_counter + 1` in about a minute — the queue would
+    drain before a tester had finished opening the page. Paused, the controller
+    returns `Held` and the cursor does not move until an operator resumes.
 
     Deliberately absent: shuffle_seed, participant_count, and prequeue_offsets
     (written only by the seal), the prequeue_counter and arrivals shards, and
@@ -216,7 +221,7 @@ def fresh_counters(event_id: str, phase: str, target_rate: int, queue_ahead: int
     return {
         "event_id": {"S": event_key(event_id)},
         "phase": {"S": phase},
-        "admission_control": {"S": "open"},
+        "admission_control": {"S": "paused" if queue_ahead else "open"},
         "queue_counter": {"N": str(queue_ahead)},
         "serving_counter": {"N": "0"},
         "target_rate": {"N": str(target_rate)},
@@ -245,10 +250,9 @@ def parse_args() -> argparse.Namespace:
         default=0,
         metavar="N",
         help=(
-            "Start the queue N places deep, so the next visitor joins at N+1 and "
-            "waits for the cursor to reach them. Default 0, which admits the first "
-            "visitor on the next controller pass. Roughly N / (rate * 10) passes to "
-            "clear, one every 10s."
+            "Start the queue N places deep and leave admission PAUSED, so the next "
+            "visitor joins at N+1 with the cursor held at 0. Resume from the "
+            "dashboard to watch it drain. Default 0: no queue, admission open."
         ),
     )
     p.add_argument(
@@ -341,6 +345,14 @@ def main() -> int:
     say("Reset complete")
     if args.phase != "active":
         print(f"Phase is {args.phase}: nobody will be admitted until it is active.")
+    elif args.queue_ahead:
+        clears = args.queue_ahead / (args.target_rate * 10)
+        print(
+            f"The queue is {args.queue_ahead:,} deep and admission is PAUSED, so the cursor is\n"
+            f"held at 0. Join now to take position {args.queue_ahead + 1:,}, then press Resume on\n"
+            f"the dashboard to start it draining — roughly {clears:.0f} to {clears / 2:.0f} passes\n"
+            "at 10s each, since the controller doubles its release while nobody arrives."
+        )
     else:
         print("The event is live. A visitor arriving now queues and is admitted within a minute.")
     print(
