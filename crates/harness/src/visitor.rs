@@ -140,6 +140,12 @@ pub enum Polling {
 pub struct VisitorTally {
     pub status_requests: AtomicU64,
     pub queue_num_requests: AtomicU64,
+    /// Milliseconds each visitor spent present and polling, summed across the
+    /// cohort. Under `--countdown`/`--arrival` a visitor sleeps until their
+    /// arrival offset and issues no requests before it, so this is the only
+    /// honest denominator for a per-visitor-per-minute rate: `visitors × run
+    /// length` would count time nobody was in the room.
+    pub active_ms: AtomicU64,
 }
 
 /// A deterministic jitter source. Real jitter is `Math.random()`; a run that
@@ -282,6 +288,11 @@ pub async fn run<F, Fut>(
     // same tick as everyone else's.
     tokio::time::sleep(Duration::from_millis(arrives_at + jitter.next() % POLL_MS)).await;
 
+    // From here on the visitor is in the room. Everything before this point is
+    // time they were not waiting and caused no origin requests, so it is not
+    // theirs to be divided by.
+    let turned_up_at = tokio::time::Instant::now();
+
     let mut serving_position = 0u64;
 
     while tokio::time::Instant::now() < settings.deadline {
@@ -359,6 +370,12 @@ pub async fn run<F, Fut>(
         };
         tokio::time::sleep(sleep).await;
     }
+
+    // A visitor whose arrival offset lands past the deadline never entered the
+    // loop and contributes nothing here, which is right: they issued no
+    // requests either.
+    let active_ms = u64::try_from(turned_up_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+    tally.active_ms.fetch_add(active_ms, Ordering::Relaxed);
 }
 
 /// Pulls `position` out of a `/queue_num` body without a JSON dependency on the
@@ -768,6 +785,140 @@ mod tests {
             total,
             VISITORS * 2,
             "closed ⇒ ceiling: exactly one status poll and one refused queue_num ask per visitor"
+        );
+    }
+
+    // --- The report's denominator: time visitors were actually in the room ---
+
+    /// Runs `visitors` through the real `run()` loop for `run_secs` with the
+    /// given arrival shape and returns the cohort's total active milliseconds —
+    /// the denominator `report` divides by.
+    async fn measure_active_ms(
+        visitors: u64,
+        run_secs: u64,
+        countdown_s: u64,
+        arrival: Arrival,
+    ) -> u64 {
+        let edge = Arc::new(Edge::new(Duration::from_secs(10), run_secs));
+        let tally = Arc::new(VisitorTally::default());
+        let origin = Arc::new(|path: String| async move {
+            if path.starts_with("/v1/status") {
+                (
+                    200,
+                    r#"{"serving_state":"running","serving_position":0,"target_rate":5}"#
+                        .to_owned(),
+                )
+            } else {
+                (200, r#"{"position":100000000,"live_join":true}"#.to_owned())
+            }
+        });
+        let settings = RunSettings {
+            polling: Polling::HoldPosition,
+            spread_ms: 0,
+            countdown_ms: countdown_s * 1000,
+            arrival,
+            deadline: tokio::time::Instant::now() + Duration::from_secs(run_secs),
+            target_rate: 5,
+        };
+
+        let mut tasks = Vec::with_capacity(visitors as usize);
+        for n in 0..visitors {
+            tasks.push(tokio::spawn(run(
+                Arc::clone(&edge),
+                format!("req-{n}"),
+                n + 1,
+                settings,
+                Arc::clone(&origin),
+                Arc::clone(&tally),
+            )));
+        }
+        #[expect(
+            clippy::unwrap_used,
+            reason = "a panicked visitor task is a test bug, not an expected outcome"
+        )]
+        for task in tasks {
+            task.await.unwrap();
+        }
+        tally.active_ms.load(Ordering::Relaxed)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn with_no_countdown_every_visitor_is_active_for_the_whole_run() {
+        // Everyone turns up at t=0, so the measured denominator must match what
+        // `visitors × run length` always assumed — bar each visitor's sub-poll
+        // arrival jitter. This is the case the old formula got right, and it
+        // has to stay right.
+        const VISITORS: u64 = 20;
+        const RUN_SECS: u64 = 120;
+
+        let active = measure_active_ms(VISITORS, RUN_SECS, 0, Arrival::Uniform).await;
+
+        // Each visitor turns up within one poll interval of t=0 and leaves on
+        // the first loop check past the deadline, so their active time is the
+        // run give or take one interval either side. Nothing subtracts an
+        // arrival delay, because there is none to subtract.
+        let whole_run = VISITORS * RUN_SECS * 1000;
+        let slack = VISITORS * (POLL_MS + JITTER_MS);
+        assert!(
+            (whole_run - slack..=whole_run + slack).contains(&active),
+            "active={active} expected within one poll interval per visitor of {whole_run}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_countdown_excludes_the_time_before_each_visitor_arrives() {
+        // The bug: `report` divided by `visitors × run length` however late
+        // visitors turned up, so a run that spends half its length filling the
+        // room charged every request against ~1.5x the waiting that happened.
+        // A visitor sleeping until their arrival offset causes no origin
+        // requests, so that time is not theirs to be divided by.
+        const VISITORS: u64 = 50;
+        const RUN_SECS: u64 = 120;
+        const COUNTDOWN_S: u64 = 60;
+
+        let active = measure_active_ms(VISITORS, RUN_SECS, COUNTDOWN_S, Arrival::Uniform).await;
+
+        // Each visitor is active for `RUN_SECS - arrives_at`, and a uniform
+        // arrival lands in [0, COUNTDOWN_S], so no visitor can exceed the run
+        // and none can fall below what is left after the whole countdown.
+        let most = VISITORS * RUN_SECS * 1000;
+        let least = VISITORS * (RUN_SECS - COUNTDOWN_S) * 1000 - VISITORS * POLL_MS;
+        assert!(
+            (least..=most).contains(&active),
+            "active={active} outside the arithmetically possible {least}..={most}"
+        );
+        // A uniform mean arrival at COUNTDOWN_S/2 puts the mean active time at
+        // RUN_SECS - COUNTDOWN_S/2 = 90s. Pinning the mean is what catches the
+        // bug: the old denominator claimed 120s per visitor.
+        let mean_active_s = active / VISITORS / 1000;
+        assert!(
+            (80..=100).contains(&mean_active_s),
+            "mean active {mean_active_s}s: expected ~90s, not the run's full {RUN_SECS}s"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_late_arrival_shape_is_active_for_less_time_than_a_uniform_one() {
+        // `Arrival::Late` bunches arrivals towards the end of the countdown, so
+        // the cohort is present for less of the run and the understatement the
+        // old denominator produced was correspondingly larger. The denominator
+        // has to track the shape, not just the fact that a countdown was set.
+        const VISITORS: u64 = 50;
+        const RUN_SECS: u64 = 120;
+        const COUNTDOWN_S: u64 = 60;
+
+        let uniform = measure_active_ms(VISITORS, RUN_SECS, COUNTDOWN_S, Arrival::Uniform).await;
+        let late = measure_active_ms(VISITORS, RUN_SECS, COUNTDOWN_S, Arrival::Late).await;
+
+        // `u.powf(0.2)` puts the mean arrival around 50s of the 60s countdown
+        // against the uniform 30s, so the late cohort is present for roughly
+        // 70s of the run against 90s. A margin well outside the per-visitor
+        // overshoot jitter, so this fails if the denominator stops tracking
+        // arrivals rather than passing on a coin flip.
+        assert!(
+            late * 10 < uniform * 9,
+            "late={late} uniform={uniform}: a later-arriving cohort must wait for materially \
+             less of the run, not within jitter of the same"
         );
     }
 }
