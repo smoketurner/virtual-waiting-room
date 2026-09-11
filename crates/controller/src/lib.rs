@@ -162,9 +162,17 @@ pub fn target_release_per_interval(target_rate: u32) -> u64 {
 pub fn compute_release(inputs: ReleaseInputs, prev: Option<NoShowState>) -> ReleaseDecision {
     let arrivals_total = sum_arrivals(inputs.arrivals);
     let observed_arrivals = arrivals_total.saturating_sub(inputs.last_arrivals_total);
+    // Positions are 1-indexed and the cursor is exclusive, so the people the
+    // cursor passed last interval are `[max(last, 1), serving_counter)`.
+    // Position 0 is never issued: a cursor moving from 0 to 1 releases nobody,
+    // which is exactly what the end-of-line clamp does on an empty queue. Left
+    // in, that phantom is measured against zero arrivals as a 100% no-show and
+    // pins the smoothed rate at EWMA_ALPHA for the rest of the empty period —
+    // an over-release waiting for the moment real traffic starts. Counting only
+    // issued positions keeps this the same units as `observed_arrivals`: people.
     let released_last = inputs
         .serving_counter
-        .saturating_sub(inputs.last_serving_counter);
+        .saturating_sub(inputs.last_serving_counter.max(1));
 
     let target = target_release_per_interval(inputs.target_rate);
 
@@ -774,6 +782,92 @@ mod tests {
         let d = compute_release(i, None);
         assert_eq!(d.next_serving_counter, 1);
         assert_eq!(d.release, 0);
+    }
+
+    #[test]
+    fn the_empty_queue_cursor_move_is_not_measured_as_a_no_show() {
+        // The pass after `an_empty_queue_banks_no_admission_credit`: the clamp
+        // left the cursor at 1, so `serving_counter - last_serving_counter` is
+        // 1 — but position 0 is never issued, so nobody was released and there
+        // is nothing to measure. Measuring it against zero arrivals reads as a
+        // 100% no-show and pins the smoothed rate at EWMA_ALPHA.
+        let mut i = inputs(0, 0, 1, 0, 50);
+        i.queue_counter = 0;
+        let d = compute_release(i, None);
+        assert_eq!(
+            d.no_show.smoothed_rate.to_bits(),
+            0.0f64.to_bits(),
+            "a cursor move onto the empty-queue ceiling released nobody to measure, got {:e}",
+            d.no_show.smoothed_rate
+        );
+    }
+
+    #[test]
+    fn the_empty_queue_cursor_move_is_not_measured_once_the_queue_fills() {
+        // The same phantom, measured on the pass where the first joiners have
+        // landed: `queue_counter` is no longer 0, so anything keying off an
+        // empty queue at measurement time misses it. What makes the release
+        // phantom is which positions the cursor passed, not how long the queue
+        // is by the time the next pass reads it.
+        let mut i = inputs(0, 0, 1, 0, 50);
+        i.queue_counter = 100_000;
+        let d = compute_release(i, None);
+        assert_eq!(
+            d.no_show.smoothed_rate.to_bits(),
+            0.0f64.to_bits(),
+            "a queue that filled after the phantom does not make it measurable, got {:e}",
+            d.no_show.smoothed_rate
+        );
+        // With nothing measured the release is the operator's raw target, not
+        // the 1 / (1 - 0.3) correction the phantom would have justified.
+        assert_eq!(d.release, target_release_per_interval(50));
+    }
+
+    #[test]
+    fn an_empty_period_does_not_over_release_when_traffic_begins() {
+        // The whole arc from the bug report. An Active event sits empty, the
+        // clamp parks the cursor at 1, and the operator's rate is 50/s (500 an
+        // interval). When a cohort finally joins and every released visitor
+        // arrives, the controller must meter at the target — not carry a
+        // smoothed no-show rate banked from measuring the phantom.
+        let mut empty = inputs(0, 0, 0, 0, 50);
+        empty.queue_counter = 0;
+        let parked = compute_release(empty, None);
+        assert_eq!(parked.next_serving_counter, 1);
+
+        // The measuring pass over the phantom: still empty, nothing learned.
+        let mut measuring = inputs(0, 0, 1, 0, 50);
+        measuring.queue_counter = 0;
+        let measured = compute_release(measuring, Some(parked.no_show));
+
+        // Traffic arrives and the cursor does real work: 500 released, all 500
+        // arrived, so the observed no-show is genuinely 0.
+        let first_real = compute_release(inputs(500, 0, 501, 1, 50), Some(measured.no_show));
+        assert_eq!(
+            first_real.no_show.smoothed_rate.to_bits(),
+            0.0f64.to_bits(),
+            "the empty period banked no no-show rate to carry in, got {:e}",
+            first_real.no_show.smoothed_rate
+        );
+        assert_eq!(
+            first_real.release,
+            target_release_per_interval(50),
+            "no no-shows to compensate for: the release is the operator's target"
+        );
+    }
+
+    #[test]
+    fn the_first_real_release_counts_issued_positions_only() {
+        // A cursor advancing 0 -> 501 passes positions 0..500, but position 0
+        // was never issued, so 500 people were released. Counting 501 would
+        // read 500 arrivals as a no-show that did not happen.
+        let d = compute_release(inputs(500, 0, 501, 0, 50), None);
+        assert_eq!(
+            d.no_show.smoothed_rate.to_bits(),
+            0.0f64.to_bits(),
+            "every released visitor arrived; position 0 is not one of them, got {:e}",
+            d.no_show.smoothed_rate
+        );
     }
 
     #[test]
