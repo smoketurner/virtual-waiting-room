@@ -69,3 +69,16 @@ locals {
     waiting_path        = local.waiting_page_path
   })
 }
+
+# Guards the redirect loop the waiting.js bounce guard used to absorb: the
+# gate's refusal redirect targets waiting_page_path, and that path must fall
+# under waiting_path_pattern (the ungated behaviour) or the redirect lands on
+# the protected default behaviour instead, gets refused again, and loops.
+# waiting_path_pattern's trailing "*" is the only wildcard it uses, so
+# trimming it and checking a prefix is exact for this module's one pattern.
+check "waiting_page_reachable_without_a_credential" {
+  assert {
+    condition     = startswith(local.waiting_page_path, trimsuffix(local.waiting_path_pattern, "*"))
+    error_message = "waiting_page_path (${local.waiting_page_path}) must fall under waiting_path_pattern (${local.waiting_path_pattern}), or a visitor refused by the gate is redirected to a path the protected behaviour serves instead of the ungated one, and the refusal loops."
+  }
+}

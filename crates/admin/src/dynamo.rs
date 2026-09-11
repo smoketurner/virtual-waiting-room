@@ -213,6 +213,32 @@ impl Store for DynamoStore {
         send_guarded(req, "fail_open_until").await
     }
 
+    async fn set_rules_audit(
+        &self,
+        event_id: &str,
+        rules_digest: &str,
+        rules_count: usize,
+        actor: &str,
+        now_ms: u64,
+    ) -> Result<(), StoreError> {
+        // Unconditional, like set_fail_open_until: the ruleset itself already
+        // landed in the KeyValueStore by the time this runs, so there is
+        // nothing here to guard a race against — only the record of it.
+        let mut req = self
+            .client
+            .update_item()
+            .table_name(&self.counters_table)
+            .set_key(Some(event_key(event_id)))
+            .update_expression(
+                "SET rules_digest = :d, rules_count = :c, last_action = :a, \
+                 last_action_by = :by, last_action_at = :at, last_action_epoch_ms = :ms",
+            )
+            .expression_attribute_values(":d", AttributeValue::S(rules_digest.to_owned()))
+            .expression_attribute_values(":c", AttributeValue::N(rules_count.to_string()));
+        req = apply_audit_values(req, crate::AdminAction::SetRules, actor, now_ms);
+        send_guarded(req, "rules_audit").await
+    }
+
     async fn force_maintenance(
         &self,
         event_id: &str,

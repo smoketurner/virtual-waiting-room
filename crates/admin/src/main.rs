@@ -18,8 +18,9 @@ use admin::oidc::{self, OidcClient, OidcConfig};
 use admin::sessions::{AdminSession, PendingLogin, SessionStore};
 use admin::templates::Dashboard;
 use admin::{
-    ApplyError, apply_fail_open, apply_message, apply_pause, apply_phase, apply_rate,
-    apply_recover, apply_reset, apply_resume,
+    ApplyError, EdgeConfigStore, apply_fail_open, apply_message, apply_pause, apply_phase,
+    apply_rate, apply_recover, apply_reset, apply_resume, apply_set_rules, format_rules,
+    parse_rules,
 };
 use askama::Template;
 use axum::Form;
@@ -138,7 +139,7 @@ async fn main() -> Result<(), Error> {
         .route("/admin/resume", post(resume))
         .route("/admin/fail_open", post(fail_open))
         .route("/admin/recover", post(recover))
-        .route("/admin/rules", post(deferred))
+        .route("/admin/rules", post(set_rules))
         .route("/update_session", post(deferred))
         .route("/static/{*path}", get(static_asset))
         .with_state(state)
@@ -358,6 +359,15 @@ async fn dashboard(State(state): State<Shared>, headers: HeaderMap) -> Response 
         Ok(Some(mut view)) => {
             view.csp_nonce = admin::security::nonce();
             view.operator_email = session.email;
+            // Rules live only in the KeyValueStore (issue #71), not in
+            // ControlState, so the current ruleset is a second read. A
+            // failure here must not break the whole dashboard — the operator
+            // still needs to see phase/rate/message/admission — so it is
+            // logged and the form renders empty rather than erroring out.
+            match state.edge.read_config().await {
+                Ok(cfg) => view.rules_text = format_rules(&cfg.rules),
+                Err(e) => tracing::warn!(error = %e, "could not read the current ruleset"),
+            }
             match view.render() {
                 Ok(html) => {
                     let mut response = Html(html).into_response();
@@ -524,6 +534,44 @@ async fn recover(State(state): State<Shared>, headers: HeaderMap) -> Response {
             &state.store,
             &state.edge,
             &state.event_id,
+            &session.email,
+            now_ms(),
+        )
+        .await,
+    )
+}
+
+#[derive(Deserialize)]
+struct RulesForm {
+    rules: String,
+}
+
+/// Replaces the edge gate's ruleset (issue #71). One rule per line, in the
+/// same tag vocabulary as the `KeyValueStore` wire form: `p <prefix>`,
+/// `c <name>`, `u <substring>`, `h <name> <value>`. Blank lines and lines
+/// starting with `#` are ignored, so an operator can leave the form
+/// human-readable. Validation (per-field bounds, rule count, byte ceiling) is
+/// `apply_set_rules`'s job; a parse failure here is reported the same way —
+/// a plain-text 400 naming exactly what was wrong, so it works with
+/// JavaScript disabled.
+async fn set_rules(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Form(form): Form<RulesForm>,
+) -> Response {
+    let Some(session) = authed(&state, &headers).await else {
+        return Redirect::to("/admin/login").into_response();
+    };
+    let rules = match parse_rules(&form.rules) {
+        Ok(rules) => rules,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    finish(
+        apply_set_rules(
+            &state.store,
+            &state.edge,
+            &state.event_id,
+            rules,
             &session.email,
             now_ms(),
         )

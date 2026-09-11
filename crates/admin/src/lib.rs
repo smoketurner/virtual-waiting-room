@@ -5,7 +5,7 @@
 
 use std::future::Future;
 
-use wr_common::{IllegalControl, Phase, ProtectionRule, StoredControl};
+use wr_common::{IllegalControl, Phase, ProtectionRule, RuleFieldError, StoredControl};
 
 pub mod dynamo;
 pub mod edge;
@@ -21,11 +21,15 @@ pub const MAX_FAIL_OPEN_MINUTES: u32 = 1440;
 
 /// The gate's `KeyValueStore` config document (`c`), issue #71. `v` is a schema
 /// version the gate refuses to run against if it does not recognise it;
-/// `enforce_from` and `rules` are written by Terraform and by a future
-/// rules-editing action, neither of which this crate writes yet, so they are
-/// carried through read-modify-write unchanged by every write this crate does
-/// perform. `fail_open_until` mirrors `Counters.fail_open_until` and is the
-/// only field an admin action here mutates.
+/// `enforce_from` is written by Terraform and carried through read-modify-write
+/// unchanged by every action this crate performs. `rules` is authoritative
+/// here — the `KeyValueStore`, not `Counters`, is where a ruleset lives; storing
+/// a second copy in `DynamoDB` would let an operator save a rule `DynamoDB`
+/// accepts (400 KB) that the `KeyValueStore` refuses (950 B): saved, but never
+/// received by the gate, with nothing to say so. One store means nothing can
+/// diverge. `fail_open_until` mirrors `Counters.fail_open_until`, which is a different
+/// fact from a second copy: the epoch self-resolves on both sides, so there is
+/// nothing to reconcile.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct GateConfig {
     pub v: u8,
@@ -42,7 +46,12 @@ pub struct GateConfig {
 /// 35 so a ruleset this crate encodes never risks the edge, and enforced by
 /// the writer rather than merely documented (ADR-0021 §6).
 pub const MAX_RULES: usize = 35;
-const MAX_CONFIG_BYTES: usize = 1024;
+/// 950, not the store's documented 1,024: the `KeyValueStore` API accounts in
+/// bytes (`PutKey` returns `TotalSizeInBytes`, worth logging once this runs
+/// for real) and the documented examples show roughly a byte of per-pair
+/// overhead beyond key plus value length, so this margin is evidenced rather
+/// than superstition.
+const MAX_CONFIG_BYTES: usize = 950;
 
 /// Why a [`GateConfig`] could not be encoded for the edge.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -53,18 +62,24 @@ pub enum GateConfigError {
     TooLarge { actual: usize, max: usize },
     #[error("could not serialize the config: {0}")]
     Serialize(String),
+    #[error(transparent)]
+    Field(#[from] RuleFieldError),
 }
 
-/// Encodes a [`GateConfig`] to the compact JSON the gate reads, enforcing the
-/// rule-count and byte ceilings so an oversized document never reaches the
-/// edge writer. AWS-free — this is the risky part of the writer, so it is
+/// Encodes a [`GateConfig`] to the compact JSON the gate reads, enforcing
+/// per-field input bounds, the rule-count ceiling, and the byte ceiling so an
+/// invalid or oversized document never reaches the edge writer. This is the
+/// single function that returns the exact string a caller is about to
+/// `PutKey` — there is deliberately no other path that validates one thing
+/// and writes another. AWS-free — the risky part of the writer, so it is
 /// tested (and runs) in every build, including one built without AWS SDK
 /// features enabled.
 ///
 /// # Errors
 ///
-/// [`GateConfigError`] if the ruleset or the encoded document is too large,
-/// or if serialization itself fails (unreachable for this shape in practice).
+/// [`GateConfigError`] if a rule field fails input validation, the ruleset or
+/// the encoded document is too large, or serialization itself fails
+/// (unreachable for this shape in practice).
 pub fn encode_gate_config(cfg: &GateConfig) -> Result<String, GateConfigError> {
     if cfg.rules.len() > MAX_RULES {
         return Err(GateConfigError::TooManyRules {
@@ -72,6 +87,7 @@ pub fn encode_gate_config(cfg: &GateConfig) -> Result<String, GateConfigError> {
             max: MAX_RULES,
         });
     }
+    wr_common::validate_rule_fields(&cfg.rules)?;
     let json = serde_json::to_string(cfg).map_err(|e| GateConfigError::Serialize(e.to_string()))?;
     if json.len() > MAX_CONFIG_BYTES {
         return Err(GateConfigError::TooLarge {
@@ -180,6 +196,23 @@ pub trait Store {
         now_ms: u64,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
+    /// Stamps the audit fields for a ruleset change (issue #71), plus
+    /// `rules_digest` (first 16 hex characters of SHA-256 over the encoded
+    /// `KeyValueStore` value) and `rules_count`. Unconditional, and called
+    /// *after* the `KeyValueStore` write lands — the `KeyValueStore` is
+    /// authoritative for the ruleset itself, so this record only ever
+    /// describes a change that actually happened; nothing reads it back to
+    /// make a decision, so a failure here is logged and swallowed rather than
+    /// failing the operator's action.
+    fn set_rules_audit(
+        &self,
+        event_id: &str,
+        rules_digest: &str,
+        rules_count: usize,
+        actor: &str,
+        now_ms: u64,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
     /// Forces the maintenance phase, guarded on the expected current phase and
     /// stamping audit. NOT debounced — the emergency full-stop must always apply.
     fn force_maintenance(
@@ -249,6 +282,10 @@ pub enum AdminAction {
     /// clears `fail_open_until`, so an operator who queued a pause during the
     /// window lands in `Paused`, not `Open`.
     Recover,
+    /// Replaces the edge gate's ruleset (issue #71). The ruleset itself lives
+    /// only in the `KeyValueStore` — this label and the audit fields it stamps
+    /// on `Counters` are what makes the change visible on the dashboard.
+    SetRules,
 }
 
 impl AdminAction {
@@ -264,6 +301,7 @@ impl AdminAction {
             Self::SetPhase => "set_phase",
             Self::FailOpen => "fail_open",
             Self::Recover => "recover",
+            Self::SetRules => "set_rules",
         }
     }
 }
@@ -298,6 +336,11 @@ pub enum ActionError {
     /// exceeds [`MAX_FAIL_OPEN_MINUTES`].
     #[error("invalid fail-open duration")]
     InvalidDuration,
+    /// The submitted ruleset failed input validation, was too large to
+    /// encode, or a line could not be parsed as a rule. Carries the exact
+    /// reason so the form can be re-shown with it.
+    #[error("invalid rules: {0}")]
+    InvalidRules(String),
     /// A control-plane mutation arrived within the debounce window (ADR-0017
     /// defensive controls) — a double-click or fast toggle.
     #[error("action rejected: too soon after the previous change")]
@@ -563,7 +606,7 @@ where
 /// fail-open are orthogonal, so a paused event can still be fail-opened.
 /// Writes the edge's `KeyValueStore` mirror first: a crash between the two
 /// writes then leaves the edge open with the machinery still minting and
-/// counting, whereas DynamoDB-first would stop `generate_token` while the
+/// counting, whereas `DynamoDB`-first would stop `generate_token` while the
 /// edge still enforced (ADR-0021 §4.2).
 ///
 /// # Errors
@@ -640,6 +683,145 @@ pub async fn apply_recover<S: Store, E: EdgeConfigStore>(
     Ok(())
 }
 
+/// Replaces the edge gate's ruleset (issue #71). The `KeyValueStore` is the
+/// sole store for `rules` — this reads the current config, keeps
+/// `enforce_from` and `fail_open_until` exactly as they were, replaces only
+/// `rules`, and validates the whole document through [`encode_gate_config`]
+/// before writing anything, so a rejected ruleset never partially lands.
+///
+/// Write order: the `KeyValueStore` first, then the audit stamp — the store
+/// is authoritative, so the record only ever describes a change that
+/// actually happened.
+///
+/// # Errors
+///
+/// [`ActionError::InvalidRules`] if a field fails validation or the encoded
+/// document is too large; [`ActionError::NotFound`] if the event is missing;
+/// store and edge-store errors otherwise.
+pub async fn apply_set_rules<S: Store, E: EdgeConfigStore>(
+    store: &S,
+    edge: &E,
+    event_id: &str,
+    rules: Vec<ProtectionRule>,
+    actor: &str,
+    now_ms: u64,
+) -> Result<(), ApplyError> {
+    if store.load(event_id).await?.is_none() {
+        return Err(ActionError::NotFound.into());
+    }
+
+    let mut cfg = edge
+        .read_config()
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+    cfg.rules = rules;
+    let encoded = encode_gate_config(&cfg).map_err(|e| ActionError::InvalidRules(e.to_string()))?;
+
+    edge.write_config(&cfg)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+
+    let digest = rules_digest(&encoded);
+    if let Err(e) = store
+        .set_rules_audit(event_id, &digest, cfg.rules.len(), actor, now_ms)
+        .await
+    {
+        // Non-fatal: the KeyValueStore write already landed and is what the
+        // gate reads. A missed audit stamp costs the dashboard's "last
+        // changed by X at T" line, not correctness.
+        tracing::error!(
+            error = %e,
+            event = "rules_audit_failed",
+            "ruleset was written but the audit stamp failed"
+        );
+    }
+    Ok(())
+}
+
+/// The first 16 hex characters of SHA-256 over the exact string that was
+/// `PutKey`'d, for the audit trail's `rules_digest` field.
+fn rules_digest(encoded: &str) -> String {
+    use aws_lc_rs::digest::{SHA256, digest};
+    let hash = digest(&SHA256, encoded.as_bytes());
+    hash.as_ref()[..8]
+        .iter()
+        .fold(String::with_capacity(16), |mut out, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
+}
+
+/// Parses the operator-facing ruleset form, one rule per line: `p <prefix>`,
+/// `c <name>`, `u <substring>`, `h <name> <value>`. Blank lines and lines
+/// starting with `#` are ignored, so an operator can leave the form
+/// human-readable. Field-level and count/size validation is
+/// [`apply_set_rules`]'s job via [`encode_gate_config`]; this only turns text
+/// into rules or names the line that would not parse.
+///
+/// # Errors
+///
+/// A message naming the offending line (1-indexed as the operator sees it)
+/// and why it did not parse.
+pub fn parse_rules(text: &str) -> Result<Vec<ProtectionRule>, String> {
+    let mut rules = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((tag, rest)) = line.split_once(char::is_whitespace) else {
+            return Err(format!(
+                "line {}: expected \"<tag> <value...>\", got {line:?}",
+                i + 1
+            ));
+        };
+        let rest = rest.trim();
+        let rule = match tag {
+            "p" => ProtectionRule::PathPrefix(rest.to_owned()),
+            "c" => ProtectionRule::Cookie(rest.to_owned()),
+            "u" => ProtectionRule::UserAgent(rest.to_owned()),
+            "h" => {
+                let Some((name, value)) = rest.split_once(char::is_whitespace) else {
+                    return Err(format!(
+                        "line {}: \"h\" needs a name and a value, got {rest:?}",
+                        i + 1
+                    ));
+                };
+                ProtectionRule::Header {
+                    name: name.to_owned(),
+                    value: value.trim().to_owned(),
+                }
+            }
+            other => {
+                return Err(format!(
+                    "line {}: unknown rule tag {other:?} (expected p, c, u, or h)",
+                    i + 1
+                ));
+            }
+        };
+        rules.push(rule);
+    }
+    Ok(rules)
+}
+
+/// The inverse of [`parse_rules`], for pre-filling the form with the current
+/// ruleset.
+#[must_use]
+pub fn format_rules(rules: &[ProtectionRule]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for rule in rules {
+        let _ = match rule {
+            ProtectionRule::PathPrefix(p) => writeln!(out, "p {p}"),
+            ProtectionRule::Cookie(name) => writeln!(out, "c {name}"),
+            ProtectionRule::UserAgent(ua) => writeln!(out, "u {ua}"),
+            ProtectionRule::Header { name, value } => writeln!(out, "h {name} {value}"),
+        };
+    }
+    out
+}
+
 /// Sets the operator broadcast message (debounced, audit-stamped).
 ///
 /// # Errors
@@ -693,6 +875,8 @@ mod tests {
         last_action_by: Mutex<Option<String>>,
         last_action_at: Mutex<Option<String>>,
         last_epoch: Mutex<Option<u64>>,
+        /// The most recent `set_rules_audit` call's digest + count, if any.
+        rules_audit: Mutex<Option<(String, usize)>>,
         missing: bool,
         /// When set, the next guarded write reports a lost race.
         conflict: bool,
@@ -711,6 +895,7 @@ mod tests {
                 last_action_by: Mutex::new(None),
                 last_action_at: Mutex::new(None),
                 last_epoch: Mutex::new(None),
+                rules_audit: Mutex::new(None),
                 missing: false,
                 conflict: false,
             }
@@ -884,6 +1069,24 @@ mod tests {
             } else {
                 *self.fail_open_until.lock().unwrap() = until;
                 self.stamp_audit(action, actor, now_ms);
+                Ok(())
+            };
+            std::future::ready(result)
+        }
+
+        fn set_rules_audit(
+            &self,
+            _event_id: &str,
+            rules_digest: &str,
+            rules_count: usize,
+            actor: &str,
+            now_ms: u64,
+        ) -> impl Future<Output = Result<(), StoreError>> + Send {
+            let result = if self.conflict {
+                Err(StoreError::Conflict)
+            } else {
+                *self.rules_audit.lock().unwrap() = Some((rules_digest.to_owned(), rules_count));
+                self.stamp_audit(AdminAction::SetRules, actor, now_ms);
                 Ok(())
             };
             std::future::ready(result)
@@ -1471,6 +1674,194 @@ mod tests {
             apply_recover(&store, &edge, "evt", "op@x", 0).await,
             Err(ApplyError::Action(ActionError::NotFound))
         ));
+    }
+
+    // --- set_rules (issue #71) --------------------------------------------
+
+    #[tokio::test]
+    async fn set_rules_writes_the_edge_and_then_the_audit_record() {
+        let store = FakeStore::with_phase(Phase::Active);
+        let edge = FakeEdgeStore::default();
+        let rules = vec![
+            ProtectionRule::PathPrefix("/checkout".to_owned()),
+            ProtectionRule::Cookie("loyalty_member".to_owned()),
+        ];
+        apply_set_rules(&store, &edge, "evt", rules.clone(), "op@x", 1000)
+            .await
+            .unwrap();
+        assert_eq!(edge.cfg.lock().unwrap().rules, rules);
+        let (digest, count) = store.rules_audit.lock().unwrap().clone().unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(digest.len(), 16, "digest must be the 16-hex-char prefix");
+        assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[tokio::test]
+    async fn set_rules_preserves_enforce_from_and_fail_open_until() {
+        // The KeyValueStore write is a read-modify-write of the whole
+        // document: a ruleset change must not clobber fields it does not own.
+        let store = FakeStore::with_phase(Phase::Active);
+        let edge = FakeEdgeStore::default();
+        edge.cfg.lock().unwrap().enforce_from = 42;
+        edge.cfg.lock().unwrap().fail_open_until = 99;
+        apply_set_rules(
+            &store,
+            &edge,
+            "evt",
+            vec![ProtectionRule::PathPrefix("/x".to_owned())],
+            "op@x",
+            0,
+        )
+        .await
+        .unwrap();
+        let cfg = edge.cfg.lock().unwrap();
+        assert_eq!(cfg.enforce_from, 42);
+        assert_eq!(cfg.fail_open_until, 99);
+    }
+
+    #[tokio::test]
+    async fn set_rules_rejects_an_invalid_field_before_writing_anything() {
+        let store = FakeStore::with_phase(Phase::Active);
+        let edge = FakeEdgeStore::default();
+        let bad = vec![ProtectionRule::Cookie("bad\nname".to_owned())];
+        let err = apply_set_rules(&store, &edge, "evt", bad, "op@x", 0)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ApplyError::Action(ActionError::InvalidRules(_))
+        ));
+        // Nothing written: the store's config is still the default empty one.
+        assert!(edge.cfg.lock().unwrap().rules.is_empty());
+        assert!(store.rules_audit.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn set_rules_rejects_too_many_rules() {
+        let store = FakeStore::with_phase(Phase::Active);
+        let edge = FakeEdgeStore::default();
+        let too_many: Vec<ProtectionRule> = (0..=MAX_RULES)
+            .map(|i| ProtectionRule::PathPrefix(format!("/p{i}")))
+            .collect();
+        let err = apply_set_rules(&store, &edge, "evt", too_many, "op@x", 0)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ApplyError::Action(ActionError::InvalidRules(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn set_rules_on_missing_event_is_not_found() {
+        let store = FakeStore {
+            missing: true,
+            ..Default::default()
+        };
+        let edge = FakeEdgeStore::default();
+        assert!(matches!(
+            apply_set_rules(&store, &edge, "evt", vec![], "op@x", 0).await,
+            Err(ApplyError::Action(ActionError::NotFound))
+        ));
+    }
+
+    #[tokio::test]
+    async fn set_rules_accepts_an_empty_ruleset_dormancy() {
+        // [] is dormancy (#60): the operator must be able to clear a ruleset
+        // back to passing everything through.
+        let store = FakeStore::with_phase(Phase::Active);
+        let edge = FakeEdgeStore::default();
+        edge.cfg.lock().unwrap().rules = vec![ProtectionRule::PathPrefix("/x".to_owned())];
+        apply_set_rules(&store, &edge, "evt", vec![], "op@x", 0)
+            .await
+            .unwrap();
+        assert!(edge.cfg.lock().unwrap().rules.is_empty());
+    }
+
+    // --- rules form parsing (issue #71) -----------------------------------
+
+    #[test]
+    fn parse_rules_reads_every_tag() {
+        let text = "p /checkout\nc loyalty_member\nu HeadlessChrome\nh x-internal-monitor true\n";
+        let rules = parse_rules(text).unwrap();
+        assert_eq!(
+            rules,
+            vec![
+                ProtectionRule::PathPrefix("/checkout".to_owned()),
+                ProtectionRule::Cookie("loyalty_member".to_owned()),
+                ProtectionRule::UserAgent("HeadlessChrome".to_owned()),
+                ProtectionRule::Header {
+                    name: "x-internal-monitor".to_owned(),
+                    value: "true".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_rules_skips_blank_lines_and_comments() {
+        let text = "\n# a comment\np /checkout\n\n";
+        assert_eq!(
+            parse_rules(text).unwrap(),
+            vec![ProtectionRule::PathPrefix("/checkout".to_owned())]
+        );
+    }
+
+    #[test]
+    fn parse_rules_header_value_may_contain_spaces() {
+        let rules = parse_rules("h user-agent some bot 1.0").unwrap();
+        assert_eq!(
+            rules,
+            vec![ProtectionRule::Header {
+                name: "user-agent".to_owned(),
+                value: "some bot 1.0".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_rules_rejects_an_unknown_tag_naming_the_line() {
+        let err = parse_rules("p /ok\nz bogus").unwrap_err();
+        assert!(err.contains("line 2"), "{err}");
+        assert!(err.contains('z'), "{err}");
+    }
+
+    #[test]
+    fn parse_rules_rejects_a_header_missing_its_value() {
+        let err = parse_rules("h x-only-a-name").unwrap_err();
+        assert!(err.contains("line 1"), "{err}");
+    }
+
+    #[test]
+    fn parse_rules_rejects_a_tag_with_no_value() {
+        let err = parse_rules("p").unwrap_err();
+        assert!(err.contains("line 1"), "{err}");
+    }
+
+    #[test]
+    fn parse_rules_of_an_empty_string_is_an_empty_dormant_ruleset() {
+        assert_eq!(parse_rules("").unwrap(), Vec::new());
+        assert_eq!(parse_rules("\n\n  \n").unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn format_rules_round_trips_through_parse_rules() {
+        let rules = vec![
+            ProtectionRule::PathPrefix("/checkout".to_owned()),
+            ProtectionRule::Cookie("loyalty_member".to_owned()),
+            ProtectionRule::UserAgent("HeadlessChrome".to_owned()),
+            ProtectionRule::Header {
+                name: "x-internal-monitor".to_owned(),
+                value: "true".to_owned(),
+            },
+        ];
+        let text = format_rules(&rules);
+        assert_eq!(parse_rules(&text).unwrap(), rules);
+    }
+
+    #[test]
+    fn format_rules_of_an_empty_slice_is_an_empty_string() {
+        assert_eq!(format_rules(&[]), "");
     }
 
     // --- gate config encoding --------------------------------------------

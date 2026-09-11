@@ -60,6 +60,91 @@ pub fn matches_any<R: RequestView + ?Sized>(rules: &[ProtectionRule], req: &R) -
     rules.iter().any(|r| r.matches(req))
 }
 
+/// Per-field byte caps on rule input (issue #71): sized so one worst-case
+/// rule costs about a fifth of the `KeyValueStore`'s value budget rather than
+/// all of it, while a realistic ruleset still reaches roughly 40 rules.
+pub const MAX_PATH_PREFIX_BYTES: usize = 128;
+pub const MAX_HEADER_NAME_BYTES: usize = 64;
+pub const MAX_HEADER_VALUE_BYTES: usize = 128;
+pub const MAX_COOKIE_NAME_BYTES: usize = 64;
+pub const MAX_USER_AGENT_BYTES: usize = 64;
+
+/// A rule field that failed input validation. Named by rule index and field,
+/// not just "rule N is invalid", so the admin can point the operator at the
+/// exact box to fix.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RuleFieldError {
+    #[error("rule {rule_index}: {field} is {actual} bytes, over the {limit}-byte limit")]
+    TooLong {
+        rule_index: usize,
+        field: &'static str,
+        limit: usize,
+        actual: usize,
+    },
+    /// Anything outside printable ASCII `0x20..=0x7E`: rejects newlines and
+    /// control characters that could break the `KeyValueStore` JSON or the
+    /// gate's parse, and — since one byte is one character under ASCII —
+    /// makes the bytes-vs-characters ambiguity in AWS's docs moot. It also
+    /// closes the `eq_ignore_ascii_case` (Rust) vs `toLowerCase()` (JS)
+    /// case-folding divergence: the two agree exactly on ASCII input.
+    #[error("rule {rule_index}: {field} contains a non-printable-ASCII byte")]
+    NotAscii {
+        rule_index: usize,
+        field: &'static str,
+    },
+}
+
+fn check_field(
+    rule_index: usize,
+    field: &'static str,
+    value: &str,
+    limit: usize,
+) -> Result<(), RuleFieldError> {
+    if !value.bytes().all(|b| (0x20..=0x7E).contains(&b)) {
+        return Err(RuleFieldError::NotAscii { rule_index, field });
+    }
+    if value.len() > limit {
+        return Err(RuleFieldError::TooLong {
+            rule_index,
+            field,
+            limit,
+            actual: value.len(),
+        });
+    }
+    Ok(())
+}
+
+/// Validates every rule's fields against the per-field bounds above. Shared
+/// by the admin input boundary and the edge-config encoder so the two never
+/// disagree about what is acceptable — the authorizer's env-parsed rules are
+/// deliberately out of scope (a Terraform variable set by an engineer is not
+/// the untrusted boundary this exists for, and it has no JavaScript evaluator
+/// for the case-folding divergence to arise in).
+///
+/// # Errors
+///
+/// The first [`RuleFieldError`] encountered, in rule order.
+pub fn validate_rule_fields(rules: &[ProtectionRule]) -> Result<(), RuleFieldError> {
+    for (i, rule) in rules.iter().enumerate() {
+        match rule {
+            ProtectionRule::PathPrefix(p) => {
+                check_field(i, "path prefix", p, MAX_PATH_PREFIX_BYTES)?;
+            }
+            ProtectionRule::Cookie(name) => {
+                check_field(i, "cookie name", name, MAX_COOKIE_NAME_BYTES)?;
+            }
+            ProtectionRule::UserAgent(ua) => {
+                check_field(i, "user agent substring", ua, MAX_USER_AGENT_BYTES)?;
+            }
+            ProtectionRule::Header { name, value } => {
+                check_field(i, "header name", name, MAX_HEADER_NAME_BYTES)?;
+                check_field(i, "header value", value, MAX_HEADER_VALUE_BYTES)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The compact tuple wire form the 1 KB `KeyValueStore` value ceiling requires:
 /// `["p",prefix]` | `["c",name]` | `["u",substring]` | `["h",name,value]`. The
 /// derived struct/enum form (`{"PathPrefix":"/checkout"}`) runs 30-45 bytes a
@@ -242,5 +327,97 @@ mod tests {
     fn an_unknown_tag_is_rejected_not_defaulted() {
         assert!(serde_json::from_str::<ProtectionRule>(r#"["z","x"]"#).is_err());
         assert!(serde_json::from_str::<ProtectionRule>(r#"["z","x","y"]"#).is_err());
+    }
+
+    #[test]
+    fn validate_rule_fields_accepts_a_well_formed_ruleset() {
+        let rules = vec![
+            ProtectionRule::PathPrefix("/checkout".to_owned()),
+            ProtectionRule::Header {
+                name: "x-internal-monitor".to_owned(),
+                value: "true".to_owned(),
+            },
+            ProtectionRule::Cookie("loyalty_member".to_owned()),
+            ProtectionRule::UserAgent("HeadlessChrome".to_owned()),
+        ];
+        assert_eq!(validate_rule_fields(&rules), Ok(()));
+    }
+
+    #[test]
+    fn validate_rule_fields_rejects_a_field_over_its_limit() {
+        let rules = vec![ProtectionRule::PathPrefix(
+            "/".repeat(MAX_PATH_PREFIX_BYTES + 1),
+        )];
+        assert_eq!(
+            validate_rule_fields(&rules),
+            Err(RuleFieldError::TooLong {
+                rule_index: 0,
+                field: "path prefix",
+                limit: MAX_PATH_PREFIX_BYTES,
+                actual: MAX_PATH_PREFIX_BYTES + 1,
+            })
+        );
+    }
+
+    #[test]
+    fn validate_rule_fields_accepts_exactly_the_limit() {
+        let rules = vec![ProtectionRule::Cookie("a".repeat(MAX_COOKIE_NAME_BYTES))];
+        assert_eq!(validate_rule_fields(&rules), Ok(()));
+    }
+
+    #[test]
+    fn validate_rule_fields_rejects_a_newline() {
+        let rules = vec![ProtectionRule::UserAgent("bad\nbot".to_owned())];
+        assert_eq!(
+            validate_rule_fields(&rules),
+            Err(RuleFieldError::NotAscii {
+                rule_index: 0,
+                field: "user agent substring",
+            })
+        );
+    }
+
+    #[test]
+    fn validate_rule_fields_rejects_non_ascii() {
+        let rules = vec![ProtectionRule::Cookie("café".to_owned())];
+        assert_eq!(
+            validate_rule_fields(&rules),
+            Err(RuleFieldError::NotAscii {
+                rule_index: 0,
+                field: "cookie name",
+            })
+        );
+    }
+
+    #[test]
+    fn validate_rule_fields_checks_both_header_fields() {
+        let long_value = "v".repeat(MAX_HEADER_VALUE_BYTES + 1);
+        let rules = vec![ProtectionRule::Header {
+            name: "x-ok".to_owned(),
+            value: long_value,
+        }];
+        assert!(matches!(
+            validate_rule_fields(&rules),
+            Err(RuleFieldError::TooLong {
+                field: "header value",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn validate_rule_fields_reports_the_first_offending_rule_in_order() {
+        let rules = vec![
+            ProtectionRule::PathPrefix("/ok".to_owned()),
+            ProtectionRule::Cookie("bad\t".to_owned()),
+            ProtectionRule::PathPrefix("/also-fine".to_owned()),
+        ];
+        assert_eq!(
+            validate_rule_fields(&rules),
+            Err(RuleFieldError::NotAscii {
+                rule_index: 1,
+                field: "cookie name",
+            })
+        );
     }
 }

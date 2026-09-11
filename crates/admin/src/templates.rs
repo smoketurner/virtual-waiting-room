@@ -68,6 +68,13 @@ pub struct Dashboard {
     /// state view (the poller endpoint reuses this struct).
     #[serde(skip)]
     pub csp_nonce: String,
+    /// The current edge-gate ruleset (issue #71), one line per rule, for
+    /// pre-filling the rules form. Read from the `KeyValueStore` separately
+    /// from `ControlState` (rules live only there), so it defaults empty
+    /// here and is set by the handler after `from_state`, the same way
+    /// `operator_email` and `csp_nonce` are. Not part of the JSON state view.
+    #[serde(skip)]
+    pub rules_text: String,
 }
 
 impl Dashboard {
@@ -118,6 +125,7 @@ impl Dashboard {
             },
             csp_nonce: String::new(),
             operator_email: String::new(),
+            rules_text: String::new(),
         }
     }
 }

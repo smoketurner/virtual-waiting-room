@@ -171,11 +171,35 @@
       </div>
     </section>
 
+    <!-- Edge gate protection rules (issue #71) -->
+    <section class="card span-2">
+      <div class="card-header">
+        <h2>Protection rules</h2>
+        <p class="sub">Which requests the edge gate covers. One rule per line; empty (no lines) means dormant — every request passes through untouched.</p>
+      </div>
+      <div class="card-body">
+        <form method="post" action="/admin/rules">
+          <div class="form-field">
+            <label for="rules">Rules</label>
+            <textarea id="rules" name="rules" rows="6" title="One rule per line: p &lt;path prefix&gt;, c &lt;cookie name&gt;, u &lt;user agent substring&gt;, or h &lt;header name&gt; &lt;header value&gt;.">{{ rules_text }}</textarea>
+            <span class="help">
+              <code>p /checkout</code> path prefix &middot;
+              <code>c loyalty_member</code> cookie present &middot;
+              <code>u HeadlessChrome</code> user agent contains &middot;
+              <code>h x-internal-monitor true</code> header equals (case-insensitive).
+              Lines starting with <code>#</code> are ignored. Replaces the whole ruleset on submit.
+            </span>
+          </div>
+          <button type="submit" title="Replace the edge gate's ruleset with what is in the box above.">Set rules</button>
+        </form>
+      </div>
+    </section>
+
     <!-- Deferred plane -->
     <section class="card">
-      <div class="card-header"><h2>Protection rules · sessions</h2></div>
+      <div class="card-header"><h2>Sessions</h2></div>
       <div class="card-body">
-        <p class="deferred">Not yet available. The authorizer and session plane ship after the MVP.</p>
+        <p class="deferred">Not yet available. The session-management plane ships after the MVP.</p>
       </div>
     </section>
   </div>

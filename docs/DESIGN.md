@@ -586,7 +586,7 @@ serves the previous value if the origin is slow.
 | `/admin/resume` | Resume admissions, restoring the configured rate |
 | `/admin/fail_open` | Engage the fail-open break-glass epoch for a given duration (issue #71) |
 | `/admin/recover` | Clear the fail-open epoch — not "resume": a queued pause still applies once it clears |
-| `/admin/rules` | Update protection rules — **not built**: the edge gate's ruleset and `enforce_from` are written directly to the KeyValueStore today |
+| `/admin/rules` | Replaces the edge gate's ruleset, one rule per line. Written directly to the KeyValueStore — it is the sole store for `rules`, never DynamoDB — with an audit record (`rules_digest`, `rules_count`) stamped on `Counters` after the write lands. `enforce_from` is still Terraform-only. |
 | `/metrics` | Event metrics as JSON |
 | `/update_session` | Report session completion or abandonment |
 
