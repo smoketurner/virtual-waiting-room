@@ -6,6 +6,7 @@ members = [
     "crates/authorizer",
     "crates/controller",
     "crates/generate_token",
+    "crates/harness",
     "crates/read",
     "crates/seal_event",
     "crates/wr-common",

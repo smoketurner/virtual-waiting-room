@@ -1,0 +1,24 @@
+[package]
+name = "harness"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "harness"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true, features = ["std"] }
+reqwest = { workspace = true, features = ["json", "rustls-tls"] }
+serde_json = { workspace = true, features = ["std"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync"] }
+
+[lints.clippy]
+# The measurements are this tool's whole output and they are read by a person at
+# a terminal, not shipped to a log aggregator. Everything else in the workspace
+# denies stdout because it runs in Lambda, where an unstructured line is noise.
+print_stdout = "allow"

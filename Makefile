@@ -55,7 +55,14 @@ CONTROLLER_ARTIFACT := $(ARTIFACTS)/controller/bootstrap/bootstrap.zip
 AUTHORIZER_ARTIFACT := $(ARTIFACTS)/authorizer/bootstrap/bootstrap.zip
 TOKEN_ARTIFACT      := $(ARTIFACTS)/generate_token/bootstrap/bootstrap.zip
 
-.PHONY: help build init plan apply destroy fmt validate clean
+# Local load generation. `harness` is a development tool, not a Lambda, so it is
+# deliberately absent from LAMBDA_CRATES and never packaged. Override on the
+# command line: make load VISITORS=2000 POLLING=every-tick
+VISITORS := 500
+SECONDS  := 30
+POLLING  := hold-position
+
+.PHONY: help build init plan apply destroy fmt validate clean load
 
 help: ## Show this help.
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -89,3 +96,6 @@ validate: build init ## Build the Lambdas then terraform validate the dev root.
 
 clean: ## Remove staged Lambda artifacts.
 	rm -rf -- $(ARTIFACTS)
+
+load: ## Generate waiting-room load locally and report origin requests per visitor.
+	cargo run -q -p harness -- --visitors $(VISITORS) --seconds $(SECONDS) --polling $(POLLING)
