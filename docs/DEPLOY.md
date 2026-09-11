@@ -149,18 +149,21 @@ AWS_PROFILE=dev-admin uv run scripts/smoke_test.py
 
 ## The edge gate's signing secret (issue #71)
 
-The admission gate is a CloudFront Function that verifies session cookies with a per-deployment
-HMAC key. **There is no bootstrap step.** Terraform generates the key with `random_bytes` at apply
-and writes it to both of its homes — the SSM SecureString `/<name_prefix>/signing-key` that
-`generate_token` reads, and the CloudFront KeyValueStore key `k` that the gate reads. One value
-from one source, so the two cannot disagree.
+The gate verifies session cookies with a per-deployment HMAC key. There is no bootstrap step.
+`random_bytes` generates the key during `make apply`. Terraform writes that one value to two
+places: the SSM SecureString `/<name_prefix>/signing-key`, which `generate_token` reads, and the
+KeyValueStore key `k`, which the gate reads. The two cannot diverge because both come from the
+same resource.
 
-The key is in Terraform state, which the S3 backend encrypts. The admin OIDC client secret is
-different: the identity provider issues it, so Terraform creates a placeholder under
-`ignore_changes` and it is written out of band.
+The key is stored in Terraform state. The S3 backend encrypts it.
 
-Changing the key — a `terraform taint` on `random_bytes.signing_key`, or anything else forcing it
-to regenerate — invalidates every live session immediately. Do it between events, not during one.
+The admin OIDC client secret works differently. The identity provider issues it, so Terraform
+creates a placeholder under `ignore_changes` and an operator writes the real value out of band.
+
+Regenerating the key invalidates every session cookie already issued. The gate refuses those
+visitors with `x-wr-reason=signature` and redirects them to the waiting page. Visitors whose
+positions the controller has expired cannot rejoin. The deployment accepts one key at a time, so
+there is no overlap period. Regenerate only before an event opens.
 
 ### Choosing `SESSION_TTL_SECS`
 

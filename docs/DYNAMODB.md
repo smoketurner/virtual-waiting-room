@@ -290,10 +290,11 @@ so two Lambdas cannot interpret one stored row two different ways.
 The same discipline applies to `serving_state`, which `/v1/status` publishes: it is derived from
 `(phase, admission_control)` on every read and never stored.
 
-Fail-open follows the same rule. `admission_control` stores what an operator chose — `open` or
-`paused` — and `fail_open_until` stores when the break-glass window ends. The three-valued control
-every consumer matches on is `resolve(stored, until, now)`, computed per read, so a fail-open
-window cannot be in force on one side of the system and lapsed on the other.
+Fail-open follows the same rule. `admission_control` stores what the operator chose: `open` or
+`paused`. `fail_open_until` stores when the break-glass window ends. Callers match on the
+three-valued control that `resolve(stored, until, now)` returns, computed on every read. A
+fail-open window therefore expires at the same instant everywhere rather than in one component at
+a time.
 
 ---
 

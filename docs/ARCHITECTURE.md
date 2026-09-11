@@ -505,49 +505,47 @@ uniformity test uses a different threshold and does not assert a specific χ².
 
 ## 11. Known gaps in the code
 
-**Fail-open is a mechanism, not an automatic response.** An operator sets `fail_open_until` and
-every edge honours it, but nothing trips it on its own. The function makes no network calls, so it
-cannot observe the backend being unreachable at all
-([#58](https://github.com/smoketurner/virtual-waiting-room/issues/58)) — detection would have to
-live in something that can, and does not exist yet.
+**Fail-open requires an operator.** Setting `fail_open_until` makes every edge pass traffic
+through until that epoch. Nothing sets it automatically. The function makes no network calls, so
+it cannot detect an unreachable backend
+([#58](https://github.com/smoketurner/virtual-waiting-room/issues/58)). A component that can
+observe the backend would have to trip it, and none exists.
 
-**The session cookie is an unbound bearer credential.** It carries no visitor binding
-([#61](https://github.com/smoketurner/virtual-waiting-room/issues/61)) and there is no revocation
-([#63](https://github.com/smoketurner/virtual-waiting-room/issues/63)): the gate verifies a
-signature and an expiry, so a stolen cookie is as good as the original until it expires.
-`generate_token` takes a request id from a query string and authenticates nothing else, so anyone
-holding a request id can mint one ([#62](https://github.com/smoketurner/virtual-waiting-room/issues/62)).
+**The session cookie is a bearer credential.** The gate verifies a signature and an expiry and
+nothing else, so a stolen cookie works as well as the original until it expires. There is no
+visitor binding ([#61](https://github.com/smoketurner/virtual-waiting-room/issues/61)) and no
+revocation ([#63](https://github.com/smoketurner/virtual-waiting-room/issues/63)). `generate_token`
+authenticates only a request id from the query string, so anyone holding that id can mint a cookie
+([#62](https://github.com/smoketurner/virtual-waiting-room/issues/62)).
 
-**The admin Lambda can read the signing secret.** Its `GetKey`/`PutKey` grant on the gate's
-KeyValueStore covers the secret as well as the config. It cannot be narrowed: the store is the only
-resource type the service defines, it publishes no condition keys, and a function associates
-exactly one store.
+**The admin Lambda can read the signing key.** Its KeyValueStore grant covers the key as well as
+the config. IAM cannot narrow it. The store is the only resource type the service defines, the
+service publishes no condition keys, and a function associates exactly one store.
 
 **`generate_token` is replayable and inflates the arrival count.** It never marks a position
 spent. A visitor who calls it twice records two arrivals against one release. That understates the
 no-show rate, so the controller under-releases — the safe direction, but the measurement is wrong.
 
-**Standby is a dormant gate, not an automatic transition.** An empty ruleset passes every request
-through, and `enforce_from` schedules the switch to enforcing at one instant on every edge. What is
-missing is the trigger: there is no inflow alarm and no automatic phase transition, so an operator
-sets both by hand.
+**Standby requires an operator.** An empty ruleset passes every request through, and
+`enforce_from` switches every edge to enforcing at one instant. Nothing triggers either. There is
+no inflow alarm and no automatic phase transition.
 
-**Rule evaluation does not reach GovCloud.** The CloudFront path evaluates the full rule set —
-path, header, cookie, user agent — but `authorizer`, the only gate available where CloudFront
-Functions do not exist, wires just `PathPrefix` from `PROTECTED_PATH_PREFIXES`. The two gates share
-the type and not the configuration path, so a commercial and a GovCloud deployment of the same
-product protect different things.
+**GovCloud matches on path prefixes only.** The CloudFront path evaluates all four rule kinds:
+path, header, cookie, and user agent. `authorizer` is the only gate available where CloudFront
+Functions do not exist, and it wires just `PathPrefix` from `PROTECTED_PATH_PREFIXES`. The two
+gates share the rule type but not the configuration path, so a commercial deployment and a
+GovCloud deployment protect different requests.
 
 **Sessions cannot be completed or abandoned.** `PositionStatus` has `Completed` and `Abandoned`
-variants that only the controller's expiry path and `generate_token`'s refusal ever read.
+variants. Only the controller's expiry path and `generate_token`'s refusal read them.
 `/update_session` returns 501, so nothing writes them.
 
-**The edge does not slide sessions.** `generate_token` mints one fixed-TTL session and nothing
-re-issues it, so a visitor whose checkout outlasts `SESSION_TTL_SECS` is logged out and rejoins the
-queue. `authorizer`'s `SessionMode::Sliding` extends on activity; the two gates never run in the
-same deployment, so this is a choice between them rather than an inconsistency a visitor can see.
+**The edge does not extend sessions.** `generate_token` mints one session for
+`SESSION_TTL_SECS` and nothing re-issues it. A visitor still on the origin when it expires returns
+to the queue. `authorizer` offers `SessionMode::Sliding`, which extends on activity. The two gates
+never run in the same deployment, so an operator chooses between them.
 
-**Two properties are unmeasured against a real deployment.** The function's compute utilization
+**Two properties are unmeasured against a real deployment:** the function's compute utilization
 per request, and how long a KeyValueStore write takes to reach every edge.
 
 ---
