@@ -404,13 +404,9 @@ operation both leave the admission path.
 resolve `StoredControl` against `fail_open_until` (issue #71) — the rest of the change is what
 `main.rs` does with the returned `Grant`, the three-file split working as intended.
 
-**The admin Lambda can now read the signing secret, and that cannot be narrowed.** It needs
-`GetKey`/`PutKey` on the KeyValueStore to read the ruleset back and write it, but the store is the
-only resource type the service defines, it publishes no condition keys, and a function may
-associate exactly one store — so the secret in `k` cannot be moved beyond the admin's reach. The
-admin previously held no path to the signing key at all (its SSM grant covers only the OIDC client
-secret), so this is a real increase in what a compromised admin yields: the key that mints
-sessions. Its OIDC boundary now protects the gate, not just the dashboard.
+**The admin Lambda can read the signing secret.** It needs `GetKey`/`PutKey` on the KeyValueStore
+for the ruleset, and that reaches `k` as well as `c`. IAM cannot narrow it: the store is the only
+resource type the service defines and it publishes no condition keys.
 
 **One key, one rotation.** `generate_token` stops reading the CloudFront signer parameter and reads
 `/signing-key`, the parameter the authorizer already uses.

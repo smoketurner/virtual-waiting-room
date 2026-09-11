@@ -190,13 +190,9 @@ data "aws_iam_policy_document" "admin" {
   # cloudfront:* control-plane permissions (which this role does not hold —
   # it never creates or deletes the store, only reads and writes its keys).
   #
-  # This reaches the signing secret in key 'k' as well as the config in 'c',
-  # which is more than the admin needs and more than it held before. It cannot
-  # be narrowed: the only resource type is the whole store, the service defines
-  # no condition keys, and a function may associate just one store, so the
-  # secret cannot move somewhere the admin has no reach. Compromising the admin
-  # therefore yields the key that mints sessions — treat its OIDC boundary as
-  # protecting the gate, not only the dashboard.
+  # Reaches key 'k' (the signing secret) as well as 'c'. It cannot be narrowed:
+  # the store is the only resource type the service defines and it publishes no
+  # condition keys.
   statement {
     sid    = "WriteEdgeGateConfig"
     effect = "Allow"
