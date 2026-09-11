@@ -387,13 +387,19 @@ async fn set_phase(
     headers: HeaderMap,
     Form(form): Form<PhaseForm>,
 ) -> Response {
-    if authed(&state, &headers).await.is_none() {
+    let Some(session) = authed(&state, &headers).await else {
         return Redirect::to("/admin/login").into_response();
-    }
+    };
     finish(
-        apply_phase(&state.store, &state.event_id, &form.phase)
-            .await
-            .map(|_| ()),
+        apply_phase(
+            &state.store,
+            &state.event_id,
+            &form.phase,
+            &session.email,
+            now_ms(),
+        )
+        .await
+        .map(|_| ()),
     )
 }
 
