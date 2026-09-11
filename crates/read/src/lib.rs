@@ -101,6 +101,16 @@ pub struct StatusResponse {
     /// Operator broadcast text for the waiting page. Absent when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// The operator's target admission rate in visitors per second, absent
+    /// until one is set.
+    ///
+    /// Published so a waiting visitor gets a wait estimate on their first poll
+    /// rather than after a minute of watching the cursor. It is a target, not a
+    /// measurement — the controller corrects releases against a no-show rate,
+    /// so the cursor's real speed differs — which is why a client should prefer
+    /// the movement it observes once it has enough of it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_rate: Option<u32>,
 }
 
 /// A resolved `/queue_num` response.
@@ -139,6 +149,7 @@ pub fn status(counters: &Counters) -> StatusResponse {
         participant_count: counters.participant_count,
         prequeue_offsets: counters.prequeue_offsets,
         message: counters.message.clone(),
+        target_rate: counters.target_rate,
     }
 }
 
@@ -212,6 +223,7 @@ mod tests {
             participant_count: Some(sealed.participant_count()),
             prequeue_offsets: Some(offsets),
             message: None,
+            target_rate: None,
             admission_control: AdmissionControl::Open,
         }
     }
@@ -236,6 +248,7 @@ mod tests {
             participant_count: None,
             prequeue_offsets: None,
             message: None,
+            target_rate: None,
             admission_control: AdmissionControl::Open,
         };
         let json = serde_json::to_value(status(&counters)).unwrap();
@@ -281,6 +294,24 @@ mod tests {
     }
 
     #[test]
+    fn status_publishes_the_target_rate_when_set() {
+        let mut counters = sealed_counters([1; SHARDS], [7u8; 32]);
+        counters.target_rate = Some(250);
+        let json = serde_json::to_value(status(&counters)).unwrap();
+        assert_eq!(json["target_rate"], 250);
+    }
+
+    #[test]
+    fn status_omits_the_target_rate_when_unset() {
+        // A waiting page must be able to tell "no rate set" from "rate is
+        // zero": the first means the operator has not started admitting and no
+        // estimate can be made, the second would read as an infinite wait.
+        let counters = sealed_counters([1; SHARDS], [7u8; 32]);
+        let json = serde_json::to_value(status(&counters)).unwrap();
+        assert!(json.get("target_rate").is_none());
+    }
+
+    #[test]
     fn status_publishes_serving_state() {
         // Active event -> running; pause it -> paused; fail-open -> fail_open.
         let mut counters = sealed_counters([1; SHARDS], [7u8; 32]);
@@ -322,6 +353,7 @@ mod tests {
             participant_count: None,
             prequeue_offsets: None,
             message: None,
+            target_rate: None,
             admission_control: AdmissionControl::Open,
         };
         assert_eq!(

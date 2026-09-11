@@ -611,6 +611,7 @@ mod tests {
             participant_count: None,
             prequeue_offsets: None,
             message: None,
+            target_rate: None,
             admission_control: AdmissionControl::Open,
         }
     }
@@ -633,6 +634,7 @@ mod tests {
             participant_count: Some(sealed.participant_count()),
             prequeue_offsets: Some(offsets),
             message: None,
+            target_rate: None,
             admission_control: AdmissionControl::Open,
         }
     }
