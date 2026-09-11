@@ -415,14 +415,15 @@ sessions. Its OIDC boundary now protects the gate, not just the dashboard.
 **One key, one rotation.** `generate_token` stops reading the CloudFront signer parameter and reads
 `/signing-key`, the parameter the authorizer already uses.
 
-**Terraform: −4 resources, +3 for the KeyValueStore and its two seeded keys.** `modules/core` nets
-65 → 64, under the 80 budget (N6): `tls_private_key`, `aws_ssm_parameter.cf_signer_key`,
-`aws_cloudfront_public_key.signer` and `aws_cloudfront_key_group.signer` go (`tls_private_key` is
-itself a resource, hence −4, not −3); `aws_cloudfront_key_value_store.gate` and two
-`aws_cloudfrontkeyvaluestore_key` resources (`c`, `k`) replace them. `modules/edge` nets 14 → 15
-(+1 for the function). The §6 ruleset result is what keeps room in the budget for the KVS resources
-— every additional ~45 rules would be one more Terraform resource, but none are added by this issue,
-since no rules-editing admin action ships with it.
+**Terraform: `modules/core` stays at 65, under the 80 budget (N6).** Four resources go:
+`tls_private_key`, `aws_ssm_parameter.cf_signer_key`, `aws_cloudfront_public_key.signer` and
+`aws_cloudfront_key_group.signer` (`tls_private_key` is itself a resource, hence −4, not −3).
+Four arrive: `aws_cloudfront_key_value_store.gate`, two `aws_cloudfrontkeyvaluestore_key`
+resources (`c`, `k`), and `random_bytes.signing_key`, which generates the value both `k` and the
+SSM parameter take. `modules/edge` goes 14 → 15, adding the function.
+
+The ruleset lives in one KeyValueStore value rather than one resource per rule, so adding rules
+costs no Terraform resources.
 
 **A JavaScript toolchain returns, dev-only.** ADR-0018 removed one deliberately; it had already come
 back for `waiting.js`'s adaptive-poll tests before this ADR. A Node-based conformance runner with no

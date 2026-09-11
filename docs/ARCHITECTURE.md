@@ -32,7 +32,7 @@ valid session cookie, or a fail-open/pending epoch all pass through; otherwise i
 the origin receives the request. Sub-millisecond compute at the edge, never a call to the origin
 or any backend.
 
-The core Terraform module holds 64 managed resources; the edge module holds 18.
+The core Terraform module holds 65 managed resources; the edge module holds 15.
 
 ---
 
