@@ -71,16 +71,52 @@ pub struct Edge {
     counts: Mutex<HashMap<String, Arc<Counts>>>,
     /// Minimum lifetime for an error response, independent of its own headers.
     error_ttl: Duration,
+    /// Origin requests bucketed by the second they happened in.
+    ///
+    /// A total says how much work an event costs; the peak second says whether
+    /// it fits through a throttle. They can differ by orders of magnitude when
+    /// a cohort does something in unison, which is exactly the case here.
+    per_second: Vec<AtomicU64>,
+    started: Instant,
 }
 
 impl Edge {
     #[must_use]
-    pub fn new(error_ttl: Duration) -> Self {
+    pub fn new(error_ttl: Duration, run_seconds: u64) -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
             inflight: Mutex::new(HashMap::new()),
             counts: Mutex::new(HashMap::new()),
             error_ttl,
+            per_second: (0..=run_seconds).map(|_| AtomicU64::new(0)).collect(),
+            started: Instant::now(),
+        }
+    }
+
+    /// The busiest second of the run, and which second it was.
+    #[must_use]
+    pub fn peak_origin_per_second(&self) -> (u64, u64) {
+        self.per_second
+            .iter()
+            .enumerate()
+            .map(|(second, count)| (count.load(Ordering::Relaxed), second as u64))
+            .max()
+            .unwrap_or((0, 0))
+    }
+
+    /// Origin requests per second, in order.
+    #[must_use]
+    pub fn origin_timeline(&self) -> Vec<u64> {
+        self.per_second
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .collect()
+    }
+
+    fn record_origin(&self) {
+        let second = self.started.elapsed().as_secs() as usize;
+        if let Some(bucket) = self.per_second.get(second) {
+            bucket.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -177,6 +213,7 @@ impl Edge {
         }
 
         counts.origin.fetch_add(1, Ordering::Relaxed);
+        self.record_origin();
         let (status, body) = fetch().await;
 
         // An error outlives its own max-age: a waiting visitor polls a 404 for

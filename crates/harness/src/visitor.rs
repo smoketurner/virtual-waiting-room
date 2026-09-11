@@ -40,10 +40,31 @@ pub fn first_ask_spread_ms(participants: u64) -> u64 {
 pub enum Polling {
     /// Ask once and hold it, because a position cannot change. The shipped
     /// client.
+    ///
+    /// A position cannot be asked for before the seal — it does not exist until
+    /// the seed does — so the whole cohort asks in the window just after it,
+    /// spread only as far as the client's own spread reaches.
     HoldPosition,
     /// Ask again on every poll. What the client did before, kept so a run can
     /// measure the cost of the difference instead of taking it on trust.
     EveryTick,
+    /// Fetch the registration's `(shard, local index)` once during the
+    /// countdown, then compute the position locally from the seal outputs on
+    /// `/status`.
+    ///
+    /// The row exists from the moment registration lands, so this ask is not
+    /// tied to the seal, and afterwards the visitor needs nothing of their own
+    /// — only the shared `/status` document, which is keyed on path and
+    /// collapses.
+    ///
+    /// Measuring it is what showed that being free of the seal is worth less
+    /// than it sounds. Asking on arrival reproduces the arrival rush, which for
+    /// a scheduled event is a wall of people just before the start: against a
+    /// late-arriving million, that peaks around six times higher than waiting
+    /// for the seal and spreading deliberately. Given the same spread the two
+    /// land within a few per cent of each other, which says the spread is doing
+    /// the work and the timing is close to incidental.
+    DerivePosition,
 }
 
 /// What one visitor did, summed across the run.
@@ -78,12 +99,44 @@ impl Jitter {
     }
 }
 
+/// When a cohort turns up during the countdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arrival {
+    /// Evenly across the countdown. Convenient, and not what happens.
+    Uniform,
+    /// Bunched towards the start, which is how a scheduled event actually
+    /// fills: a trickle when the countdown opens and a wall of people in the
+    /// last minutes before it starts.
+    Late,
+}
+
+/// Where in the countdown one visitor arrives.
+///
+/// `Late` raises a uniform draw to a power below one, which pulls the mass
+/// towards the end of the window. It is a shape, not a fitted model — the point
+/// is to stop assuming the flattering case, not to predict a real audience.
+fn arrival_offset_ms(arrival: Arrival, countdown_ms: u64, draw: u64) -> u64 {
+    if countdown_ms == 0 {
+        return 0;
+    }
+    let u = (draw % 1_000_000) as f64 / 1_000_000.0;
+    let fraction = match arrival {
+        Arrival::Uniform => u,
+        Arrival::Late => u.powf(0.2),
+    };
+    (countdown_ms as f64 * fraction) as u64
+}
+
 /// What every visitor in a run shares.
 #[derive(Debug, Clone, Copy)]
 pub struct RunSettings {
     pub polling: Polling,
     /// Window the cohort spreads its one position request over.
     pub spread_ms: u64,
+    /// How long the countdown runs before the seal. A position becomes askable
+    /// only after this; a registration row is askable from the start.
+    pub countdown_ms: u64,
+    pub arrival: Arrival,
     pub deadline: tokio::time::Instant,
 }
 
@@ -102,19 +155,41 @@ pub async fn run<F, Fut>(
     let mut jitter = Jitter::new(seed);
     let mut held_position: Option<u64> = None;
     let started = tokio::time::Instant::now();
-    // Each visitor takes a random slice of the shared window, exactly as the
-    // client does, so the cohort's one position request is spread rather than
-    // arriving in unison.
-    let first_ask_after = Duration::from_millis(if settings.spread_ms == 0 {
-        0
-    } else {
-        jitter.next() % settings.spread_ms
+    // When this visitor turns up. Nothing they do can happen before it.
+    let arrives_at = arrival_offset_ms(settings.arrival, settings.countdown_ms, jitter.next());
+
+    let first_ask_after = Duration::from_millis(match settings.polling {
+        // Readable the moment the row lands, so this ask is not tied to the
+        // seal — but arriving is not the same as being spread. A real audience
+        // turns up in a rush just before the start, so asking on arrival
+        // reproduces that rush exactly. The deliberate spread is what flattens
+        // a cohort, so apply it here too, starting from when each visitor
+        // arrives rather than from the seal.
+        Polling::DerivePosition => {
+            arrives_at
+                + if settings.spread_ms == 0 {
+                    0
+                } else {
+                    jitter.next() % settings.spread_ms
+                }
+        }
+        // Cannot be asked before the seal, so the wait is the countdown plus
+        // this visitor's slice of the client's spread.
+        Polling::HoldPosition => {
+            settings.countdown_ms
+                + if settings.spread_ms == 0 {
+                    0
+                } else {
+                    jitter.next() % settings.spread_ms
+                }
+        }
+        Polling::EveryTick => settings.countdown_ms,
     });
 
-    // Visitors do not arrive in lockstep; without this the whole cohort polls
-    // on the same tick and every entry expires for all of them at once, which
-    // would flatter collapsing.
-    tokio::time::sleep(Duration::from_millis(jitter.next() % POLL_MS)).await;
+    // Nothing happens before this visitor turns up, and once they have, their
+    // first poll lands somewhere inside the polling interval rather than on the
+    // same tick as everyone else's.
+    tokio::time::sleep(Duration::from_millis(arrives_at + jitter.next() % POLL_MS)).await;
 
     while tokio::time::Instant::now() < settings.deadline {
         // /status: keyed on path alone, so the whole cohort shares one entry.
@@ -129,8 +204,8 @@ pub async fn run<F, Fut>(
 
         let ask = match settings.polling {
             // The old client asked on every tick and knew nothing of a spread.
-            Polling::EveryTick => true,
-            Polling::HoldPosition => {
+            Polling::EveryTick => started.elapsed() >= first_ask_after,
+            Polling::HoldPosition | Polling::DerivePosition => {
                 held_position.is_none() && started.elapsed() >= first_ask_after
             }
         };

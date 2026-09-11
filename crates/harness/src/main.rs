@@ -29,7 +29,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 use crate::edge::Edge;
-use crate::visitor::{Polling, VisitorTally};
+use crate::visitor::{Arrival, Polling, VisitorTally};
 
 /// CloudFront's default minimum lifetime for a cached error response.
 const ERROR_TTL: Duration = Duration::from_secs(10);
@@ -37,7 +37,9 @@ const ERROR_TTL: Duration = Duration::from_secs(10);
 struct Args {
     visitors: usize,
     seconds: u64,
+    countdown: u64,
     polling: Polling,
+    arrival: Arrival,
     origin: Option<String>,
 }
 
@@ -45,7 +47,9 @@ fn parse_args() -> Result<Args> {
     let mut args = Args {
         visitors: 100,
         seconds: 60,
+        countdown: 0,
         polling: Polling::HoldPosition,
+        arrival: Arrival::Uniform,
         origin: None,
     };
     let mut argv = std::env::args().skip(1);
@@ -54,13 +58,24 @@ fn parse_args() -> Result<Args> {
         match flag.as_str() {
             "--visitors" => args.visitors = value()?.parse().context("--visitors")?,
             "--seconds" => args.seconds = value()?.parse().context("--seconds")?,
+            "--countdown" => args.countdown = value()?.parse().context("--countdown")?,
+            "--arrival" => {
+                args.arrival = match value()?.as_str() {
+                    "uniform" => Arrival::Uniform,
+                    "late" => Arrival::Late,
+                    other => anyhow::bail!("--arrival must be uniform or late: {other}"),
+                }
+            }
             "--origin" => args.origin = Some(value()?),
             "--polling" => {
                 args.polling = match value()?.as_str() {
                     "hold-position" => Polling::HoldPosition,
                     "every-tick" => Polling::EveryTick,
+                    "derive-position" => Polling::DerivePosition,
                     other => {
-                        anyhow::bail!("--polling must be hold-position or every-tick: {other}")
+                        anyhow::bail!(
+                            "--polling must be hold-position, every-tick or derive-position: {other}"
+                        )
                     }
                 }
             }
@@ -73,7 +88,7 @@ fn parse_args() -> Result<Args> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = parse_args()?;
-    let edge = Arc::new(Edge::new(ERROR_TTL));
+    let edge = Arc::new(Edge::new(ERROR_TTL, args.seconds));
 
     let origin_url = args.origin.clone();
     let client = reqwest::Client::builder()
@@ -124,6 +139,7 @@ async fn main() -> Result<()> {
         match args.polling {
             Polling::HoldPosition => "hold-position",
             Polling::EveryTick => "every-tick",
+            Polling::DerivePosition => "derive-position",
         },
         args.origin.as_deref().unwrap_or("(built-in stub)")
     );
@@ -131,6 +147,8 @@ async fn main() -> Result<()> {
     let settings = visitor::RunSettings {
         polling: args.polling,
         spread_ms: visitor::first_ask_spread_ms(args.visitors as u64),
+        countdown_ms: args.countdown * 1000,
+        arrival: args.arrival,
         deadline,
     };
     println!(
@@ -153,11 +171,11 @@ async fn main() -> Result<()> {
         task.await.context("a visitor task panicked")?;
     }
 
-    report(&edge, args.visitors, args.seconds).await;
+    report(&edge, args.visitors, args.seconds, args.countdown).await;
     Ok(())
 }
 
-async fn report(edge: &Edge, visitors: usize, seconds: u64) {
+async fn report(edge: &Edge, visitors: usize, seconds: u64, countdown_s: u64) {
     let minutes = seconds as f64 / 60.0;
     let per = visitors as f64 * minutes;
 
@@ -179,9 +197,45 @@ async fn report(edge: &Edge, visitors: usize, seconds: u64) {
         "  origin requests per second, all endpoints: {:.1}",
         total_origin as f64 / seconds as f64
     );
-    println!(
-        "\n  Run this again with a different --visitors. An endpoint whose origin\n  \
-         column barely moves is collapsing and stays affordable as the room fills;\n  \
-         one that scales with the visitor count is a per-visitor cost at every poll."
-    );
+    let (peak, at) = edge.peak_origin_per_second();
+    println!("  busiest second: {peak} origin requests, at t={at}s");
+    histogram(&edge.origin_timeline(), countdown_s);
+}
+
+/// Origin requests per second, as a chart.
+///
+/// The totals say what an event costs; the shape says whether it fits through a
+/// throttle. A cohort that does one thing in unison produces a spike that a
+/// total hides completely.
+fn histogram(timeline: &[u64], countdown_s: u64) {
+    let peak = timeline.iter().copied().max().unwrap_or(0);
+    if peak == 0 {
+        return;
+    }
+    // Keep the chart a readable height however long the run was.
+    let buckets = 40usize.min(timeline.len());
+    let per_bucket = timeline.len().div_ceil(buckets);
+
+    println!("\n  origin requests per second over the run (▏= peak {peak}/s)");
+    for (n, chunk) in timeline.chunks(per_bucket).enumerate() {
+        let seconds = (n * per_bucket) as u64;
+        // The busiest second in the bucket, not the mean: a throttle is tripped
+        // by the worst instant, and averaging it away is how a spike gets
+        // reported as comfortable.
+        let worst = chunk.iter().copied().max().unwrap_or(0);
+        let width = (worst * 50 / peak) as usize;
+        let seal = if seconds == countdown_s.saturating_sub(countdown_s % per_bucket as u64)
+            && countdown_s > 0
+        {
+            " <- seal"
+        } else {
+            ""
+        };
+        println!(
+            "  t={seconds:>4}s {:>9} {}{}",
+            worst,
+            "#".repeat(width),
+            seal
+        );
+    }
 }
