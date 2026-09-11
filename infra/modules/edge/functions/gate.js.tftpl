@@ -1,0 +1,239 @@
+// The admission gate, at viewer-request on the protected behaviour only
+// (issue #71). Decides locally: no backend call, no network access.
+//
+// Source bytes are a hard deployment limit here (10,240, not adjustable), so
+// comments are kept to what stops a specific bug being reintroduced. The
+// reasoning lives in docs/adr/0021-edge-function-gate.md.
+import cf from 'cloudfront';
+import crypto from 'crypto';
+
+var kvs = cf.kvs();
+var KIND_SESSION = 0x02;
+var EVENT_ID = '${event_id}';
+var SESSION_COOKIE = '${session_cookie_name}';
+var WAITING_PATH = '${waiting_path}';
+
+// The protected behaviour forwards allViewer, so a visitor can send these.
+function stripSpoofableHeaders(request) {
+    delete request.headers['x-wr-gate'];
+    delete request.headers['x-wr-gate-failed'];
+}
+
+// No timing-safe compare here: HMAC both digests and compare those.
+function macEquals(secret, a, b) {
+    var ha = crypto.createHmac('sha256', secret);
+    ha.update(a);
+    var hb = crypto.createHmac('sha256', secret);
+    hb.update(b);
+    return ha.digest('base64url') === hb.digest('base64url');
+}
+
+var BASE64URL_RE = /^[A-Za-z0-9_-]+$/;
+
+// Node accepts padding, junk bytes and '+'/'/'; Rust rejects all three.
+function strictBase64url(s) {
+    if (!BASE64URL_RE.test(s)) {
+        return null;
+    }
+    return Buffer.from(s, 'base64url');
+}
+
+// base64url(payload).base64url(mac), MAC over kind || payload. Mirrors
+// wr_common::crypto byte for byte.
+function verify(credential, kind, secret) {
+    var dot = credential.indexOf('.');
+    if (dot < 1) {
+        return null;
+    }
+    var payload = strictBase64url(credential.substring(0, dot));
+    var mac = strictBase64url(credential.substring(dot + 1));
+    if (!payload || !mac || mac.length === 0) {
+        return null;
+    }
+
+    var hmac = crypto.createHmac('sha256', secret);
+    hmac.update(Buffer.concat([Buffer.from([kind]), payload]));
+    if (!macEquals(secret, hmac.digest('base64url'), mac.toString('base64url'))) {
+        return null;
+    }
+
+    var at = 0;
+    var len = payload.length;
+    if (at + 2 > len) { return null; }
+    var eventLen = payload.readUInt16BE(at);
+    at += 2;
+    if (at + eventLen > len) { return null; }
+    var eventId = payload.toString('utf8', at, at + eventLen);
+    at += eventLen;
+
+    if (at + 2 > len) { return null; }
+    var reqLen = payload.readUInt16BE(at);
+    at += 2;
+    if (at + reqLen > len) { return null; }
+    at += reqLen; // request_id: not read by the gate
+
+    if (at + 8 > len) { return null; }
+    if (payload.readUInt16BE(at) !== 0) { return null; }
+    at += 8; // issued_at: not read, but walked and range-checked
+
+    if (at + 8 > len) { return null; }
+    if (payload.readUInt16BE(at) !== 0) { return null; }
+    at += 2;
+    var expiresAt = payload.readUIntBE(at, 6);
+    at += 6;
+
+    if (at !== len) {
+        return null; // trailing bytes: Rust's decode_session rejects these
+    }
+    return { eventId: eventId, expiresAt: expiresAt };
+}
+
+// Own-property only: a rule named "constructor" would otherwise be truthy
+// with no .value, throwing and passing every request through.
+function ownProperty(obj, key) {
+    return Object.prototype.hasOwnProperty.call(obj, key) ? obj[key] : undefined;
+}
+
+// CloudFront sends the raw path to the origin, so a rule must not be evaded
+// by an encoding the origin treats as equivalent. Not a full RFC 3986
+// resolver: ".." segments are deliberately not resolved.
+function normalizedPath(uri) {
+    var decoded = uri;
+    try {
+        decoded = decodeURIComponent(uri);
+    } catch (e) {
+        decoded = uri; // malformed percent-encoding: compare the raw URI
+    }
+    decoded = decoded.replace(/^\/+/, '/').replace(/^\/\.\//, '/');
+    return decoded.toLowerCase();
+}
+
+function queryString(qs) {
+    var parts = [];
+    for (var key in qs) {
+        if (Object.prototype.hasOwnProperty.call(qs, key) && qs[key] && typeof qs[key].value === 'string') {
+            parts.push(encodeURIComponent(key) + '=' + encodeURIComponent(qs[key].value));
+        }
+    }
+    return parts.length ? '?' + parts.join('&') : '';
+}
+
+// ["p",prefix] | ["h",name,value] | ["c",name] | ["u",substring]. Mirrors
+// wr_common::rules::ProtectionRule::matches; vectors prove they agree.
+function matches(rule, request) {
+    var headers = request.headers || {};
+    var cookies = request.cookies || {};
+    if (rule[0] === 'p') {
+        return normalizedPath(request.uri).indexOf(rule[1].toLowerCase()) === 0;
+    }
+    if (rule[0] === 'h') {
+        var h = ownProperty(headers, rule[1].toLowerCase());
+        return !!h && typeof h.value === 'string' && h.value.toLowerCase() === rule[2].toLowerCase();
+    }
+    if (rule[0] === 'c') {
+        return ownProperty(cookies, rule[1]) !== undefined;
+    }
+    if (rule[0] === 'u') {
+        var ua = ownProperty(headers, 'user-agent');
+        return !!ua && typeof ua.value === 'string' && ua.value.indexOf(rule[1]) >= 0;
+    }
+    return false;
+}
+
+function wantsHtml(request) {
+    var headers = request.headers || {};
+    var mode = headers['sec-fetch-mode'];
+    if (mode && mode.value !== 'navigate') {
+        return false;
+    }
+    var accept = headers['accept'];
+    return !accept || accept.value.indexOf('text/html') >= 0;
+}
+
+// XHR gets 403 JSON (#72), navigation a 302; both carry a reason (#73).
+function refuse(request, reason) {
+    if (wantsHtml(request)) {
+        var destination = request.uri + queryString(request.querystring);
+        var next = '&next=' + encodeURIComponent(destination);
+        return {
+            statusCode: 302,
+            statusDescription: 'Found',
+            headers: {
+                'location': { value: WAITING_PATH + '?r=' + reason + next },
+                'cache-control': { value: 'no-store' },
+                'x-wr-reason': { value: reason }
+            }
+        };
+    }
+    return {
+        statusCode: 403,
+        statusDescription: 'Forbidden',
+        headers: {
+            'content-type': { value: 'application/json' },
+            'cache-control': { value: 'no-store' },
+            'x-wr-reason': { value: reason },
+            'x-wr-waiting-room': { value: WAITING_PATH },
+            'access-control-expose-headers': { value: 'x-wr-reason,x-wr-waiting-room' }
+        },
+        body: '{"queued":true,"reason":"' + reason + '","waitingRoom":"' + WAITING_PATH + '"}'
+    };
+}
+
+async function handler(event) {
+    var request = event.request;
+    stripSpoofableHeaders(request);
+    try {
+        // cfg.r === [] is dormancy (#60): every request matches no rule.
+        var cfg = await kvs.get('c', { format: 'json' });
+        if (cfg.v !== 1) {
+            throw new Error('unrecognized gate config version');
+        }
+
+        var protectedByRule = false;
+        for (var i = 0; i < cfg.r.length; i++) {
+            if (matches(cfg.r[i], request)) {
+                protectedByRule = true;
+                break;
+            }
+        }
+        if (!protectedByRule) {
+            return request;
+        }
+
+        var now = Math.floor(Date.now() / 1000);
+
+        // enforce_from: one scheduled instant on every edge, not a window.
+        if (cfg.s && now < cfg.s) {
+            request.headers['x-wr-gate'] = { value: 'pending' };
+            return request;
+        }
+        // fail_open_until: skew can only delay relief, never shorten it.
+        if (cfg.f && now < cfg.f) {
+            request.headers['x-wr-gate'] = { value: 'failopen' };
+            return request;
+        }
+
+        var cookie = (request.cookies || {})[SESSION_COOKIE];
+        if (!cookie) {
+            return refuse(request, 'none');
+        }
+
+        var secret = await kvs.get('k', { format: 'string' });
+        var session = verify(cookie.value, KIND_SESSION, secret);
+        if (!session) {
+            return refuse(request, 'signature');
+        }
+        if (session.eventId !== EVENT_ID) {
+            return refuse(request, 'event');
+        }
+        if (now >= session.expiresAt) {
+            return refuse(request, 'expired');
+        }
+        return request;
+    } catch (e) {
+        // The gate being broken, not #58: no network calls happen here.
+        console.log('gate threw: ' + e);
+        request.headers['x-wr-gate-failed'] = { value: 'true' };
+        return request;
+    }
+}

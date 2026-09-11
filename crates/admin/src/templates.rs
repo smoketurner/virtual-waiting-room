@@ -38,11 +38,20 @@ pub struct Dashboard {
     /// the JSON state view.
     #[serde(skip)]
     pub message_raw: String,
-    /// The operator's admission override as its wire string — `open`, `paused`,
-    /// or `fail_open`. The template branches on it and the poller sends it back
-    /// as JSON, so all three states are visible rather than collapsing the two
+    /// The *resolved* admission override as its wire string — `open`,
+    /// `paused`, or `fail_open` (issue #71: resolved from the stored control
+    /// and the fail-open epoch at render time, never read as a stored
+    /// string). The template branches on it and the poller sends it back as
+    /// JSON, so all three states are visible rather than collapsing the two
     /// non-open ones together.
     pub admission_control: String,
+    /// Seconds remaining in the fail-open window, `0` when none is active.
+    pub fail_open_remaining_secs: u64,
+    /// What the resolved control becomes once the fail-open window lapses:
+    /// the *stored* control's wire string (`open` or `paused`), surfaced so
+    /// the operator can see a queued pause rather than only "Fail open" with
+    /// no hint of what follows it.
+    pub queued_control: String,
     /// The visitor-facing serving state, derived from the phase and the
     /// admission control. Human label for display: "Running" / "Paused" /
     /// "Closed" / "Fail open".
@@ -59,13 +68,31 @@ pub struct Dashboard {
     /// state view (the poller endpoint reuses this struct).
     #[serde(skip)]
     pub csp_nonce: String,
+    /// The current edge-gate ruleset (issue #71), one line per rule, for
+    /// pre-filling the rules form. Read from the `KeyValueStore` separately
+    /// from `ControlState` (rules live only there), so it defaults empty
+    /// here and is set by the handler after `from_state`, the same way
+    /// `operator_email` and `csp_nonce` are. Not part of the JSON state view.
+    #[serde(skip)]
+    pub rules_text: String,
+    /// Set by the handler when the `KeyValueStore` read behind [`Self::rules_text`]
+    /// failed. The template hides the rules form in that case rather than
+    /// showing what looks like an empty (dormant) ruleset — submitting that
+    /// form would overwrite the real ruleset with an empty one. Not part of
+    /// the JSON state view.
+    #[serde(skip)]
+    pub rules_load_failed: bool,
 }
 
 impl Dashboard {
-    /// Builds the view from control state, formatting optionals for display.
+    /// Builds the view from control state at `now` (epoch seconds), which
+    /// resolves the stored control against the fail-open epoch (issue #71) —
+    /// nothing here ever reads a stored "`fail_open`" string, because
+    /// `StoredControl` cannot hold one.
     #[must_use]
-    pub fn from_state(state: &ControlState) -> Self {
+    pub fn from_state(state: &ControlState, now: u64) -> Self {
         let dash = |s: Option<String>| s.unwrap_or_else(|| "not set".to_owned());
+        let resolved = wr_common::resolve(state.stored_control, state.fail_open_until, now);
         Self {
             event_id: state.event_id.clone(),
             phase: state.phase.as_wire_str().to_owned(),
@@ -75,10 +102,12 @@ impl Dashboard {
             target_rate: dash(state.target_rate.map(|n| n.to_string())),
             message: dash(state.message.clone()),
             message_raw: state.message.clone().unwrap_or_default(),
-            admission_control: state.admission_control.as_wire_str().to_owned(),
+            admission_control: resolved.as_wire_str().to_owned(),
+            fail_open_remaining_secs: state.fail_open_until.saturating_sub(now),
+            queued_control: state.stored_control.as_wire_str().to_owned(),
             serving_state: {
                 use wr_common::ServingState::{Closed, FailOpen, Paused, Running};
-                match wr_common::serving_state(state.phase, state.admission_control) {
+                match wr_common::serving_state(state.phase, resolved) {
                     Running => "Running",
                     Paused => "Paused",
                     Closed => "Closed",
@@ -103,6 +132,8 @@ impl Dashboard {
             },
             csp_nonce: String::new(),
             operator_email: String::new(),
+            rules_text: String::new(),
+            rules_load_failed: false,
         }
     }
 }
@@ -138,7 +169,8 @@ mod tests {
             participant_count: Some(1000),
             target_rate: Some(500),
             message: Some("Doors open at noon".to_owned()),
-            admission_control: wr_common::AdmissionControl::Open,
+            stored_control: wr_common::StoredControl::Open,
+            fail_open_until: 0,
             last_action: Some("set_rate".to_owned()),
             last_action_by: Some("op@example.com".to_owned()),
             last_action_at: Some("2026-09-09T22:00:00Z".to_owned()),
@@ -148,11 +180,34 @@ mod tests {
 
     #[test]
     fn renders_current_state() {
-        let html = Dashboard::from_state(&state()).render().unwrap();
+        let html = Dashboard::from_state(&state(), 0).render().unwrap();
         assert!(html.contains("launch"));
         assert!(html.contains(">active<"));
         assert!(html.contains("Doors open at noon"));
         assert!(html.contains("500"));
+    }
+
+    #[test]
+    fn a_failed_ruleset_read_hides_the_rules_form_instead_of_showing_it_empty() {
+        // Critic finding: an empty textarea from a real read failure is
+        // indistinguishable from a genuinely empty (dormant) ruleset, and
+        // submitting it would overwrite the real one. The form must not
+        // render at all in that case.
+        let mut view = Dashboard::from_state(&state(), 0);
+        view.rules_load_failed = true;
+        let html = view.render().unwrap();
+        assert!(!html.contains("action=\"/admin/rules\""));
+        assert!(html.contains("Could not read the current ruleset"));
+    }
+
+    #[test]
+    fn a_successful_ruleset_read_shows_the_form_not_the_error() {
+        let mut view = Dashboard::from_state(&state(), 0);
+        view.rules_text = "p /checkout".to_owned();
+        let html = view.render().unwrap();
+        assert!(html.contains("action=\"/admin/rules\""));
+        assert!(html.contains("p /checkout"));
+        assert!(!html.contains("Could not read the current ruleset"));
     }
 
     #[test]
@@ -171,7 +226,7 @@ mod tests {
             (Phase::Maintenance, "maintenance"),
         ] {
             s.phase = phase;
-            assert_eq!(Dashboard::from_state(&s).phase, wire);
+            assert_eq!(Dashboard::from_state(&s, 0).phase, wire);
         }
     }
 
@@ -181,14 +236,14 @@ mod tests {
         // admin.css defines; `status-prequeue` would render unstyled.
         let mut s = state();
         s.phase = Phase::PreQueue;
-        let html = Dashboard::from_state(&s).render().unwrap();
+        let html = Dashboard::from_state(&s, 0).render().unwrap();
         assert!(html.contains("status-pre_queue"), "{html}");
         assert!(html.contains(">pre_queue<"), "{html}");
     }
 
     #[test]
     fn core_actions_are_plain_form_posts_no_js() {
-        let html = Dashboard::from_state(&state()).render().unwrap();
+        let html = Dashboard::from_state(&state(), 0).render().unwrap();
         // Every operator action is a POST form to its /admin route — works with
         // JavaScript disabled.
         for action in [
@@ -217,28 +272,26 @@ mod tests {
         s.participant_count = None;
         s.target_rate = None;
         s.message = None;
-        let html = Dashboard::from_state(&s).render().unwrap();
+        let html = Dashboard::from_state(&s, 0).render().unwrap();
         assert!(html.contains("not set"));
     }
 
     #[test]
     fn each_admission_state_renders_its_own_banner_and_badge() {
-        use wr_common::AdmissionControl::{FailOpen, Open, Paused};
-
-        let render = |control| {
-            let mut s = state();
-            s.admission_control = control;
-            Dashboard::from_state(&s).render().unwrap()
-        };
+        use wr_common::StoredControl::{Open, Paused};
 
         // Open: no banner, and the action offered is Pause.
-        let open = render(Open);
+        let mut s = state();
+        s.stored_control = Open;
+        let open = Dashboard::from_state(&s, 0).render().unwrap();
         assert!(!open.contains("pause-banner"));
         assert!(open.contains("action=\"/admin/pause\""));
         assert!(open.contains(">open<"));
 
         // Paused: banner, and the action offered is Resume, not Pause again.
-        let paused = render(Paused);
+        let mut s = state();
+        s.stored_control = Paused;
+        let paused = Dashboard::from_state(&s, 0).render().unwrap();
         assert!(paused.contains("Admission is PAUSED"));
         assert!(paused.contains("action=\"/admin/resume\""));
         assert!(!paused.contains("action=\"/admin/pause\""));
@@ -246,7 +299,9 @@ mod tests {
 
         // Fail open: its own banner and badge, never rendered as the normal
         // admitting state — the operator must see the room is being bypassed.
-        let failed_open = render(FailOpen);
+        let mut s = state();
+        s.fail_open_until = 1000;
+        let failed_open = Dashboard::from_state(&s, 500).render().unwrap();
         assert!(failed_open.contains("FAIL OPEN"));
         assert!(failed_open.contains(">fail open<"));
         assert!(!failed_open.contains("Admission is PAUSED"));
@@ -255,13 +310,27 @@ mod tests {
     #[test]
     fn serving_state_reports_fail_open_to_the_operator() {
         let mut s = state();
-        s.admission_control = wr_common::AdmissionControl::FailOpen;
-        assert_eq!(Dashboard::from_state(&s).serving_state, "Fail open");
+        s.fail_open_until = 1000;
+        assert_eq!(Dashboard::from_state(&s, 500).serving_state, "Fail open");
+    }
+
+    #[test]
+    fn fail_open_shows_the_queued_control_it_lands_in() {
+        // v4's declared UI change: a paused event that is also fail-open must
+        // show "Paused" as what it lands in once the window lapses, not
+        // "Open" — the resolved control (fail_open) says nothing about it.
+        let mut s = state();
+        s.stored_control = wr_common::StoredControl::Paused;
+        s.fail_open_until = 1000;
+        let view = Dashboard::from_state(&s, 500);
+        assert_eq!(view.admission_control, "fail_open");
+        assert_eq!(view.queued_control, "paused");
+        assert_eq!(view.fail_open_remaining_secs, 500);
     }
 
     #[test]
     fn deferred_features_are_labeled_not_faked() {
-        let html = Dashboard::from_state(&state()).render().unwrap();
+        let html = Dashboard::from_state(&state(), 0).render().unwrap();
         assert!(html.contains("Not yet available"));
     }
 
@@ -273,7 +342,7 @@ mod tests {
         // change (pause/resume, phase transition) flips it alongside its
         // sibling badges, instead of leaving "Visitors see: Running" stale next
         // to a "paused" / "post_event" badge until a full page reload.
-        let html = Dashboard::from_state(&state()).render().unwrap();
+        let html = Dashboard::from_state(&state(), 0).render().unwrap();
         assert!(
             html.contains(r#"id="s-serving_state""#),
             "#s-serving_state must be present in the current-state card"
@@ -293,7 +362,7 @@ mod tests {
         // getElementById handler (badges that swap className/innerHTML). This
         // guards the whole class of "serialised field gets an s- id but is left
         // out of the poller" regressions; #s-serving_state was one instance.
-        let html = Dashboard::from_state(&state()).render().unwrap();
+        let html = Dashboard::from_state(&state(), 0).render().unwrap();
         let nums = nums_array(&html);
         // Badge elements change className/innerHTML, so they use dedicated
         // handlers rather than the nums textContent loop — by design.
@@ -324,7 +393,7 @@ mod tests {
         // serializes it. Guard the other half of the contract: serving_state is
         // NOT #[serde(skip)], unlike the render-only inputs it must stay apart
         // from.
-        let view = Dashboard::from_state(&state());
+        let view = Dashboard::from_state(&state(), 0);
         let json = serde_json::to_string(&view).unwrap();
         assert!(
             json.contains(r#""serving_state":"Running""#),

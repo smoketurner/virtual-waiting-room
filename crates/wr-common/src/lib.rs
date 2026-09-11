@@ -17,13 +17,19 @@ pub mod expr;
 pub mod ids;
 pub mod items;
 pub mod permutation;
+pub mod rules;
 
 pub use crypto::{AdmissionToken, Session, SigningKey, VerifyError};
 pub use ids::{
-    AdmissionControl, EventId, IllegalControl, Phase, RequestId, ServingState, UnknownControl,
-    UnknownPhase, serving_state,
+    AdmissionControl, EventId, IllegalControl, Phase, RequestId, ServingState, StoredControl,
+    UnknownControl, UnknownPhase, resolve, serving_state,
 };
 pub use items::{
     Counters, PositionItem, PositionStatus, PreQueueItem, ResolveError, ResolvedPosition, Sealed,
 };
 pub use permutation::{Assignment, SHARDS, SealError, SealedOffsets, Seed, prp, shard_for};
+pub use rules::{
+    MAX_COOKIE_NAME_BYTES, MAX_HEADER_NAME_BYTES, MAX_HEADER_VALUE_BYTES, MAX_PATH_PREFIX_BYTES,
+    MAX_USER_AGENT_BYTES, ProtectionRule, RequestView, RuleFieldError, RuleWire, matches_any,
+    validate_rule_fields,
+};

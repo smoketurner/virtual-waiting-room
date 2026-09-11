@@ -47,7 +47,8 @@ The event item carries, by writer:
 | `max_expired_position` | `controller` | Highest position expired |
 | `last_serving_counter`, `last_arrivals_total`, `no_show_rate` | `controller` | Measurement state carried across passes |
 | `phase` | `seal_event`, `admin` | `idle` / `pre_queue` / `active` / `post_event` / `maintenance` |
-| `admission_control` | `admin` | `open` / `paused` / `fail_open` |
+| `admission_control` | `admin` | `open` / `paused` |
+| `fail_open_until` | `admin` | Epoch-seconds break-glass deadline; absent or `0` means not engaged |
 | `target_rate` | `admin` | Visitors **per second** |
 | `shuffle_seed` | `seal_event` | 256-bit permutation key (B), written once |
 | `participant_count` | `seal_event` | Cohort size `N` |
@@ -288,6 +289,12 @@ so two Lambdas cannot interpret one stored row two different ways.
 
 The same discipline applies to `serving_state`, which `/v1/status` publishes: it is derived from
 `(phase, admission_control)` on every read and never stored.
+
+Fail-open follows the same rule. `admission_control` stores what the operator chose: `open` or
+`paused`. `fail_open_until` stores when the break-glass window ends. Callers match on the
+three-valued control that `resolve(stored, until, now)` returns, computed on every read. A
+fail-open window therefore expires at the same instant everywhere rather than in one component at
+a time.
 
 ---
 

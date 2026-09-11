@@ -129,7 +129,9 @@ $EDITOR infra/environments/dev/terraform.tfvars
 # 3. Build the four Lambda binaries and stage them under .artifacts/.
 make build ARCH=arm64          # must match lambda_architecture
 
-# 4. Review the plan, then deploy.
+# 4. Review the plan, then deploy. The gate's signing key is generated and
+#    written to both of its homes by this apply — there is no separate
+#    bootstrap step.
 make plan
 make apply
 ```
@@ -144,6 +146,36 @@ provisions boto3 from the script's inline metadata on first run:
 ```bash
 AWS_PROFILE=dev-admin uv run scripts/smoke_test.py
 ```
+
+## The edge gate's signing secret (issue #71)
+
+The gate verifies session cookies with a per-deployment HMAC key. There is no bootstrap step.
+`random_bytes` generates the key during `make apply`. Terraform writes that one value to two
+places: the SSM SecureString `/<name_prefix>/signing-key`, which `generate_token` reads, and the
+KeyValueStore key `k`, which the gate reads. The two cannot diverge because both come from the
+same resource.
+
+The key is stored in Terraform state. The S3 backend encrypts it.
+
+The admin OIDC client secret works differently. The identity provider issues it, so Terraform
+creates a placeholder under `ignore_changes` and an operator writes the real value out of band.
+
+Regenerating the key invalidates every session cookie already issued. The gate refuses those
+visitors with `x-wr-reason=signature` and redirects them to the waiting page. Visitors whose
+positions the controller has expired cannot rejoin. The deployment accepts one key at a time, so
+there is no overlap period. Regenerate only before an event opens.
+
+### Choosing `SESSION_TTL_SECS`
+
+The CloudFront-path session has a fixed lifetime, not a sliding one: `generate_token` mints a
+session valid for `SESSION_TTL_SECS` (`modules/core`'s `session_ttl_seconds`, default 3600) and
+nothing re-issues it — a visitor still on the protected origin when it expires is logged out and
+has to rejoin the queue, checkout included (ADR-0021 §5.3). This differs from `authorizer`'s
+`SessionMode::Sliding`, which extends the idle window on activity up to a hard cap; the two gates
+never run in the same deployment, so this is a choice between them, not an inconsistency a visitor
+could observe. Set `session_ttl_seconds` comfortably longer than the worst realistic time on the
+protected origin — cart to confirmation, not the median — or a visitor can lose their admission to
+nothing more than a slow checkout.
 
 ## Tear down
 

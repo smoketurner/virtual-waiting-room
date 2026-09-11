@@ -3,9 +3,23 @@ name: Client CI
 on:
   push:
     branches: [main]
-    paths: ["infra/modules/edge/pages/**", "infra/modules/edge/tests/**", ".github/workflows/client-ci.yml"]
+    paths:
+      [
+        "infra/modules/edge/pages/**",
+        "infra/modules/edge/functions/**",
+        "infra/modules/edge/tests/**",
+        "crates/wr-common/tests/vectors/**",
+        ".github/workflows/client-ci.yml",
+      ]
   pull_request:
-    paths: ["infra/modules/edge/pages/**", "infra/modules/edge/tests/**", ".github/workflows/client-ci.yml"]
+    paths:
+      [
+        "infra/modules/edge/pages/**",
+        "infra/modules/edge/functions/**",
+        "infra/modules/edge/tests/**",
+        "crates/wr-common/tests/vectors/**",
+        ".github/workflows/client-ci.yml",
+      ]
 
 permissions: {}
 

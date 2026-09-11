@@ -77,15 +77,21 @@ variable "generate_token_artifact_path" {
   type        = string
 }
 
-variable "admission_cookie_ttl_seconds" {
-  description = "How long an admission cookie set stays valid. Long enough to complete a purchase, short enough that a leaked set is not a standing bypass."
+variable "session_ttl_seconds" {
+  description = "How long an admission session credential stays valid. Long enough to complete a purchase, short enough that a leaked cookie is not a standing bypass."
   type        = number
   default     = 3600
 
   validation {
-    condition     = var.admission_cookie_ttl_seconds > 0 && var.admission_cookie_ttl_seconds <= 86400
-    error_message = "admission_cookie_ttl_seconds must be between 1 second and 24 hours."
+    condition     = var.session_ttl_seconds > 0 && var.session_ttl_seconds <= 86400
+    error_message = "session_ttl_seconds must be between 1 second and 24 hours."
   }
+}
+
+variable "session_cookie_name" {
+  description = "Name of the session cookie generate_token sets and the edge gate's CloudFront Function (modules/edge) verifies. Shared between the two modules at the dev root so they cannot drift apart."
+  type        = string
+  default     = "vwr_session"
 }
 
 

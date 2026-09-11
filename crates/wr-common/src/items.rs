@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use aws_sdk_dynamodb::types::AttributeValue;
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{AdmissionControl, Phase};
+use crate::ids::{Phase, StoredControl};
 use crate::permutation::{Assignment, SHARDS, SealedOffsets, Seed};
 
 /// The admission status of a written [`Position`].
@@ -88,10 +88,15 @@ pub struct Counters {
     /// derived from it before enough of the cursor's own movement has been
     /// observed to measure the real rate.
     pub target_rate: Option<u32>,
-    /// The operator's live admission override (ADR-0019): `Open` / `Paused` /
-    /// `FailOpen`. Replaces the former `admission_paused` + `fail_open` booleans
-    /// so an illegal combination cannot be stored.
-    pub admission_control: AdmissionControl,
+    /// The operator's stored admission override (ADR-0019, issue #71):
+    /// `Open` / `Paused`. Never `FailOpen` — that is resolved from
+    /// `fail_open_until` by [`crate::ids::resolve`], not stored here.
+    pub stored_control: StoredControl,
+    /// Epoch-seconds fail-open deadline: `now < fail_open_until` means the
+    /// waiting room is bypassed. `0` means no fail-open window is in force.
+    /// Self-expiring by construction, so a control plane that engages it and
+    /// then dies cannot leave the deployment open indefinitely.
+    pub fail_open_until: u64,
 }
 
 /// The sealed pre-queue index space and permutation seed, once the seal has
@@ -208,12 +213,14 @@ impl Counters {
                 .and_then(|v| v.as_s().ok())
                 .filter(|s| !s.is_empty())
                 .cloned(),
-            admission_control: item
+            stored_control: item
                 .get("admission_control")
                 .and_then(|v| v.as_s().ok())
                 .and_then(|s| s.parse().ok())
-                // Missing, empty, or unrecognized: normal admission (safe default).
+                // Missing, empty, or unrecognized (including a legacy
+                // "fail_open" string): normal admission (safe default).
                 .unwrap_or_default(),
+            fail_open_until: num("fail_open_until").unwrap_or(0),
         }
     }
 }
@@ -316,7 +323,8 @@ mod tests {
             prequeue_offsets: None,
             message: None,
             target_rate: None,
-            admission_control: AdmissionControl::Open,
+            stored_control: StoredControl::Open,
+            fail_open_until: 0,
         }
     }
 
@@ -361,7 +369,21 @@ mod tests {
         // nobody yet", which a defaulted 0 would be indistinguishable from
         // only by accident.
         assert!(counters.target_rate.is_none());
-        assert_eq!(counters.admission_control, AdmissionControl::Open);
+        assert_eq!(counters.stored_control, StoredControl::Open);
+        assert_eq!(counters.fail_open_until, 0);
+    }
+
+    #[test]
+    fn from_item_reads_the_fail_open_epoch() {
+        let mut item = HashMap::new();
+        item.insert(
+            "fail_open_until".to_owned(),
+            AttributeValue::N("1_800_000_000".replace('_', "")),
+        );
+        assert_eq!(
+            Counters::from_item("evt-1", &item).fail_open_until,
+            1_800_000_000
+        );
     }
 
     #[test]

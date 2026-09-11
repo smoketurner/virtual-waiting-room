@@ -185,6 +185,29 @@ data "aws_iam_policy_document" "admin" {
     resources = [aws_ssm_parameter.oidc_client_secret.arn]
   }
 
+  # Issue #71: mirrors fail_open_until to the edge gate's KeyValueStore.
+  # Data-plane actions on the store's own ARN, distinct from the
+  # cloudfront:* control-plane permissions (which this role does not hold —
+  # it never creates or deletes the store, only reads and writes its keys).
+  #
+  # This reaches the signing secret in key 'k' as well as the config in 'c',
+  # which is more than the admin needs and more than it held before. It cannot
+  # be narrowed: the only resource type is the whole store, the service defines
+  # no condition keys, and a function may associate just one store, so the
+  # secret cannot move somewhere the admin has no reach. Compromising the admin
+  # therefore yields the key that mints sessions — treat its OIDC boundary as
+  # protecting the gate, not only the dashboard.
+  statement {
+    sid    = "WriteEdgeGateConfig"
+    effect = "Allow"
+    actions = [
+      "cloudfront-keyvaluestore:DescribeKeyValueStore",
+      "cloudfront-keyvaluestore:GetKey",
+      "cloudfront-keyvaluestore:PutKey",
+    ]
+    resources = [aws_cloudfront_key_value_store.gate.arn]
+  }
+
   statement {
     sid    = "Logs"
     effect = "Allow"
@@ -284,10 +307,10 @@ data "aws_iam_policy_document" "generate_token" {
   }
 
   statement {
-    sid       = "ReadSignerKey"
+    sid       = "ReadSigningKey"
     effect    = "Allow"
     actions   = ["ssm:GetParameter"]
-    resources = [aws_ssm_parameter.cf_signer_key.arn]
+    resources = [aws_ssm_parameter.signing_key.arn]
   }
 
   statement {

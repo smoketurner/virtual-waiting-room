@@ -13,11 +13,14 @@
 use std::sync::Arc;
 
 use admin::dynamo::DynamoStore;
+use admin::edge::KvsStore;
 use admin::oidc::{self, OidcClient, OidcConfig};
 use admin::sessions::{AdminSession, PendingLogin, SessionStore};
 use admin::templates::Dashboard;
 use admin::{
-    ApplyError, apply_message, apply_pause, apply_phase, apply_rate, apply_reset, apply_resume,
+    ApplyError, EdgeConfigStore, apply_fail_open, apply_message, apply_pause, apply_phase,
+    apply_rate, apply_recover, apply_reset, apply_resume, apply_set_rules, format_rules,
+    parse_rules,
 };
 use askama::Template;
 use axum::Form;
@@ -49,6 +52,7 @@ struct StaticAssets;
 
 struct AppState {
     store: DynamoStore,
+    edge: KvsStore,
     sessions: SessionStore,
     oidc: OidcClient,
     http: reqwest::Client,
@@ -102,8 +106,11 @@ async fn main() -> Result<(), Error> {
     .await
     .map_err(|e| Error::from(e.to_string()))?;
 
+    let kvs = aws_sdk_cloudfrontkeyvaluestore::Client::new(&config);
+
     let state = Arc::new(AppState {
         store: DynamoStore::new(dynamo.clone(), std::env::var("COUNTERS_TABLE")?),
+        edge: KvsStore::new(kvs, std::env::var("EDGE_KVS_ARN")?),
         sessions: SessionStore::new(dynamo, std::env::var("TOKENS_TABLE")?),
         oidc,
         http,
@@ -130,7 +137,9 @@ async fn main() -> Result<(), Error> {
         .route("/admin/reset", post(reset))
         .route("/admin/pause", post(pause))
         .route("/admin/resume", post(resume))
-        .route("/admin/rules", post(deferred))
+        .route("/admin/fail_open", post(fail_open))
+        .route("/admin/recover", post(recover))
+        .route("/admin/rules", post(set_rules))
         .route("/update_session", post(deferred))
         .route("/static/{*path}", get(static_asset))
         .with_state(state)
@@ -346,10 +355,24 @@ async fn dashboard(State(state): State<Shared>, headers: HeaderMap) -> Response 
     let Some(session) = authed(&state, &headers).await else {
         return Redirect::to("/admin/login").into_response();
     };
-    match state.store_load().await {
+    match state.store_load(now_ms() / 1000).await {
         Ok(Some(mut view)) => {
             view.csp_nonce = admin::security::nonce();
             view.operator_email = session.email;
+            // Rules live only in the KeyValueStore (issue #71), not in
+            // ControlState, so the current ruleset is a second read. A
+            // failure here must not break the whole dashboard — the operator
+            // still needs to see phase/rate/message/admission — so it is
+            // logged and the rules form is hidden rather than shown empty:
+            // an empty textarea is indistinguishable from a real dormant
+            // ruleset, and submitting it would overwrite the real one.
+            match state.edge.read_config().await {
+                Ok(cfg) => view.rules_text = format_rules(&cfg.rules),
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not read the current ruleset");
+                    view.rules_load_failed = true;
+                }
+            }
             match view.render() {
                 Ok(html) => {
                     let mut response = Html(html).into_response();
@@ -370,7 +393,7 @@ async fn state_json(State(state): State<Shared>, headers: HeaderMap) -> Response
     if authed(&state, &headers).await.is_none() {
         return (StatusCode::UNAUTHORIZED, "not authenticated").into_response();
     }
-    match state.store_load().await {
+    match state.store_load(now_ms() / 1000).await {
         Ok(Some(view)) => axum::Json(view).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, "event not found").into_response(),
         Err(e) => server_error(&e),
@@ -477,6 +500,90 @@ async fn resume(State(state): State<Shared>, headers: HeaderMap) -> Response {
     finish(apply_resume(&state.store, &state.event_id, &session.email, now_ms()).await)
 }
 
+#[derive(Deserialize)]
+struct FailOpenForm {
+    minutes: String,
+}
+
+/// Engages fail-open (issue #71): break-glass, until the given duration
+/// lapses on its own. Legal regardless of pause state.
+async fn fail_open(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Form(form): Form<FailOpenForm>,
+) -> Response {
+    let Some(session) = authed(&state, &headers).await else {
+        return Redirect::to("/admin/login").into_response();
+    };
+    finish(
+        apply_fail_open(
+            &state.store,
+            &state.edge,
+            &state.event_id,
+            &form.minutes,
+            &session.email,
+            now_ms(),
+        )
+        .await,
+    )
+}
+
+/// Clears the fail-open epoch. Not "resume": under the split this only
+/// clears the epoch, so a pause queued during the window still applies.
+async fn recover(State(state): State<Shared>, headers: HeaderMap) -> Response {
+    let Some(session) = authed(&state, &headers).await else {
+        return Redirect::to("/admin/login").into_response();
+    };
+    finish(
+        apply_recover(
+            &state.store,
+            &state.edge,
+            &state.event_id,
+            &session.email,
+            now_ms(),
+        )
+        .await,
+    )
+}
+
+#[derive(Deserialize)]
+struct RulesForm {
+    rules: String,
+}
+
+/// Replaces the edge gate's ruleset (issue #71). One rule per line, in the
+/// same tag vocabulary as the `KeyValueStore` wire form: `p <prefix>`,
+/// `c <name>`, `u <substring>`, `h <name> <value>`. Blank lines and lines
+/// starting with `#` are ignored, so an operator can leave the form
+/// human-readable. Validation (per-field bounds, rule count, byte ceiling) is
+/// `apply_set_rules`'s job; a parse failure here is reported the same way —
+/// a plain-text 400 naming exactly what was wrong, so it works with
+/// JavaScript disabled.
+async fn set_rules(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Form(form): Form<RulesForm>,
+) -> Response {
+    let Some(session) = authed(&state, &headers).await else {
+        return Redirect::to("/admin/login").into_response();
+    };
+    let rules = match parse_rules(&form.rules) {
+        Ok(rules) => rules,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    finish(
+        apply_set_rules(
+            &state.store,
+            &state.edge,
+            &state.event_id,
+            rules,
+            &session.email,
+            now_ms(),
+        )
+        .await,
+    )
+}
+
 /// Current epoch-millis for the audit stamp + debounce guard.
 fn now_ms() -> u64 {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
@@ -511,13 +618,14 @@ async fn static_asset(Path(path): Path<String>) -> Response {
 }
 
 impl AppState {
-    /// Loads control state and maps it to the dashboard view.
-    async fn store_load(&self) -> Result<Option<Dashboard>, String> {
+    /// Loads control state and maps it to the dashboard view, resolved at
+    /// `now` (epoch seconds).
+    async fn store_load(&self, now: u64) -> Result<Option<Dashboard>, String> {
         use admin::Store;
         self.store
             .load(&self.event_id)
             .await
-            .map(|opt| opt.as_ref().map(Dashboard::from_state))
+            .map(|opt| opt.as_ref().map(|state| Dashboard::from_state(state, now)))
             .map_err(|e| e.to_string())
     }
 }

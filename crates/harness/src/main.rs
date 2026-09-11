@@ -96,6 +96,14 @@ fn parse_args() -> Result<Args> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Install the aws-lc-rs rustls provider process-wide so reqwest's
+    // no-provider rustls path uses aws-lc-rs, not ring (mirrors
+    // crates/admin/src/main.rs, which needs the same install for the same
+    // reason).
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .map_err(|_| anyhow::anyhow!("failed to install aws-lc-rs rustls provider"))?;
+
     let args = parse_args()?;
     let edge = Arc::new(Edge::new(ERROR_TTL, args.seconds));
 

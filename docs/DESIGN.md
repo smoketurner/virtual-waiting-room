@@ -83,29 +83,54 @@ authorizer without a call to the waiting-room backend.
   Visitor polls /status → serving_counter ≥ own position
         │
   POST /v1/generate_token → generate_token (Rust)
-        1. position reached, event admitting, position still a live claim?
+        1. position reached, event admitting (resolved from StoredControl +
+           fail_open_until, issue #71), position still a live claim?
         2. ADD arrivals#(hash % 10)
-        3. sign a CloudFront custom policy, RSA PKCS#1 v1.5 over SHA-256
-        4. Set-Cookie: CloudFront-Policy, -Signature, -Key-Pair-Id,
-                       -Hash-Algorithm=SHA256      (Path=/, no Domain)
+        3. sign an HMAC-SHA256 session credential (wr_common::crypto)
+        4. Set-Cookie: <session_cookie_name>=<credential>  (Path=/, Secure,
+                        HttpOnly, SameSite=Lax, Max-Age)
         │
         ▼
-  CloudFront protected behaviour [trusted key group]   ← the gate, no compute
-     ├─ valid signed cookies    → forward to the operator's origin
-     └─ missing or expired      → 403, mapped by custom_error_response to
-                                  /_wr/waiting.html (an ungated behaviour)
+  CloudFront Function, viewer-request, protected behaviour only  ← the gate
+     1. no configured rule matches       → pass through (dormancy, #60)
+     2. enforce_from/fail_open_until in the future → pass through, marked
+     3. valid session cookie             → pass through
+     4. missing or invalid               → refuse with a reason (#73):
+                                            302 to /_wr/waiting.html for
+                                            navigation, 403 JSON for XHR (#72)
+     5. the gate itself throws           → pass through, marked (not #58 —
+                                            see below)
 ```
 
-**The alternative gate** (ADR-0020). For an origin the operator controls and wants per-request
-rules on — header, cookie, user agent — `modules/authorizer` runs a Rust Lambda at that origin
-instead: session cookie → admission token → protection-rule match → 302, deciding locally with
-no backend call. It is built and deployable and is not in the CloudFront path.
+A CloudFront Function (ADR-0021, issue #71) replaced the earlier trusted-key-group gate
+(ADR-0020, superseded): it reads its whole configuration and the signing secret from one
+CloudFront KeyValueStore, so it decides locally instead of only verifying a signature. Still no
+compute in the *origin* request path — the function runs at the edge in sub-millisecond time,
+never calling the origin or any backend.
 
-Two properties of the edge gate are load-bearing and currently open. It has **no fail-open
-path** — an outage of the token path returns 403 to every visitor of the whole distribution
-([#58](https://github.com/smoketurner/virtual-waiting-room/issues/58)) — and it has **no dormant
-state**, so standby mode is not deliverable through it
-([#60](https://github.com/smoketurner/virtual-waiting-room/issues/60)).
+**The alternative gate** (ADR-0011, ADR-0020 §5.1's authorizer half). For an origin the operator
+controls and wants per-request rules on — header, cookie, user agent — `modules/authorizer` runs
+a Rust Lambda at that origin instead: session cookie → admission token → protection-rule match →
+302, deciding locally with no backend call. It shares `wr_common::rules::ProtectionRule` with the
+edge gate's config writer, and it is the only gate available in GovCloud, where CloudFront
+Functions do not exist. It is built and deployable and is not in the CloudFront path.
+
+**Fail-open (#58) is a mechanism, not yet an automatic response.** `Counters.fail_open_until` is
+an epoch the gate evaluates against its own clock and `/admin/fail_open` sets it (mirrored to the
+KeyValueStore, admin-writer-first on entry so a crash leaves the edge minting and counting rather
+than blocked). What is not delivered is a watchdog that trips it automatically on a DynamoDB
+outage — engaging fail-open still depends on a human, or a future watchdog, noticing the backend
+is down.
+
+**Dormancy (#60) is delivered.** An empty ruleset (`r: []` in the KeyValueStore config, which is
+also what a fresh stack is seeded with) matches no request, so every visitor passes straight
+through — standby mode. `/admin/rules` writes the ruleset (validated per-field and re-encoded
+through `wr_common::rules::validate_rule_fields` + `encode_gate_config`, audited on `Counters` as
+`rules_digest`/`rules_count`), so an operator leaves dormancy from the dashboard. Scheduled
+activation into enforcement uses `enforce_from`, a timestamp every edge compares against its own
+clock, so propagation skew can only delay enforcement, never skip it; there is no `/admin` route
+yet that writes `enforce_from` itself, so an operator edits the KeyValueStore directly for that
+one field.
 
 ---
 
@@ -410,7 +435,8 @@ skipped number.
 | `serving_counter` | N | Admission high-water mark |
 | `max_expired_position` | N | Highest expired position |
 | `phase` | S | `idle` / `pre_queue` / `active` / `post_event` / `maintenance` |
-| `admission_control` | S | Operator's live intent: `open` / `paused` / `fail_open` (ADR-0019), which with `phase` derives the visitor-facing `ServingState` |
+| `admission_control` | S | The *stored* control (ADR-0019, ADR-0021 issue #71): `open` / `paused` only — never `fail_open`. Combined with `fail_open_until` by `wr_common::resolve(stored, fail_open_until, now)` into the three-valued resolved control that, with `phase`, derives the visitor-facing `ServingState` |
+| `fail_open_until` | N | Epoch-seconds fail-open deadline (issue #71); `0` = no window in force. Mirrored to the edge gate's KeyValueStore |
 | `target_rate` | N | Operator-set admission rate, in visitors per second |
 | `shuffle_seed` | B | 256-bit permutation key, written once at T−0 |
 | `participant_count` | N | Pre-queue cohort size, the permutation domain |
@@ -543,7 +569,7 @@ observe a TTL-pending item apply a `FilterExpression` on `expires_at`.
 |---|---|---|---|---|
 | Polled | `/status`, `/queue_num`, `/queue_pos_expiry`, `/public_key` | Min TTL 1 s | none | API Gateway |
 | Write | `/join`, `/generate_token` | disabled | none | API Gateway |
-| Protected origin | `/*` (default) | disabled | admission cookies forwarded | Operator origin, gated by a trusted key group |
+| Protected origin | `/*` (default) | disabled | session cookie forwarded | Operator origin, gated by a CloudFront Function at viewer-request (ADR-0021, issue #71) |
 | Waiting page | `/_wr/*` | cached | none | S3, deliberately ungated — this is what a refused visitor sees |
 
 Minimum TTL must exceed zero and polled behaviours must forward no cookies, or CloudFront
@@ -561,7 +587,9 @@ serves the previous value if the origin is slow.
 | `/admin/reset` | Reset event state |
 | `/admin/pause` | Pause admissions (reversible; queue and configured rate preserved) |
 | `/admin/resume` | Resume admissions, restoring the configured rate |
-| `/admin/rules` | Update protection rules |
+| `/admin/fail_open` | Engage the fail-open break-glass epoch for a given duration (issue #71) |
+| `/admin/recover` | Clear the fail-open epoch — not "resume": a queued pause still applies once it clears |
+| `/admin/rules` | Replaces the edge gate's ruleset, one rule per line. Written directly to the KeyValueStore — it is the sole store for `rules`, never DynamoDB — with an audit record (`rules_digest`, `rules_count`) stamped on `Counters` after the write lands. `enforce_from` is still Terraform-only. |
 | `/metrics` | Event metrics as JSON |
 | `/update_session` | Report session completion or abandonment |
 
@@ -574,16 +602,19 @@ Two artifacts, signed with the same key over different inputs so neither can be 
 the other ([ADR-0011](adr/0011-session-cookie-after-token.md)):
 
 - **Admission token** — carries event id, queue id, and expiry. Travels on the URL,
-  short-lived, validated once.
-- **Session cookie** — set by the authorizer after the token validates, scoped per event.
-  Supports a sliding window extended on activity and a hard cap from issue time.
-- **CloudFront signed cookie set** — what the edge gate actually checks, and the only credential
-  in the deployed CloudFront path: `CloudFront-Policy`, `-Signature`, `-Key-Pair-Id` and
-  `-Hash-Algorithm=SHA256`, minted by `generate_token` over an RSA key pair whose public half is
-  in a trusted key group (ADR-0020). It is a bearer credential until its policy expires: it
-  carries no visitor binding, is scoped `https://*`
-  ([#61](https://github.com/smoketurner/virtual-waiting-room/issues/61)), and cannot be revoked
-  ([#63](https://github.com/smoketurner/virtual-waiting-room/issues/63)).
+  short-lived, validated once. Used only on the `authorizer` path (an origin the operator
+  controls); the CloudFront path (below) has no token-then-session exchange, since
+  `generate_token` mints the session cookie directly (ADR-0021 §3.1).
+- **Session cookie** — one HMAC-SHA256 credential (`wr_common::crypto`), event-scoped, signed
+  over a domain-separating kind byte so it cannot be replayed as an admission token or vice versa
+  (ADR-0011). On the `authorizer` path it is set after a token validates and supports a sliding
+  window; on the CloudFront path (ADR-0021, issue #71) `generate_token` sets it directly and it is
+  the only credential the edge gate checks. It is a bearer credential until it expires: it carries
+  no visitor binding, is scoped by `event_id`
+  ([#61](https://github.com/smoketurner/virtual-waiting-room/issues/61), closed on the CloudFront
+  path — the gate refuses a credential minted for another event), and cannot be revoked
+  ([#63](https://github.com/smoketurner/virtual-waiting-room/issues/63), still open — no design
+  chosen).
 
 The signing key is per-deployment, held in an SSM Parameter Store SecureString (a SecureString is free where a Secrets Manager secret is $0.40/mo, which N1 does not allow). Its compromise permits minting
 admission for every event in that deployment.

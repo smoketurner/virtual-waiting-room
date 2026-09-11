@@ -448,7 +448,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
-    use wr_common::{AdmissionControl, SealedOffsets};
+    use wr_common::{SealedOffsets, StoredControl};
 
     use super::*;
 
@@ -640,7 +640,8 @@ mod tests {
             prequeue_offsets: None,
             message: None,
             target_rate: None,
-            admission_control: AdmissionControl::Open,
+            stored_control: StoredControl::Open,
+            fail_open_until: 0,
         }
     }
 
@@ -663,7 +664,8 @@ mod tests {
             prequeue_offsets: Some(offsets),
             message: None,
             target_rate: None,
-            admission_control: AdmissionControl::Open,
+            stored_control: StoredControl::Open,
+            fail_open_until: 0,
         }
     }
 

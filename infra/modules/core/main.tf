@@ -142,19 +142,23 @@ resource "aws_dynamodb_table" "tokens" {
 # (AWS-managed alias/aws/ssm key - a standard SecureString parameter is free,
 # unlike a Secrets Manager secret's $0.40/mo, which matters for N1 idle cost).
 #
-# The real key is generated and rotated OUT OF BAND (never in the repo, never in
-# state). Terraform creates the parameter with a placeholder and then ignores
-# its value, so the operator/bootstrap can overwrite it without drift and the
-# secret material never lands in Terraform state.
+# Generated at apply and written to both readers — here for the Lambdas, and
+# to the gate's KeyValueStore for the edge (edge_gate.tf). One value from one
+# source means the two copies cannot disagree, and there is no bootstrap step
+# to skip: a deployment either has a real key everywhere or does not exist.
+#
+# This puts the key in Terraform state, which the S3 backend encrypts. That is
+# the same trade the retired tls_private_key made for the RSA key this one
+# replaces, so it is not a new exposure.
+resource "random_bytes" "signing_key" {
+  length = 32
+}
+
 resource "aws_ssm_parameter" "signing_key" {
   name        = "/${var.name_prefix}/signing-key"
   description = "Virtual Waiting Room per-deployment signing key (admission tokens + session cookies)."
   type        = "SecureString"
-  value       = "PLACEHOLDER-overwrite-out-of-band" # nosemgrep: not a real secret
-
-  lifecycle {
-    ignore_changes = [value]
-  }
+  value       = random_bytes.signing_key.base64
 
   tags = var.tags
 }

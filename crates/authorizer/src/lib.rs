@@ -14,9 +14,15 @@
 pub mod dynamo;
 pub mod token;
 
-use wr_common::{Session, SigningKey, VerifyError};
+use wr_common::{RequestView, Session, SigningKey, VerifyError};
 
 pub use token::{TokenError, generate_token};
+// Rule matching moved to wr-common (issue #71): the admin's edge-config
+// writer and `infra/modules/edge/functions/gate.js` must agree with the
+// authorizer on exactly one encoding, so there is one Rust type rather than
+// two that happen to look alike. Re-exported so existing `authorizer::
+// ProtectionRule` call sites are unaffected.
+pub use wr_common::ProtectionRule;
 
 /// How a session's lifetime is bounded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,38 +43,6 @@ pub enum UnreachablePolicy {
     FailOpen,
     /// Block: send the visitor to the waiting room even though it is down.
     FailClosed,
-}
-
-/// One local protection rule: a request matches when the named request
-/// attribute contains the configured substring. A path that no rule matches is
-/// unprotected and forwarded without a credential.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ProtectionRule {
-    /// The request path starts with this prefix.
-    PathPrefix(String),
-    /// A request header equals this `(name, value)` pair (case-insensitive name).
-    Header { name: String, value: String },
-    /// A cookie of this name is present.
-    Cookie(String),
-    /// The user agent contains this substring.
-    UserAgent(String),
-}
-
-impl ProtectionRule {
-    /// Whether this rule matches the request.
-    #[must_use]
-    pub fn matches(&self, req: &Request) -> bool {
-        match self {
-            Self::PathPrefix(prefix) => req.path.starts_with(prefix.as_str()),
-            Self::Header { name, value } => req
-                .header(name)
-                .is_some_and(|actual| actual.eq_ignore_ascii_case(value)),
-            Self::Cookie(name) => req.cookie(name).is_some(),
-            Self::UserAgent(needle) => req
-                .header("user-agent")
-                .is_some_and(|ua| ua.contains(needle.as_str())),
-        }
-    }
 }
 
 /// The parsed request the authorizer decides over. Header names are compared
@@ -110,7 +84,21 @@ impl Request {
     /// Whether any rule protects this request.
     #[must_use]
     pub fn is_protected(&self, rules: &[ProtectionRule]) -> bool {
-        rules.iter().any(|r| r.matches(self))
+        wr_common::matches_any(rules, self)
+    }
+}
+
+impl RequestView for Request {
+    fn path(&self) -> &str {
+        &self.path
+    }
+
+    fn header(&self, name: &str) -> Option<&str> {
+        Request::header(self, name)
+    }
+
+    fn cookie(&self, name: &str) -> Option<&str> {
+        Request::cookie(self, name)
     }
 }
 
@@ -194,7 +182,7 @@ pub fn decide(
         && session.event_id == cfg.event_id
     {
         let refresh_cookie =
-            slide(&session, cfg.session_mode, now).map(|s| session_cookie(&s.sign(key), cfg, now));
+            slide(&session, cfg.session_mode, now).map(|s| session_cookie(&s.sign(key), cfg));
         return Decision::Forward { refresh_cookie };
     }
 
@@ -207,7 +195,7 @@ pub fn decide(
         && admitted.event_id == cfg.event_id
     {
         let session = mint_session(&admitted.request_id, cfg, now);
-        let set_cookie = session_cookie(&session.sign(key), cfg, now);
+        let set_cookie = session_cookie(&session.sign(key), cfg);
         let arrival_shard = wr_common::shard_for(admitted.request_id.as_bytes());
         let stripped_path = strip_token(&req.path);
         return Decision::SetSessionAndForward {
@@ -231,7 +219,7 @@ pub fn decide(
     //    the visitor to wait.
     match (reachability, cfg.unreachable_policy) {
         (Reachability::Unreachable, UnreachablePolicy::FailOpen) => Decision::FailOpenBypass {
-            set_cookie: bypass_cookie(cfg, now),
+            set_cookie: bypass_cookie(cfg),
         },
         (Reachability::Unreachable, UnreachablePolicy::FailClosed)
         | (Reachability::Reachable, _) => Decision::Redirect {
@@ -290,12 +278,11 @@ pub fn slide(session: &Session, mode: SessionMode, now: u64) -> Option<Session> 
 
 /// A `Set-Cookie` header value for the session, scoped per event, `HttpOnly`,
 /// `Secure`, `SameSite=Lax`, with a `Max-Age` matching the session expiry.
-fn session_cookie(value: &str, cfg: &Config, now: u64) -> String {
+fn session_cookie(value: &str, cfg: &Config) -> String {
     let max_age = match cfg.session_mode {
         SessionMode::Fixed { ttl_secs } => ttl_secs,
         SessionMode::Sliding { idle_secs, .. } => idle_secs,
     };
-    let _ = now;
     format!(
         "{}={value}; Max-Age={max_age}; Path=/; HttpOnly; Secure; SameSite=Lax",
         cfg.session_cookie_name
@@ -303,8 +290,7 @@ fn session_cookie(value: &str, cfg: &Config, now: u64) -> String {
 }
 
 /// A `Set-Cookie` header value for the time-limited fail-open bypass.
-fn bypass_cookie(cfg: &Config, now: u64) -> String {
-    let _ = now;
+fn bypass_cookie(cfg: &Config) -> String {
     format!(
         "{}=1; Max-Age={}; Path=/; HttpOnly; Secure; SameSite=Lax",
         cfg.bypass_cookie_name, cfg.bypass_ttl_secs

@@ -26,11 +26,13 @@ to their registration index. One conditional `UpdateItem` assigns positions to t
 pre-queue cohort. The permutation is a 4-round Feistel network keyed by a 256-bit seed, and its
 byte encoding is pinned by frozen test vectors.
 
-**The gate is the content delivery network (CDN).** The CloudFront default cache behaviour names
-a trusted key group. CloudFront verifies signed cookies at the edge and refuses an un-admitted
-visitor before the origin receives the request. No code of ours runs in that path either.
+**The gate is a CloudFront Function.** The default cache behaviour associates a viewer-request
+function that decides locally from a KeyValueStore (ADR-0021, issue #71): no configured rule, a
+valid session cookie, or a fail-open/pending epoch all pass through; otherwise it refuses before
+the origin receives the request. Sub-millisecond compute at the edge, never a call to the origin
+or any backend.
 
-The core Terraform module holds 65 managed resources.
+The core Terraform module holds 64 managed resources; the edge module holds 18.
 
 ---
 
@@ -45,7 +47,7 @@ API, one CloudFront distribution.
 | `seal_event` | EventBridge Scheduler, one-shot | 10 s | Folds shard counts into offsets; writes the seal |
 | `read` | API Gateway | 10 s | Serves `GET /v1/status` and `GET /v1/queue_num` |
 | `controller` | EventBridge Scheduler, `rate(1 minute)` | 30 s | Meters admission; expires positions |
-| `generate_token` | API Gateway | 30 s | Checks the position; records the arrival; signs the cookies |
+| `generate_token` | API Gateway | 10 s | Checks the position; records the arrival; signs the session cookie the edge gate verifies |
 | `admin` | API Gateway | 10 s | Axum operator UI and control plane |
 
 Every function runs `provided.al2023` at 256 MB on the architecture named in
@@ -339,79 +341,77 @@ zero yields a cutoff of zero and expires nothing.
 advances to the highest position expired — the highest position, not a count, because the
 attribute names a position.
 
-### 6.3 Minting the cookies
+### 6.3 Minting the session cookie
 
 `POST /v1/generate_token` takes `request_id` from the query string or the JSON body. It reads
 `Positions` first; a live-join row is authoritative and the `PreQueue` lookup is skipped when one
 answers.
 
-`decide` refuses in this order: admission control not `Open`, phase not `Active`, no registration,
-position not yet reached. A `Positions` row whose status is `completed`, `abandoned` or `expired`
-is `Spent` — permanent, so the client stops rather than keeps polling. The cursor is exclusive:
+`decide` refuses in this order: resolved admission control (`wr_common::resolve(stored_control,
+fail_open_until, now)`, issue #71) not `Open`, phase not `Active`, no registration, position not
+yet reached. A `Positions` row whose status is `completed`, `abandoned` or `expired` is `Spent` —
+permanent, so the client stops rather than keeps polling. The cursor is exclusive:
 `position >= serving_counter` means still queued.
 
 Refusals map to statuses the waiting page acts on: 425 still queued, 409 not admitting or not
 sealed, 404 not registered, 410 spent, 500 corrupt.
 
-The arrival is recorded before the cookies are signed. A visitor counted but not admitted
+The arrival is recorded before the cookie is signed. A visitor counted but not admitted
 understates the no-show rate. One admitted but not counted makes the controller over-release for
 every later interval. A failed arrival write is logged at error under the stable event name
 `arrival_record_failed` and the visitor is admitted anyway.
 
-The cookies are a CloudFront **custom** policy over `https://*`, signed RSA PKCS#1 v1.5 over
-SHA-256, defaulting to a one-hour lifetime:
+The credential is an HMAC-SHA256 `wr_common::crypto::Session` — the same wire format the
+authorizer's session cookie already used (ADR-0011), domain-separated from an admission token by
+a leading kind byte so neither validates as the other — set directly as a cookie, defaulting to a
+one-hour lifetime:
 
 ```
-CloudFront-Policy=<base64>; Path=/; Max-Age=3600; Secure; HttpOnly; SameSite=Lax
-CloudFront-Signature=<base64>; ...
-CloudFront-Key-Pair-Id=<id>; ...
-CloudFront-Hash-Algorithm=SHA256; ...
+<session_cookie_name>=<base64url(payload)>.<base64url(mac)>; Path=/; Max-Age=3600; Secure; HttpOnly; SameSite=Lax
 ```
 
-The base64 is CloudFront's variant, with `+/=` replaced by `-~_`.
-`CloudFront-Hash-Algorithm=SHA256` must be sent or CloudFront assumes SHA-1 and rejects every
-signature. `Path=/` with no `Domain` must be used or the browser never sends the cookies back on
-the protected request.
+`Path=/` with no `Domain` must be used or the browser never sends the cookie back on the
+protected request.
 
 The signing key is read from SSM Parameter Store once at cold start, inside the boosted init
-phase, so neither the TLS handshake nor the RSA key parse lands on a visitor's request.
+phase, so the TLS handshake does not land on a visitor's request. Terraform generates that key and
+writes it to both SSM and the gate's KeyValueStore in the same apply, so the minting and verifying
+sides always hold the same value.
 
 ---
 
 ## 7. The gate
 
-The CloudFront default cache behaviour names `trusted_key_groups`. CloudFront verifies the signed
-cookies itself on every request to the protected origin. Caching is disabled there and an origin
-request policy forwards the session cookie, all viewer headers, and all query strings.
+A CloudFront Function (`cloudfront-js-2.0`, ADR-0021, issue #71) is associated with the default
+cache behaviour at `viewer-request`, reading its whole configuration and the signing secret from
+one CloudFront KeyValueStore. It decides locally, in this order:
 
-A refused visitor gets a 403, which a distribution-wide `custom_error_response` turns into:
+1. No rule in the KeyValueStore's ruleset matches → pass through untouched (`r: []` is dormancy).
+2. `enforce_from` (a scheduled go-live epoch) or `fail_open_until` (break-glass) is in the
+   future → pass through, marked `x-wr-gate: pending` / `failopen`.
+3. A valid session cookie for this event, not expired → pass through.
+4. Otherwise → refused with a reason: a navigation gets a 302 to the waiting page with
+   `?r=<reason>&next=<destination>`; an XHR/fetch gets 403 JSON with `x-wr-reason`.
+5. The gate itself throwing (an unreadable KeyValueStore, an unrecognised config version) →
+   pass through, marked `x-wr-gate-failed: true`. This is not the same thing as a
+   backend-unreachable fail-open (#58) — the function makes no network calls and cannot observe
+   that at all.
 
-```hcl
-custom_error_response {
-  error_code            = 403
-  response_code         = 200
-  response_page_path    = "/_wr/waiting.html"
-  error_caching_min_ttl = 0
-}
-```
-
-The waiting page is the correct answer to "you are not admitted yet", and a 403 body keeps
-browsers from rendering it as a normal page. `error_caching_min_ttl` must stay 0: CloudFront
-caches its own error responses, and a cached refusal keeps showing the waiting page to a visitor
-who has since been admitted.
+Caching is disabled on this behaviour and an origin request policy forwards the session cookie,
+all viewer headers, and all query strings. `x-wr-gate`/`x-wr-gate-failed` are stripped from the
+incoming request before any decision logic runs, since the protected behaviour forwards
+`allViewer` and a visitor's own request could otherwise carry a spoofed value.
 
 `/_wr/*` is its own behaviour against a private S3 bucket, outside the gate. Gating it would make
-the refusal loop.
-
-The client handles the loop that remains. A visitor holding cookies CloudFront refuses would
-bounce between the origin and the waiting page, so `waiting.js` counts bounces, retries the same
-pass up to five times, and then stops with an explanation rather than cycling.
+the refusal loop, and a `check` block asserts the waiting page's path falls under the pattern that
+serves it. The `next=` parameter on a redirect carries the visitor's original destination through
+the waiting page, so they land where they were going once admitted.
 
 ### The cache behaviours
 
 | Behaviour | Path | Cache policy | Cookies | Origin |
 |---|---|---|---|---|
-| Default | `/*` | CachingDisabled | session cookie forwarded | Protected origin, trusted key group |
+| Default | `/*` | CachingDisabled | session cookie forwarded | Protected origin, gated by the CloudFront Function |
 | Waiting page | `/_wr/*` | Cached | none | S3, ungated |
 | Polled | `/v1/status` | Min TTL 1 s, key: path | none | API Gateway |
 | Polled | `/v1/queue_num` | Min TTL 1 s, key: path + `event_id` + `request_id` | none | API Gateway |
@@ -441,7 +441,8 @@ The admin Lambda serves an Axum router behind an API Gateway greedy proxy:
 | `/admin/message` | POST | Operator broadcast |
 | `/admin/reset` | POST | Reset event state |
 | `/admin/pause`, `/admin/resume` | POST | Admission control transitions |
-| `/admin/rules` | POST | 501 Not Implemented |
+| `/admin/fail_open`, `/admin/recover` | POST | Sets and clears the break-glass epoch |
+| `/admin/rules` | POST | Writes the edge gate's ruleset to the KeyValueStore |
 | `/update_session` | POST | 501 Not Implemented |
 | `/metrics` | GET | Routed by API Gateway, **no handler in the router** |
 
@@ -499,42 +500,53 @@ uniformity test uses a different threshold and does not assert a specific χ².
 | The controller schedule is created when the controller is | Always created |
 | The operator message attribute is `operator_message` | The attribute is `message` |
 | `GET /metrics` returns event metrics | API Gateway routes it to the admin Lambda, whose router has no `/metrics` handler |
-| A refused visitor gets a 403 mapped to the waiting page | The mapping rewrites the status to **200** |
 
 ---
 
 ## 11. Known gaps in the code
 
-**The gate verifies, it does not decide.** CloudFront checks a signature. It cannot be told to
-stand down when the backend is unreachable ([#58](https://github.com/smoketurner/virtual-waiting-room/issues/58))
-or to pass traffic through while the event is dormant ([#60](https://github.com/smoketurner/virtual-waiting-room/issues/60)).
-`AdmissionControl::FailOpen` is a storable state that holds the controller, but nothing enforces
-it at the edge.
+**Fail-open requires an operator.** Setting `fail_open_until` makes every edge pass traffic
+through until that epoch. Nothing sets it automatically. The function makes no network calls, so
+it cannot detect an unreachable backend
+([#58](https://github.com/smoketurner/virtual-waiting-room/issues/58)). A component that can
+observe the backend would have to trip it, and none exists.
 
-**The cookies are unbound bearer credentials.** The policy resource is `https://*` with no visitor
-binding ([#61](https://github.com/smoketurner/virtual-waiting-room/issues/61)) and no revocation
-([#63](https://github.com/smoketurner/virtual-waiting-room/issues/63)). `generate_token` takes a
-request id from a query string and authenticates nothing else, so anyone holding a request id can
-mint a set.
+**The session cookie is a bearer credential.** The gate verifies a signature and an expiry and
+nothing else, so a stolen cookie works as well as the original until it expires. There is no
+visitor binding ([#61](https://github.com/smoketurner/virtual-waiting-room/issues/61)) and no
+revocation ([#63](https://github.com/smoketurner/virtual-waiting-room/issues/63)). `generate_token`
+authenticates only a request id from the query string, so anyone holding that id can mint a cookie
+([#62](https://github.com/smoketurner/virtual-waiting-room/issues/62)).
+
+**The admin Lambda can read the signing key.** Its KeyValueStore grant covers the key as well as
+the config. IAM cannot narrow it. The store is the only resource type the service defines, the
+service publishes no condition keys, and a function associates exactly one store.
 
 **`generate_token` is replayable and inflates the arrival count.** It never marks a position
 spent. A visitor who calls it twice records two arrivals against one release. That understates the
 no-show rate, so the controller under-releases — the safe direction, but the measurement is wrong.
 
-**Standby mode is not implemented.** There is no inflow alarm, no dormant state, and no automatic
-phase transition. `Phase::Idle` and `Phase::PostEvent` exist and an operator sets them by hand.
+**Standby requires an operator.** An empty ruleset passes every request through, and
+`enforce_from` switches every edge to enforcing at one instant. Nothing triggers either. There is
+no inflow alarm and no automatic phase transition.
 
-**Protection rules are not wired.** `authorizer` implements `ProtectionRule` matching on path,
-header, cookie and user agent. `/admin/rules` returns 501, and the CloudFront path has no rule
-evaluation at all.
+**GovCloud matches on path prefixes only.** The CloudFront path evaluates all four rule kinds:
+path, header, cookie, and user agent. `authorizer` is the only gate available where CloudFront
+Functions do not exist, and it wires just `PathPrefix` from `PROTECTED_PATH_PREFIXES`. The two
+gates share the rule type but not the configuration path, so a commercial deployment and a
+GovCloud deployment protect different requests.
 
 **Sessions cannot be completed or abandoned.** `PositionStatus` has `Completed` and `Abandoned`
-variants that only the controller's expiry path and `generate_token`'s refusal ever read.
+variants. Only the controller's expiry path and `generate_token`'s refusal read them.
 `/update_session` returns 501, so nothing writes them.
 
-[ADR-0021](adr/0021-edge-function-gate.md) is accepted and addresses the first two by replacing the
-key-group gate with a CloudFront Function that decides at the edge. `infra/` contains no CloudFront
-Function and no KeyValueStore, so none of it is deployed.
+**The edge does not extend sessions.** `generate_token` mints one session for
+`SESSION_TTL_SECS` and nothing re-issues it. A visitor still on the origin when it expires returns
+to the queue. `authorizer` offers `SessionMode::Sliding`, which extends on activity. The two gates
+never run in the same deployment, so an operator chooses between them.
+
+**Two properties are unmeasured against a real deployment:** the function's compute utilization
+per request, and how long a KeyValueStore write takes to reach every edge.
 
 ---
 
@@ -572,9 +584,11 @@ cause — an `event_id` containing `#` — but nothing else in the deployment is
 event.
 
 **What happens when the signing key is compromised?**
-Everything. One per-deployment key signs the CloudFront policies, and `authorizer` uses the same
-parameter for its HMAC tokens and sessions with a kind-byte domain separation. Rotation is listed
-as an open decision in [`adr/README.md`](adr/README.md).
+Everything. One per-deployment key signs the session cookies the edge gate verifies, and
+`authorizer` uses the same key for its admission tokens and sessions with a kind-byte domain
+separation. Holding it mints admission for the whole event. Terraform generates it, so changing it
+means forcing `random_bytes.signing_key` to regenerate — which invalidates every live session, so
+it is a between-events operation rather than a routine one.
 
 ---
 
@@ -594,11 +608,11 @@ number:    CloudFront [/v1/queue_num, Min TTL 1 s, keyed per visitor]
 admit:     CloudFront [/v1/generate_token, uncached, AllViewerExceptHostHeader]
              → API Gateway → generate_token
              → DynamoDB (check position, record arrival)
-             → 4 Set-Cookie headers
+             → 1 Set-Cookie header (HMAC session credential)
 
-protected: CloudFront [/*, trusted key group]
-             ├─ valid cookies    → customer origin (or the demo fixture)
-             └─ missing/expired  → 403 → rewritten 200 → /_wr/waiting.html
+protected: CloudFront [/*, CloudFront Function at viewer-request]
+             ├─ valid session cookie → customer origin (or the demo fixture)
+             └─ missing/expired       → 302/403 → /_wr/waiting.html
 
 seal:      EventBridge Scheduler at(seal_start_time)   [only if set]
              → seal_event → BatchGetItem ×10 → one guarded UpdateItem

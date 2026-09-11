@@ -30,3 +30,7 @@ jobs:
       # calls AWS.
       - run: terraform -chdir=infra/environments/dev init -backend=false -input=false
       - run: terraform -chdir=infra/environments/dev validate
+      # The edge gate association test (issue #71) mocks the aws provider, so
+      # it needs no AWS credentials and no backend.
+      - run: terraform -chdir=infra/modules/edge init -backend=false -input=false
+      - run: terraform -chdir=infra/modules/edge test
