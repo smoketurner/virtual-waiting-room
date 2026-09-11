@@ -23,13 +23,20 @@ pub trait Store {
     ) -> impl Future<Output = Result<Option<ControlState>, StoreError>> + Send;
 
     /// Transitions the phase with a guard on the expected current phase, so two
-    /// operators cannot race a transition. Returns `Conflict` if the stored
-    /// phase no longer matches `from`.
+    /// operators cannot race a transition, and stamps the audit fields
+    /// (`last_action` = `action`, `last_action_by`, `last_action_at`,
+    /// `last_action_epoch_ms`) atomically in the same `UpdateItem`. Returns
+    /// `Conflict` if the stored phase no longer matches `from`. NOT debounced —
+    /// like `force_maintenance`, the operator's lifecycle/recovery move must
+    /// always apply.
     fn set_phase(
         &self,
         event_id: &str,
         from: Phase,
         to: Phase,
+        action: AdminAction,
+        actor: &str,
+        now_ms: u64,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
     /// Sets the admission target rate, guarded (ADR-0017 defensive controls):
@@ -126,6 +133,7 @@ pub enum AdminAction {
     Pause,
     Resume,
     ForceMaintenance,
+    SetPhase,
 }
 
 impl AdminAction {
@@ -138,6 +146,7 @@ impl AdminAction {
             Self::Pause => "pause",
             Self::Resume => "resume",
             Self::ForceMaintenance => "force_maintenance",
+            Self::SetPhase => "set_phase",
         }
     }
 }
@@ -229,21 +238,43 @@ pub fn next_phases(from: Phase) -> Vec<Phase> {
     }
 }
 
+/// Transitions the event to the requested phase, stamping the operator and
+/// time on `Counters` (ADR-0017 §6) so the dashboard's "last changed by X at
+/// T" line reflects the transition — including the recovery *out* of
+/// `Maintenance`, which the phase dropdown routes through here.
+///
+/// Entering `Maintenance` is rejected here even though `transition_allowed`
+/// permits it from any phase: the emergency stop must go through `/admin/reset`
+/// (`force_maintenance`), so it is audited under its own label and a crafted
+/// `POST /admin/phase?phase=maintenance` cannot write `phase = maintenance`
+/// unaudited. The phase dropdown never offers `Maintenance` (`next_phases`
+/// excludes it), so this only catches a hand-crafted request.
 ///
 /// # Errors
 ///
-/// [`ActionError`] if the phase is unknown, the event is missing, or the
-/// transition is illegal; the store's [`StoreError`] is mapped to
+/// [`ActionError::UnknownPhase`] if the phase string is not a known phase;
+/// [`ActionError::NotFound`] if the event is missing;
+/// [`ActionError::IllegalTransition`] if the transition is illegal (including
+/// any target of `Maintenance`); the store's [`StoreError`] is mapped to
 /// [`ActionError`] on a lost race.
 pub async fn apply_phase<S: Store>(
     store: &S,
     event_id: &str,
     to: &str,
+    actor: &str,
+    now_ms: u64,
 ) -> Result<Phase, ApplyError> {
     let to = parse_phase(to)?;
     let Some(state) = store.load(event_id).await? else {
         return Err(ActionError::NotFound.into());
     };
+    if to == Phase::Maintenance {
+        return Err(ActionError::IllegalTransition {
+            from: state.phase,
+            to,
+        }
+        .into());
+    }
     if !transition_allowed(state.phase, to) {
         return Err(ActionError::IllegalTransition {
             from: state.phase,
@@ -251,7 +282,16 @@ pub async fn apply_phase<S: Store>(
         }
         .into());
     }
-    store.set_phase(event_id, state.phase, to).await?;
+    store
+        .set_phase(
+            event_id,
+            state.phase,
+            to,
+            AdminAction::SetPhase,
+            actor,
+            now_ms,
+        )
+        .await?;
     Ok(to)
 }
 
@@ -440,6 +480,12 @@ mod tests {
         control: Mutex<AdmissionControl>,
         /// The audit label the last control change recorded.
         control_action: Mutex<Option<AdminAction>>,
+        /// The four ADR-0017 §6 audit fields, mirroring `apply_audit_values` in
+        /// `dynamo.rs` so the fake faithfully exposes the dashboard-facing
+        /// attribution like the real store.
+        last_action: Mutex<Option<String>>,
+        last_action_by: Mutex<Option<String>>,
+        last_action_at: Mutex<Option<String>>,
         last_epoch: Mutex<Option<u64>>,
         missing: bool,
         /// When set, the next guarded write reports a lost race.
@@ -454,6 +500,9 @@ mod tests {
                 message: Mutex::new(None),
                 control: Mutex::new(AdmissionControl::Open),
                 control_action: Mutex::new(None),
+                last_action: Mutex::new(None),
+                last_action_by: Mutex::new(None),
+                last_action_at: Mutex::new(None),
                 last_epoch: Mutex::new(None),
                 missing: false,
                 conflict: false,
@@ -467,6 +516,15 @@ mod tests {
                 phase: Mutex::new(phase),
                 ..Self::default()
             }
+        }
+
+        /// Stamps all four audit fields, mirroring `apply_audit_values` in the
+        /// real store; every mutating method calls this.
+        fn stamp_audit(&self, action: AdminAction, actor: &str, now_ms: u64) {
+            *self.last_action.lock().unwrap() = Some(action.as_str().to_owned());
+            *self.last_action_by.lock().unwrap() = Some(actor.to_owned());
+            *self.last_action_at.lock().unwrap() = Some(now_ms.to_string());
+            *self.last_epoch.lock().unwrap() = Some(now_ms);
         }
     }
 
@@ -487,9 +545,9 @@ mod tests {
                     target_rate: *self.rate.lock().unwrap(),
                     message: self.message.lock().unwrap().clone(),
                     admission_control: *self.control.lock().unwrap(),
-                    last_action: None,
-                    last_action_by: None,
-                    last_action_at: None,
+                    last_action: self.last_action.lock().unwrap().clone(),
+                    last_action_by: self.last_action_by.lock().unwrap().clone(),
+                    last_action_at: self.last_action_at.lock().unwrap().clone(),
                     last_action_epoch_ms: *self.last_epoch.lock().unwrap(),
                 }))
             };
@@ -501,11 +559,15 @@ mod tests {
             _event_id: &str,
             _from: Phase,
             to: Phase,
+            action: AdminAction,
+            actor: &str,
+            now_ms: u64,
         ) -> impl Future<Output = Result<(), StoreError>> + Send {
             let result = if self.conflict {
                 Err(StoreError::Conflict)
             } else {
                 *self.phase.lock().unwrap() = to;
+                self.stamp_audit(action, actor, now_ms);
                 Ok(())
             };
             std::future::ready(result)
@@ -516,14 +578,14 @@ mod tests {
             _event_id: &str,
             _expected: Option<u32>,
             rate: u32,
-            _actor: &str,
+            actor: &str,
             now_ms: u64,
         ) -> impl Future<Output = Result<(), StoreError>> + Send {
             let result = if self.conflict {
                 Err(StoreError::Conflict)
             } else {
                 *self.rate.lock().unwrap() = Some(rate);
-                *self.last_epoch.lock().unwrap() = Some(now_ms);
+                self.stamp_audit(AdminAction::SetRate, actor, now_ms);
                 Ok(())
             };
             std::future::ready(result)
@@ -533,11 +595,11 @@ mod tests {
             &self,
             _event_id: &str,
             message: &str,
-            _actor: &str,
+            actor: &str,
             now_ms: u64,
         ) -> impl Future<Output = Result<(), StoreError>> + Send {
             *self.message.lock().unwrap() = Some(message.to_owned());
-            *self.last_epoch.lock().unwrap() = Some(now_ms);
+            self.stamp_audit(AdminAction::SetMessage, actor, now_ms);
             std::future::ready(Ok(()))
         }
 
@@ -547,7 +609,7 @@ mod tests {
             from: AdmissionControl,
             to: AdmissionControl,
             action: AdminAction,
-            _actor: &str,
+            actor: &str,
             now_ms: u64,
         ) -> impl Future<Output = Result<(), StoreError>> + Send {
             // Mirrors the conditional write: the move applies only if the stored
@@ -558,7 +620,7 @@ mod tests {
             } else {
                 *guard = to;
                 *self.control_action.lock().unwrap() = Some(action);
-                *self.last_epoch.lock().unwrap() = Some(now_ms);
+                self.stamp_audit(action, actor, now_ms);
                 Ok(())
             };
             std::future::ready(result)
@@ -568,14 +630,14 @@ mod tests {
             &self,
             _event_id: &str,
             _from: Phase,
-            _actor: &str,
+            actor: &str,
             now_ms: u64,
         ) -> impl Future<Output = Result<(), StoreError>> + Send {
             let result = if self.conflict {
                 Err(StoreError::Conflict)
             } else {
                 *self.phase.lock().unwrap() = Phase::Maintenance;
-                *self.last_epoch.lock().unwrap() = Some(now_ms);
+                self.stamp_audit(AdminAction::ForceMaintenance, actor, now_ms);
                 Ok(())
             };
             std::future::ready(result)
@@ -629,15 +691,24 @@ mod tests {
     #[tokio::test]
     async fn apply_phase_advances_and_persists() {
         let store = FakeStore::with_phase(Phase::Idle);
-        let to = apply_phase(&store, "evt", "pre_queue").await.unwrap();
+        let to = apply_phase(&store, "evt", "pre_queue", "op@x", 1_000)
+            .await
+            .unwrap();
         assert_eq!(to, Phase::PreQueue);
         assert_eq!(*store.phase.lock().unwrap(), Phase::PreQueue);
+        // Audit is stamped (ADR-0017 §6).
+        let state = store.load("evt").await.unwrap().unwrap();
+        assert_eq!(state.last_action.as_deref(), Some("set_phase"));
+        assert_eq!(state.last_action_by.as_deref(), Some("op@x"));
+        assert_eq!(state.last_action_epoch_ms, Some(1_000));
     }
 
     #[tokio::test]
     async fn apply_phase_rejects_illegal_transition() {
         let store = FakeStore::with_phase(Phase::Idle);
-        let err = apply_phase(&store, "evt", "active").await.unwrap_err();
+        let err = apply_phase(&store, "evt", "active", "op@x", 1_000)
+            .await
+            .unwrap_err();
         assert!(matches!(
             err,
             ApplyError::Action(ActionError::IllegalTransition {
@@ -652,7 +723,9 @@ mod tests {
     #[tokio::test]
     async fn apply_phase_rejects_unknown_phase() {
         let store = FakeStore::with_phase(Phase::Idle);
-        let err = apply_phase(&store, "evt", "bogus").await.unwrap_err();
+        let err = apply_phase(&store, "evt", "bogus", "op@x", 1_000)
+            .await
+            .unwrap_err();
         assert!(matches!(err, ApplyError::Action(ActionError::UnknownPhase)));
     }
 
@@ -662,7 +735,9 @@ mod tests {
             missing: true,
             ..FakeStore::default()
         };
-        let err = apply_phase(&store, "evt", "pre_queue").await.unwrap_err();
+        let err = apply_phase(&store, "evt", "pre_queue", "op@x", 1_000)
+            .await
+            .unwrap_err();
         assert!(matches!(err, ApplyError::Action(ActionError::NotFound)));
     }
 
@@ -673,8 +748,53 @@ mod tests {
             conflict: true,
             ..FakeStore::default()
         };
-        let err = apply_phase(&store, "evt", "pre_queue").await.unwrap_err();
+        let err = apply_phase(&store, "evt", "pre_queue", "op@x", 1_000)
+            .await
+            .unwrap_err();
         assert!(matches!(err, ApplyError::Store(StoreError::Conflict)));
+    }
+
+    #[tokio::test]
+    async fn apply_phase_rejects_maintenance_target() {
+        // Entering maintenance must go through /admin/reset (force_maintenance)
+        // so it is audited under its own label; a crafted POST to /admin/phase
+        // with phase=maintenance is rejected here, before any write.
+        for from in [
+            Phase::Idle,
+            Phase::PreQueue,
+            Phase::Active,
+            Phase::PostEvent,
+        ] {
+            let store = FakeStore::with_phase(from);
+            let err = apply_phase(&store, "evt", "maintenance", "op@x", 1_000)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ApplyError::Action(ActionError::IllegalTransition {
+                        from: _,
+                        to: Phase::Maintenance
+                    })
+                ),
+                "maintenance must be rejected from {from:?}"
+            );
+            // Store is untouched.
+            assert_eq!(*store.phase.lock().unwrap(), from);
+        }
+        // Maintenance -> Maintenance is also rejected (no same-phase no-op for
+        // maintenance through this route).
+        let store = FakeStore::with_phase(Phase::Maintenance);
+        let err = apply_phase(&store, "evt", "maintenance", "op@x", 1_000)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ApplyError::Action(ActionError::IllegalTransition {
+                from: Phase::Maintenance,
+                to: Phase::Maintenance
+            })
+        ));
     }
 
     #[tokio::test]
@@ -682,6 +802,113 @@ mod tests {
         let store = FakeStore::with_phase(Phase::Active);
         apply_reset(&store, "evt", "op@x", 1000).await.unwrap();
         assert_eq!(*store.phase.lock().unwrap(), Phase::Maintenance);
+        // The emergency stop stamps audit (ADR-0017 §6).
+        let state = store.load("evt").await.unwrap().unwrap();
+        assert_eq!(state.last_action.as_deref(), Some("force_maintenance"));
+        assert_eq!(state.last_action_by.as_deref(), Some("op@x"));
+        assert_eq!(state.last_action_epoch_ms, Some(1000));
+    }
+
+    #[tokio::test]
+    async fn recovery_from_maintenance_via_phase_stamps_audit() {
+        // The full emergency-stop + recovery lifecycle, mirroring the
+        // dashboard dropdown path: force_maintenance (audited) then
+        // apply_phase(Maintenance -> Active) — the ADR-0017 Revision's
+        // designated recovery route, which must also be audited.
+        let store = FakeStore::with_phase(Phase::Active);
+
+        // Audited emergency stop.
+        apply_reset(&store, "evt", "op@x", 5_000).await.unwrap();
+        assert_eq!(*store.phase.lock().unwrap(), Phase::Maintenance);
+        let state = store.load("evt").await.unwrap().unwrap();
+        assert_eq!(state.last_action.as_deref(), Some("force_maintenance"));
+        assert_eq!(state.last_action_by.as_deref(), Some("op@x"));
+        assert_eq!(state.last_action_epoch_ms, Some(5_000));
+
+        // The dropdown's offered recovery path (next_phases(Maintenance)[0]).
+        assert_eq!(
+            next_phases(Phase::Maintenance),
+            vec![Phase::Active, Phase::Idle]
+        );
+        apply_phase(&store, "evt", "active", "op@y", 6_000)
+            .await
+            .unwrap();
+        assert_eq!(*store.phase.lock().unwrap(), Phase::Active);
+
+        // FIXED: the recovery now stamps audit — the dashboard-facing
+        // "last changed by X at T" line names the recovery (set_phase by
+        // op@y at T6_000), not the entry into maintenance.
+        let state = store.load("evt").await.unwrap().unwrap();
+        assert_eq!(state.last_action.as_deref(), Some("set_phase"));
+        assert_eq!(state.last_action_by.as_deref(), Some("op@y"));
+        assert_eq!(state.last_action_epoch_ms, Some(6_000));
+    }
+
+    #[tokio::test]
+    async fn recovery_from_maintenance_to_idle_stamps_audit() {
+        // The other dropdown recovery option: Maintenance -> Idle (reset).
+        let store = FakeStore::with_phase(Phase::Maintenance);
+        apply_phase(&store, "evt", "idle", "op@z", 7_000)
+            .await
+            .unwrap();
+        assert_eq!(*store.phase.lock().unwrap(), Phase::Idle);
+        let state = store.load("evt").await.unwrap().unwrap();
+        assert_eq!(state.last_action.as_deref(), Some("set_phase"));
+        assert_eq!(state.last_action_by.as_deref(), Some("op@z"));
+        assert_eq!(state.last_action_epoch_ms, Some(7_000));
+    }
+
+    #[tokio::test]
+    async fn apply_phase_stamps_audit_on_each_lifecycle_transition() {
+        // Every lifecycle transition records the actor and time, not just the
+        // recovery-from-maintenance path.
+        let store = FakeStore::with_phase(Phase::Idle);
+        apply_phase(&store, "evt", "pre_queue", "alice", 1_000)
+            .await
+            .unwrap();
+        assert_eq!(*store.phase.lock().unwrap(), Phase::PreQueue);
+        let state = store.load("evt").await.unwrap().unwrap();
+        assert_eq!(state.last_action.as_deref(), Some("set_phase"));
+        assert_eq!(state.last_action_by.as_deref(), Some("alice"));
+        assert_eq!(state.last_action_epoch_ms, Some(1_000));
+
+        apply_phase(&store, "evt", "active", "bob", 2_000)
+            .await
+            .unwrap();
+        let state = store.load("evt").await.unwrap().unwrap();
+        assert_eq!(state.last_action.as_deref(), Some("set_phase"));
+        assert_eq!(state.last_action_by.as_deref(), Some("bob"));
+        assert_eq!(state.last_action_epoch_ms, Some(2_000));
+
+        apply_phase(&store, "evt", "post_event", "carol", 3_000)
+            .await
+            .unwrap();
+        let state = store.load("evt").await.unwrap().unwrap();
+        assert_eq!(state.last_action.as_deref(), Some("set_phase"));
+        assert_eq!(state.last_action_by.as_deref(), Some("carol"));
+        assert_eq!(state.last_action_epoch_ms, Some(3_000));
+    }
+
+    #[tokio::test]
+    async fn apply_phase_overwrites_prior_audit_from_a_different_action() {
+        // A phase transition after a set_rate must update the audit line to
+        // set_phase, proving set_phase does not leave the prior action's
+        // stamp in place (the bug).
+        let store = FakeStore::with_phase(Phase::Active);
+        apply_rate(&store, "evt", "500", "rate-op", 1_000)
+            .await
+            .unwrap();
+        let state = store.load("evt").await.unwrap().unwrap();
+        assert_eq!(state.last_action.as_deref(), Some("set_rate"));
+        assert_eq!(state.last_action_by.as_deref(), Some("rate-op"));
+
+        apply_phase(&store, "evt", "post_event", "phase-op", 2_000)
+            .await
+            .unwrap();
+        let state = store.load("evt").await.unwrap().unwrap();
+        assert_eq!(state.last_action.as_deref(), Some("set_phase"));
+        assert_eq!(state.last_action_by.as_deref(), Some("phase-op"));
+        assert_eq!(state.last_action_epoch_ms, Some(2_000));
     }
 
     #[tokio::test]

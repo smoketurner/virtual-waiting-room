@@ -74,31 +74,32 @@ impl Store for DynamoStore {
         }))
     }
 
-    async fn set_phase(&self, event_id: &str, from: Phase, to: Phase) -> Result<(), StoreError> {
-        let result = self
+    async fn set_phase(
+        &self,
+        event_id: &str,
+        from: Phase,
+        to: Phase,
+        action: crate::AdminAction,
+        actor: &str,
+        now_ms: u64,
+    ) -> Result<(), StoreError> {
+        // Guarded on the expected phase (lost-race safety) but NOT debounced —
+        // like force_maintenance, the operator's lifecycle/recovery move must
+        // always apply (ADR-0017 §6 audit stamped atomically).
+        let mut req = self
             .client
             .update_item()
             .table_name(&self.counters_table)
             .set_key(Some(event_key(event_id)))
-            .update_expression("SET phase = :to")
+            .update_expression(
+                "SET phase = :to, last_action = :a, last_action_by = :by, \
+                 last_action_at = :at, last_action_epoch_ms = :ms",
+            )
             .condition_expression("phase = :from")
             .expression_attribute_values(":to", AttributeValue::S(to.as_wire_str().to_owned()))
-            .expression_attribute_values(":from", AttributeValue::S(from.as_wire_str().to_owned()))
-            .send()
-            .await;
-
-        match result {
-            Ok(_) => Ok(()),
-            Err(SdkError::ServiceError(se))
-                if matches!(
-                    se.err(),
-                    UpdateItemError::ConditionalCheckFailedException(_)
-                ) =>
-            {
-                Err(StoreError::Conflict)
-            }
-            Err(e) => Err(StoreError::Backend(format!("update_item(phase): {e}"))),
-        }
+            .expression_attribute_values(":from", AttributeValue::S(from.as_wire_str().to_owned()));
+        req = apply_audit_values(req, action, actor, now_ms);
+        send_guarded(req, "phase").await
     }
 
     async fn set_rate(
