@@ -125,7 +125,16 @@
               <option value="{{ opt.value }}">{{ opt.label }}</option>
               {% endfor %}
             </select>
-            <span class="help">The lifecycle advances one step at a time: <code>idle → pre_queue → active → post_event</code>. Only the next step is offered, so skipping (for example <code>idle → active</code>) is not possible. From <code>maintenance</code> the options are to return to <code>active</code> or reset to <code>idle</code>.</span>
+            <ol class="lifecycle" aria-label="Event lifecycle">
+              {% for step in lifecycle %}
+              <li class="step {{ step.state }}"{% if step.state == "current" %} aria-current="step"{% endif %}>{{ step.name }}</li>
+              {% endfor %}
+            </ol>
+            {% if off_path %}
+            <span class="help">The event is in <code>maintenance</code>, which is not a step on this path. Return to <code>active</code> to resume, or <code>idle</code> to reset.</span>
+            {% else %}
+            <span class="help">Only the next step is offered, so a phase cannot be skipped.</span>
+            {% endif %}
           </div>
           <button type="submit" title="Apply the phase transition.">Set phase</button>
         </form>
@@ -143,8 +152,8 @@
         <form method="post" action="/admin/rate">
           <div class="form-field">
             <label for="rate">Target rate (visitors per second)</label>
-            <input id="rate" name="rate" type="number" min="1" required title="Target visitors admitted to the origin per second.">
-            <span class="help">Set this to the requests per second the origin sustains. The value is a whole number from 1 to the deployment ceiling. To stop admission, use <strong>Pause</strong>; rate 0 is rejected. <strong>The admission controller ships after the MVP</strong>, so this value is stored but not yet enforced.</span>
+            <input id="rate" name="rate" type="number" min="1" required value="{{ target_rate_raw }}" title="Target visitors admitted to the origin per second.">
+            <span class="help">Currently <strong>{{ target_rate }}</strong>. Set this to the requests per second the origin sustains, as a whole number from 1 to the deployment ceiling. The controller releases this many per second, correcting upward for no-shows to at most twice it. To stop admission use <strong>Pause</strong>; rate 0 is rejected.</span>
           </div>
           <button type="submit" title="Store the target admission rate.">Set rate</button>
         </form>

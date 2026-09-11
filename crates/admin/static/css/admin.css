@@ -495,3 +495,41 @@ button.danger:hover {
   color: var(--gray-300);
   font-weight: 500;
 }
+
+/* --- Lifecycle strip ------------------------------------------------------ */
+
+/* The phase path, drawn rather than described. Where the event is now is a
+   position on a line, which is the thing the prose was trying to convey. */
+.lifecycle {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  list-style: none;
+  margin: 12px 0;
+  padding: 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.lifecycle .step {
+  flex: 1 1 auto;
+  padding: 6px 8px;
+  text-align: center;
+  border-radius: 4px;
+  border: 1px solid var(--vouch-border);
+  background: var(--vouch-raised);
+  color: var(--gray-500);
+  white-space: nowrap;
+}
+
+.lifecycle .done {
+  color: var(--gray-400);
+  border-color: var(--vouch-subtle);
+}
+
+.lifecycle .current {
+  color: #0a0a0a;
+  background: var(--vouch-accent);
+  border-color: var(--vouch-accent);
+  font-weight: 600;
+}
