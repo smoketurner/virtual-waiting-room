@@ -190,6 +190,18 @@ and re-mirror, unless `--force` is passed to regenerate).
 Regenerating the secret (a second bootstrap run, or `--force`) invalidates every live session
 immediately — treat it as a flag day, not a routine operation.
 
+### Choosing `SESSION_TTL_SECS`
+
+The CloudFront-path session has a fixed lifetime, not a sliding one: `generate_token` mints a
+session valid for `SESSION_TTL_SECS` (`modules/core`'s `session_ttl_seconds`, default 3600) and
+nothing re-issues it — a visitor still on the protected origin when it expires is logged out and
+has to rejoin the queue, checkout included (ADR-0021 §5.3). This differs from `authorizer`'s
+`SessionMode::Sliding`, which extends the idle window on activity up to a hard cap; the two gates
+never run in the same deployment, so this is a choice between them, not an inconsistency a visitor
+could observe. Set `session_ttl_seconds` comfortably longer than the worst realistic time on the
+protected origin — cart to confirmation, not the median — or a visitor can lose their admission to
+nothing more than a slow checkout.
+
 ## Tear down
 
 ```bash

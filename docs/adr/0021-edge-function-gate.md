@@ -282,6 +282,23 @@ minute," never as immediate. That rules it out as a response to something happen
 it means a short credential TTL remains the primary defence with revocation as a second line.
 Neither design is chosen, so #63 is listed in §1 as unresolved rather than claimed.
 
+### 5.3 Sliding sessions are not delivered at the edge
+
+`generate_token` mints one fixed-TTL session (`SESSION_TTL_SECS`) and the gate only verifies or
+refuses it — there is no `SessionMode` on this path and no re-issue. This was already flagged as
+moot/deferred in §7 measurement 4 before the CloudFront Function existed, and it stays deferred now
+that it does: CloudFront Functions can set cookies on a generated response, so a re-issue-on-activity
+step is possible in principle, but nothing implements it.
+
+The `authorizer` path is not the same: `SessionMode::Sliding` re-issues the session cookie on any
+request that still carries a valid one, extending the idle window up to a hard cap from first issue.
+The two gates never run in the same deployment, so this is not an inconsistency a visitor could
+observe within one event — but it is a real difference in what the two gates give an operator. A
+visitor admitted through the CloudFront path is logged out and must rejoin the queue if their
+session outlives `SESSION_TTL_SECS`, checkout included; the same visitor through the authorizer path
+with sliding configured is not. An operator choosing between the two gates has to decide whether
+`SESSION_TTL_SECS` comfortably exceeds the worst realistic checkout time — see `docs/DEPLOY.md`.
+
 ## 6. Measured in the spike
 
 **A Rust-minted credential verifies; the JS verifier accepts a strict superset of what Rust
