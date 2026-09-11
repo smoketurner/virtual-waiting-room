@@ -166,7 +166,6 @@ impl Store for DynamoStore {
         } else {
             "admission_control = :from"
         };
-        let cutoff = now_ms.saturating_sub(crate::DEBOUNCE_MS).to_string();
         let mut req = self
             .client
             .update_item()
@@ -178,12 +177,12 @@ impl Store for DynamoStore {
             )
             .expression_attribute_values(":to", AttributeValue::S(to.as_wire_str().to_owned()))
             .expression_attribute_values(":from", AttributeValue::S(from.as_wire_str().to_owned()))
-            .condition_expression(format!(
-                "{control_guard} AND (attribute_not_exists(last_action_epoch_ms) \
-                 OR last_action_epoch_ms < :cutoff)"
-            ))
-            .expression_attribute_values(":cutoff", AttributeValue::N(cutoff));
+            .condition_expression(control_guard);
         req = apply_audit_values(req, action, actor, now_ms);
+        // The debounce boundary lives in the single shared `guard_debounce`
+        // helper so the admission-control transition uses the same inclusive
+        // cutoff as `set_rate` and `set_message`.
+        req = guard_debounce(req, now_ms);
         send_guarded(req, "admission_control").await
     }
 
@@ -256,14 +255,34 @@ fn guard_expected_rate(req: UpdateReq, expected: Option<u32>) -> UpdateReq {
     }
 }
 
-/// Adds the debounce guard (last mutation older than the window), composing with
-/// any existing condition via AND.
+/// The debounce predicate appended to every guarded mutation. Inclusive at
+/// the cutoff (`<= :cutoff`): with `cutoff = now_ms - DEBOUNCE_MS`,
+/// `last_action_epoch_ms <= cutoff` is the same inequality as
+/// `now_ms - last_action_epoch_ms >= DEBOUNCE_MS`, which is exactly what the
+/// in-process `debounce_check` accepts. A mutation at the boundary (`delta ==
+/// DEBOUNCE_MS`) must succeed on both halves of the guard — a strict `<` here
+/// would reject it and surface a misleading HTTP 409 instead of the expected
+/// success.
+const DEBOUNCE_PREDICATE: &str =
+    "(attribute_not_exists(last_action_epoch_ms) OR last_action_epoch_ms <= :cutoff)";
+
+/// Composes [`DEBOUNCE_PREDICATE`] with any existing condition via `AND`. Pure
+/// so the inclusive boundary is unit-testable without a `DynamoDB` client; the
+/// live `DynamoStore` runs the same string via [`guard_debounce`].
+fn combine_debounce(existing: Option<&str>) -> String {
+    match existing {
+        Some(c) => format!("{c} AND {DEBOUNCE_PREDICATE}"),
+        None => DEBOUNCE_PREDICATE.to_owned(),
+    }
+}
+
+/// Adds the debounce guard (a prior mutation at least `DEBOUNCE_MS` ago),
+/// composing with any existing condition via AND.
 fn guard_debounce(req: UpdateReq, now_ms: u64) -> UpdateReq {
     let cutoff = now_ms.saturating_sub(crate::DEBOUNCE_MS).to_string();
-    let debounce = "(attribute_not_exists(last_action_epoch_ms) OR last_action_epoch_ms < :cutoff)";
     let combined = match req.get_condition_expression().clone() {
-        Some(c) => format!("{c} AND {debounce}"),
-        None => debounce.to_owned(),
+        Some(c) => combine_debounce(Some(c.as_str())),
+        None => combine_debounce(None),
     };
     req.condition_expression(combined)
         .expression_attribute_values(":cutoff", AttributeValue::N(cutoff))
@@ -342,5 +361,35 @@ mod tests {
             AttributeValue::N("1".to_owned()),
         );
         assert_eq!(admission_control_from(&wrong_type), AdmissionControl::Open);
+    }
+
+    #[test]
+    fn debounce_predicate_is_inclusive_at_the_cutoff() {
+        // With `cutoff = now_ms - DEBOUNCE_MS`, the DynamoDB condition must
+        // accept the exact boundary `delta == DEBOUNCE_MS`, matching the
+        // in-process `debounce_check` (which rejects only `delta < DEBOUNCE_MS`).
+        // Reverting to the strict `< :cutoff` rejects the boundary and surfaces a
+        // misleading HTTP 409 instead of the expected success.
+        assert!(
+            DEBOUNCE_PREDICATE.contains("<= :cutoff"),
+            "debounce predicate must be inclusive at the cutoff, got: {DEBOUNCE_PREDICATE}"
+        );
+        assert!(
+            !DEBOUNCE_PREDICATE.contains("< :cutoff"),
+            "debounce predicate must not use the strict `<` operator at the cutoff"
+        );
+    }
+
+    #[test]
+    fn combine_debounce_ands_the_predicate_onto_an_existing_guard() {
+        // A prior guard (expected-rate or admission-control) is preserved and
+        // the inclusive debounce predicate is AND-ed after it.
+        assert_eq!(
+            combine_debounce(Some("target_rate = :exp")).as_str(),
+            "target_rate = :exp AND (attribute_not_exists(last_action_epoch_ms) \
+             OR last_action_epoch_ms <= :cutoff)"
+        );
+        // `set_message` has no prior guard: the predicate stands alone.
+        assert_eq!(combine_debounce(None).as_str(), DEBOUNCE_PREDICATE);
     }
 }
