@@ -189,7 +189,7 @@
         }
       });
     });
-    var nums = ["serving_counter", "queue_counter", "participant_count", "target_rate", "message"];
+    var nums = ["serving_counter", "queue_counter", "participant_count", "target_rate", "message", "serving_state"];
     function refresh() {
       fetch("/admin/state", { headers: { "Accept": "application/json" }, credentials: "same-origin" })
         .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })

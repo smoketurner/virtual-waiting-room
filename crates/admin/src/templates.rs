@@ -228,4 +228,100 @@ mod tests {
         let html = Dashboard::from_state(&state()).render().unwrap();
         assert!(html.contains("Not yet available"));
     }
+
+    #[test]
+    fn poller_refreshes_serving_state() {
+        // #s-serving_state is the visitor-facing projection rendered in the
+        // "Live. Refreshes automatically." card next to the phase and admission
+        // badges. The poller must write it on every tick so an out-of-band
+        // change (pause/resume, phase transition) flips it alongside its
+        // sibling badges, instead of leaving "Visitors see: Running" stale next
+        // to a "paused" / "post_event" badge until a full page reload.
+        let html = Dashboard::from_state(&state()).render().unwrap();
+        assert!(
+            html.contains(r#"id="s-serving_state""#),
+            "#s-serving_state must be present in the current-state card"
+        );
+        assert!(
+            nums_array(&html).contains(&"serving_state"),
+            "the poller's nums array must include \"serving_state\" so the \
+             getElementById(\"s-\" + f) loop updates #s-serving_state live"
+        );
+    }
+
+    #[test]
+    fn poller_refreshes_every_s_prefixed_state_element() {
+        // Every server-rendered element with an `s-`-prefixed id lives in the
+        // "Live. Refreshes automatically." card, so the poller must refresh each
+        // — either through the nums array (plain textContent) or a dedicated
+        // getElementById handler (badges that swap className/innerHTML). This
+        // guards the whole class of "serialised field gets an s- id but is left
+        // out of the poller" regressions; #s-serving_state was one instance.
+        let html = Dashboard::from_state(&state()).render().unwrap();
+        let nums = nums_array(&html);
+        // Badge elements change className/innerHTML, so they use dedicated
+        // handlers rather than the nums textContent loop — by design.
+        let dedicated = ["s-phase-badge", "s-admission-badge"];
+        for id in dedicated {
+            assert!(
+                html.contains(&format!("getElementById(\"{id}\")")),
+                "dedicated handler for #{id} must call getElementById so the badge refreshes live"
+            );
+        }
+        for id in s_prefixed_ids(&html) {
+            let in_nums = id
+                .strip_prefix("s-")
+                .is_some_and(|bare| nums.contains(&bare));
+            let in_dedicated = dedicated.contains(&id);
+            assert!(
+                in_nums || in_dedicated,
+                "poller does not refresh #{id}: add its bare name to the nums \
+                 array or a dedicated getElementById handler (otherwise the Live \
+                 card shows stale data until a full page reload)"
+            );
+        }
+    }
+
+    #[test]
+    fn admin_state_json_includes_serving_state_for_the_poller() {
+        // The poller can only refresh #s-serving_state if /admin/state actually
+        // serializes it. Guard the other half of the contract: serving_state is
+        // NOT #[serde(skip)], unlike the render-only inputs it must stay apart
+        // from.
+        let view = Dashboard::from_state(&state());
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(
+            json.contains(r#""serving_state":"Running""#),
+            "/admin/state must serialise serving_state so the poller can write it; got: {json}"
+        );
+        for render_only in [r#""message_raw""#, r#""operator_email""#, r#""csp_nonce""#] {
+            assert!(
+                !json.contains(render_only),
+                "{render_only} is a render-only input and must stay out of the JSON state view"
+            );
+        }
+    }
+
+    /// The poller's plain-text refresh list, parsed from the inline `<script>`
+    /// `var nums = [...]` literal in the rendered dashboard.
+    fn nums_array(html: &str) -> Vec<&str> {
+        let start = html.find("var nums = [").unwrap();
+        let end = html[start..].find("];").unwrap();
+        let literal = &html[start + "var nums = [".len()..start + end];
+        literal
+            .split(',')
+            .map(|s| s.trim().trim_matches('"'))
+            .collect()
+    }
+
+    /// Every `id="s-..."` value in the rendered dashboard — the set of elements
+    /// the poller's `s-` id convention places in its live-refresh namespace.
+    fn s_prefixed_ids(html: &str) -> Vec<&str> {
+        html.match_indices(r#"id="s-"#)
+            .map(|(i, _)| {
+                let rest = &html[i + r#"id=""#.len()..];
+                &rest[..rest.find('"').unwrap()]
+            })
+            .collect()
+    }
 }
