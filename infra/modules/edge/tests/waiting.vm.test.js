@@ -410,3 +410,21 @@ test("the status timestamp is stamped from the clock once a position is known", 
   await client.flush();
   assert.notEqual(client.elements["updated-at"].textContent, first);
 });
+
+test("the progress baseline survives a reload", async () => {
+  // A long wait outlives a tab. Without persistence the bar resets to empty on
+  // every reopen, telling a visitor who has waited an hour that they are at the
+  // start.
+  const first = loadClient({ route: route(() => activeStatus({ serving_position: 100 }), 1000) });
+  await first.flush();
+  const started = first.win.localStorage.getItem("vwr_ahead_at_start");
+  assert.notEqual(started, null, "the starting distance is stored");
+
+  const second = loadClient({ route: route(() => activeStatus({ serving_position: 600 }), 1000) });
+  second.win.localStorage.setItem("vwr_ahead_at_start", started);
+  second.win.localStorage.setItem("vwr_request_id", first.win.localStorage.getItem("vwr_request_id"));
+  await second.flush();
+
+  const width = parseFloat(second.elements.fill.style.width);
+  assert.ok(width > 0, `progress carried over, got ${second.elements.fill.style.width}`);
+});

@@ -18,31 +18,28 @@
 
       <div class="bar" id="bar" hidden>
         <div class="fill" id="fill">
-          <svg class="marker" viewBox="0 0 10 16" aria-hidden="true" focusable="false">
-            <circle cx="5.6" cy="2.2" r="1.9" />
-            <path d="M5.6 4.6 3.2 8.1l1.5 1.1-1.9 5.3 1.7.6 1.8-4.9 1.4 1.5.9 3.6 1.7-.4-1-4.2-1.6-1.8.8-2.5 1.6 1.9 1.4-1.1-2.5-3z" />
-          </svg>
+          <span class="marker" aria-hidden="true">🏃</span>
         </div>
       </div>
 
-      <section class="card" id="stats" hidden>
+      <dl class="card" id="stats" hidden>
         <div class="stat">
-          <div class="label">Your position</div>
-          <div class="value" id="position">—</div>
+          <dt class="label">Your number in line</dt>
+          <dd class="value" id="position">—</dd>
         </div>
         <div class="stat">
-          <div class="label">Now serving</div>
-          <div class="value" id="serving">—</div>
+          <dt class="label">People ahead of you</dt>
+          <dd class="value" id="ahead">—</dd>
         </div>
         <div class="stat">
-          <div class="label">Ahead of you</div>
-          <div class="value" id="ahead">—</div>
+          <dt class="label">Now serving</dt>
+          <dd class="value" id="serving">—</dd>
         </div>
         <div class="stat">
-          <div class="label">Estimated wait</div>
-          <div class="value" id="eta">—</div>
+          <dt class="label">Estimated wait</dt>
+          <dd class="value" id="eta">—</dd>
         </div>
-      </section>
+      </dl>
 
       <p class="updated" id="updated" hidden>
         <span class="pulse" aria-hidden="true"></span>
