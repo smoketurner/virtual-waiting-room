@@ -16,8 +16,8 @@ use wr_common::expr::{arrivals_shard_key, event_key, shard_count_of, shard_index
 use wr_common::{AdmissionControl, Phase, PositionStatus, SHARDS};
 
 use crate::{
-    ControllerState, ExpiredPosition, NoShowState, ReleaseDecision, ReleaseInputs, Store,
-    StoreError,
+    ControllerState, ExpiredPosition, NoShowState, ReleaseDecision, ReleaseInputs, ReleaseOutcome,
+    Store, StoreError,
 };
 
 /// A live `DynamoDB` store bound to the counters and positions tables.
@@ -122,7 +122,7 @@ impl Store for DynamoStore {
         event_id: &str,
         decision: &ReleaseDecision,
         expected_serving_counter: u64,
-    ) -> Result<(), StoreError> {
+    ) -> Result<ReleaseOutcome, StoreError> {
         let result = self
             .client
             .update_item()
@@ -165,7 +165,7 @@ impl Store for DynamoStore {
             .await;
 
         match result {
-            Ok(_) => Ok(()),
+            Ok(_) => Ok(ReleaseOutcome::Advanced),
             Err(SdkError::ServiceError(se))
                 if matches!(
                     se.err(),
@@ -173,8 +173,13 @@ impl Store for DynamoStore {
                 ) =>
             {
                 // Another invoke advanced first; this pass's release is stale.
+                // The release did not persist, so `decision.next_serving_counter`
+                // is *not* the live cursor — the caller must not derive an expiry
+                // cutoff from it. Returning `LostRace` lets `run_pass` skip
+                // expiry on this pass; the next pass's consistent read of
+                // `serving_counter` produces the correct cutoff.
                 tracing::info!(event_id, "release write lost the race; skipping");
-                Ok(())
+                Ok(ReleaseOutcome::LostRace)
             }
             Err(e) => Err(StoreError(format!("update_item release: {e}"))),
         }
