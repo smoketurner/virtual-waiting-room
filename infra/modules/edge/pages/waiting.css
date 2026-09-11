@@ -123,38 +123,37 @@ h1 {
    bar of this length would not. */
 .bar {
   margin: 0 0 20px;
-  height: 26px;
-  border-radius: 5px;
+  height: 34px;
+  border-radius: 8px;
   background: var(--accent-soft);
   border: 1px solid var(--line);
-  padding: 3px;
+  padding: 4px;
 }
 
 .fill {
   position: relative;
   height: 100%;
   width: 0;
-  min-width: 3px;
-  border-radius: 2px;
-  background: repeating-linear-gradient(
-    90deg,
-    var(--accent) 0 9px,
-    transparent 9px 13px
-  );
-  /* Eases between polls so the queue reads as moving rather than jumping. */
-  transition: width 600ms ease;
+  /* Enough that the marker has something under it at the very start of a long
+     wait, where the real fraction rounds to nothing. */
+  min-width: 8px;
+  border-radius: 5px;
+  background: var(--accent);
+  /* Eases between polls so the queue reads as moving rather than jumping. Long
+     enough to be seen: the step between two polls is often a fraction of a
+     percent, and an instant repaint of that is invisible. */
+  transition: width 900ms cubic-bezier(0.4, 0, 0.2, 1);
 }
 
-/* Rides the leading edge, so it advances with the fill and needs no separate
-   position of its own. An emoji rather than a drawn glyph: it is one character
-   in a page that ships no fonts and no images, and it reads as a person at a
-   size a hand-drawn figure does not. */
+/* Centred on the leading edge, so it sits half on the filled side and half on
+   the empty one and is never clipped by either. Being inside .fill means it
+   travels with the same transition and needs no animation of its own. */
 .marker {
   position: absolute;
-  right: -10px;
+  right: 0;
   top: 50%;
-  transform: translateY(-50%);
-  font-size: 17px;
+  transform: translate(50%, -50%);
+  font-size: 21px;
   line-height: 1;
 }
 
