@@ -2,6 +2,9 @@
 //! `/queue_num` position resolution. Pure functions over the domain types so
 //! they run without AWS; the handler fetches the items and calls these.
 
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
 use serde::Serialize;
 #[cfg(test)]
 use wr_common::AdmissionControl;
@@ -9,6 +12,70 @@ use wr_common::{
     Counters, Phase, PreQueueItem, ResolveError, ResolvedPosition, SHARDS, ServingState,
     serving_state,
 };
+
+/// Holds the event's `Counters` item for a beat inside one execution
+/// environment.
+///
+/// `/status` answers the same document to everyone, so the edge collapses it to
+/// roughly one origin fetch per second however many people are waiting.
+/// `/queue_num` cannot: its answer is per visitor, so its cache key is per
+/// visitor and every poll is an origin request. Both read the same single
+/// `Counters` item, and a `DynamoDB` partition serves at most 3,000 read units
+/// per second — one item's worth of traffic for the whole waiting room. A
+/// million waiting visitors would ask for it tens of thousands of times a
+/// second.
+///
+/// Caching it here makes that one read per environment per TTL instead of one
+/// per request, which is what keeps origin load flat as the room grows rather
+/// than scaling with it.
+///
+/// Staleness is bounded by the TTL and costs nothing that matters:
+/// `serving_position` is the only field that moves once an event is sealed, the
+/// controller advances it far more slowly than this, and the edge already
+/// serves the same document from cache for a comparable window.
+#[derive(Debug)]
+pub struct CountersCache {
+    ttl: Duration,
+    /// `None` while empty. The inner `Option` distinguishes "no event item
+    /// exists" from "not looked up yet", so a missing event is cached too and
+    /// a flood of requests for an event that does not exist costs one read per
+    /// TTL rather than one each.
+    slot: Mutex<Option<(Instant, Option<Counters>)>>,
+}
+
+impl CountersCache {
+    /// A cache holding entries for `ttl`.
+    #[must_use]
+    pub fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            slot: Mutex::new(None),
+        }
+    }
+
+    /// The cached lookup if it is still fresh at `now`.
+    ///
+    /// The outer `Option` is the cache hit; the inner one is whether the event
+    /// item exists. A poisoned lock reports a miss rather than propagating:
+    /// the fallback is a live read, which is always correct.
+    #[must_use]
+    pub fn get(&self, now: Instant) -> Option<Option<Counters>> {
+        let guard = self.slot.lock().ok()?;
+        let (stored_at, ref value) = *guard.as_ref()?;
+        if now.duration_since(stored_at) < self.ttl {
+            Some(value.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Records a lookup made at `now`.
+    pub fn put(&self, now: Instant, value: Option<Counters>) {
+        if let Ok(mut guard) = self.slot.lock() {
+            *guard = Some((now, value));
+        }
+    }
+}
 
 /// The `/status` payload — one document the countdown and queue pages poll.
 /// Seal outputs appear only once the event is active.
@@ -320,5 +387,62 @@ mod tests {
             t: 1_788_000_000,
         };
         assert_eq!(queue_num(&counters, &bad), Err(QueueNumError::BadShard));
+    }
+
+    // --- counters cache -----------------------------------------------------
+
+    const TTL: Duration = Duration::from_secs(1);
+
+    #[test]
+    fn an_empty_cache_is_a_miss() {
+        let cache = CountersCache::new(TTL);
+        assert!(cache.get(Instant::now()).is_none());
+    }
+
+    #[test]
+    fn a_fresh_entry_is_served_without_a_read() {
+        let cache = CountersCache::new(TTL);
+        let now = Instant::now();
+        let counters = sealed_counters([1, 0, 0, 0, 0, 0, 0, 0, 0, 0], [3u8; 32]);
+        cache.put(now, Some(counters.clone()));
+        assert_eq!(cache.get(now + TTL / 2), Some(Some(counters)));
+    }
+
+    #[test]
+    fn an_entry_expires_exactly_at_the_ttl() {
+        let cache = CountersCache::new(TTL);
+        let now = Instant::now();
+        cache.put(
+            now,
+            Some(sealed_counters([1, 0, 0, 0, 0, 0, 0, 0, 0, 0], [3u8; 32])),
+        );
+        // At the boundary the entry is already stale: the handler must re-read
+        // rather than serve a value older than the window it promised.
+        assert!(cache.get(now + TTL).is_none());
+        assert!(cache.get(now + TTL + Duration::from_millis(1)).is_none());
+    }
+
+    #[test]
+    fn a_missing_event_is_cached_too() {
+        // Otherwise a flood aimed at an event that does not exist costs one
+        // DynamoDB read per request, which is the case the cache exists for.
+        let cache = CountersCache::new(TTL);
+        let now = Instant::now();
+        cache.put(now, None);
+        assert_eq!(cache.get(now + TTL / 2), Some(None));
+    }
+
+    #[test]
+    fn a_later_put_replaces_an_earlier_one() {
+        let cache = CountersCache::new(TTL);
+        let now = Instant::now();
+        let first = sealed_counters([1, 0, 0, 0, 0, 0, 0, 0, 0, 0], [3u8; 32]);
+        let mut second = first.clone();
+        second.serving_counter = 99;
+        cache.put(now, Some(first));
+        cache.put(now + TTL / 2, Some(second.clone()));
+        // Freshness is measured from the newer write, so the entry outlives
+        // the first put's expiry.
+        assert_eq!(cache.get(now + TTL), Some(Some(second)));
     }
 }

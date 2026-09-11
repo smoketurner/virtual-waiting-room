@@ -225,8 +225,51 @@
   var MAX_MISSES = 8;
   var misses = 0;
 
+  // A place in line, once known, never changes: it is derived from a sealed
+  // permutation for a pre-queue registrant and from a claimed row for a live
+  // joiner. Only the serving cursor moves, and /status carries that. So the
+  // number is fetched once and held, and every later poll reads /status alone —
+  // which is keyed on path, so the edge collapses the whole waiting room into
+  // about one origin request a second. Re-fetching it each poll instead would
+  // put one request per visitor per interval on an endpoint that cannot
+  // collapse, because its answer is per visitor.
+  var knownPosition = null;
+  var knownLiveJoin = false;
+
+  function forgetPosition() {
+    knownPosition = null;
+    knownLiveJoin = false;
+  }
+
+  // Everyone learns their number at once when the event opens, so asking the
+  // instant the queue goes live would turn a whole cohort into one spike
+  // against an endpoint with no collapsing. Each client waits a random slice of
+  // a window sized to the cohort: a small room barely waits, a large one
+  // spreads. Nobody loses their place by waiting — the number already exists,
+  // and the page keeps showing the queue moving meanwhile.
+  //
+  // The window is capped because a visitor should not stare at a page that will
+  // not say where they are. Past roughly FIRST_ASK_TARGET_RPS * the cap, the
+  // spread alone stops being enough and the account's API Gateway throttle
+  // (10,000 requests a second by default, raisable on request) has to go up.
+  var FIRST_ASK_TARGET_RPS = 5000;
+  var FIRST_ASK_MAX_SPREAD_MS = 60000;
+  var firstAskAt = null;
+
+  function scheduleFirstAsk(participants) {
+    if (firstAskAt !== null) {
+      return;
+    }
+    var spread = Math.min(
+      FIRST_ASK_MAX_SPREAD_MS,
+      ((participants || 0) / FIRST_ASK_TARGET_RPS) * 1000
+    );
+    firstAskAt = Date.now() + Math.floor(Math.random() * spread);
+  }
+
   function forgetJoin() {
     misses = 0;
+    forgetPosition();
     try {
       window.localStorage.removeItem(JOINED_KEY);
     } catch (e) {
@@ -347,6 +390,11 @@
         if (s.serving_state === "closed") {
           el.stats.hidden = true;
           el.bar.hidden = true;
+          // A closed event has not dealt this visitor a number, and if one was
+          // held from an earlier run of the same page it belongs to a cohort
+          // that no longer exists — an operator who resets an event seals a new
+          // one with a different permutation.
+          forgetPosition();
           say(
             "The event isn't open yet",
             "This page updates on its own when it opens."
@@ -376,13 +424,33 @@
           return;
         }
 
+        scheduleFirstAsk(s.participant_count);
+
         return join()
           .then(function () {
+            if (knownPosition !== null) {
+              // Already known, and it cannot have changed. Serve it from here
+              // so the poll costs only the /status request above.
+              return {
+                status: 200,
+                body: { position: knownPosition, live_join: knownLiveJoin },
+              };
+            }
+            if (Date.now() < firstAskAt) {
+              return null;
+            }
             return getJSON(
               "/v1/queue_num?request_id=" + encodeURIComponent(requestId)
             );
           })
           .then(function (q) {
+            if (q === null) {
+              // Inside the spread window. The queue is open and moving, and
+              // saying so is more honest than a spinner — this visitor has a
+              // number already, it just has not been asked for yet.
+              say("You're in line", "Finding your number…");
+              return schedule();
+            }
             if (q.status === 404) {
               misses += 1;
               if (misses >= MAX_MISSES) {
@@ -400,6 +468,8 @@
             if (q.status !== 200) {
               throw new Error("queue_num " + q.status);
             }
+            knownPosition = q.body.position;
+            knownLiveJoin = q.body.live_join;
             renderQueue(
               q.body.position,
               s.serving_position,
