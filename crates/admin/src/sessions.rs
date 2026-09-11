@@ -10,6 +10,7 @@
 //! * Session: PK `session#<id>`, holds the authenticated subject + email for
 //!   ~8 h. The cookie carries only the opaque `<id>`.
 
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aws_sdk_dynamodb::Client;
@@ -30,6 +31,7 @@ pub enum SessionError {
 }
 
 /// A pending OIDC login transaction, keyed by the CSRF state token.
+#[derive(Debug, PartialEq, Eq)]
 pub struct PendingLogin {
     pub pkce_verifier: String,
     pub nonce: String,
@@ -52,6 +54,44 @@ fn now_secs() -> Result<u64, SessionError> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .map_err(|_| SessionError::Clock)
+}
+
+/// Decodes a consumed pending-login row from its `DynamoDB` attributes.
+///
+/// Returns `None` when the row is absent, already past its `expires_at` TTL
+/// (`DynamoDB` TTL deletion is not instant, so the expiry is enforced on
+/// read), or missing the PKCE verifier / nonce. `now` is the current epoch
+/// second; a broken clock collapses it to the epoch so a clock failure never
+/// rejects a fresh login (mirroring `load_session`).
+///
+/// This is the AWS-free pure half of `take_pending`: it takes exactly the
+/// shape `DeleteItem(AllOld)` returns so the expiry/parsing logic can be
+/// unit-tested without a live `Client`.
+fn pending_login_from(
+    attributes: Option<&HashMap<String, AttributeValue>>,
+    now: u64,
+) -> Option<PendingLogin> {
+    let item = attributes?;
+    let expired = item
+        .get("expires_at")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<u64>().ok())
+        .is_some_and(|exp| now >= exp);
+    if expired {
+        return None;
+    }
+    let pkce_verifier = item
+        .get("pkce_verifier")
+        .and_then(|v| v.as_s().ok())
+        .cloned();
+    let nonce = item.get("nonce").and_then(|v| v.as_s().ok()).cloned();
+    match (pkce_verifier, nonce) {
+        (Some(pkce_verifier), Some(nonce)) => Some(PendingLogin {
+            pkce_verifier,
+            nonce,
+        }),
+        _ => None,
+    }
 }
 
 impl SessionStore {
@@ -90,11 +130,14 @@ impl SessionStore {
     }
 
     /// Consumes (reads and deletes) a pending login by CSRF state. Returns
-    /// `None` if absent or expired — callers treat that as an invalid callback.
+    /// `None` if absent or past its TTL — `DynamoDB` TTL deletion is not
+    /// instant, so the expiry is also checked on read (the same compensation
+    /// `load_session` uses). Callers treat `None` as an invalid callback.
     ///
     /// # Errors
     /// Returns [`SessionError::Backend`] if the delete fails.
     pub async fn take_pending(&self, state: &str) -> Result<Option<PendingLogin>, SessionError> {
+        let now = now_secs().unwrap_or_default();
         let out = self
             .client
             .delete_item()
@@ -105,21 +148,7 @@ impl SessionStore {
             .await
             .map_err(|e| SessionError::Backend(format!("take_pending: {e}")))?;
 
-        let Some(item) = out.attributes() else {
-            return Ok(None);
-        };
-        let pkce_verifier = item
-            .get("pkce_verifier")
-            .and_then(|v| v.as_s().ok())
-            .cloned();
-        let nonce = item.get("nonce").and_then(|v| v.as_s().ok()).cloned();
-        match (pkce_verifier, nonce) {
-            (Some(pkce_verifier), Some(nonce)) => Ok(Some(PendingLogin {
-                pkce_verifier,
-                nonce,
-            })),
-            _ => Ok(None),
-        }
+        Ok(pending_login_from(out.attributes(), now))
     }
 
     /// Creates a session and returns its opaque id (for the cookie).
@@ -219,4 +248,227 @@ fn uuid_v4() -> String {
         &h[16..20],
         &h[20..32]
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Fixed "current time" (2023-11-14 22:13:20 UTC) so the expiry tests are
+    // independent of the wall clock and of DynamoDB's lazy TTL sweep.
+    const NOW: u64 = 1_700_000_000;
+
+    /// Builds a PKCE row shaped like the one `put_pending` writes.
+    fn row(
+        verifier: &str,
+        nonce: &str,
+        expires_at: Option<u64>,
+    ) -> HashMap<String, AttributeValue> {
+        let mut item = HashMap::from([
+            (
+                "pkce_verifier".to_string(),
+                AttributeValue::S(verifier.to_string()),
+            ),
+            ("nonce".to_string(), AttributeValue::S(nonce.to_string())),
+        ]);
+        if let Some(exp) = expires_at {
+            item.insert("expires_at".to_string(), AttributeValue::N(exp.to_string()));
+        }
+        item
+    }
+
+    // ---- Regression: an expired row must NOT be returned as a valid login ----
+
+    #[test]
+    fn expired_row_is_rejected_even_when_verifier_and_nonce_are_present() {
+        // A row past `expires_at` that DynamoDB has not yet purged is exactly
+        // the bug: `DeleteItem(AllOld)` still returns it. The read-time check
+        // must treat it as expired instead of handing the stale verifier and
+        // nonce to the callback flow.
+        let item = row("verifier", "nonce", Some(NOW - 1));
+        assert_eq!(
+            pending_login_from(Some(&item), NOW),
+            None,
+            "an expired PKCE transaction must not be returned as valid"
+        );
+    }
+
+    #[test]
+    fn row_at_the_expiry_boundary_is_rejected() {
+        // `now >= exp` ⇒ expired: at the exact `expires_at` second the
+        // transaction is gone, matching `load_session`.
+        let item = row("verifier", "nonce", Some(NOW));
+        assert_eq!(pending_login_from(Some(&item), NOW), None);
+    }
+
+    // ---- Happy / adjacent paths around the TTL window ----
+
+    #[test]
+    fn fresh_row_is_returned_with_verifier_and_nonce() {
+        let item = row("verifier-123", "nonce-456", Some(NOW + PKCE_TTL_SECS));
+        assert_eq!(
+            pending_login_from(Some(&item), NOW),
+            Some(PendingLogin {
+                pkce_verifier: "verifier-123".to_string(),
+                nonce: "nonce-456".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn row_just_before_expiry_is_still_valid() {
+        let item = row("v", "n", Some(NOW + 1));
+        assert!(pending_login_from(Some(&item), NOW).is_some());
+    }
+
+    #[test]
+    fn the_full_pkce_ttl_window_stays_valid() {
+        // `put_pending` writes `expires_at = now + PKCE_TTL_SECS`. The whole
+        // window must remain usable; only at/after `expires_at` does it expire.
+        let written_at = NOW;
+        let item = row("v", "n", Some(written_at + PKCE_TTL_SECS));
+        let last_valid_second = written_at + PKCE_TTL_SECS - 1;
+        assert!(pending_login_from(Some(&item), last_valid_second).is_some());
+        assert_eq!(
+            pending_login_from(Some(&item), written_at + PKCE_TTL_SECS),
+            None
+        );
+        assert!(pending_login_from(Some(&item), written_at + PKCE_TTL_SECS + 999).is_none());
+    }
+
+    // ---- Absent / sparse handles ----
+
+    #[test]
+    fn absent_attributes_yield_none() {
+        // `DeleteItem` returns no attributes when the row never existed (or was
+        // already consumed by a prior callback) — an invalid state.
+        assert_eq!(pending_login_from(None, NOW), None);
+    }
+
+    #[test]
+    fn row_missing_expires_at_is_treated_as_unexpired() {
+        // Matches `load_session`: a missing TTL attribute does not reject the
+        // row — only a present, numeric, past `expires_at` expires it.
+        let item = row("v", "n", None);
+        assert_eq!(
+            pending_login_from(Some(&item), NOW),
+            Some(PendingLogin {
+                pkce_verifier: "v".to_string(),
+                nonce: "n".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn row_with_non_numeric_expires_at_is_treated_as_unexpired() {
+        // A malformed `expires_at` can't be parsed, so the expiry predicate is
+        // not satisfied — defensive, mirroring `load_session`'s `.ok()` chain.
+        let mut item = row("v", "n", None);
+        item.insert(
+            "expires_at".to_string(),
+            AttributeValue::N("not-a-number".to_string()),
+        );
+        assert_eq!(
+            pending_login_from(Some(&item), NOW),
+            Some(PendingLogin {
+                pkce_verifier: "v".to_string(),
+                nonce: "n".to_string(),
+            })
+        );
+    }
+
+    // ---- Malformed payloads ----
+
+    #[test]
+    fn row_missing_pkce_verifier_yields_none() {
+        let mut item = HashMap::new();
+        item.insert("nonce".to_string(), AttributeValue::S("n".to_string()));
+        item.insert(
+            "expires_at".to_string(),
+            AttributeValue::N((NOW + 60).to_string()),
+        );
+        assert_eq!(pending_login_from(Some(&item), NOW), None);
+    }
+
+    #[test]
+    fn row_missing_nonce_yields_none() {
+        let mut item = HashMap::new();
+        item.insert(
+            "pkce_verifier".to_string(),
+            AttributeValue::S("v".to_string()),
+        );
+        item.insert(
+            "expires_at".to_string(),
+            AttributeValue::N((NOW + 60).to_string()),
+        );
+        assert_eq!(pending_login_from(Some(&item), NOW), None);
+    }
+
+    #[test]
+    fn row_with_wrong_value_types_yields_none() {
+        // Verifier/nonce stored as numbers can't satisfy `.as_s()`.
+        let item = HashMap::from([
+            (
+                "pkce_verifier".to_string(),
+                AttributeValue::N("123".to_string()),
+            ),
+            ("nonce".to_string(), AttributeValue::N("456".to_string())),
+            (
+                "expires_at".to_string(),
+                AttributeValue::N((NOW + 60).to_string()),
+            ),
+        ]);
+        assert_eq!(pending_login_from(Some(&item), NOW), None);
+    }
+
+    #[test]
+    fn empty_row_yields_none() {
+        let item: HashMap<String, AttributeValue> = HashMap::new();
+        assert_eq!(pending_login_from(Some(&item), NOW), None);
+    }
+
+    #[test]
+    fn extra_attributes_are_ignored() {
+        let mut item = row("v", "n", Some(NOW + 60));
+        item.insert(
+            "future_field".to_string(),
+            AttributeValue::S("z".to_string()),
+        );
+        assert_eq!(
+            pending_login_from(Some(&item), NOW),
+            Some(PendingLogin {
+                pkce_verifier: "v".to_string(),
+                nonce: "n".to_string(),
+            })
+        );
+    }
+
+    // ---- Clock-fail defense (mirrors `load_session`) ----
+
+    #[test]
+    fn clock_failure_never_rejects_a_fresh_login() {
+        // A broken clock collapses `now` to 0 (the epoch); a fresh login whose
+        // `expires_at` is far in the future stays valid. `take_pending`
+        // computes `now = now_secs().unwrap_or_default()` for exactly this.
+        let item = row("v", "n", Some(NOW + PKCE_TTL_SECS));
+        assert_eq!(
+            pending_login_from(Some(&item), 0),
+            Some(PendingLogin {
+                pkce_verifier: "v".to_string(),
+                nonce: "n".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn expiry_is_enforced_against_a_real_clock_now_too() {
+        // Smoke check the helper against the real wall clock: a row written
+        // "now" via the same formula `put_pending` uses must be valid, and one
+        // written long ago must be rejected.
+        let real_now = now_secs().unwrap_or_default();
+        let fresh = row("v", "n", Some(real_now + PKCE_TTL_SECS));
+        assert!(pending_login_from(Some(&fresh), real_now).is_some());
+        let stale = row("v", "n", Some(real_now.saturating_sub(PKCE_TTL_SECS + 1)));
+        assert_eq!(pending_login_from(Some(&stale), real_now), None);
+    }
 }
