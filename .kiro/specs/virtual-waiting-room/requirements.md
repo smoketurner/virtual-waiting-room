@@ -299,6 +299,10 @@ pre-event preparation in the Operational section.
 - THE SYSTEM SHALL isolate concurrent events in one deployment from each other.
 - Acceptance: One event driven to its throughput ceiling does not increase queue-join latency or error rate for another event in the same deployment.
 
+**N10** — As an operator, I want client polling cost to scale with distance to the front so that a large waiting cohort does not multiply request volume by a fixed interval.
+- THE SYSTEM SHALL make client polling cost scale with distance to the front, not with waiting visitors × a fixed interval.
+- Acceptance: Poll count is O(log) in the starting wait, and the harness client-request total under `--polling backoff` is materially below `--polling hold-position` at identical settings.
+
 ---
 
 ## 4. Operational

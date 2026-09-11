@@ -54,6 +54,7 @@ Throwaway code. Measures what documentation cannot settle.
 ### 1e. Read path
 
 - [ ] `/status` (phase, serving position, rate, operator message — one payload), `/queue_num`, `/queue_pos_expiry` [F3.1] — Partial: `/status` and `/queue_num` are served by the read Lambda; `/queue_pos_expiry` is not routed at all, and neither is `/public_key`.
+- [x] Adaptive poll interval: `/status` publishes a Terraform-set `poll_policy` (floor/ceiling/divisor); `waiting.js` clamps its interval to it, scaling with distance to the front instead of polling at a fixed interval [N10, ADR-0023]
 
 ### 1f. Admission, session, and outflow control
 
@@ -212,7 +213,7 @@ Out of scope for this release; see REQUIREMENTS §5.
 | Risk | Mitigation |
 |---|---|
 | Pre-queue randomization disputed as unfair | Recorded seed makes it auditable and reproducible [F1.5]; document the fairness model up front |
-| Client poll interval drives cost more than any infrastructure choice | Configurable, default 10s, modelled per client [O6] |
+| Client poll interval drives cost more than any infrastructure choice | Adaptive since [#69](https://github.com/smoketurner/virtual-waiting-room/issues/69) — scales with distance to the front, floor/ceiling/divisor Terraform-configurable, modelled per client [N10, O6, ADR-0023] |
 | Load harness cannot generate 1M participants from one source | Distributed harness; budget for it in Phase 3 |
 | GovCloud variant larger than estimated — no CloudFront, no virtual private cloud (VPC) origins | Phase 5, priced separately; no date until commercial ships |
 | On-call burden during a live event | Price as incident-critical infrastructure; cap concurrent engagements |

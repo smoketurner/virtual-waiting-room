@@ -50,6 +50,22 @@ repos:
         language: system
         types: [shell]
 
+      # Requires a Node.js toolchain on PATH — a new local prerequisite for
+      # this Rust-and-Terraform repo. Minimum Node 20 (node:test is stable,
+      # unflagged, from there); CI pins the exact version in
+      # .github/workflows/client-ci.yml. language: system runs whatever is on
+      # PATH, so verify against that minimum rather than assuming it matches
+      # CI's pin.
+      - id: node-test
+        name: node --test (waiting.js)
+        # Through bash so the glob expands here rather than in Node: naming the
+        # files keeps the Node 20 floor, where a bare directory argument is not
+        # searched and native glob patterns are not understood.
+        entry: bash -c 'node --test infra/modules/edge/tests/*.test.js'
+        language: system
+        types: [javascript]
+        pass_filenames: false
+
       # Heavy checks run at the pre-push stage only. types:[rust] + pass_filenames:false
       # means they run once over the whole workspace, but only when the push carries
       # a Rust change.

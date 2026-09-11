@@ -16,9 +16,60 @@
 
   var STORAGE_KEY = "vwr_request_id";
   var JOINED_KEY = "vwr_joined";
-  var POLL_MS = 5000;
-  // Spread reconnects so a whole cohort does not retry in lockstep after a blip.
-  var JITTER_MS = 1500;
+
+  // Adaptive poll interval (#69). No policy published ⇒ behave
+  // exactly as this client always has: floor === ceiling === 5000ms, divisor
+  // 1, so intervalFor always returns the fixed 5000ms this client polled at
+  // before this change. The real numbers are set in terraform.tfvars and
+  // arrive on /status as `poll_policy`.
+  var POLL_FLOOR_MS = 5000;
+  var POLL_CEILING_MS = 5000;
+  var POLL_DIVISOR = 1;
+  // Proportional jitter, spread as a fraction of the interval being jittered
+  // rather than a flat window, so a visitor at the ceiling is not spread by
+  // the same few seconds as one at the floor. 0.3 at the floor gives
+  // 5000..6500ms — the same window this client always used.
+  var JITTER_FRACTION = 0.3;
+  // Bounds a published policy must fall within to be trusted; see adoptPolicy.
+  var MIN_MS = 1000;
+  var MAX_MS = 300000;
+  var MAX_DIVISOR = 1000;
+
+  var policy = {
+    floorMs: POLL_FLOOR_MS,
+    ceilingMs: POLL_CEILING_MS,
+    divisor: POLL_DIVISOR,
+  };
+  // Must be initialised, not just declared. Left undefined, the first
+  // schedule() computes Math.round(undefined * (1 + jitter)) = NaN,
+  // setTimeout clamps a NaN delay to 1ms, and the client retries flat-out —
+  // hundreds of times a second — for as long as the first /status call keeps
+  // failing, which is exactly when the origin is unhealthy.
+  var nextIntervalMs = POLL_FLOOR_MS;
+
+  function num(v, lo, hi) {
+    return typeof v === "number" && isFinite(v) && v >= lo && v <= hi ? v : null;
+  }
+
+  // No policy published, or one with a bad field, leaves the current policy
+  // standing: the fixed-interval default for a client that has not adopted a
+  // real one yet, or the last good policy for one that has. The server never
+  // sends a partial policy, so one bad field makes the whole document
+  // suspect and none of it is adopted — and reverting an already-adaptive
+  // client to a fixed interval mid-event because one poll came back
+  // malformed would be worse than trusting the policy it already has.
+  function adoptPolicy(p) {
+    if (!p || typeof p !== "object") {
+      return;
+    }
+    var f = num(p.floor_ms, MIN_MS, MAX_MS);
+    var c = num(p.ceiling_ms, MIN_MS, MAX_MS);
+    var d = num(p.divisor, 1, MAX_DIVISOR);
+    if (f === null || c === null || d === null || c < f) {
+      return;
+    }
+    policy = { floorMs: f, ceilingMs: c, divisor: d };
+  }
 
   var el = {
     headline: document.getElementById("headline"),
@@ -148,7 +199,7 @@
   }
 
   function jitter() {
-    return POLL_MS + Math.floor(Math.random() * JITTER_MS);
+    return Math.round(nextIntervalMs * (1 + Math.random() * JITTER_FRACTION));
   }
 
   function say(headline, sub) {
@@ -340,6 +391,45 @@
     return moved > 0 ? moved / seconds : null;
   }
 
+  // Prefer what was observed over what was merely declared, and share that
+  // choice between the on-screen ETA and the poll interval so the two never
+  // disagree: the controller corrects releases against a no-show rate, so
+  // the cursor's real speed differs from the operator's target, and the
+  // interval should track what is actually happening rather than what was
+  // only intended.
+  function currentRate(targetRate) {
+    var rate = measuredRate();
+    return rate !== null ? rate : targetRate;
+  }
+
+  // How this client turns "distance to the front" into a poll interval (#69).
+  // Proportional to the wait this visitor can see, floored so the
+  // front of the queue stays responsive, and capped so a visitor deep in a
+  // huge queue is not made to wait the length of the queue between polls.
+  // Without a wait to be proportional to — no rate, no known position —
+  // there is nothing to divide, so this falls back to the floor, which is
+  // the interval every client used before this change.
+  function intervalFor(waitSeconds) {
+    if (!(waitSeconds > 0)) {
+      return policy.floorMs;
+    }
+    return Math.min(
+      policy.ceilingMs,
+      Math.max(policy.floorMs, (waitSeconds * 1000) / policy.divisor)
+    );
+  }
+
+  function intervalForPosition(ahead, rate) {
+    return rate > 0 ? intervalFor(ahead / rate) : policy.floorMs;
+  }
+
+  // How far ahead this visitor is right now, from the position last learned
+  // and the cursor on this poll. null before a position is known — there is
+  // nothing to measure distance from yet.
+  function aheadNow(serving) {
+    return knownPosition === null ? null : Math.max(0, knownPosition - serving);
+  }
+
   // The estimate falls freely and rises only when the queue has genuinely
   // slowed. Anything smaller than the band is measurement noise, and a wait
   // that creeps upward in front of someone reads as the system losing their
@@ -372,13 +462,10 @@
   }
 
   function renderEta(ahead, targetRate) {
-    // Prefer what was observed; fall back to the operator's target so the first
-    // poll says something, rather than leaving a dash for the half minute it
-    // takes to watch the cursor move.
-    var rate = measuredRate();
-    if (rate === null && targetRate > 0) {
-      rate = targetRate;
-    }
+    // Falls back to the operator's target so the first poll says something,
+    // rather than leaving a dash for the half minute it takes to watch the
+    // cursor move.
+    var rate = currentRate(targetRate);
     if (!rate || rate <= 0) {
       // No rate set means the operator is not admitting anyone yet, which is
       // not a long wait — it is an unknown one, and saying so is honest.
@@ -483,6 +570,22 @@
 
   var timer = null;
   var stopped = false;
+  // Set at the start of every /status fetch, so the visibility handler can
+  // tell how long it has actually been since the last poll.
+  var lastPollAt = 0;
+  // True from the moment a poll starts until its whole chain — /status, the
+  // join()/queue_num() that may follow, an admission attempt — settles. The
+  // visibility handler can fire tick() out of band with a chain already
+  // running; without this guard the two chains both call join() before
+  // either has written JOINED_KEY, taking two positions for one visitor.
+  var inFlight = false;
+  // Set when the visibility handler wants to poll but tick() is still
+  // in-flight (inFlight above), so the request would otherwise be dropped
+  // outright: a visitor who returns while a poll is mid-flight then waited
+  // out the running chain's own, possibly much longer, interval instead of
+  // being caught up promptly. schedule() consumes this once the running
+  // chain settles.
+  var catchUpWanted = false;
 
   function stop() {
     stopped = true;
@@ -499,10 +602,37 @@
     if (timer) {
       window.clearTimeout(timer);
     }
+    // A hidden tab costs requests and sees nothing. Leave no timer running;
+    // the visibilitychange handler below restarts polling on return. Nothing
+    // is left for catchUpWanted to carry either: hidden again means the
+    // handler recomputes freshly from lastPollAt the next time this tab is
+    // shown.
+    if (document.hidden) {
+      catchUpWanted = false;
+      timer = null;
+      return;
+    }
+    if (catchUpWanted) {
+      catchUpWanted = false;
+      // Honour the dropped poll now, measured from when this chain's own
+      // poll actually started — the floor stays the bound, but the wait for
+      // it does not reset just because this chain was already running.
+      timer = window.setTimeout(
+        tick,
+        Math.max(0, policy.floorMs - (Date.now() - lastPollAt))
+      );
+      return;
+    }
     timer = window.setTimeout(tick, jitter());
   }
 
   function tick() {
+    if (inFlight) {
+      catchUpWanted = true;
+      return;
+    }
+    inFlight = true;
+    lastPollAt = Date.now();
     getJSON("/v1/status")
       .then(function (res) {
         if (res.status !== 200) {
@@ -514,9 +644,13 @@
         // their own number, so an estimate is ready the moment there is
         // something to estimate.
         observeCursor(s.serving_position);
+        // Before any serving_state branch: a stale policy would otherwise
+        // govern the closed/paused early returns below.
+        adoptPolicy(s.poll_policy);
         eventId = s.event_id || eventId;
         if (!eventId) {
           // Nothing to join yet; the next poll tries again.
+          nextIntervalMs = policy.floorMs;
           say("Getting your place in line…", "Just a moment.");
           return schedule();
         }
@@ -529,6 +663,7 @@
           // that no longer exists — an operator who resets an event seals a new
           // one with a different permutation.
           forgetPosition();
+          nextIntervalMs = policy.ceilingMs;
           say(
             "The event isn't open yet",
             "This page updates on its own when it opens."
@@ -550,6 +685,17 @@
             "Admission is paused",
             "You keep your place in line. This page updates when it resumes."
           );
+          // A near-front visitor stays near the floor across a pause instead
+          // of drifting to the ceiling: the cursor is frozen while paused, so
+          // `ahead` is stable, and the operator's rate is preserved across
+          // the hold, so this is the same estimate the visitor had a moment
+          // ago. A visitor with no position yet has nothing to be
+          // proportional to, so the ceiling is the right default there.
+          var pausedAhead = aheadNow(s.serving_position);
+          nextIntervalMs =
+            pausedAhead === null
+              ? policy.ceilingMs
+              : intervalForPosition(pausedAhead, currentRate(s.target_rate));
           return schedule();
         }
         if (s.serving_state === "fail_open") {
@@ -582,11 +728,13 @@
               // Inside the spread window. The queue is open and moving, and
               // saying so is more honest than a spinner — this visitor has a
               // number already, it just has not been asked for yet.
+              nextIntervalMs = policy.floorMs;
               say("You're in line", "Finding your number…");
               return schedule();
             }
             if (q.status === 404) {
               misses += 1;
+              nextIntervalMs = policy.floorMs;
               if (misses >= MAX_MISSES) {
                 // The place is gone rather than late. Drop the claim so the
                 // next tick takes a new one; keeping the same request id means
@@ -611,6 +759,7 @@
               s.target_rate
             );
             if (q.body.position < s.serving_position) {
+              nextIntervalMs = policy.floorMs;
               return redeem().then(function () {
                 // Still queued after all, or refused: keep polling. A success
                 // navigates away and a permanent refusal has called stop(),
@@ -620,13 +769,23 @@
                 }
               });
             }
+            var ahead = aheadNow(s.serving_position);
+            nextIntervalMs =
+              ahead === 0
+                ? policy.floorMs
+                : intervalForPosition(ahead, currentRate(s.target_rate));
             return schedule();
           });
       })
       .catch(function () {
-        // Transient. Say nothing alarming and try again — a blip must not look
-        // like a lost place.
+        // Transient. Say nothing alarming and try again — a blip must not
+        // look like a lost place. nextIntervalMs is left at its last value:
+        // an unknown state deserves no faster and no slower a retry than the
+        // visitor was already getting.
         schedule();
+      })
+      .then(function () {
+        inFlight = false;
       });
   }
 
@@ -653,6 +812,47 @@
     el.note.className = "note error";
     return;
   }
+
+  // A hidden tab is stopped outright (schedule() above) rather than polled
+  // at a slower rate: browsers throttle it only after minutes and only some
+  // of them, so stopping is the only way to actually save the requests.
+  // Catching up the moment the visitor looks again is what makes that safe.
+  // #97: a visitor hidden longer than the admission
+  // grace loses their place — a pre-existing gap this sharpens but does not
+  // create, tracked separately rather than in scope here.
+  //
+  // Registered here rather than earlier: the first tick() below always runs
+  // regardless of visibility — a page loaded into a background tab still has
+  // to join(), and claiming a place is not deferrable — and a bounce-retry
+  // page above never polls at all, so it has no schedule for this listener
+  // to restart.
+  document.addEventListener("visibilitychange", function () {
+    if (stopped) {
+      return;
+    }
+    if (document.hidden) {
+      if (timer) {
+        window.clearTimeout(timer);
+        timer = null;
+      }
+      return;
+    }
+    if (timer) {
+      window.clearTimeout(timer);
+      timer = null;
+    }
+    // Poll now only if the floor has genuinely elapsed since the last one;
+    // otherwise a visitor flapping between tabs (switching away and back
+    // every couple of seconds) polls every couple of seconds, beating the
+    // floor the whole design treats as a hard bound. Schedule the remainder
+    // of the floor window instead.
+    var sinceLastPoll = Date.now() - lastPollAt;
+    if (sinceLastPoll >= policy.floorMs) {
+      tick();
+    } else {
+      timer = window.setTimeout(tick, policy.floorMs - sinceLastPoll);
+    }
+  });
 
   el.note.textContent =
     "Closing this page keeps your place — reopening it picks the same place back up.";

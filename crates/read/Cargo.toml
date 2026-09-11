@@ -29,5 +29,8 @@ tracing = { workspace = true, default-features = true }
 tracing-subscriber = { workspace = true, features = ["fmt", "env-filter", "json"] }
 wr-common = { workspace = true }
 
+[dev-dependencies]
+proptest = { workspace = true, features = ["std"] }
+
 [lints]
 workspace = true
