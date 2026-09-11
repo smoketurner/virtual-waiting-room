@@ -329,9 +329,19 @@ mod tests {
     }
 
     #[test]
-    fn deferred_features_are_labeled_not_faked() {
+    fn the_dashboard_offers_no_control_that_is_not_wired() {
+        // Stronger than labelling a deferred panel "not yet available": a
+        // control the operator cannot use is not rendered at all. The session
+        // plane answers 501, so nothing here may post to it.
         let html = Dashboard::from_state(&state(), 0).render().unwrap();
-        assert!(html.contains("Not yet available"));
+        assert!(
+            !html.contains("/update_session"),
+            "the dashboard must not offer a control backed by a 501 endpoint"
+        );
+        assert!(
+            !html.contains("Not yet available"),
+            "a feature that is not built is left out, not shown as a dead panel"
+        );
     }
 
     #[test]

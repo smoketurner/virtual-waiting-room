@@ -138,11 +138,14 @@ body {
 
 /* --- Grid + cards (Vouch .card: bg-surface border rounded-lg p-8) ---------- */
 
+/* Cards stretch to the height of the tallest in their row, and each card's
+   submit drops to the bottom, so the buttons in a row share a baseline instead
+   of sitting wherever their explanation happens to end. */
 .grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr));
   gap: 16px;
-  align-items: start;
+  align-items: stretch;
 }
 
 .span-2 {
@@ -156,6 +159,15 @@ body {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
   gap: 24px;
+}
+
+.controls-row .control {
+  display: flex;
+  flex-direction: column;
+}
+
+.controls-row .control > form {
+  margin-top: auto;
 }
 
 .controls-row .control + .control {
@@ -177,6 +189,8 @@ body {
   border: 1px solid var(--vouch-border);
   border-radius: 8px;
   overflow: hidden;
+  display: flex;
+  flex-direction: column;
 }
 
 .card > .card-header {
@@ -201,6 +215,20 @@ body {
 
 .card > .card-body {
   padding: 20px;
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+}
+
+/* The last form in a card is its submit. Pushing it down is what puts the
+   buttons on a shared baseline; anything above it keeps its natural height. */
+.card > .card-body > form:last-of-type {
+  margin-top: auto;
+}
+
+/* The emergency card body lays its controls out in columns, not a stack. */
+.card > .card-body.controls-row {
+  display: grid;
 }
 
 /* Emergency container — the andon cord, error-tinted */

@@ -66,15 +66,15 @@
         <div class="control">
         {% if admission_control == "paused" %}
         <p class="deferred">Admission is paused. Waiting visitors see a "you keep your place" notice and nobody new is let through.</p>
+        <p class="help">Resume clears the notice and starts admitting again. Every visitor kept their queue position through the pause.</p>
         <form method="post" action="/admin/resume">
           <button class="normal big" type="submit" title="Start admitting visitors again. The notice clears.">Resume admission</button>
         </form>
-        <p class="help" style="margin-top:12px;color:var(--gray-500);">Resume clears the notice and starts admitting again. Every visitor kept their queue position through the pause.</p>
         {% else %}
+        <p class="help"><strong>Pause holds the line.</strong> Waiting visitors see a "you keep your place" notice, the queue keeps forming, and nobody new is admitted. A Resume button appears here to clear it. Reversible.</p>
         <form method="post" action="/admin/pause">
           <button class="danger big" type="submit" title="Pause admission. Waiting visitors see a 'you keep your place' notice; nobody new is let through.">Pause admission</button>
         </form>
-        <p class="help" style="margin-top:12px;color:var(--gray-500);"><strong>Pause holds the line.</strong> Waiting visitors see a "you keep your place" notice, the queue keeps forming, and nobody new is admitted. A Resume button appears here to clear it. Reversible.</p>
         {% endif %}
         </div>
         <div class="control">
@@ -98,10 +98,10 @@
         {% if phase == "maintenance" %}
         <p class="deferred">The event is in maintenance. Waiting visitors see an "event is temporarily down" page. Recover from the Phase control: return to <code>active</code> to resume, or <code>idle</code> to reset.</p>
         {% else %}
+        <p class="help"><strong>Force maintenance takes the whole event down.</strong> Waiting visitors see an "event is temporarily down" page, not a queue. Use it for an outage, not a routine hold. Recover from the Phase control (return to <code>active</code> or <code>idle</code>). Pause only holds admission; this stops everything.</p>
         <form method="post" action="/admin/reset" data-confirm="Force maintenance takes the whole event down. Waiting visitors see an 'event is temporarily down' page. Continue?">
           <button class="danger" type="submit" title="Take the event down. Waiting visitors see an 'event is temporarily down' page. Requires confirmation. Reversible from the Phase control.">Force maintenance</button>
         </form>
-        <p class="help" style="margin-top:12px;color:var(--gray-500);"><strong>Force maintenance takes the whole event down.</strong> Waiting visitors see an "event is temporarily down" page, not a queue. Use it for an outage, not a routine hold. Recover from the Phase control (return to <code>active</code> or <code>idle</code>). Pause only holds admission; this stops everything.</p>
         {% endif %}
         </div>
       </div>
@@ -172,14 +172,6 @@
           <button type="submit" class="normal" title="Remove the broadcast message.">Clear message</button>
         </form>
         {% endif %}
-      </div>
-    </section>
-
-    <!-- Deferred plane -->
-    <section class="card">
-      <div class="card-header"><h2>Sessions</h2></div>
-      <div class="card-body">
-        <p class="deferred">Not yet available. The session-management plane ships after the MVP.</p>
       </div>
     </section>
 
