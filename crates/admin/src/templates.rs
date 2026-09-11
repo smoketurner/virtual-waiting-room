@@ -38,6 +38,19 @@ pub struct Dashboard {
     /// the JSON state view.
     #[serde(skip)]
     pub message_raw: String,
+    /// The stored rate as the form should show it: the bare number, or empty
+    /// when unset. `target_rate` renders "not set" for display, which would
+    /// land in the input as literal text. Render-only, like `message_raw`.
+    #[serde(skip)]
+    pub target_rate_raw: String,
+    /// The four lifecycle phases in order, each marked `done`, `current` or
+    /// `todo`, so the template can draw where the event is instead of
+    /// describing it. `maintenance` is not a step: it is an override reachable
+    /// from anywhere, and `off_path` says the event is sitting in it.
+    #[serde(skip)]
+    pub lifecycle: Vec<Step>,
+    #[serde(skip)]
+    pub off_path: bool,
     /// The *resolved* admission override as its wire string — `open`,
     /// `paused`, or `fail_open` (issue #71: resolved from the stored control
     /// and the fail-open epoch at render time, never read as a stored
@@ -84,6 +97,32 @@ pub struct Dashboard {
     pub rules_load_failed: bool,
 }
 
+/// One phase in the lifecycle strip.
+pub struct Step {
+    pub name: &'static str,
+    /// `done`, `current` or `todo` — used directly as a CSS class.
+    pub state: &'static str,
+}
+
+/// The lifecycle in order, marked against `phase`. A phase not on the path
+/// (`maintenance`) leaves every step `todo`, and `off_path` carries that.
+fn lifecycle_for(phase: &str) -> Vec<Step> {
+    const ORDER: [&str; 4] = ["idle", "pre_queue", "active", "post_event"];
+    let at = ORDER.iter().position(|p| *p == phase);
+    ORDER
+        .iter()
+        .enumerate()
+        .map(|(i, name)| Step {
+            name,
+            state: match at {
+                Some(cur) if i < cur => "done",
+                Some(cur) if i == cur => "current",
+                _ => "todo",
+            },
+        })
+        .collect()
+}
+
 impl Dashboard {
     /// Builds the view from control state at `now` (epoch seconds), which
     /// resolves the stored control against the fail-open epoch (issue #71) —
@@ -96,10 +135,13 @@ impl Dashboard {
         Self {
             event_id: state.event_id.clone(),
             phase: state.phase.as_wire_str().to_owned(),
+            lifecycle: lifecycle_for(state.phase.as_wire_str()),
+            off_path: state.phase == wr_common::Phase::Maintenance,
             serving_counter: state.serving_counter,
             queue_counter: state.queue_counter,
             participant_count: dash(state.participant_count.map(|n| n.to_string())),
             target_rate: dash(state.target_rate.map(|n| n.to_string())),
+            target_rate_raw: state.target_rate.map(|n| n.to_string()).unwrap_or_default(),
             message: dash(state.message.clone()),
             message_raw: state.message.clone().unwrap_or_default(),
             admission_control: resolved.as_wire_str().to_owned(),
@@ -438,5 +480,28 @@ mod tests {
                 &rest[..rest.find('"').unwrap()]
             })
             .collect()
+    }
+
+    #[test]
+    fn the_lifecycle_marks_where_the_event_is() {
+        let steps = super::lifecycle_for("active");
+        let marked: Vec<_> = steps.iter().map(|s| (s.name, s.state)).collect();
+        assert_eq!(
+            marked,
+            vec![
+                ("idle", "done"),
+                ("pre_queue", "done"),
+                ("active", "current"),
+                ("post_event", "todo"),
+            ]
+        );
+
+        // maintenance is an override reachable from anywhere, not a step on the
+        // path, so nothing is current and the template says so instead.
+        let off = super::lifecycle_for("maintenance");
+        assert!(
+            off.iter().all(|s| s.state == "todo"),
+            "a phase off the path marks no step current"
+        );
     }
 }
