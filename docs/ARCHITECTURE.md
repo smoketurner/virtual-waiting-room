@@ -403,9 +403,9 @@ incoming request before any decision logic runs, since the protected behaviour f
 `allViewer` and a visitor's own request could otherwise carry a spoofed value.
 
 `/_wr/*` is its own behaviour against a private S3 bucket, outside the gate. Gating it would make
-the refusal loop. The `next=` parameter on a redirect carries the visitor's original destination
-through the waiting page back to itself once admitted, which is what replaced the client-side
-bounce-guard loop the old signed-cookie gate needed (ADR-0020, superseded).
+the refusal loop, and a `check` block asserts the waiting page's path falls under the pattern that
+serves it. The `next=` parameter on a redirect carries the visitor's original destination through
+the waiting page, so they land where they were going once admitted.
 
 ### The cache behaviours
 
@@ -547,9 +547,8 @@ re-issues it, so a visitor whose checkout outlasts `SESSION_TTL_SECS` is logged 
 queue. `authorizer`'s `SessionMode::Sliding` extends on activity; the two gates never run in the
 same deployment, so this is a choice between them rather than an inconsistency a visitor can see.
 
-**Two properties still need a real deployment to confirm.** The function's compute utilization was
-measured against the spike's smaller build, not the shipped one, and the KeyValueStore propagation
-window has not been re-measured for this configuration.
+**Two properties are unmeasured against a real deployment.** The function's compute utilization
+per request, and how long a KeyValueStore write takes to reach every edge.
 
 ---
 

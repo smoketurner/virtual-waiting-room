@@ -150,24 +150,17 @@ AWS_PROFILE=dev-admin uv run scripts/smoke_test.py
 ## The edge gate's signing secret (issue #71)
 
 The admission gate is a CloudFront Function that verifies session cookies with a per-deployment
-HMAC key. **There is no bootstrap step.** Terraform generates the key with `random_bytes` at
-apply and writes it to both of its homes — the SSM SecureString `/<name_prefix>/signing-key` that
+HMAC key. **There is no bootstrap step.** Terraform generates the key with `random_bytes` at apply
+and writes it to both of its homes — the SSM SecureString `/<name_prefix>/signing-key` that
 `generate_token` reads, and the CloudFront KeyValueStore key `k` that the gate reads. One value
-from one source, so the two cannot disagree and there is no ordering to get wrong.
+from one source, so the two cannot disagree.
 
-This puts the key in Terraform state, which the S3 backend encrypts. That is the same trade the
-retired `tls_private_key` made for the RSA key this one replaces, so it is not a new exposure.
-The admin OIDC client secret still uses the placeholder-and-`ignore_changes` pattern, because it
-comes from the identity provider and Terraform cannot generate it.
+The key is in Terraform state, which the S3 backend encrypts. The admin OIDC client secret is
+different: the identity provider issues it, so Terraform creates a placeholder under
+`ignore_changes` and it is written out of band.
 
-The key is deliberately not carried in the function's own code: `cloudfront:GetFunction` returns
-that code to anyone holding a permission nobody treats as secret-bearing, and CloudFront retains
-function versions, so every key ever used would persist. A KeyValueStore value is replaced rather
-than versioned.
-
-Changing the key — a `terraform taint` on `random_bytes.signing_key`, or anything else that
-forces it to regenerate — invalidates every live session immediately. Treat it as a flag day, not
-a routine operation, and do it only between events.
+Changing the key — a `terraform taint` on `random_bytes.signing_key`, or anything else forcing it
+to regenerate — invalidates every live session immediately. Do it between events, not during one.
 
 ### Choosing `SESSION_TTL_SECS`
 

@@ -47,7 +47,7 @@ The event item carries, by writer:
 | `max_expired_position` | `controller` | Highest position expired |
 | `last_serving_counter`, `last_arrivals_total`, `no_show_rate` | `controller` | Measurement state carried across passes |
 | `phase` | `seal_event`, `admin` | `idle` / `pre_queue` / `active` / `post_event` / `maintenance` |
-| `admission_control` | `admin` | `open` / `paused` — what the operator set, never `fail_open` (issue #71) |
+| `admission_control` | `admin` | `open` / `paused` |
 | `fail_open_until` | `admin` | Epoch-seconds break-glass deadline; absent or `0` means not engaged |
 | `target_rate` | `admin` | Visitors **per second** |
 | `shuffle_seed` | `seal_event` | 256-bit permutation key (B), written once |
@@ -290,14 +290,10 @@ so two Lambdas cannot interpret one stored row two different ways.
 The same discipline applies to `serving_state`, which `/v1/status` publishes: it is derived from
 `(phase, admission_control)` on every read and never stored.
 
-Fail-open follows the same rule for the same reason. `admission_control` stores only what an
-operator chose — `open` or `paused` — and `fail_open_until` stores when the break-glass window
-ends. The three-valued control every consumer matches on is `resolve(stored, until, now)`,
-computed per read. Storing `fail_open` as a third value meant it could outlive its own deadline:
-the edge stopped bypassing when the window lapsed while DynamoDB still read `fail_open`, and
-`generate_token` refuses to mint under it, so nobody could be admitted at all until an operator
-noticed. One epoch, resolved on both sides, makes that state unrepresentable rather than guarded
-against.
+Fail-open follows the same rule. `admission_control` stores what an operator chose — `open` or
+`paused` — and `fail_open_until` stores when the break-glass window ends. The three-valued control
+every consumer matches on is `resolve(stored, until, now)`, computed per read, so a fail-open
+window cannot be in force on one side of the system and lapsed on the other.
 
 ---
 
