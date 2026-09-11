@@ -32,7 +32,7 @@ valid session cookie, or a fail-open/pending epoch all pass through; otherwise i
 the origin receives the request. Sub-millisecond compute at the edge, never a call to the origin
 or any backend.
 
-The core Terraform module holds 64 managed resources; the edge module holds 15.
+The core Terraform module holds 64 managed resources; the edge module holds 18.
 
 ---
 
@@ -441,7 +441,8 @@ The admin Lambda serves an Axum router behind an API Gateway greedy proxy:
 | `/admin/message` | POST | Operator broadcast |
 | `/admin/reset` | POST | Reset event state |
 | `/admin/pause`, `/admin/resume` | POST | Admission control transitions |
-| `/admin/rules` | POST | 501 Not Implemented |
+| `/admin/fail_open`, `/admin/recover` | POST | Sets and clears the break-glass epoch |
+| `/admin/rules` | POST | Writes the edge gate's ruleset to the KeyValueStore |
 | `/update_session` | POST | 501 Not Implemented |
 | `/metrics` | GET | Routed by API Gateway, **no handler in the router** |
 
@@ -499,42 +500,56 @@ uniformity test uses a different threshold and does not assert a specific χ².
 | The controller schedule is created when the controller is | Always created |
 | The operator message attribute is `operator_message` | The attribute is `message` |
 | `GET /metrics` returns event metrics | API Gateway routes it to the admin Lambda, whose router has no `/metrics` handler |
-| A refused visitor gets a 403 mapped to the waiting page | The mapping rewrites the status to **200** |
 
 ---
 
 ## 11. Known gaps in the code
 
-**The gate verifies, it does not decide.** CloudFront checks a signature. It cannot be told to
-stand down when the backend is unreachable ([#58](https://github.com/smoketurner/virtual-waiting-room/issues/58))
-or to pass traffic through while the event is dormant ([#60](https://github.com/smoketurner/virtual-waiting-room/issues/60)).
-`AdmissionControl::FailOpen` is a storable state that holds the controller, but nothing enforces
-it at the edge.
+**Fail-open is a mechanism, not an automatic response.** An operator sets `fail_open_until` and
+every edge honours it, but nothing trips it on its own. The function makes no network calls, so it
+cannot observe the backend being unreachable at all
+([#58](https://github.com/smoketurner/virtual-waiting-room/issues/58)) — detection would have to
+live in something that can, and does not exist yet.
 
-**The cookies are unbound bearer credentials.** The policy resource is `https://*` with no visitor
-binding ([#61](https://github.com/smoketurner/virtual-waiting-room/issues/61)) and no revocation
-([#63](https://github.com/smoketurner/virtual-waiting-room/issues/63)). `generate_token` takes a
-request id from a query string and authenticates nothing else, so anyone holding a request id can
-mint a set.
+**The session cookie is an unbound bearer credential.** It carries no visitor binding
+([#61](https://github.com/smoketurner/virtual-waiting-room/issues/61)) and there is no revocation
+([#63](https://github.com/smoketurner/virtual-waiting-room/issues/63)): the gate verifies a
+signature and an expiry, so a stolen cookie is as good as the original until it expires.
+`generate_token` takes a request id from a query string and authenticates nothing else, so anyone
+holding a request id can mint one ([#62](https://github.com/smoketurner/virtual-waiting-room/issues/62)).
+
+**The admin Lambda can read the signing secret.** Its `GetKey`/`PutKey` grant on the gate's
+KeyValueStore covers the secret as well as the config. It cannot be narrowed: the store is the only
+resource type the service defines, it publishes no condition keys, and a function associates
+exactly one store.
 
 **`generate_token` is replayable and inflates the arrival count.** It never marks a position
 spent. A visitor who calls it twice records two arrivals against one release. That understates the
 no-show rate, so the controller under-releases — the safe direction, but the measurement is wrong.
 
-**Standby mode is not implemented.** There is no inflow alarm, no dormant state, and no automatic
-phase transition. `Phase::Idle` and `Phase::PostEvent` exist and an operator sets them by hand.
+**Standby is a dormant gate, not an automatic transition.** An empty ruleset passes every request
+through, and `enforce_from` schedules the switch to enforcing at one instant on every edge. What is
+missing is the trigger: there is no inflow alarm and no automatic phase transition, so an operator
+sets both by hand.
 
-**Protection rules are not wired.** `authorizer` implements `ProtectionRule` matching on path,
-header, cookie and user agent. `/admin/rules` returns 501, and the CloudFront path has no rule
-evaluation at all.
+**Rule evaluation does not reach GovCloud.** The CloudFront path evaluates the full rule set —
+path, header, cookie, user agent — but `authorizer`, the only gate available where CloudFront
+Functions do not exist, wires just `PathPrefix` from `PROTECTED_PATH_PREFIXES`. The two gates share
+the type and not the configuration path, so a commercial and a GovCloud deployment of the same
+product protect different things.
 
 **Sessions cannot be completed or abandoned.** `PositionStatus` has `Completed` and `Abandoned`
 variants that only the controller's expiry path and `generate_token`'s refusal ever read.
 `/update_session` returns 501, so nothing writes them.
 
-[ADR-0021](adr/0021-edge-function-gate.md) is accepted and addresses the first two by replacing the
-key-group gate with a CloudFront Function that decides at the edge. `infra/` contains no CloudFront
-Function and no KeyValueStore, so none of it is deployed.
+**The edge does not slide sessions.** `generate_token` mints one fixed-TTL session and nothing
+re-issues it, so a visitor whose checkout outlasts `SESSION_TTL_SECS` is logged out and rejoins the
+queue. `authorizer`'s `SessionMode::Sliding` extends on activity; the two gates never run in the
+same deployment, so this is a choice between them rather than an inconsistency a visitor can see.
+
+**Two properties still need a real deployment to confirm.** The function's compute utilization was
+measured against the spike's smaller build, not the shipped one, and the KeyValueStore propagation
+window has not been re-measured for this configuration.
 
 ---
 
@@ -572,9 +587,11 @@ cause — an `event_id` containing `#` — but nothing else in the deployment is
 event.
 
 **What happens when the signing key is compromised?**
-Everything. One per-deployment key signs the CloudFront policies, and `authorizer` uses the same
-parameter for its HMAC tokens and sessions with a kind-byte domain separation. Rotation is listed
-as an open decision in [`adr/README.md`](adr/README.md).
+Everything. One per-deployment key signs the session cookies the edge gate verifies, and
+`authorizer` uses the same key for its admission tokens and sessions with a kind-byte domain
+separation. Holding it mints admission for the whole event. Terraform generates it, so changing it
+means forcing `random_bytes.signing_key` to regenerate — which invalidates every live session, so
+it is a between-events operation rather than a routine one.
 
 ---
 
