@@ -168,14 +168,23 @@ pub fn shard_index_of<S: std::hash::BuildHasher>(
     (shard < SHARDS).then_some(shard)
 }
 
-/// Reads a shard item's count, defaulting to zero for a shard nothing has
-/// written yet.
+/// Reads a shard item's count, or `None` if the count attribute is absent,
+/// not a `Number`, or not a parseable `u64`.
+///
+/// `None` distinguishes "this item has no readable count" from "this shard
+/// has no item": a shard that nothing has written yields no item at all from a
+/// `BatchGetItem` response, so it never reaches a fold that could call this.
+/// A present item whose count cannot be read is therefore corruption, not an
+/// empty shard — callers that fold batch-get items must turn `None` into an
+/// error rather than silently zero the shard, reserving zero for a shard that
+/// never reached them because it had no item.
 #[must_use]
-pub fn shard_count_of<S: std::hash::BuildHasher>(item: &HashMap<String, AttributeValue, S>) -> u64 {
+pub fn shard_count_of<S: std::hash::BuildHasher>(
+    item: &HashMap<String, AttributeValue, S>,
+) -> Option<u64> {
     item.get(SHARD_COUNT_ATTR)
         .and_then(|v| v.as_n().ok())
         .and_then(|n| n.parse::<u64>().ok())
-        .unwrap_or(0)
 }
 
 /// `ADD queue_counter :n` — claims a contiguous block of `n` live-join
@@ -277,7 +286,7 @@ mod tests {
             ),
         ]);
         assert_eq!(shard_index_of(&item), Some(7));
-        assert_eq!(shard_count_of(&item), 42);
+        assert_eq!(shard_count_of(&item), Some(42));
 
         // Out of range or absent is None, never a wrong shard.
         let bad = HashMap::from([(
@@ -286,8 +295,10 @@ mod tests {
         )]);
         assert_eq!(shard_index_of(&bad), None);
         assert_eq!(shard_index_of(&HashMap::new()), None);
-        // A shard nothing has written counts zero rather than failing.
-        assert_eq!(shard_count_of(&HashMap::new()), 0);
+        // An unreadable or absent count is None; callers reserve zero for an
+        // absent *item*, since a present item reaching a fold is never empty —
+        // a missing count on one is corruption, not a still-unwritten shard.
+        assert_eq!(shard_count_of(&HashMap::new()), None);
     }
 
     #[test]

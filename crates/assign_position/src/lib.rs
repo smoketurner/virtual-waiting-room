@@ -3,12 +3,19 @@
 //!
 //! Consumes a batch of enqueued join messages. Each batch reads the event's
 //! `Counters` item once (a strongly consistent `GetItem`) to decide which of
-//! two paths every valid record in the batch takes:
+//! two paths every valid record in the batch takes, or to reject the batch
+//! outright when no `Counters` item exists yet:
 //!
+//! - **Rejected (unconfigured event)** — no `Counters` item exists, so the
+//!   event has not been set up. Every valid record is failed and claims
+//!   nothing, surfacing the state as a hard failure rather than letting a
+//!   pre-seal live join increment `queue_counter` before the seal `SET`s it
+//!   to the cohort size (an unconditional `SET` that would discard the
+//!   increment and let a later cohort member or post-seal joiner collide on
+//!   the same numeric position).
 //! - **Live join** — the event is sealed, or its phase is anything but
-//!   `PreQueue`, or no `Counters` item exists yet. Allocates one contiguous
-//!   block of queue positions with one counter increment and writes one
-//!   `Positions` row per valid record.
+//!   `PreQueue`. Allocates one contiguous block of queue positions with one
+//!   counter increment and writes one `Positions` row per valid record.
 //! - **Pre-queue** — the event is not sealed and its phase is `PreQueue`.
 //!   Groups the batch's valid records by shard (`hash(request_id) % 10`) and
 //!   claims one contiguous block of local indices per shard, then writes one
@@ -182,9 +189,9 @@ pub fn is_uuid_v7(id: &str) -> bool {
 /// `UUIDv7`, or whose `event_id` does not match `event_id` is an immediate
 /// batch failure and claims nothing. The remaining valid records all take the
 /// same path — live join or pre-queue — decided once from the event's
-/// `Counters` item (see the module docs). A `Counters` read failure fails
-/// every valid record; a missing `Counters` item takes the live path, exactly
-/// as an event that has never been sealed or opened behaves today.
+/// `Counters` item (see the module docs). A `Counters` read failure, or a
+/// missing `Counters` item (the event has not been set up yet), fails every
+/// valid record and claims nothing.
 pub async fn process_batch<S: Store>(
     store: &S,
     event_id: &str,
@@ -207,7 +214,27 @@ pub async fn process_batch<S: Store>(
     }
 
     let counters = match store.load_counters(event_id).await {
-        Ok(counters) => counters,
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            // No `Counters` item: the event has not been set up yet. Failing
+            // every valid record prevents a pre-seal live join from
+            // incrementing `queue_counter` before the seal `SET`s it to the
+            // cohort size — an unconditional `SET` that would discard the
+            // increment and let a later cohort member (or post-seal live
+            // joiner) collide on the same numeric position. The message
+            // retries until setup, then dead-letters after `maxReceiveCount`:
+            // a misconfiguration surfaced as a hard failure rather than
+            // silently processed into a collision.
+            tracing::warn!(
+                event_id = event_id,
+                valid = valid.len(),
+                "no Counters item; failing batch until the event is set up"
+            );
+            for (message_id, _) in &valid {
+                outcome.failures.push(message_id.clone());
+            }
+            return outcome;
+        }
         Err(err) => {
             tracing::error!(error = %err, "counters read failed; retrying batch");
             for (message_id, _) in &valid {
@@ -219,11 +246,9 @@ pub async fn process_batch<S: Store>(
 
     // Branch on the seal outputs, never on phase alone: an operator can walk
     // the phase back to PreQueue after a seal (Active -> Maintenance -> Idle
-    // -> PreQueue) without unsealing the index space, and a missing Counters
-    // item behaves exactly like today's live path.
-    let live_path = counters
-        .as_ref()
-        .is_none_or(|c| c.sealed().is_some() || c.phase != Phase::PreQueue);
+    // -> PreQueue) without unsealing the index space, and a record arriving
+    // in that state is still a live join.
+    let live_path = counters.sealed().is_some() || counters.phase != Phase::PreQueue;
 
     if live_path {
         process_live_batch(store, event_id, valid, &mut outcome).await;
@@ -468,7 +493,8 @@ mod tests {
 
         // `load_counters` canned responses, consumed in call order; the last
         // value repeats once the queue is down to one. `None` per response
-        // means "no Counters item" (today's live-path default).
+        // means "no Counters item" (an unconfigured event: the batch is failed
+        // rather than taking the live path).
         counters_sequence: Mutex<VecDeque<Option<Counters>>>,
         counters_fail_from_call: Option<u32>,
         counters_calls: Mutex<u32>,
@@ -488,7 +514,9 @@ mod tests {
                 prequeue_seen: Mutex::new(Vec::new()),
                 prequeue_claim_fails: false,
                 fail_prequeue_write_for: None,
-                counters_sequence: Mutex::new(VecDeque::from([None])),
+                counters_sequence: Mutex::new(VecDeque::from([Some(counters_with_phase(
+                    Phase::Idle,
+                ))])),
                 counters_fail_from_call: None,
                 counters_calls: Mutex::new(0),
             }
@@ -852,6 +880,128 @@ mod tests {
         assert_eq!(outcome.failures.len(), 2);
         assert!(store.writes.lock().unwrap().is_empty());
         assert!(store.prequeue_writes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_counters_item_fails_every_valid_record_and_claims_nothing() {
+        // The contract change: with no `Counters` item the event is
+        // unconfigured, so a join is never processed. Failing every valid
+        // record (rather than taking the live path) prevents a pre-seal live
+        // join from incrementing `queue_counter` before the seal `SET`s it to
+        // the cohort size, which would discard the increment and cause a
+        // position collision.
+        let store = FakeStore {
+            counters_sequence: Mutex::new(VecDeque::from([None])),
+            ..FakeStore::default()
+        };
+        let records = vec![
+            rec("m1", "018f3a2b-7c9d-7e1f-8001-0123456789ab"),
+            rec("m2", "018f3a2b-7c9d-7e1f-8002-0123456789ab"),
+        ];
+        let outcome = process_batch(&store, "evt-1", &records).await;
+        assert_eq!(outcome.failures, vec!["m1".to_owned(), "m2".to_owned()]);
+        assert_eq!(
+            *store.counter.lock().unwrap(),
+            0,
+            "no live block claimed on an unconfigured event"
+        );
+        assert!(store.writes.lock().unwrap().is_empty());
+        assert!(store.prequeue_writes.lock().unwrap().is_empty());
+    }
+
+    /// Reproduces the collision from the bug report end-to-end through the
+    /// `Store` port. A join that arrives before any `Counters` item exists is
+    /// now rejected (not routed to the live path), so it leaves no `Positions`
+    /// row to collide with the pre-queue cohort once the event is later set to
+    /// `PreQueue` and sealed. Before the fix, step (1) took the live path,
+    /// incremented `queue_counter`, and the seal's `SET queue_counter = :n`
+    /// overwrote it — handing a cohort member the same numeric position.
+    #[tokio::test]
+    async fn pre_seal_join_before_counters_item_does_not_collide_with_cohort() {
+        let store = FakeStore::default();
+
+        // (1) A join arrives before any `Counters` item exists: rejected, and
+        // it neither increments `queue_counter` nor writes a `Positions` row.
+        *store.counters_sequence.lock().unwrap() = VecDeque::from([None]);
+        let early = process_batch(
+            &store,
+            "evt-1",
+            &[rec("m1", "018f3a2b-7c9d-7e1f-8001-0123456789ab")],
+        )
+        .await;
+        assert_eq!(early.failures, vec!["m1".to_owned()]);
+        assert_eq!(
+            *store.counter.lock().unwrap(),
+            0,
+            "the pre-seal joiner must not increment queue_counter"
+        );
+        assert!(
+            store.writes.lock().unwrap().is_empty(),
+            "the pre-seal joiner must leave no Positions row to collide"
+        );
+
+        // (2) The admin sets phase = PreQueue; two cohort members register on
+        // shard 0. The pre-queue path claims local indices and never touches
+        // `queue_counter`.
+        *store.counters_sequence.lock().unwrap() =
+            VecDeque::from([Some(counters_with_phase(Phase::PreQueue))]);
+        let ids = ids_on_shard(0, 2);
+        let cohort: Vec<BatchRecord> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| rec(&format!("c{i}"), id))
+            .collect();
+        let outcome = process_batch(&store, "evt-1", &cohort).await;
+        assert!(outcome.failures.is_empty());
+        assert_eq!(store.prequeue_writes.lock().unwrap().len(), 2);
+        assert_eq!(
+            *store.counter.lock().unwrap(),
+            0,
+            "pre-queue registration never increments queue_counter"
+        );
+
+        // (3) The seal `SET`s queue_counter = N (N = 2). The PRP is a
+        // permutation of [0, 2), so the cohort occupies {0, 1}. Because the
+        // pre-seal joiner was rejected, no `Positions` row exists at {0, 1},
+        // so no numeric position is held by two visitors.
+        *store.counter.lock().unwrap() = 2; // the seal's unconditional `SET queue_counter = :n`
+        let live_positions: Vec<u64> = store
+            .writes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|w| w.position)
+            .collect();
+        assert!(
+            live_positions.is_empty(),
+            "no pre-seal live Positions row collides with the cohort [0, 2)"
+        );
+
+        // (4) A post-seal live join lands strictly above the cohort
+        // (N + 1 = 3), never overlapping {0, 1} — the guard PR #57 intended.
+        *store.counters_sequence.lock().unwrap() = VecDeque::from([Some(sealed_counters(
+            [2, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            Phase::Active,
+        ))]);
+        let after = process_batch(
+            &store,
+            "evt-1",
+            &[rec("m2", "018f3a2b-7c9d-7e1f-8009-0123456789ab")],
+        )
+        .await;
+        assert!(after.failures.is_empty());
+        let live_positions: Vec<u64> = store
+            .writes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|w| w.position)
+            .collect();
+        assert_eq!(
+            live_positions,
+            vec![3],
+            "post-seal live join starts at N + 1"
+        );
     }
 
     // --- pre-queue path ------------------------------------------------------
