@@ -500,6 +500,7 @@ uniformity test uses a different threshold and does not assert a specific χ².
 | The operator message attribute is `operator_message` | The attribute is `message` |
 | `GET /metrics` returns event metrics | API Gateway routes it to the admin Lambda, whose router has no `/metrics` handler |
 | A refused visitor gets a 403 mapped to the waiting page | The mapping rewrites the status to **200** |
+| `/admin/phase` forces maintenance mode | `apply_phase` rejects a `Maintenance` target — entering `Maintenance` uses `/admin/reset` (`force_maintenance`), audited under its own label |
 
 ---
 
