@@ -176,7 +176,15 @@ async fn carry_out<S: Store>(
     decision: Decision,
 ) -> Result<Response<Body>, Error> {
     match decision {
-        Decision::Forward => Ok(forward()),
+        Decision::Forward {
+            refresh_cookie: None,
+        } => Ok(forward()),
+        Decision::Forward {
+            refresh_cookie: Some(set_cookie),
+        } => {
+            info!("sliding session re-issued on activity");
+            Ok(set_session(&set_cookie, path))
+        }
         Decision::SetSessionAndForward {
             set_cookie,
             arrival_shard,
@@ -476,9 +484,36 @@ mod tests {
     #[tokio::test]
     async fn forward_decision_makes_no_store_calls() {
         let store = FakeStore::new();
-        let resp = run(&store, Decision::Forward).await;
+        let resp = run(
+            &store,
+            Decision::Forward {
+                refresh_cookie: None,
+            },
+        )
+        .await;
         assert_eq!(resp.status(), 200);
         assert!(resp.headers().get("set-cookie").is_none());
+        assert!(store.reservations.lock().unwrap().is_empty());
+        assert!(store.arrivals.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sliding_refresh_sets_the_cookie_and_makes_no_store_calls() {
+        // A sliding session re-issued on activity carries its own `Set-Cookie`
+        // but is already admitted: it reserves no token and records no arrival.
+        let store = FakeStore::new();
+        let resp = run(
+            &store,
+            Decision::Forward {
+                refresh_cookie: Some("vwr_session=refreshed; Max-Age=1800".to_owned()),
+            },
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers().get("set-cookie").unwrap().to_str().unwrap(),
+            "vwr_session=refreshed; Max-Age=1800"
+        );
         assert!(store.reservations.lock().unwrap().is_empty());
         assert!(store.arrivals.lock().unwrap().is_empty());
     }

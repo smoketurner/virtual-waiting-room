@@ -82,7 +82,7 @@ Throwaway code. Measures what documentation cannot settle.
 - [ ] Authorizer decision tree: session → token → protection match → 302 [F3.4]
 - [ ] Session cookie set after token validation (ADR-0011), signed over different inputs
       from the token, scoped per event, token stripped from the URL [F3.5, F3.6]
-- [ ] Sliding and fixed session validity modes [F3.7]
+- [x] Sliding and fixed session validity modes [F3.7]
 - [ ] Fail open with a time-limited bypass cookie, configurable (ADR-0009)
       [F4.1, F4.2, F4.3]
 - [ ] No-show compensating outflow controller: measure arrivals against releases, smooth,

@@ -132,8 +132,10 @@ pub struct Config {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
     /// The request already carries a valid session, or is unprotected. Forward
-    /// as-is.
-    Forward,
+    /// as-is. `refresh_cookie`, when `Some`, is a re-signed session cookie the
+    /// caller must set on the response (sliding-window refresh on activity);
+    /// `None` carries no `Set-Cookie`.
+    Forward { refresh_cookie: Option<String> },
     /// A valid admission token was converted to a session. Reserve the
     /// single-use admission token first (denying any replay), then set this
     /// signed session cookie, record an arrival for this shard, strip the token
@@ -184,12 +186,16 @@ pub fn decide(
     reachability: Reachability,
 ) -> Decision {
     // 1. A valid, unexpired, correctly-scoped session cookie forwards straight
-    //    through with no further work.
+    //    through. Under a sliding session mode it is re-issued with a later
+    //    expiry on this activity (up to the hard cap); a fixed session is
+    //    forwarded unchanged.
     if let Some(cookie) = req.cookie(&cfg.session_cookie_name)
         && let Ok(session) = Session::verify(cookie, key, now)
         && session.event_id == cfg.event_id
     {
-        return Decision::Forward;
+        let refresh_cookie =
+            slide(&session, cfg.session_mode, now).map(|s| session_cookie(&s.sign(key), cfg, now));
+        return Decision::Forward { refresh_cookie };
     }
 
     // 2. A valid admission token becomes a session: mint the cookie, surface the
@@ -215,7 +221,9 @@ pub fn decide(
 
     // 3. A request no rule protects is forwarded without a credential.
     if !req.is_protected(&cfg.rules) {
-        return Decision::Forward;
+        return Decision::Forward {
+            refresh_cookie: None,
+        };
     }
 
     // 4. The path is protected and the visitor has no valid credential. If the
@@ -382,7 +390,9 @@ mod tests {
             .push(("vwr_session".to_owned(), session.sign(&key())));
         assert_eq!(
             decide(&req, &cfg(), &key(), 2000, Reachability::Reachable),
-            Decision::Forward
+            Decision::Forward {
+                refresh_cookie: None
+            }
         );
     }
 
@@ -517,7 +527,9 @@ mod tests {
         let req = req_to("/public/home");
         assert_eq!(
             decide(&req, &cfg(), &key(), 2000, Reachability::Reachable),
-            Decision::Forward
+            Decision::Forward {
+                refresh_cookie: None
+            }
         );
     }
 
@@ -568,7 +580,9 @@ mod tests {
             .push(("vwr_session".to_owned(), session.sign(&key())));
         assert_eq!(
             decide(&req, &cfg(), &key(), 2000, Reachability::Unreachable),
-            Decision::Forward
+            Decision::Forward {
+                refresh_cookie: None
+            }
         );
     }
 
@@ -634,5 +648,86 @@ mod tests {
         assert_eq!(strip_token("/x?a=1&token=abc&b=2"), "/x?a=1&b=2");
         assert_eq!(strip_token("/x?a=1"), "/x?a=1");
         assert_eq!(strip_token("/x"), "/x");
+    }
+
+    #[test]
+    fn sliding_session_is_reissued_on_activity() {
+        // Mid-window activity on a sliding session re-issues the session
+        // (extends the idle window up to the hard cap) rather than silently
+        // forwarding the stale cookie. This is the F3.7 sliding guarantee
+        // wired through `decide()`, which previously dropped the verified
+        // session and returned a plain `Forward`.
+        let mut cfg = cfg();
+        cfg.session_mode = SessionMode::Sliding {
+            idle_secs: 100,
+            cap_secs: 500,
+        };
+        let session = Session {
+            event_id: "smoke".to_owned(),
+            request_id: "r1".to_owned(),
+            issued_at: 1000,
+            expires_at: 1100,
+        };
+        let mut req = req_to("/tickets");
+        req.cookies
+            .push(("vwr_session".to_owned(), session.sign(&key())));
+        let decision = decide(&req, &cfg, &key(), 1050, Reachability::Reachable);
+        match decision {
+            Decision::Forward {
+                refresh_cookie: None,
+            } => panic!("sliding session should be re-issued on activity, not silently forwarded"),
+            Decision::Forward {
+                refresh_cookie: Some(cookie),
+            } => {
+                // The refresh is a well-formed Set-Cookie for this event's
+                // session, scoped and flagged like a fresh issue.
+                assert!(cookie.starts_with("vwr_session="), "got: {cookie}");
+                assert!(cookie.contains("HttpOnly"));
+                assert!(cookie.contains("Secure"));
+                assert!(cookie.contains("SameSite=Lax"));
+                assert!(cookie.contains("Max-Age=100;"));
+                // The re-signed value verifies as a session whose expiry moved
+                // from 1100 to 1150 (now 1050 + idle 100), still under the 1500
+                // cap measured from the original issued_at.
+                let value = cookie.split(['=', ';']).nth(1).unwrap();
+                let refreshed = Session::verify(value, &key(), 1050).unwrap();
+                assert_eq!(refreshed.event_id, "smoke");
+                assert_eq!(refreshed.request_id, "r1");
+                assert_eq!(refreshed.issued_at, 1000);
+                assert_eq!(refreshed.expires_at, 1150);
+            }
+            other => panic!("expected Forward with refresh cookie, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sliding_session_at_cap_is_forwarded_without_re_set() {
+        // Once a sliding session has reached the hard cap (issued_at + cap_secs),
+        // activity does not extend it further: `slide()` returns `None` and the
+        // request is forwarded without a re-set cookie. The cap is a hard
+        // ceiling regardless of activity.
+        let mut cfg = cfg();
+        cfg.session_mode = SessionMode::Sliding {
+            idle_secs: 100,
+            cap_secs: 500,
+        };
+        let session = Session {
+            event_id: "smoke".to_owned(),
+            request_id: "r1".to_owned(),
+            issued_at: 1000,
+            // Already at the cap (1000 + 500).
+            expires_at: 1500,
+        };
+        let mut req = req_to("/tickets");
+        req.cookies
+            .push(("vwr_session".to_owned(), session.sign(&key())));
+        let decision = decide(&req, &cfg, &key(), 1490, Reachability::Reachable);
+        assert_eq!(
+            decision,
+            Decision::Forward {
+                refresh_cookie: None
+            },
+            "session at the hard cap should forward without a re-set cookie"
+        );
     }
 }
