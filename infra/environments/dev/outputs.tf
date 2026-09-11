@@ -69,9 +69,9 @@ output "waiting_room_page_url" {
   value       = "https://${module.edge.distribution_domain_name}/_wr/waiting.html"
 }
 
-output "admission_key_pair_id" {
-  description = "ID of the CloudFront public key that verifies admission cookies."
-  value       = module.core.admission_key_pair_id
+output "gate_kvs_arn" {
+  description = "ARN of the edge gate's CloudFront KeyValueStore (issue #71). Read by scripts/bootstrap_edge_gate.py."
+  value       = module.core.gate_kvs_arn
 }
 
 output "demo_origin_bucket" {

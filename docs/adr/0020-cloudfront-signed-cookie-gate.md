@@ -1,6 +1,6 @@
 # ADR-0020: CloudFront signed cookies are the admission gate
 
-**Status:** Accepted
+**Status:** Superseded by [ADR-0021](0021-edge-function-gate.md).
 
 **Supersedes:** the origin-authorizer half of [ADR-0009](0009-fail-open.md)
 as the *primary* gate. The authorizer remains for origins the customer controls.

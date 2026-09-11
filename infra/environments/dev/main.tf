@@ -35,6 +35,10 @@ module "core" {
   poll_floor_ms   = var.poll_floor_ms
   poll_ceiling_ms = var.poll_ceiling_ms
   poll_divisor    = var.poll_divisor
+
+  # Shared with module.edge below so generate_token and the gate's CloudFront
+  # Function cannot drift onto different cookie names (issue #71).
+  session_cookie_name = var.session_cookie_name
 }
 
 # demo-origin: a stand-in for the customer's protected origin. This is the dev
@@ -67,9 +71,11 @@ module "edge" {
   demo_origin_domain_name       = module.demo_origin.bucket_regional_domain_name
   demo_origin_access_control_id = module.demo_origin.origin_access_control_id
 
-  # Turns the gate on: CloudFront verifies admission cookies signed by this key
-  # group before it will reach the protected origin.
-  trusted_key_group_ids = [module.core.admission_key_group_id]
+  # The edge gate (issue #71): the CloudFront Function reads its config and
+  # signing secret from this store, and event_id is templated into its source.
+  gate_kvs_arn        = module.core.gate_kvs_arn
+  event_id            = var.event_id
+  session_cookie_name = var.session_cookie_name
 }
 
 # authorizer. The function is the gate at the customer's protected origin: it

@@ -1,0 +1,274 @@
+{
+  "positives": [
+    {
+      "name": "typical",
+      "key_hex": "612d33322d627974652d746573742d7369676e696e672d6b65792d76616c7565",
+      "event_id": "smoke",
+      "request_id": "018f3a2b-7c9d-7e1f-abcd-0123456789ab",
+      "issued_at": 1700000000,
+      "expires_at": 1700003600,
+      "now": 1700000001,
+      "credential": "AAVzbW9rZQAkMDE4ZjNhMmItN2M5ZC03ZTFmLWFiY2QtMDEyMzQ1Njc4OWFiAAAAAGVT8QAAAAAAZVP_EA.GhYXmifnu5FCFkhrfxhwa77_NAlxqxZQZYaU5l2rpic"
+    },
+    {
+      "name": "empty_event_id",
+      "key_hex": "612d33322d627974652d746573742d7369676e696e672d6b65792d76616c7565",
+      "event_id": "",
+      "request_id": "r1",
+      "issued_at": 0,
+      "expires_at": 1000,
+      "now": 500,
+      "credential": "AAAAAnIxAAAAAAAAAAAAAAAAAAAD6A.ezwImwLnaoH1v2lRCNF2NM3KCQuJkrMOqptCK1kX14Y"
+    },
+    {
+      "name": "multibyte_event_id",
+      "key_hex": "612d33322d627974652d746573742d7369676e696e672d6b65792d76616c7565",
+      "event_id": "événement-日本語-🎫",
+      "request_id": "r1",
+      "issued_at": 0,
+      "expires_at": 1000,
+      "now": 500,
+      "credential": "ABrDqXbDqW5lbWVudC3ml6XmnKzoqp4t8J-OqwACcjEAAAAAAAAAAAAAAAAAAAPo.rmflAY7KdB6CEjLbZUXDy_02WayEpuCqBhRouimi0oI"
+    },
+    {
+      "name": "expires_at_above_u32",
+      "key_hex": "612d33322d627974652d746573742d7369676e696e672d6b65792d76616c7565",
+      "event_id": "smoke",
+      "request_id": "r1",
+      "issued_at": 0,
+      "expires_at": 4294979641,
+      "now": 4294967296,
+      "credential": "AAVzbW9rZQACcjEAAAAAAAAAAAAAAAEAADA5.kDAJlV_XInJ2A3eiYN0KaxWYM0DU7mU0z-D6kix1UdM"
+    },
+    {
+      "name": "near_max_length_ids",
+      "key_hex": "612d33322d627974652d746573742d7369676e696e672d6b65792d76616c7565",
+      "event_id": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+      "request_id": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+      "issued_at": 0,
+      "expires_at": 1000,
+      "now": 500,
+      "credential": "ASxycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnIBLHJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycgAAAAAAAAAAAAAAAAAAA-g.eVc1ZcZT2RZ-tgLbxCe5oY7_GvessNDAukobOnHnfg8"
+    },
+    {
+      "name": "expires_at_boundary",
+      "key_hex": "612d33322d627974652d746573742d7369676e696e672d6b65792d76616c7565",
+      "event_id": "smoke",
+      "request_id": "r1",
+      "issued_at": 0,
+      "expires_at": 1000,
+      "now": 999,
+      "credential": "AAVzbW9rZQACcjEAAAAAAAAAAAAAAAAAAAPo.5u9S-tnfTYZXmUi7Yd6n27B7FdBB7qKmAVEJWgoUzBY"
+    }
+  ],
+  "negatives": [
+    {
+      "name": "wrong_key",
+      "key_hex": "612d33322d627974652d746573742d7369676e696e672d6b65792d76616c7565",
+      "credential": "AAVzbW9rZQACcjEAAAAAAAAD6AAAAAAAAAfQ.kkxEJZv9F27b4whoo00jnZLlgydp1E2UiFpsDky4bfE",
+      "now": 1500
+    },
+    {
+      "name": "flipped_payload_bit",
+      "key_hex": "612d33322d627974652d746573742d7369676e696e672d6b65792d76616c7565",
+      "credential": "AQVzbW9rZQACcjEAAAAAAAAD6AAAAAAAAAfQ.eHg7Z-Wn5prI4AXqjJne_-LPByosWabpp28gGSwEaxo",
+      "now": 1500
+    },
+    {
+      "name": "flipped_mac_bit",
+      "key_hex": "612d33322d627974652d746573742d7369676e696e672d6b65792d76616c7565",
+      "credential": "AAVzbW9rZQACcjEAAAAAAAAD6AAAAAAAAAfQ.eXg7Z-Wn5prI4AXqjJne_-LPByosWabpp28gGSwEaxo",
+      "now": 1500
+    },
+    {
+      "name": "token_kind_as_session",
+      "key_hex": "612d33322d627974652d746573742d7369676e696e672d6b65792d76616c7565",
+      "credential": "AAVzbW9rZQACcjEAAAAAAAAH0A.Cr0Le8SxReLngXmu90McaX7PBUCzCcEvWu5xkZGTlrk",
+      "now": 1500
+    },
+    {
+      "name": "trailing_byte",
+      "key_hex": "612d33322d627974652d746573742d7369676e696e672d6b65792d76616c7565",
+      "credential": "AAVzbW9rZQACcjEAAAAAAAAD6AAAAAAAAAfQqw.Ja5YjIcV8iAEpP3KjhgdgCxhI6j2fEyavSMheJ3JsQo",
+      "now": 1500
+    },
+    {
+      "name": "no_dot",
+      "key_hex": "612d33322d627974652d746573742d7369676e696e672d6b65792d76616c7565",
+      "credential": "not-a-credential",
+      "now": 0
+    },
+    {
+      "name": "base64_with_padding",
+      "key_hex": "612d33322d627974652d746573742d7369676e696e672d6b65792d76616c7565",
+      "credential": "AAVzbW9rZQACcjEAAAAAAAAD6AAAAAAAAAfQ==.eHg7Z-Wn5prI4AXqjJne_-LPByosWabpp28gGSwEaxo",
+      "now": 1500
+    },
+    {
+      "name": "base64_with_plus_slash",
+      "key_hex": "612d33322d627974652d746573742d7369676e696e672d6b65792d76616c7565",
+      "credential": "AA+/.AA+/",
+      "now": 0
+    }
+  ],
+  "rules": [
+    {
+      "name": "path_prefix_matches",
+      "rule": [
+        "p",
+        "/checkout"
+      ],
+      "request": {
+        "path": "/checkout/step2",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": true
+    },
+    {
+      "name": "path_prefix_no_match",
+      "rule": [
+        "p",
+        "/checkout"
+      ],
+      "request": {
+        "path": "/about",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": false
+    },
+    {
+      "name": "cookie_present",
+      "rule": [
+        "c",
+        "loyalty_member"
+      ],
+      "request": {
+        "path": "/",
+        "headers": [],
+        "cookies": [
+          [
+            "loyalty_member",
+            "1"
+          ]
+        ]
+      },
+      "matches": true
+    },
+    {
+      "name": "cookie_absent",
+      "rule": [
+        "c",
+        "loyalty_member"
+      ],
+      "request": {
+        "path": "/",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": false
+    },
+    {
+      "name": "user_agent_substring",
+      "rule": [
+        "u",
+        "HeadlessChrome"
+      ],
+      "request": {
+        "path": "/",
+        "headers": [
+          [
+            "user-agent",
+            "Mozilla/5.0 HeadlessChrome/120"
+          ]
+        ],
+        "cookies": []
+      },
+      "matches": true
+    },
+    {
+      "name": "user_agent_absent",
+      "rule": [
+        "u",
+        "HeadlessChrome"
+      ],
+      "request": {
+        "path": "/",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": false
+    },
+    {
+      "name": "header_exact_match_case_insensitive_name",
+      "rule": [
+        "h",
+        "X-Internal-Monitor",
+        "true"
+      ],
+      "request": {
+        "path": "/",
+        "headers": [
+          [
+            "x-internal-monitor",
+            "true"
+          ]
+        ],
+        "cookies": []
+      },
+      "matches": true
+    },
+    {
+      "name": "header_value_case_insensitive",
+      "rule": [
+        "h",
+        "x-internal-monitor",
+        "TRUE"
+      ],
+      "request": {
+        "path": "/",
+        "headers": [
+          [
+            "x-internal-monitor",
+            "true"
+          ]
+        ],
+        "cookies": []
+      },
+      "matches": true
+    },
+    {
+      "name": "header_value_mismatch",
+      "rule": [
+        "h",
+        "x-internal-monitor",
+        "true"
+      ],
+      "request": {
+        "path": "/",
+        "headers": [
+          [
+            "x-internal-monitor",
+            "false"
+          ]
+        ],
+        "cookies": []
+      },
+      "matches": false
+    },
+    {
+      "name": "empty_ruleset_has_no_bearing_here_but_prefix_of_root_matches_everything",
+      "rule": [
+        "p",
+        "/"
+      ],
+      "request": {
+        "path": "/anything/at/all",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": true
+    }
+  ]
+}

@@ -17,7 +17,7 @@
   {% if admission_control == "paused" %}
   <div class="banner" id="pause-banner">Admission is PAUSED. The queue keeps forming; no one is admitted.</div>
   {% elif admission_control == "fail_open" %}
-  <div class="banner" id="pause-banner">FAIL OPEN. The waiting room is bypassed and every arrival goes straight to the origin.</div>
+  <div class="banner" id="pause-banner">FAIL OPEN until {{ fail_open_remaining_secs }}s remaining. The waiting room is bypassed and every arrival goes straight to the origin, then <strong>{{ queued_control }}</strong>.</div>
   {% endif %}
 
   <div class="grid">
@@ -74,6 +74,22 @@
           <button class="danger big" type="submit" title="Pause admission. Waiting visitors see a 'you keep your place' notice; nobody new is let through.">Pause admission</button>
         </form>
         <p class="help" style="margin-top:12px;color:var(--gray-500);"><strong>Pause holds the line.</strong> Waiting visitors see a "you keep your place" notice, the queue keeps forming, and nobody new is admitted. A Resume button appears here to clear it. Reversible.</p>
+        {% endif %}
+        <hr class="divider">
+        {% if admission_control == "fail_open" %}
+        <p class="deferred">FAIL OPEN for {{ fail_open_remaining_secs }}s more, then <strong>{{ queued_control }}</strong>. The waiting room is bypassed; every arrival goes straight to the origin.</p>
+        <form method="post" action="/admin/recover" data-confirm="Clear fail-open now? Admission lands in {{ queued_control }} immediately.">
+          <button class="danger" type="submit" title="Clear the fail-open window now. Admission lands in the state shown above.">Clear fail-open (lands in {{ queued_control }})</button>
+        </form>
+        {% else %}
+        <form method="post" action="/admin/fail_open" data-confirm="Bypass the waiting room? Every arrival will go straight to the origin for the duration entered, with no admission check.">
+          <div class="form-field">
+            <label for="fail_open_minutes">Fail open for (minutes)</label>
+            <input id="fail_open_minutes" name="minutes" type="number" min="1" max="1440" required title="How long to bypass the waiting room, in minutes.">
+            <span class="help">Break-glass: bypasses the gate entirely for the given duration, then reverts on its own with no further action needed. Legal even while paused — it lands in whatever is set here once it lapses.</span>
+          </div>
+          <button class="danger" type="submit" title="Bypass the waiting room for the given duration.">Fail open</button>
+        </form>
         {% endif %}
         <hr class="divider">
         {% if phase == "maintenance" %}

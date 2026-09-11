@@ -23,19 +23,26 @@ infra/                        All Terraform — kept separate from the Rust work
     dev/                      The only deployable root (terraform apply runs here)
   modules/
     core/                     DynamoDB, SQS, Lambdas, IAM, regional REST API + validator,
-                              the CloudFront signing key pair / public key / key group
-    edge/                     CloudFront cache behaviours + the S3-hosted waiting page
+                              the edge gate's CloudFront KeyValueStore (issue #71)
+    edge/                     CloudFront cache behaviours, the S3-hosted waiting page, and the
+                              admission gate CloudFront Function (functions/gate.js.tftpl)
     authorizer/               Origin authorizer + optional CloudFront VPC origin
     demo-origin/              Fixture standing in for an operator origin in the dev root
 crates/                       Rust workspace — one crate per Lambda + shared lib
-  wr-common/                  permutation, ids + items, expr, crypto — re-exported flat
+  wr-common/                  permutation, ids + items, expr, crypto, rules — re-exported flat.
+                              tests/vectors.rs generates the cross-language conformance vectors
+                              infra/modules/edge/tests/*.conformance.test.js consume
   assign_position/            SQS consumer: position range claim + Positions writes
   seal_event/                 T−0 conditional seal
   read/                       /v1/status, /v1/queue_num
-  generate_token/             Admission check + CloudFront signed-cookie minting
+  generate_token/             Admission check + signed session cookie minting (issue #71)
   controller/                 Outflow control and position expiry
-  admin/                      Axum operator UI and /admin/* actions
+  admin/                      Axum operator UI and /admin/* actions, including the edge gate's
+                              KeyValueStore writer (edge.rs)
   authorizer/                 The alternative origin gate
+scripts/
+  bootstrap_edge_gate.py       Writes the signing secret to SSM and the edge gate's
+                              KeyValueStore in one run (issue #71)
 examples/                     Deployable example + generated variable reference — not built
 openapi/                      OpenAPI spec (N8) — not built
 ```

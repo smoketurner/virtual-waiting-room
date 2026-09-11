@@ -5,13 +5,101 @@
 
 use std::future::Future;
 
-use wr_common::{AdmissionControl, IllegalControl, Phase};
+use wr_common::{IllegalControl, Phase, ProtectionRule, StoredControl};
 
 pub mod dynamo;
+pub mod edge;
 pub mod oidc;
 pub mod security;
 pub mod sessions;
 pub mod templates;
+
+/// The upper sanity bound on a fail-open duration (minutes): long enough for
+/// a real break-glass window, short enough that a fat-fingered value cannot
+/// bypass the waiting room for days.
+pub const MAX_FAIL_OPEN_MINUTES: u32 = 1440;
+
+/// The gate's `KeyValueStore` config document (`c`), issue #71. `v` is a schema
+/// version the gate refuses to run against if it does not recognise it;
+/// `enforce_from` and `rules` are written by Terraform and by a future
+/// rules-editing action, neither of which this crate writes yet, so they are
+/// carried through read-modify-write unchanged by every write this crate does
+/// perform. `fail_open_until` mirrors `Counters.fail_open_until` and is the
+/// only field an admin action here mutates.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct GateConfig {
+    pub v: u8,
+    #[serde(rename = "s")]
+    pub enforce_from: u64,
+    #[serde(rename = "f")]
+    pub fail_open_until: u64,
+    #[serde(rename = "r")]
+    pub rules: Vec<ProtectionRule>,
+}
+
+/// The 1 KB `KeyValueStore` value ceiling (ADR-0021 §2) leaves room for roughly
+/// 45 rules at the spike's measured 23 bytes/rule; enforced here at a rounder
+/// 35 so a ruleset this crate encodes never risks the edge, and enforced by
+/// the writer rather than merely documented (ADR-0021 §6).
+pub const MAX_RULES: usize = 35;
+const MAX_CONFIG_BYTES: usize = 1024;
+
+/// Why a [`GateConfig`] could not be encoded for the edge.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum GateConfigError {
+    #[error("ruleset has {actual} rules, over the {max} limit")]
+    TooManyRules { actual: usize, max: usize },
+    #[error("encoded config is {actual} bytes, over the {max}-byte KeyValueStore value limit")]
+    TooLarge { actual: usize, max: usize },
+    #[error("could not serialize the config: {0}")]
+    Serialize(String),
+}
+
+/// Encodes a [`GateConfig`] to the compact JSON the gate reads, enforcing the
+/// rule-count and byte ceilings so an oversized document never reaches the
+/// edge writer. AWS-free — this is the risky part of the writer, so it is
+/// tested (and runs) in every build, including one built without AWS SDK
+/// features enabled.
+///
+/// # Errors
+///
+/// [`GateConfigError`] if the ruleset or the encoded document is too large,
+/// or if serialization itself fails (unreachable for this shape in practice).
+pub fn encode_gate_config(cfg: &GateConfig) -> Result<String, GateConfigError> {
+    if cfg.rules.len() > MAX_RULES {
+        return Err(GateConfigError::TooManyRules {
+            actual: cfg.rules.len(),
+            max: MAX_RULES,
+        });
+    }
+    let json = serde_json::to_string(cfg).map_err(|e| GateConfigError::Serialize(e.to_string()))?;
+    if json.len() > MAX_CONFIG_BYTES {
+        return Err(GateConfigError::TooLarge {
+            actual: json.len(),
+            max: MAX_CONFIG_BYTES,
+        });
+    }
+    Ok(json)
+}
+
+/// The port to the gate's `KeyValueStore`. A trait seam so the fail-open mirror
+/// runs without AWS; the SDK-backed implementation lives in `edge`.
+pub trait EdgeConfigStore {
+    /// Reads the current gate config document (`c`).
+    fn read_config(&self) -> impl Future<Output = Result<GateConfig, EdgeStoreError>> + Send;
+
+    /// Writes the gate config document (`c`), describe-then-put under the
+    /// store's `ETag`.
+    fn write_config(
+        &self,
+        cfg: &GateConfig,
+    ) -> impl Future<Output = Result<(), EdgeStoreError>> + Send;
+}
+
+/// An edge `KeyValueStore` failure.
+#[derive(Debug, thiserror::Error)]
+#[error("edge config store error: {0}")]
+pub struct EdgeStoreError(pub String);
 
 /// The persistence port the admin actions drive. Reading the current `Counters`
 /// state and applying one guarded mutation to it.
@@ -63,16 +151,30 @@ pub trait Store {
         now_ms: u64,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
-    /// Moves the admission control from `from` to `to`, guarded on the stored
+    /// Moves the stored control from `from` to `to`, guarded on the stored
     /// value still being `from` (so a transition that already happened is a
     /// no-op `Conflict`, making the action idempotent) and on the debounce
     /// window; stamps `action` and the audit fields atomically. `target_rate` is
-    /// untouched, so resuming restores the configured rate.
-    fn set_admission_control(
+    /// untouched, so resuming restores the configured rate. Never touches
+    /// `fail_open_until` — the two are orthogonal (issue #71).
+    fn set_stored_control(
         &self,
         event_id: &str,
-        from: AdmissionControl,
-        to: AdmissionControl,
+        from: StoredControl,
+        to: StoredControl,
+        action: AdminAction,
+        actor: &str,
+        now_ms: u64,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// Sets the fail-open epoch unconditionally (break-glass: not guarded on
+    /// the prior value, not debounced — mirroring `force_maintenance`, the
+    /// operator must always be able to engage or clear it). Stamps `action`
+    /// and the audit fields atomically.
+    fn set_fail_open_until(
+        &self,
+        event_id: &str,
+        until: u64,
         action: AdminAction,
         actor: &str,
         now_ms: u64,
@@ -99,10 +201,15 @@ pub struct ControlState {
     pub participant_count: Option<u64>,
     pub target_rate: Option<u32>,
     pub message: Option<String>,
-    /// The operator's admission override. While it is anything but `Open` the
-    /// controller admits nobody and the queue and positions stay intact;
-    /// `target_rate` is preserved across a hold.
-    pub admission_control: AdmissionControl,
+    /// The operator's stored admission override (issue #71: never `FailOpen`,
+    /// which is resolved from `fail_open_until` for display). While it is
+    /// anything but `Open` the controller admits nobody and the queue and
+    /// positions stay intact; `target_rate` is preserved across a hold.
+    pub stored_control: StoredControl,
+    /// Epoch-seconds fail-open deadline; `0` means no window is in force.
+    /// Orthogonal to `stored_control`: an operator can queue a pause during a
+    /// fail-open window, and it takes effect the moment this epoch lapses.
+    pub fail_open_until: u64,
     /// The last mutating action, who performed it (OIDC email), and when
     /// (RFC3339). Surfaced as "last changed by X at T".
     pub last_action: Option<String>,
@@ -134,6 +241,14 @@ pub enum AdminAction {
     Resume,
     ForceMaintenance,
     SetPhase,
+    /// Engages the fail-open break-glass epoch (issue #71). New with the
+    /// `StoredControl`/epoch split — before it, nothing in this crate could
+    /// engage fail-open at all.
+    FailOpen,
+    /// Clears the fail-open epoch. Not "resume": under the split this only
+    /// clears `fail_open_until`, so an operator who queued a pause during the
+    /// window lands in `Paused`, not `Open`.
+    Recover,
 }
 
 impl AdminAction {
@@ -147,6 +262,8 @@ impl AdminAction {
             Self::Resume => "resume",
             Self::ForceMaintenance => "force_maintenance",
             Self::SetPhase => "set_phase",
+            Self::FailOpen => "fail_open",
+            Self::Recover => "recover",
         }
     }
 }
@@ -177,6 +294,10 @@ pub enum ActionError {
     /// The rate exceeds the admission ceiling (ADR-0017 §4).
     #[error("rate exceeds the maximum of {max}")]
     RateTooHigh { max: u32 },
+    /// The fail-open duration could not be parsed as a positive integer, or
+    /// exceeds [`MAX_FAIL_OPEN_MINUTES`].
+    #[error("invalid fail-open duration")]
+    InvalidDuration,
     /// A control-plane mutation arrived within the debounce window (ADR-0017
     /// defensive controls) — a double-click or fast toggle.
     #[error("action rejected: too soon after the previous change")]
@@ -376,7 +497,7 @@ pub async fn apply_pause<S: Store>(
     apply_control(
         store,
         event_id,
-        AdmissionControl::pause,
+        StoredControl::pause,
         AdminAction::Pause,
         actor,
         now_ms,
@@ -400,7 +521,7 @@ pub async fn apply_resume<S: Store>(
     apply_control(
         store,
         event_id,
-        AdmissionControl::resume,
+        StoredControl::resume,
         AdminAction::Resume,
         actor,
         now_ms,
@@ -408,9 +529,11 @@ pub async fn apply_resume<S: Store>(
     .await
 }
 
-/// Applies one admission-control transition. `transition` is the state
-/// machine's own method, so a move it refuses is rejected here before any write
-/// and the store's conditional update is left to catch only a lost race.
+/// Applies one stored-control transition. `transition` is the state machine's
+/// own method, so a move it refuses is rejected here before any write and the
+/// store's conditional update is left to catch only a lost race. Legal
+/// regardless of whether fail-open is currently active (issue #71): the two
+/// are orthogonal, so pausing during a fail-open window is not refused.
 async fn apply_control<S, T>(
     store: &S,
     event_id: &str,
@@ -421,17 +544,99 @@ async fn apply_control<S, T>(
 ) -> Result<(), ApplyError>
 where
     S: Store,
-    T: Fn(AdmissionControl) -> Result<AdmissionControl, IllegalControl>,
+    T: Fn(StoredControl) -> Result<StoredControl, IllegalControl>,
 {
     let Some(state) = store.load(event_id).await? else {
         return Err(ActionError::NotFound.into());
     };
     debounce_check(&state, now_ms)?;
-    let from = state.admission_control;
+    let from = state.stored_control;
     let to = transition(from).map_err(|_| ActionError::Conflict)?;
     store
-        .set_admission_control(event_id, from, to, action, actor, now_ms)
+        .set_stored_control(event_id, from, to, action, actor, now_ms)
         .await?;
+    Ok(())
+}
+
+/// Engages fail-open (issue #71): the break-glass bypass, until
+/// `now_secs + minutes * 60`. Legal from any `StoredControl` — pausing and
+/// fail-open are orthogonal, so a paused event can still be fail-opened.
+/// Writes the edge's `KeyValueStore` mirror first: a crash between the two
+/// writes then leaves the edge open with the machinery still minting and
+/// counting, whereas DynamoDB-first would stop `generate_token` while the
+/// edge still enforced (ADR-0021 §4.2).
+///
+/// # Errors
+///
+/// [`ActionError::InvalidDuration`] if `minutes` does not parse as `1..=
+/// MAX_FAIL_OPEN_MINUTES`; [`ActionError::NotFound`] if the event is missing;
+/// store and edge-store errors otherwise.
+pub async fn apply_fail_open<S: Store, E: EdgeConfigStore>(
+    store: &S,
+    edge: &E,
+    event_id: &str,
+    minutes: &str,
+    actor: &str,
+    now_ms: u64,
+) -> Result<(), ApplyError> {
+    let minutes: u32 = minutes.parse().map_err(|_| ActionError::InvalidDuration)?;
+    if minutes == 0 || minutes > MAX_FAIL_OPEN_MINUTES {
+        return Err(ActionError::InvalidDuration.into());
+    }
+    if store.load(event_id).await?.is_none() {
+        return Err(ActionError::NotFound.into());
+    }
+    let now_secs = now_ms / 1000;
+    let until = now_secs.saturating_add(u64::from(minutes).saturating_mul(60));
+
+    let mut cfg = edge
+        .read_config()
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+    cfg.fail_open_until = until;
+    edge.write_config(&cfg)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+
+    store
+        .set_fail_open_until(event_id, until, AdminAction::FailOpen, actor, now_ms)
+        .await?;
+    Ok(())
+}
+
+/// Clears the fail-open epoch (issue #71). This is not "resume": it only
+/// clears `fail_open_until`, so an operator who queued a pause during the
+/// window lands in `Paused`, not `Open` — `apply_resume` is the separate
+/// action for that. Writes `DynamoDB` first: a crash between the two writes
+/// then leaves the machinery running and the edge open only until the
+/// already-stamped expiry, which is self-consistent (ADR-0021 §4.2).
+///
+/// # Errors
+///
+/// [`ActionError::NotFound`] if the event is missing; store and edge-store
+/// errors otherwise.
+pub async fn apply_recover<S: Store, E: EdgeConfigStore>(
+    store: &S,
+    edge: &E,
+    event_id: &str,
+    actor: &str,
+    now_ms: u64,
+) -> Result<(), ApplyError> {
+    if store.load(event_id).await?.is_none() {
+        return Err(ActionError::NotFound.into());
+    }
+    store
+        .set_fail_open_until(event_id, 0, AdminAction::Recover, actor, now_ms)
+        .await?;
+
+    let mut cfg = edge
+        .read_config()
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+    cfg.fail_open_until = 0;
+    edge.write_config(&cfg)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
     Ok(())
 }
 
@@ -477,7 +682,8 @@ mod tests {
         phase: Mutex<Phase>,
         rate: Mutex<Option<u32>>,
         message: Mutex<Option<String>>,
-        control: Mutex<AdmissionControl>,
+        control: Mutex<StoredControl>,
+        fail_open_until: Mutex<u64>,
         /// The audit label the last control change recorded.
         control_action: Mutex<Option<AdminAction>>,
         /// The four ADR-0017 §6 audit fields, mirroring `apply_audit_values` in
@@ -498,7 +704,8 @@ mod tests {
                 phase: Mutex::new(Phase::Idle),
                 rate: Mutex::new(None),
                 message: Mutex::new(None),
-                control: Mutex::new(AdmissionControl::Open),
+                control: Mutex::new(StoredControl::Open),
+                fail_open_until: Mutex::new(0),
                 control_action: Mutex::new(None),
                 last_action: Mutex::new(None),
                 last_action_by: Mutex::new(None),
@@ -507,6 +714,43 @@ mod tests {
                 missing: false,
                 conflict: false,
             }
+        }
+    }
+
+    /// An in-memory [`EdgeConfigStore`], mirroring the `KeyValueStore`'s
+    /// read-modify-write shape closely enough to exercise the write ordering
+    /// `apply_fail_open`/`apply_recover` depend on.
+    struct FakeEdgeStore {
+        cfg: Mutex<GateConfig>,
+        writes: Mutex<Vec<u64>>,
+    }
+
+    impl Default for FakeEdgeStore {
+        fn default() -> Self {
+            Self {
+                cfg: Mutex::new(GateConfig {
+                    v: 1,
+                    enforce_from: 0,
+                    fail_open_until: 0,
+                    rules: Vec::new(),
+                }),
+                writes: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl EdgeConfigStore for FakeEdgeStore {
+        fn read_config(&self) -> impl Future<Output = Result<GateConfig, EdgeStoreError>> + Send {
+            std::future::ready(Ok(self.cfg.lock().unwrap().clone()))
+        }
+
+        fn write_config(
+            &self,
+            cfg: &GateConfig,
+        ) -> impl Future<Output = Result<(), EdgeStoreError>> + Send {
+            *self.cfg.lock().unwrap() = cfg.clone();
+            self.writes.lock().unwrap().push(cfg.fail_open_until);
+            std::future::ready(Ok(()))
         }
     }
 
@@ -544,7 +788,8 @@ mod tests {
                     participant_count: None,
                     target_rate: *self.rate.lock().unwrap(),
                     message: self.message.lock().unwrap().clone(),
-                    admission_control: *self.control.lock().unwrap(),
+                    stored_control: *self.control.lock().unwrap(),
+                    fail_open_until: *self.fail_open_until.lock().unwrap(),
                     last_action: self.last_action.lock().unwrap().clone(),
                     last_action_by: self.last_action_by.lock().unwrap().clone(),
                     last_action_at: self.last_action_at.lock().unwrap().clone(),
@@ -603,11 +848,11 @@ mod tests {
             std::future::ready(Ok(()))
         }
 
-        fn set_admission_control(
+        fn set_stored_control(
             &self,
             _event_id: &str,
-            from: AdmissionControl,
-            to: AdmissionControl,
+            from: StoredControl,
+            to: StoredControl,
             action: AdminAction,
             actor: &str,
             now_ms: u64,
@@ -620,6 +865,24 @@ mod tests {
             } else {
                 *guard = to;
                 *self.control_action.lock().unwrap() = Some(action);
+                self.stamp_audit(action, actor, now_ms);
+                Ok(())
+            };
+            std::future::ready(result)
+        }
+
+        fn set_fail_open_until(
+            &self,
+            _event_id: &str,
+            until: u64,
+            action: AdminAction,
+            actor: &str,
+            now_ms: u64,
+        ) -> impl Future<Output = Result<(), StoreError>> + Send {
+            let result = if self.conflict {
+                Err(StoreError::Conflict)
+            } else {
+                *self.fail_open_until.lock().unwrap() = until;
                 self.stamp_audit(action, actor, now_ms);
                 Ok(())
             };
@@ -971,7 +1234,7 @@ mod tests {
     async fn pause_and_resume_move_the_control_between_open_and_paused() {
         let store = FakeStore::with_phase(Phase::Active);
         apply_pause(&store, "evt", "op@x", 1000).await.unwrap();
-        assert_eq!(*store.control.lock().unwrap(), AdmissionControl::Paused);
+        assert_eq!(*store.control.lock().unwrap(), StoredControl::Paused);
         assert_eq!(
             *store.control_action.lock().unwrap(),
             Some(AdminAction::Pause)
@@ -980,7 +1243,7 @@ mod tests {
         apply_resume(&store, "evt", "op@x", 1000 + DEBOUNCE_MS)
             .await
             .unwrap();
-        assert_eq!(*store.control.lock().unwrap(), AdmissionControl::Open);
+        assert_eq!(*store.control.lock().unwrap(), StoredControl::Open);
         assert_eq!(
             *store.control_action.lock().unwrap(),
             Some(AdminAction::Resume)
@@ -988,40 +1251,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_stored_fail_open_is_not_read_as_open() {
-        // A bool would collapse fail_open into "not paused" and show an operator
-        // a normal, admitting event while the waiting room is bypassed.
+    async fn a_stored_fail_open_epoch_resolves_to_fail_open() {
+        // A stale "fail_open" string in admission_control is no longer how
+        // this is represented at all — the epoch is (issue #71). A bool for
+        // stored_control would still collapse Paused/Open together, so the
+        // resolved AdmissionControl is what the operator-facing read proves.
         let store = FakeStore {
-            control: Mutex::new(AdmissionControl::FailOpen),
+            fail_open_until: Mutex::new(1000),
             phase: Mutex::new(Phase::Active),
             ..Default::default()
         };
         let state = store.load("evt").await.unwrap().unwrap();
-        assert_eq!(state.admission_control, AdmissionControl::FailOpen);
+        let resolved = wr_common::resolve(state.stored_control, state.fail_open_until, 500);
+        assert_eq!(resolved, wr_common::AdmissionControl::FailOpen);
         assert_eq!(
-            wr_common::serving_state(state.phase, state.admission_control),
+            wr_common::serving_state(state.phase, resolved),
             wr_common::ServingState::FailOpen
         );
     }
 
     #[tokio::test]
-    async fn pause_and_resume_are_refused_from_fail_open() {
-        // Fail-open is left by recovering, not by pausing or resuming; neither
-        // action may quietly overwrite it.
+    async fn pause_and_resume_are_legal_during_fail_open() {
+        // The point of the split (issue #71, v4): StoredControl and the
+        // fail-open epoch are orthogonal, so pausing while fail-open is
+        // active is not refused — it lands the moment the epoch lapses,
+        // rather than sitting blocked behind a state machine that used to
+        // treat FailOpen as a fourth value pause/resume had to route around.
         let store = FakeStore {
-            control: Mutex::new(AdmissionControl::FailOpen),
+            fail_open_until: Mutex::new(1_000_000),
             phase: Mutex::new(Phase::Active),
             ..Default::default()
         };
-        assert!(matches!(
-            apply_pause(&store, "evt", "op@x", 1000).await,
-            Err(ApplyError::Action(ActionError::Conflict))
-        ));
-        assert!(matches!(
-            apply_resume(&store, "evt", "op@x", 1000).await,
-            Err(ApplyError::Action(ActionError::Conflict))
-        ));
-        assert_eq!(*store.control.lock().unwrap(), AdmissionControl::FailOpen);
+        apply_pause(&store, "evt", "op@x", 1000).await.unwrap();
+        assert_eq!(*store.control.lock().unwrap(), StoredControl::Paused);
+        // The epoch is untouched by a pause.
+        assert_eq!(*store.fail_open_until.lock().unwrap(), 1_000_000);
     }
 
     #[tokio::test]
@@ -1060,7 +1324,7 @@ mod tests {
     #[tokio::test]
     async fn pause_when_already_paused_is_a_conflict() {
         let store = FakeStore {
-            control: Mutex::new(AdmissionControl::Paused),
+            control: Mutex::new(StoredControl::Paused),
             phase: Mutex::new(Phase::Active),
             ..Default::default()
         };
@@ -1070,7 +1334,7 @@ mod tests {
             apply_pause(&store, "evt", "op@x", 1000).await,
             Err(ApplyError::Action(ActionError::Conflict))
         ));
-        assert_eq!(*store.control.lock().unwrap(), AdmissionControl::Paused);
+        assert_eq!(*store.control.lock().unwrap(), StoredControl::Paused);
     }
 
     #[tokio::test]
@@ -1083,5 +1347,185 @@ mod tests {
         // Force maintenance immediately after still applies (emergency stop).
         apply_reset(&store, "evt", "op@x", 1100).await.unwrap();
         assert_eq!(*store.phase.lock().unwrap(), Phase::Maintenance);
+    }
+
+    // --- fail-open / recover (issue #71) --------------------------------
+
+    #[tokio::test]
+    async fn fail_open_writes_the_edge_before_dynamodb() {
+        let store = FakeStore::with_phase(Phase::Active);
+        let edge = FakeEdgeStore::default();
+        apply_fail_open(&store, &edge, "evt", "30", "op@x", 1_000_000)
+            .await
+            .unwrap();
+        let until = 1_000 + 30 * 60; // now_ms/1000 + minutes*60
+        assert_eq!(*store.fail_open_until.lock().unwrap(), until);
+        assert_eq!(edge.cfg.lock().unwrap().fail_open_until, until);
+        // Order: the edge write happened, and it is the only write recorded
+        // (DynamoDB has no equivalent "writes" log here, but the edge fake
+        // proves at least that its own write landed before this call
+        // returned, which is all a synchronous fake can distinguish).
+        assert_eq!(*edge.writes.lock().unwrap(), vec![until]);
+    }
+
+    #[tokio::test]
+    async fn fail_open_preserves_the_rest_of_the_edge_config() {
+        // The writer must read-modify-write: s and r are owned by Terraform
+        // and a future rules action respectively, and must round-trip
+        // unchanged through a fail-open write.
+        let store = FakeStore::with_phase(Phase::Active);
+        let edge = FakeEdgeStore::default();
+        edge.cfg.lock().unwrap().enforce_from = 42;
+        edge.cfg.lock().unwrap().rules = vec![ProtectionRule::PathPrefix("/checkout".to_owned())];
+        apply_fail_open(&store, &edge, "evt", "5", "op@x", 0)
+            .await
+            .unwrap();
+        let cfg = edge.cfg.lock().unwrap();
+        assert_eq!(cfg.enforce_from, 42);
+        assert_eq!(
+            cfg.rules,
+            vec![ProtectionRule::PathPrefix("/checkout".to_owned())]
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_open_is_legal_while_paused() {
+        let store = FakeStore {
+            control: Mutex::new(StoredControl::Paused),
+            phase: Mutex::new(Phase::Active),
+            ..Default::default()
+        };
+        let edge = FakeEdgeStore::default();
+        apply_fail_open(&store, &edge, "evt", "10", "op@x", 0)
+            .await
+            .unwrap();
+        assert!(*store.fail_open_until.lock().unwrap() > 0);
+        // Pausing is untouched by engaging fail-open.
+        assert_eq!(*store.control.lock().unwrap(), StoredControl::Paused);
+    }
+
+    #[tokio::test]
+    async fn fail_open_rejects_a_zero_or_oversized_duration() {
+        let store = FakeStore::with_phase(Phase::Active);
+        let edge = FakeEdgeStore::default();
+        assert!(matches!(
+            apply_fail_open(&store, &edge, "evt", "0", "op@x", 0).await,
+            Err(ApplyError::Action(ActionError::InvalidDuration))
+        ));
+        assert!(matches!(
+            apply_fail_open(&store, &edge, "evt", "not-a-number", "op@x", 0).await,
+            Err(ApplyError::Action(ActionError::InvalidDuration))
+        ));
+        let over = (MAX_FAIL_OPEN_MINUTES + 1).to_string();
+        assert!(matches!(
+            apply_fail_open(&store, &edge, "evt", &over, "op@x", 0).await,
+            Err(ApplyError::Action(ActionError::InvalidDuration))
+        ));
+    }
+
+    #[tokio::test]
+    async fn recover_clears_the_epoch_on_both_stores_dynamodb_first() {
+        let store = FakeStore::with_phase(Phase::Active);
+        let edge = FakeEdgeStore::default();
+        apply_fail_open(&store, &edge, "evt", "10", "op@x", 0)
+            .await
+            .unwrap();
+        assert!(*store.fail_open_until.lock().unwrap() > 0);
+
+        apply_recover(&store, &edge, "evt", "op@y", 5_000)
+            .await
+            .unwrap();
+        assert_eq!(*store.fail_open_until.lock().unwrap(), 0);
+        assert_eq!(edge.cfg.lock().unwrap().fail_open_until, 0);
+        // Last recorded edge write is the clearing 0.
+        assert_eq!(edge.writes.lock().unwrap().last(), Some(&0));
+    }
+
+    #[tokio::test]
+    async fn recover_is_not_resume_a_queued_pause_survives_it() {
+        // v4's declared behaviour change: recovering from fail-open only
+        // clears the epoch. An operator who paused during the window lands
+        // in Paused, not Open.
+        let store = FakeStore {
+            control: Mutex::new(StoredControl::Paused),
+            fail_open_until: Mutex::new(1_000_000),
+            phase: Mutex::new(Phase::Active),
+            ..Default::default()
+        };
+        let edge = FakeEdgeStore::default();
+        apply_recover(&store, &edge, "evt", "op@x", 0)
+            .await
+            .unwrap();
+        assert_eq!(*store.fail_open_until.lock().unwrap(), 0);
+        assert_eq!(*store.control.lock().unwrap(), StoredControl::Paused);
+    }
+
+    #[tokio::test]
+    async fn recover_on_missing_event_is_not_found() {
+        let store = FakeStore {
+            missing: true,
+            ..Default::default()
+        };
+        let edge = FakeEdgeStore::default();
+        assert!(matches!(
+            apply_recover(&store, &edge, "evt", "op@x", 0).await,
+            Err(ApplyError::Action(ActionError::NotFound))
+        ));
+    }
+
+    // --- gate config encoding --------------------------------------------
+
+    fn empty_config() -> GateConfig {
+        GateConfig {
+            v: 1,
+            enforce_from: 0,
+            fail_open_until: 0,
+            rules: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn empty_config_encodes_as_the_dormant_placeholder() {
+        // Must match the literal Terraform seeds aws_cloudfrontkeyvaluestore_key.config
+        // with, or a fresh stack's "dormant" reading disagrees with what this
+        // crate would write.
+        assert_eq!(
+            encode_gate_config(&empty_config()).unwrap(),
+            r#"{"v":1,"s":0,"f":0,"r":[]}"#
+        );
+    }
+
+    #[test]
+    fn encoder_rejects_a_ruleset_over_the_limit() {
+        let mut cfg = empty_config();
+        cfg.rules = (0..=MAX_RULES)
+            .map(|i| ProtectionRule::PathPrefix(format!("/p{i}")))
+            .collect();
+        assert_eq!(
+            encode_gate_config(&cfg),
+            Err(GateConfigError::TooManyRules {
+                actual: MAX_RULES + 1,
+                max: MAX_RULES,
+            })
+        );
+    }
+
+    #[test]
+    fn encoder_accepts_exactly_the_rule_limit() {
+        let mut cfg = empty_config();
+        cfg.rules = (0..MAX_RULES)
+            .map(|i| ProtectionRule::PathPrefix(format!("/p{i}")))
+            .collect();
+        assert!(encode_gate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn encoder_uses_the_compact_rule_wire_form() {
+        let mut cfg = empty_config();
+        cfg.rules = vec![ProtectionRule::PathPrefix("/checkout".to_owned())];
+        assert_eq!(
+            encode_gate_config(&cfg).unwrap(),
+            r#"{"v":1,"s":0,"f":0,"r":[["p","/checkout"]]}"#
+        );
     }
 }

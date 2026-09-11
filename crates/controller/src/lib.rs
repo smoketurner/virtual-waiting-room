@@ -20,7 +20,7 @@
 use std::future::Future;
 
 use serde::{Deserialize, Serialize};
-use wr_common::{AdmissionControl, Phase, SHARDS};
+use wr_common::{AdmissionControl, Phase, SHARDS, StoredControl, resolve};
 
 pub mod dynamo;
 
@@ -351,11 +351,14 @@ impl ReleaseOutcome {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ControllerState {
     pub phase: Phase,
-    /// The operator's live admission override. The phase says where the event is
-    /// on its timeline; this says whether the operator is letting visitors
-    /// through right now. Both must permit admission before the controller
-    /// advances `serving_counter`.
-    pub admission_control: AdmissionControl,
+    /// The operator's stored admission override (issue #71: never `FailOpen`,
+    /// which is resolved from `fail_open_until` instead). The phase says
+    /// where the event is on its timeline; this says whether the operator is
+    /// letting visitors through right now. Both must permit admission before
+    /// the controller advances `serving_counter`.
+    pub stored_control: StoredControl,
+    /// Epoch-seconds fail-open deadline; `0` means no window is in force.
+    pub fail_open_until: u64,
     pub inputs: ReleaseInputs,
     pub prev_no_show: Option<NoShowState>,
     pub max_expired_position: u64,
@@ -443,22 +446,36 @@ pub enum PassOutcome {
 /// cutoff, so the pass reports `Ran { released: 0, expired: 0 }` only when it
 /// did nothing observable.
 ///
+/// `now` (epoch seconds) is a parameter rather than read from the system
+/// clock inside this function, so the controller's arithmetic — including
+/// resolving `stored_control` against `fail_open_until` — stays testable with
+/// time injected rather than sampled. The durable execution loop in `main.rs`
+/// supplies its own timestamp on every pass, which is also what makes the
+/// per-pass lapse behaviour work: a fail-open window that expires mid-minute
+/// is observed on the very next pass rather than only at the next invocation.
+///
 /// # Errors
 ///
 /// Returns [`StoreError`] if any read or write fails.
-pub async fn run_pass<S: Store>(store: &S, event_id: &str) -> Result<PassOutcome, StoreError> {
+pub async fn run_pass<S: Store>(
+    store: &S,
+    event_id: &str,
+    now: u64,
+) -> Result<PassOutcome, StoreError> {
     let state = store.read_state(event_id).await?;
     if state.phase != Phase::Active {
         tracing::debug!(event_id, phase = ?state.phase, "controller skipped: not active");
         return Ok(PassOutcome::NotActive(state.phase));
     }
 
+    let admission_control = resolve(state.stored_control, state.fail_open_until, now);
+
     // Any control other than Open returns the whole pass, so neither
     // `serving_counter` nor the expiry cursor advances: a visitor cannot lose a
     // position to expiry during a hold they had no way to act through. Under
     // fail-open the waiting room is bypassed, so a release would meter nothing;
     // leaving the counter put lets a recovery resume from it.
-    match state.admission_control {
+    match admission_control {
         AdmissionControl::Open => {}
         control @ (AdmissionControl::Paused | AdmissionControl::FailOpen) => {
             tracing::info!(
@@ -936,7 +953,7 @@ mod tests {
         // The cursor does not move while paused, so the window behind it does
         // not either: a hold cannot cost anyone their place.
         let mut state = active_state(0);
-        state.admission_control = AdmissionControl::Paused;
+        state.stored_control = StoredControl::Paused;
         let store = FakeStore::new(
             state,
             vec![ExpiredPosition {
@@ -944,7 +961,7 @@ mod tests {
                 position: 3,
             }],
         );
-        run_pass(&store, "evt").await.unwrap();
+        run_pass(&store, "evt", 1_000_000).await.unwrap();
         assert!(store.marked.lock().unwrap().is_empty());
     }
 
@@ -1053,7 +1070,8 @@ mod tests {
     fn active_state(due_max_expired: u64) -> ControllerState {
         ControllerState {
             phase: Phase::Active,
-            admission_control: AdmissionControl::Open,
+            stored_control: StoredControl::Open,
+            fail_open_until: 0,
             // The cursor is far enough along that the grace window has closed
             // behind it: at 50/s over 120s it covers 6000 positions, so nothing
             // expires until it is past that. Early in an event nothing has been
@@ -1081,7 +1099,7 @@ mod tests {
             },
         ];
         let store = FakeStore::new(active_state(10), due);
-        let outcome = run_pass(&store, "evt").await.unwrap();
+        let outcome = run_pass(&store, "evt", 1_000_000).await.unwrap();
         assert_eq!(
             outcome,
             PassOutcome::Ran {
@@ -1100,7 +1118,7 @@ mod tests {
         let mut state = active_state(0);
         state.phase = Phase::PreQueue;
         let store = FakeStore::new(state, Vec::new());
-        let outcome = run_pass(&store, "evt").await.unwrap();
+        let outcome = run_pass(&store, "evt", 1_000_000).await.unwrap();
         assert_eq!(outcome, PassOutcome::NotActive(Phase::PreQueue));
         assert!(store.released.lock().unwrap().is_none());
         assert!(store.advanced.lock().unwrap().is_none());
@@ -1112,13 +1130,13 @@ mod tests {
         // through and only the admission control stops it. Nothing may advance:
         // not serving_counter, not the expiry cursor.
         let mut state = active_state(10);
-        state.admission_control = AdmissionControl::Paused;
+        state.stored_control = StoredControl::Paused;
         let due = vec![ExpiredPosition {
             request_id: "r1".to_owned(),
             position: 3,
         }];
         let store = FakeStore::new(state, due);
-        let outcome = run_pass(&store, "evt").await.unwrap();
+        let outcome = run_pass(&store, "evt", 1_000_000).await.unwrap();
         assert_eq!(outcome, PassOutcome::Held(AdmissionControl::Paused));
         assert!(
             store.released.lock().unwrap().is_none(),
@@ -1136,11 +1154,25 @@ mod tests {
         // Under fail-open the waiting room is bypassed, so metering releases
         // nothing real; the counter stays put for recovery to resume from.
         let mut state = active_state(0);
-        state.admission_control = AdmissionControl::FailOpen;
+        state.fail_open_until = 1000;
         let store = FakeStore::new(state, Vec::new());
-        let outcome = run_pass(&store, "evt").await.unwrap();
+        let outcome = run_pass(&store, "evt", 500).await.unwrap();
         assert_eq!(outcome, PassOutcome::Held(AdmissionControl::FailOpen));
         assert!(store.released.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_lapsed_fail_open_window_is_observed_on_the_very_next_pass() {
+        // now supplied per pass (not read from a clock inside run_pass) is
+        // what makes this work: the same stored state, evaluated a moment
+        // after the epoch, resolves to Open with no write on either side.
+        let mut state = active_state(0);
+        state.fail_open_until = 1000;
+        let store = FakeStore::new(state, Vec::new());
+        let held = run_pass(&store, "evt", 500).await.unwrap();
+        assert_eq!(held, PassOutcome::Held(AdmissionControl::FailOpen));
+        let ran = run_pass(&store, "evt", 1000).await.unwrap();
+        assert!(matches!(ran, PassOutcome::Ran { .. }));
     }
 
     #[tokio::test]
@@ -1148,7 +1180,7 @@ mod tests {
         // The same state with the control back to Open runs a full pass, so a
         // hold costs nothing but the intervals it covered.
         let store = FakeStore::new(active_state(0), Vec::new());
-        let outcome = run_pass(&store, "evt").await.unwrap();
+        let outcome = run_pass(&store, "evt", 1_000_000).await.unwrap();
         assert_eq!(
             outcome,
             PassOutcome::Ran {
@@ -1161,7 +1193,7 @@ mod tests {
     #[tokio::test]
     async fn no_due_positions_skips_the_cursor_write() {
         let store = FakeStore::new(active_state(5), Vec::new());
-        let outcome = run_pass(&store, "evt").await.unwrap();
+        let outcome = run_pass(&store, "evt", 1_000_000).await.unwrap();
         assert_eq!(
             outcome,
             PassOutcome::Ran {

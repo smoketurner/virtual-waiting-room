@@ -13,11 +13,13 @@
 use std::sync::Arc;
 
 use admin::dynamo::DynamoStore;
+use admin::edge::KvsStore;
 use admin::oidc::{self, OidcClient, OidcConfig};
 use admin::sessions::{AdminSession, PendingLogin, SessionStore};
 use admin::templates::Dashboard;
 use admin::{
-    ApplyError, apply_message, apply_pause, apply_phase, apply_rate, apply_reset, apply_resume,
+    ApplyError, apply_fail_open, apply_message, apply_pause, apply_phase, apply_rate,
+    apply_recover, apply_reset, apply_resume,
 };
 use askama::Template;
 use axum::Form;
@@ -49,6 +51,7 @@ struct StaticAssets;
 
 struct AppState {
     store: DynamoStore,
+    edge: KvsStore,
     sessions: SessionStore,
     oidc: OidcClient,
     http: reqwest::Client,
@@ -102,8 +105,11 @@ async fn main() -> Result<(), Error> {
     .await
     .map_err(|e| Error::from(e.to_string()))?;
 
+    let kvs = aws_sdk_cloudfrontkeyvaluestore::Client::new(&config);
+
     let state = Arc::new(AppState {
         store: DynamoStore::new(dynamo.clone(), std::env::var("COUNTERS_TABLE")?),
+        edge: KvsStore::new(kvs, std::env::var("EDGE_KVS_ARN")?),
         sessions: SessionStore::new(dynamo, std::env::var("TOKENS_TABLE")?),
         oidc,
         http,
@@ -130,6 +136,8 @@ async fn main() -> Result<(), Error> {
         .route("/admin/reset", post(reset))
         .route("/admin/pause", post(pause))
         .route("/admin/resume", post(resume))
+        .route("/admin/fail_open", post(fail_open))
+        .route("/admin/recover", post(recover))
         .route("/admin/rules", post(deferred))
         .route("/update_session", post(deferred))
         .route("/static/{*path}", get(static_asset))
@@ -346,7 +354,7 @@ async fn dashboard(State(state): State<Shared>, headers: HeaderMap) -> Response 
     let Some(session) = authed(&state, &headers).await else {
         return Redirect::to("/admin/login").into_response();
     };
-    match state.store_load().await {
+    match state.store_load(now_ms() / 1000).await {
         Ok(Some(mut view)) => {
             view.csp_nonce = admin::security::nonce();
             view.operator_email = session.email;
@@ -370,7 +378,7 @@ async fn state_json(State(state): State<Shared>, headers: HeaderMap) -> Response
     if authed(&state, &headers).await.is_none() {
         return (StatusCode::UNAUTHORIZED, "not authenticated").into_response();
     }
-    match state.store_load().await {
+    match state.store_load(now_ms() / 1000).await {
         Ok(Some(view)) => axum::Json(view).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, "event not found").into_response(),
         Err(e) => server_error(&e),
@@ -477,6 +485,52 @@ async fn resume(State(state): State<Shared>, headers: HeaderMap) -> Response {
     finish(apply_resume(&state.store, &state.event_id, &session.email, now_ms()).await)
 }
 
+#[derive(Deserialize)]
+struct FailOpenForm {
+    minutes: String,
+}
+
+/// Engages fail-open (issue #71): break-glass, until the given duration
+/// lapses on its own. Legal regardless of pause state.
+async fn fail_open(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Form(form): Form<FailOpenForm>,
+) -> Response {
+    let Some(session) = authed(&state, &headers).await else {
+        return Redirect::to("/admin/login").into_response();
+    };
+    finish(
+        apply_fail_open(
+            &state.store,
+            &state.edge,
+            &state.event_id,
+            &form.minutes,
+            &session.email,
+            now_ms(),
+        )
+        .await,
+    )
+}
+
+/// Clears the fail-open epoch. Not "resume": under the split this only
+/// clears the epoch, so a pause queued during the window still applies.
+async fn recover(State(state): State<Shared>, headers: HeaderMap) -> Response {
+    let Some(session) = authed(&state, &headers).await else {
+        return Redirect::to("/admin/login").into_response();
+    };
+    finish(
+        apply_recover(
+            &state.store,
+            &state.edge,
+            &state.event_id,
+            &session.email,
+            now_ms(),
+        )
+        .await,
+    )
+}
+
 /// Current epoch-millis for the audit stamp + debounce guard.
 fn now_ms() -> u64 {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
@@ -511,13 +565,14 @@ async fn static_asset(Path(path): Path<String>) -> Response {
 }
 
 impl AppState {
-    /// Loads control state and maps it to the dashboard view.
-    async fn store_load(&self) -> Result<Option<Dashboard>, String> {
+    /// Loads control state and maps it to the dashboard view, resolved at
+    /// `now` (epoch seconds).
+    async fn store_load(&self, now: u64) -> Result<Option<Dashboard>, String> {
         use admin::Store;
         self.store
             .load(&self.event_id)
             .await
-            .map(|opt| opt.as_ref().map(Dashboard::from_state))
+            .map(|opt| opt.as_ref().map(|state| Dashboard::from_state(state, now)))
             .map_err(|e| e.to_string())
     }
 }

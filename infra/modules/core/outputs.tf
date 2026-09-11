@@ -84,14 +84,9 @@ output "api_gateway_domain_name" {
 }
 
 
-output "admission_key_group_id" {
-  description = "ID of the CloudFront key group that verifies admission cookies. The edge module names it as the trusted key group on the protected behaviour, which is what turns the gate on."
-  value       = aws_cloudfront_key_group.signer.id
-}
-
-output "admission_key_pair_id" {
-  description = "ID of the CloudFront public key, sent as the CloudFront-Key-Pair-Id cookie."
-  value       = aws_cloudfront_public_key.signer.id
+output "gate_kvs_arn" {
+  description = "ARN of the edge gate's CloudFront KeyValueStore (issue #71). The edge module associates its CloudFront Function with it; scripts/bootstrap_edge_gate.py writes the signing secret to it."
+  value       = aws_cloudfront_key_value_store.gate.arn
 }
 
 output "generate_token_function_name" {

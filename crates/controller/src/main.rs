@@ -62,6 +62,17 @@ async fn main() -> Result<(), lambda_runtime::Error> {
     .await
 }
 
+/// Current epoch-seconds, sampled fresh on every pass rather than once per
+/// invocation: it is what lets a fail-open window that lapses mid-minute be
+/// observed on the very next pass instead of only at the next scheduled
+/// invoke, an hour of cadence away.
+fn now_secs() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 /// Runs a minute of cadence as one durable execution: [`PASSES_PER_INVOKE`]
 /// checkpointed passes separated by [`INTERVAL_SECS`] durable waits.
 ///
@@ -81,7 +92,7 @@ async fn handle(
         // every replay, so they are derived from the pass index alone.
         let outcome = ctx
             .step(move |_| async move {
-                run_pass(pass_store.as_ref(), &pass_event_id)
+                run_pass(pass_store.as_ref(), &pass_event_id, now_secs())
                     .await
                     .map_err(durable::BoxError::from)
             })

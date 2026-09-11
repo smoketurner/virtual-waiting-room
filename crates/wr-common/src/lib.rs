@@ -17,13 +17,15 @@ pub mod expr;
 pub mod ids;
 pub mod items;
 pub mod permutation;
+pub mod rules;
 
-pub use crypto::{AdmissionToken, Session, SigningKey, VerifyError};
+pub use crypto::{AdmissionToken, PLACEHOLDER_SIGNING_KEY, Session, SigningKey, VerifyError};
 pub use ids::{
-    AdmissionControl, EventId, IllegalControl, Phase, RequestId, ServingState, UnknownControl,
-    UnknownPhase, serving_state,
+    AdmissionControl, EventId, IllegalControl, Phase, RequestId, ServingState, StoredControl,
+    UnknownControl, UnknownPhase, resolve, serving_state,
 };
 pub use items::{
     Counters, PositionItem, PositionStatus, PreQueueItem, ResolveError, ResolvedPosition, Sealed,
 };
 pub use permutation::{Assignment, SHARDS, SealError, SealedOffsets, Seed, prp, shard_for};
+pub use rules::{ProtectionRule, RequestView, RuleWire, matches_any};

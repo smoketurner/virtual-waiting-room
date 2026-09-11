@@ -57,8 +57,8 @@ Request path:
 ```
 join:      CloudFront → API Gateway REST (type: aws, direct SQS SendMessage) → SQS
                → assign_position Lambda → DynamoDB
-protected: CloudFront [trusted key group] ─ valid admission cookies → client origin
-                                          └ missing/expired → 403 → /_wr/waiting.html
+protected: CloudFront [gate: CloudFront Function, viewer-request] ─ valid session cookie → client origin
+                                                                   └ missing/expired → 302/403 → /_wr/waiting.html
 ```
 
 Three separate CloudFront cache behaviours (ADR-0013). `/status` is Min TTL 1 s with no
@@ -86,18 +86,28 @@ wait that suspends the execution instead of holding the invocation open, so the 
 billed. The SDK (`aws-durable-execution-sdk`) is an experimental preview, pinned exactly. It also expires positions and
 advances `max_expired_position` (ADR-0006 — expiry is controller-driven, not DynamoDB TTL).
 
-**The gate is CloudFront itself.** The protected behaviour names a trusted key group, so
-CloudFront verifies each request's signed cookies at the edge and refuses an un-admitted
-visitor with a 403 before the origin is touched — no compute in the request path, and it
-works against an origin the customer does not let us run code in. The 403 is mapped by
-`custom_error_response` to the waiting page, which is a separate ungated behaviour served
-from S3, so a refused visitor lands on the queue rather than on an error.
+**The gate is a CloudFront Function** (ADR-0021, issue #71), associated at viewer-request with the
+protected behaviour only — never distribution-wide, since Functions bill per invocation and a
+distribution-wide association would bill every `/status` poll from every waiter. It decides
+locally, reading its whole configuration and the HMAC signing secret from one CloudFront
+KeyValueStore (`infra/modules/edge/functions/gate.js.tftpl`): no rule matches → pass through
+(dormancy, #60); a valid session cookie → pass through; otherwise refuse with a reason (#73), a
+302 to the waiting page for navigation and 403 JSON for XHR (#72). This replaces ADR-0020's
+trusted-key-group gate, which could verify a signature but not decide, closing #58's mechanism,
+#60, #64, #66, #72 and #73. `event_id` and the session cookie name are templated into the
+function's own source rather than carried in the KeyValueStore value, so Terraform stays their
+single source of truth.
 
-`generate_token` is what mints those cookies: it checks the visitor's position against
-`serving_counter`, records the arrival, and signs a CloudFront custom policy with
-RSA-PKCS1-SHA256 (`CloudFront-Hash-Algorithm=SHA256` is required — CloudFront assumes SHA-1
-otherwise). It is the only writer of `arrivals#*`, so the controller's no-show correction
-depends on it.
+`generate_token` mints the session cookie the gate verifies: it checks the visitor's position
+against `serving_counter` (resolving the operator's admission control through
+`wr_common::resolve(StoredControl, fail_open_until, now)` — `FailOpen` is never a stored string,
+only an epoch), records the arrival, and signs an HMAC-SHA256 session credential
+(`wr_common::crypto`, the same wire format the authorizer already used). It is the only writer of
+`arrivals#*` while admission is Open, so the controller's no-show correction depends on it. Both
+`generate_token` and `authorizer` refuse to start at Init if the signing key they read is still
+the Terraform-seeded placeholder (`wr_common::PLACEHOLDER_SIGNING_KEY`) — the only guard against
+`scripts/bootstrap_edge_gate.py` never having been run, since the bootstrap script cannot detect
+its own absence.
 
 `authorizer` is the alternative gate for a customer who *does* control their origin and wants
 per-request rules the edge cannot express (header, cookie, user agent). It decides locally
@@ -109,10 +119,14 @@ leading kind byte (`0x01` token, `0x02` session), so neither validates as the ot
 ### Crates
 
 `wr-common` is the single shared library, laid out as `permutation` (Feistel PRP + shard
-assembly), `ids` + `items` (newtypes, `Phase`, `AdmissionControl`, DynamoDB item shapes),
-`expr` (update/condition fragments), and `crypto` (token and session signing). Its whole
-public surface is re-exported flat, so callers write `wr_common::Phase` rather than a path
-that encodes which layer a type lives in.
+assembly), `ids` + `items` (newtypes, `Phase`, `StoredControl`/`AdmissionControl`/`resolve`,
+DynamoDB item shapes), `expr` (update/condition fragments), `crypto` (token and session signing),
+and `rules` (`ProtectionRule` + its compact KeyValueStore-sized wire encoding, shared by
+`authorizer` and `admin`'s edge-gate writer, and mirrored a third time by the CloudFront
+Function). Its whole public surface is re-exported flat, so callers write `wr_common::Phase`
+rather than a path that encodes which layer a type lives in.
+`crates/wr-common/tests/vectors.rs` generates the cross-language conformance vectors
+`infra/modules/edge/tests/*.conformance.test.js` check the CloudFront Function against.
 
 `assign_position`, `seal_event`, `read`, `controller`, `authorizer`, `admin`, and
 `generate_token` are the Lambdas.
@@ -134,9 +148,14 @@ actions must work with JavaScript disabled, and the UI adds no capability the ad
 Four DynamoDB tables, all on-demand with PITR: `Counters` (PK `event_id`), `PreQueue` (PK `r`),
 `Positions` (PK `request_id`), `Tokens` (PK `request_id`).
 
-The event's own `Counters` item holds the sequences, phase, seed, rate, and message.
-`queue_counter` and `serving_counter` must stay on it — sharding a sequence destroys ordering —
-and both are low-rate: one claim per ingest batch, one advance per controller pass.
+The event's own `Counters` item holds the sequences, phase, seed, rate, message, and the
+operator's admission override: `admission_control` (the `StoredControl` wire string, `open` or
+`paused` only — never `fail_open`, issue #71) and `fail_open_until` (an epoch-seconds deadline,
+`0` = no window). `wr_common::resolve(stored, fail_open_until, now)` is the only thing that
+produces the third, resolved value, `AdmissionControl::FailOpen`; nothing parses it back out of
+storage. `queue_counter` and `serving_counter` must stay on the item — sharding a sequence
+destroys ordering — and both are low-rate: one claim per ingest batch, one advance per controller
+pass.
 
 Keys are tagged only where a table holds more than one kind of item. `Counters` holds the
 event plus its shards, and `Tokens` holds admission-token reservations (`TKN#`), operator OIDC
@@ -167,12 +186,17 @@ event-source mapping is enabled when `assign_position` is real, and the controll
 schedule is created when the controller is. `make build` compiles every Lambda crate, reading
 its target architecture from `terraform.tfvars`.
 
-`core` owns the CloudFront signing key pair, public key, and key group alongside the
-`generate_token` Lambda that signs with it. They are global CloudFront resources that name no
-distribution, so keeping them there gives the Lambda its key-pair id without `core` and `edge`
-having to depend on each other.
+`core` owns the edge gate's CloudFront KeyValueStore (issue #71) — the store's only *writer* is
+the admin Lambda, which lives in `core`, so putting the store in `edge` would need `edge` to
+export its ARN back to `core`, a module cycle. `core` exports `gate_kvs_arn`; `edge` consumes it
+and owns the `aws_cloudfront_function` resource, which reads its ARN and templates `event_id` +
+the session cookie name into the function's own source. Writing to the KeyValueStore data plane
+needs SigV4A, signed via RustCrypto (`p256`/`hmac`/`sha2`, the `aws-sdk-cloudfrontkeyvaluestore`
+crate's `sigv4a` feature) — a deliberate, scoped exception to the single-crypto-backend rule
+(`.kiro/steering/tech.md`), never touching the admission path (`aws-lc-rs` throughout).
 
 Keep the `core` module at or under 80 Terraform resources (requirement N6); justify additions.
+Currently 64.
 
 ## Conventions specific to this repo
 
@@ -183,16 +207,21 @@ most often:
 - **Exact version pins only** in `[workspace.dependencies]` — `= "=x.y.z"`, never `^` or `~`.
   `default-features = false` on everything, and **no `features = [...]` at the workspace
   root**: each member crate opts into the features it uses.
-- **Crypto is `aws-lc-rs` only** — never `ring` or `openssl`. This constrains dependency
-  selection (see the `openidconnect`/`reqwest`/`rustls` comments in `Cargo.toml`): a
-  crate whose defaults pull in a ring-backed provider must have defaults disabled.
+- **The admission path is `aws-lc-rs` only.** `ring` and `openssl` are banned outright
+  (`deny.toml`); RustCrypto is a scoped, deliberate exception on two control-plane paths only
+  (admin's OIDC login, admin's edge-gate KeyValueStore writer — `.kiro/steering/tech.md`), never
+  the paths that mint or verify a credential. This constrains dependency selection (see the
+  `openidconnect`/`reqwest`/`rustls` comments in `Cargo.toml`): a crate whose defaults pull in a
+  ring-backed provider must have defaults disabled.
 - `allow_attributes = "deny"` means you cannot silently `#[allow]` a lint. Fix the cause.
   `unwrap_used`, `panic`, `todo`, `print_stdout` are denied workspace-wide.
 - Controller and permutation arithmetic must be checked or saturating — the release profile
   has no overflow checks, and a wrapped subtraction there releases a damaging burst.
-- Newtypes over primitives, enums over boolean flags (`AdmissionControl` replaced a
-  `paused`/`fail_open` pair so illegal combinations are unrepresentable), exhaustive `match`
-  with no `_` arms.
+- Newtypes over primitives, enums over boolean flags. `StoredControl` (`Open`/`Paused`) plus a
+  `fail_open_until` epoch replaced the three-valued `AdmissionControl` as the *stored* form
+  (issue #71): `resolve()` is the only thing that produces the third value, `FailOpen`, so it can
+  never be written to storage as a string — the storage codec has two values where the display
+  type has three, and that asymmetry is the invariant. Exhaustive `match` with no `_` arms.
 - Pin GitHub Actions to a SHA with a version comment, set `persist-credentials: false`, and
   run `actionlint` and `zizmor` before committing.
 
@@ -202,9 +231,10 @@ Correctness is the product here: a duplicate position or a non-uniform permutati
 visible fairness failure at a million people. `.kiro/steering/testing.md` lists the mechanisms
 that must stay proven — bijectivity and uniformity of the PRP, the frozen wire encoding
 vectors, contiguous shard assembly, burned slots, the straggler-racing-the-seal case, zero
-duplicate positions under concurrency, token/session non-interchangeability, fail-open, and
-no-show convergence. Use `proptest` for the permutation and counter, and mock the AWS boundary
-via the `Store` trait rather than mocking logic.
+duplicate positions under concurrency, token/session non-interchangeability, cross-language
+credential and rule conformance with the edge gate (issue #71), and no-show convergence. Use
+`proptest` for the permutation and counter, and mock the AWS boundary via the `Store` trait
+rather than mocking logic.
 
 ## Documentation layers
 

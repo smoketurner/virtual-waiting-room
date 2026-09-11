@@ -54,8 +54,9 @@ placeholder never consumes the queue.
 - **cargo-lambda** (`cargo install cargo-lambda`) and **zig** — the release
   build was verified with cargo-lambda 1.9.2 and Terraform 1.16.1.
 - **Terraform** ≥ 1.16.
-- **uv** — runs the smoke test; its PEP 723 inline metadata declares `boto3`,
-  so `uv run` provisions an ephemeral virtualenv (no manual venv or pip).
+- **uv** — runs the smoke test and `scripts/bootstrap_edge_gate.py`; each
+  script's PEP 723 inline metadata declares `boto3`, so `uv run` provisions
+  an ephemeral virtualenv (no manual venv or pip).
 - **AWS credentials** in the environment with rights to create the stack
   (Lambda, DynamoDB, SQS, API Gateway, IAM, EventBridge Scheduler). Sign in
   with `aws sso login` or `aws configure`; the CLI picks the credentials up
@@ -132,6 +133,11 @@ make build ARCH=arm64          # must match lambda_architecture
 # 4. Review the plan, then deploy.
 make plan
 make apply
+
+# 5. Write the signing secret to both places the edge gate reads it from.
+#    Required before the first POST /v1/generate_token of every deployment —
+#    see "The edge gate's signing secret" below.
+AWS_PROFILE=dev-admin uv run scripts/bootstrap_edge_gate.py
 ```
 
 `make apply` prints the stack outputs, including the API invoke URL and the
@@ -144,6 +150,45 @@ provisions boto3 from the script's inline metadata on first run:
 ```bash
 AWS_PROFILE=dev-admin uv run scripts/smoke_test.py
 ```
+
+## The edge gate's signing secret (issue #71)
+
+The admission gate is a CloudFront Function that verifies session cookies with a per-deployment
+HMAC key. Terraform creates that key's two homes — the SSM SecureString
+`/<name_prefix>/signing-key` and the CloudFront KeyValueStore key `k` — with the literal
+placeholder `PLACEHOLDER-overwrite-out-of-band` and then ignores their value
+(`lifecycle { ignore_changes = [value] }`), the same pattern already used for the admin OIDC
+client secret. `scripts/bootstrap_edge_gate.py` is what writes the real secret to both, in one
+run: generate (or reuse) the secret, write SSM, then mirror it to the KeyValueStore. Run it once
+after every `make apply` that creates a fresh stack, before serving any traffic — the script
+itself is idempotent (a second run against an already-bootstrapped stack does nothing but read
+and re-mirror, unless `--force` is passed to regenerate).
+
+**Two failure modes if this step is skipped or misunderstood, both silent:**
+
+- **The bootstrap never ran.** SSM and the KeyValueStore both still hold the literal
+  `PLACEHOLDER-overwrite-out-of-band` — which means they *agree*, so the gate verifies correctly
+  against a secret published in this repository. Nothing is refused, and nothing looks wrong,
+  until an operator writes a non-empty ruleset (`r` in the KeyValueStore config), at which point
+  anyone who has read this repo and knows the event id can mint a valid session. `generate_token`
+  and `authorizer` both refuse to start if the key they read is this placeholder
+  (`wr_common::PLACEHOLDER_SIGNING_KEY`) — that refusal, visible as a Lambda Init failure in
+  CloudWatch, is the only symptom this failure mode produces, so alarm on it.
+- **The bootstrap ran but the two writes diverged** — a failure between the SSM write and the
+  KeyValueStore write, or a stack whose KeyValueStore was seeded independently. `generate_token`
+  mints cookies signed with one key; the edge verifies against the other; every visitor is
+  refused at the edge with `x-wr-reason=signature` and loops between the waiting page and
+  `generate_token`. This is silent and delayed: `ADMISSION_GRACE_SECS = 120` means the lockout
+  becomes *permanent* (the controller expires the position and `generate_token` starts answering
+  `Denied::Spent`) roughly two minutes after the cursor passes each position. It is also
+  misleading on the dashboard: `generate_token`'s `record_arrival` fires on every looping
+  attempt even though the edge is the one refusing, so `arrivals#*` inflates and the measured
+  no-show rate reads near 0 for the duration — an operator watching arrivals sees a healthy
+  number while every visitor is stuck. Re-run `scripts/bootstrap_edge_gate.py` (add `--force` if
+  it reports the SSM value is already a real secret) to converge both sides again.
+
+Regenerating the secret (a second bootstrap run, or `--force`) invalidates every live session
+immediately — treat it as a flag day, not a routine operation.
 
 ## Tear down
 

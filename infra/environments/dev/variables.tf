@@ -77,6 +77,12 @@ variable "seal_start_time" {
   default     = ""
 }
 
+variable "session_cookie_name" {
+  description = "Name of the session cookie generate_token sets and the edge gate's CloudFront Function verifies (issue #71). Shared between modules.core and modules.edge so they cannot drift apart."
+  type        = string
+  default     = "vwr_session"
+}
+
 # --- Admin OIDC login (ADR-0016) ----------------------------------------------
 
 variable "oidc_issuer" {

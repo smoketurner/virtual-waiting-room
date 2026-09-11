@@ -14,9 +14,15 @@
 pub mod dynamo;
 pub mod token;
 
-use wr_common::{Session, SigningKey, VerifyError};
+use wr_common::{RequestView, Session, SigningKey, VerifyError};
 
 pub use token::{TokenError, generate_token};
+// Rule matching moved to wr-common (issue #71): the admin's edge-config
+// writer and `infra/modules/edge/functions/gate.js` must agree with the
+// authorizer on exactly one encoding, so there is one Rust type rather than
+// two that happen to look alike. Re-exported so existing `authorizer::
+// ProtectionRule` call sites are unaffected.
+pub use wr_common::ProtectionRule;
 
 /// How a session's lifetime is bounded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,38 +43,6 @@ pub enum UnreachablePolicy {
     FailOpen,
     /// Block: send the visitor to the waiting room even though it is down.
     FailClosed,
-}
-
-/// One local protection rule: a request matches when the named request
-/// attribute contains the configured substring. A path that no rule matches is
-/// unprotected and forwarded without a credential.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ProtectionRule {
-    /// The request path starts with this prefix.
-    PathPrefix(String),
-    /// A request header equals this `(name, value)` pair (case-insensitive name).
-    Header { name: String, value: String },
-    /// A cookie of this name is present.
-    Cookie(String),
-    /// The user agent contains this substring.
-    UserAgent(String),
-}
-
-impl ProtectionRule {
-    /// Whether this rule matches the request.
-    #[must_use]
-    pub fn matches(&self, req: &Request) -> bool {
-        match self {
-            Self::PathPrefix(prefix) => req.path.starts_with(prefix.as_str()),
-            Self::Header { name, value } => req
-                .header(name)
-                .is_some_and(|actual| actual.eq_ignore_ascii_case(value)),
-            Self::Cookie(name) => req.cookie(name).is_some(),
-            Self::UserAgent(needle) => req
-                .header("user-agent")
-                .is_some_and(|ua| ua.contains(needle.as_str())),
-        }
-    }
 }
 
 /// The parsed request the authorizer decides over. Header names are compared
@@ -110,7 +84,21 @@ impl Request {
     /// Whether any rule protects this request.
     #[must_use]
     pub fn is_protected(&self, rules: &[ProtectionRule]) -> bool {
-        rules.iter().any(|r| r.matches(self))
+        wr_common::matches_any(rules, self)
+    }
+}
+
+impl RequestView for Request {
+    fn path(&self) -> &str {
+        &self.path
+    }
+
+    fn header(&self, name: &str) -> Option<&str> {
+        Request::header(self, name)
+    }
+
+    fn cookie(&self, name: &str) -> Option<&str> {
+        Request::cookie(self, name)
     }
 }
 

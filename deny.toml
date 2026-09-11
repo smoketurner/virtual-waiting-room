@@ -33,6 +33,19 @@ allow = [
 multiple-versions = "warn"
 wildcards = "deny"
 allow-wildcard-paths = true
+# `ring` reached the workspace tree only via crates/harness's `rustls-tls`
+# reqwest feature (the provider-bundling one), which pulled hyper-rustls/ring
+# -> rustls/ring. Switching harness to `rustls-tls-webpki-roots-no-provider`
+# (matching crates/admin) plus installing the aws-lc-rs provider removed it —
+# `cargo tree --workspace -i ring` prints nothing. No `wrappers` entry: a list
+# that passed would have to name `rustls`, which is the crate that wanted
+# `ring` in the first place, so it would permit exactly what this rule exists
+# to forbid (issue #71, closes #74).
+deny = [
+  { name = "ring" },
+  { name = "openssl" },
+  { name = "openssl-sys" },
+]
 
 [sources]
 unknown-registry = "deny"

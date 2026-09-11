@@ -1,27 +1,31 @@
 //! Lambda entry point for `POST /v1/generate_token`.
 //!
-//! A waiting visitor calls this once their position has been reached. It checks
-//! the queue state, records the arrival the controller measures no-shows
-//! against, and returns the `CloudFront` signed cookies that let the visitor
-//! through the protected behaviour.
+//! A waiting visitor calls this once their position has been reached. It
+//! checks the queue state, records the arrival the controller measures
+//! no-shows against, and returns a signed session cookie: the `CloudFront`
+//! Function gate (issue #71) verifies it itself at the edge on every later
+//! request to the protected origin.
 //!
 //! The signing key is read from SSM once at cold start, in the boosted Init
-//! phase, so the TLS handshake and the RSA key parse do not land on a visitor's
-//! request.
+//! phase, so the TLS handshake does not land on a visitor's request. This
+//! Lambda refuses to start if that key is still the Terraform-seeded
+//! placeholder — see [`wr_common::PLACEHOLDER_SIGNING_KEY`].
 
 use std::env;
 
 use generate_token::dynamo::DynamoStore;
-use generate_token::{DEFAULT_COOKIE_TTL_SECS, Denied, RESOURCE_WILDCARD, Signer, Store, decide};
+use generate_token::{DEFAULT_SESSION_TTL_SECS, Denied, Store, decide};
 use lambda_http::{Body, Error, Request, RequestExt, Response, run, service_fn};
 use tracing::{error, info};
+use wr_common::{PLACEHOLDER_SIGNING_KEY, Session, SigningKey};
 
 /// Resolved once at cold start and shared across invocations.
 struct AppState {
     store: DynamoStore,
-    signer: Signer,
+    key: SigningKey,
     event_id: String,
-    cookie_ttl_secs: u64,
+    session_cookie_name: String,
+    session_ttl_secs: u64,
 }
 
 #[tokio::main]
@@ -42,8 +46,7 @@ async fn init() -> Result<AppState, Error> {
     let dynamo = aws_sdk_dynamodb::Client::new(&config);
     let ssm = aws_sdk_ssm::Client::new(&config);
 
-    let key_parameter = env::var("SIGNER_KEY_PARAMETER")?;
-    let key_pair_id = env::var("SIGNER_KEY_PAIR_ID")?;
+    let key_parameter = env::var("SIGNING_KEY_PARAMETER")?;
 
     let secret = ssm
         .get_parameter()
@@ -51,11 +54,24 @@ async fn init() -> Result<AppState, Error> {
         .with_decryption(true)
         .send()
         .await?;
-    let pem = secret
+    let key_material = secret
         .parameter()
         .and_then(aws_sdk_ssm::types::Parameter::value)
         .ok_or("signing key parameter is empty")?;
-    let signer = Signer::from_pkcs8_pem(pem, key_pair_id)?;
+    // Validation at a system boundary (the SSM read), not the storage layer:
+    // a bootstrap that never ran leaves SSM and the gate's KeyValueStore
+    // secret agreeing on this literal, so the gate would verify correctly
+    // against a key published in this repository with no symptom until an
+    // operator starts enforcing. Refusing to initialize is loud and
+    // alarmable; minting cookies under a published key is not.
+    if key_material == PLACEHOLDER_SIGNING_KEY {
+        return Err(
+            "signing key parameter still holds the Terraform placeholder; \
+                     run scripts/bootstrap_edge_gate.py before serving traffic"
+                .into(),
+        );
+    }
+    let key = SigningKey::new(key_material.as_bytes());
 
     Ok(AppState {
         store: DynamoStore::new(
@@ -64,12 +80,14 @@ async fn init() -> Result<AppState, Error> {
             env::var("PREQUEUE_TABLE")?,
             env::var("POSITIONS_TABLE")?,
         ),
-        signer,
+        key,
         event_id: env::var("EVENT_ID")?,
-        cookie_ttl_secs: env::var("COOKIE_TTL_SECS")
+        session_cookie_name: env::var("SESSION_COOKIE_NAME")
+            .unwrap_or_else(|_| "vwr_session".to_owned()),
+        session_ttl_secs: env::var("SESSION_TTL_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_COOKIE_TTL_SECS),
+            .unwrap_or(DEFAULT_SESSION_TTL_SECS),
     })
 }
 
@@ -97,12 +115,13 @@ async fn handle(state: &AppState, req: Request) -> Result<Response<Body>, Error>
         None => state.store.load_prequeue(&request_id).await?,
     };
 
-    let grant = match decide(&counters, &request_id, prequeue.as_ref(), position_row) {
+    let now = now_secs();
+    let grant = match decide(&counters, &request_id, prequeue.as_ref(), position_row, now) {
         Ok(grant) => grant,
         Err(denied) => return refusal(&denied),
     };
 
-    // Recorded before the cookies are handed out: a visitor counted but not
+    // Recorded before the cookie is handed out: a visitor counted but not
     // admitted only understates the no-show rate, whereas one admitted but not
     // counted makes the controller over-release for every later interval.
     if let Err(e) = state
@@ -120,17 +139,19 @@ async fn handle(state: &AppState, req: Request) -> Result<Response<Body>, Error>
         error!(error = %e, event = "arrival_record_failed", "failed to record arrival; admitting anyway");
     }
 
-    let expires_at = now_secs().saturating_add(state.cookie_ttl_secs);
-    let cookies = match state.signer.sign(RESOURCE_WILDCARD, expires_at) {
-        Ok(cookies) => cookies,
-        Err(e) => {
-            error!(error = %e, "failed to sign admission cookies");
-            return json(
-                500,
-                &serde_json::json!({ "error": "could not issue admission" }),
-            );
-        }
+    let expires_at = now.saturating_add(state.session_ttl_secs);
+    let session = Session {
+        event_id: state.event_id.clone(),
+        request_id: request_id.clone(),
+        issued_at: now,
+        expires_at,
     };
+    let set_cookie = format!(
+        "{}={}; Path=/; Max-Age={}; Secure; HttpOnly; SameSite=Lax",
+        state.session_cookie_name,
+        session.sign(&state.key),
+        state.session_ttl_secs
+    );
 
     info!(
         position = grant.position,
@@ -138,21 +159,19 @@ async fn handle(state: &AppState, req: Request) -> Result<Response<Body>, Error>
         "admitted"
     );
 
-    let mut builder = Response::builder()
-        .status(200)
-        .header("content-type", "application/json")
-        // The waiting page polls this; a cached admission would hand one
-        // visitor's cookies to another.
-        .header("cache-control", "no-store");
-    for cookie in cookies.set_cookie_headers(state.cookie_ttl_secs) {
-        builder = builder.header("set-cookie", cookie);
-    }
     let body = serde_json::to_string(&serde_json::json!({
         "admitted": true,
         "position": grant.position,
         "expires_at": expires_at,
     }))?;
-    Ok(builder.body(Body::from(body))?)
+    Ok(Response::builder()
+        .status(200)
+        .header("content-type", "application/json")
+        // The waiting page polls this; a cached admission would hand one
+        // visitor's cookie to another.
+        .header("cache-control", "no-store")
+        .header("set-cookie", set_cookie)
+        .body(Body::from(body))?)
 }
 
 /// The request id from the query string or the JSON body, so the endpoint works

@@ -92,7 +92,14 @@ async fn handle_status(ctx: &Ctx) -> Result<Response<Body>, Error> {
     let Some(counters) = load_counters(ctx).await? else {
         return json(404, &serde_json::json!({ "error": "event not found" }));
     };
-    json(200, &status(&counters, ctx.poll_policy))
+    json(200, &status(&counters, ctx.poll_policy, now_secs()))
+}
+
+fn now_secs() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 async fn handle_queue_num(ctx: &Ctx, req: &Request) -> Result<Response<Body>, Error> {

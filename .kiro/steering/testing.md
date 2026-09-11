@@ -42,20 +42,36 @@ visible fairness failure at 1,000,000 people. Tests are the primary evidence.
   position; malformed joins consume none.
 - **Admission / session** — a captured admission token cannot be replayed as a session, or
   vice versa; a session survives a second page view without re-queueing.
-- **CloudFront cookie encoding (ADR-0020)** — a second frozen wire contract, this one with the
-  edge rather than with an auditor. Pin it: custom-policy cookie set (`CloudFront-Policy`,
-  never `CloudFront-Expires`), whitespace-free policy JSON, the `+/=` → `-~_` base64 alphabet,
-  and `CloudFront-Hash-Algorithm=SHA256` present. Any drift presents as every admitted visitor
-  getting a 403, which no unit test would otherwise catch.
+- **Cross-language credential and rule conformance (ADR-0021, issue #71)** — a frozen wire
+  contract with the edge, proven by generated vectors rather than hand-written assertions on
+  either side. `crates/wr-common/tests/vectors.rs` generates
+  `crates/wr-common/tests/vectors/session.json` (positive credentials minted by the real
+  `Session::sign`, negatives hand-encoded independently of `wr_common`'s private wire helpers,
+  and `(rule, request) → bool` vectors) and self-checks it against the real Rust implementation;
+  `infra/modules/edge/tests/gate.conformance.test.js` loads the **shipped**
+  `gate.js.tftpl` under `node:vm` and checks the same vectors against the JS implementation.
+  Rule vectors are the only thing that proves rule agreement — `eq_ignore_ascii_case` (Rust) and
+  `toLowerCase()` (JS) diverge on non-ASCII input even though both read the same wire encoding.
+  Regenerate with `cargo test -p wr-common -- --ignored regenerate_vectors` after a wire-format
+  change; the committed file drifting from the generator fails CI. `node:vm` exercises Node's
+  `Buffer`/HMAC/base64url, not CloudFront's — it is a proxy for what
+  `scripts/spike_edge_gate.py` proved against a real function, not a replacement for it.
+- **Edge gate decision-tree branches (ADR-0021)** — `infra/modules/edge/tests/gate.decision-tree.test.js`
+  covers every branch against the shipped function: dormancy (`r: []`), `enforce_from` pending,
+  `fail_open_until` active and lapsed, each refusal reason (`none`/`signature`/`event`/`expired`),
+  XHR-versus-navigation refusal shaping, spoofed `x-wr-gate*` headers stripped at entry, and the
+  throw-and-pass-through path (an unrecognised config version, a failed KeyValueStore read).
 - **No-show compensation** — with an injected no-show rate, measured origin arrivals converge
   on the target rate.
 
 ## Not currently provable, and why
 
-- **Fail-open** — "with the waiting-room API returning 5xx, the origin stays reachable" holds
-  for the authorizer gate only. The CloudFront gate fails closed by construction (#58), so this
-  test must be scoped to the authorizer until that issue resolves. Do not write a test that
-  passes by asserting the weaker behaviour and calling it fail-open.
+- **Automatic fail-open on backend-unreachable (#58)** — the *mechanism* is proven (a
+  `fail_open_until` epoch the gate evaluates against its own clock, `resolve()` producing
+  `AdmissionControl::FailOpen`, `apply_fail_open` writing both stores in the safe order), but
+  nothing trips it automatically. Fail-open still depends on a human (or a watchdog that does
+  not exist yet) noticing the backend is down and calling `/admin/fail_open`. Do not write a
+  test that asserts DynamoDB-unreachable automatically flips the gate open — nothing does that.
 
 ## To prove when the corresponding gap closes
 
@@ -64,10 +80,10 @@ the mechanism exists.
 
 - **One position per identity** (#59) — N registrations under one verified identifier yield one
   position; a pre-queue registration classified as a bot at join is mitigated at seal.
-- **Credential scope** (#61) — cookies minted for one event are refused on another event's
-  behaviour in the same distribution.
 - **Concurrency control** (#65) — with injected session durations an order of magnitude apart,
   measured active sessions converge on the ceiling in both cases.
+- **Revocation** (#63) — no design exists yet (ADR-0021 §5.2); do not write a test against a
+  mechanism that has not been chosen.
 
 ## Load validation (Phase 3)
 

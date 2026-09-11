@@ -26,11 +26,13 @@ to their registration index. One conditional `UpdateItem` assigns positions to t
 pre-queue cohort. The permutation is a 4-round Feistel network keyed by a 256-bit seed, and its
 byte encoding is pinned by frozen test vectors.
 
-**The gate is the content delivery network (CDN).** The CloudFront default cache behaviour names
-a trusted key group. CloudFront verifies signed cookies at the edge and refuses an un-admitted
-visitor before the origin receives the request. No code of ours runs in that path either.
+**The gate is a CloudFront Function.** The default cache behaviour associates a viewer-request
+function that decides locally from a KeyValueStore (ADR-0021, issue #71): no configured rule, a
+valid session cookie, or a fail-open/pending epoch all pass through; otherwise it refuses before
+the origin receives the request. Sub-millisecond compute at the edge, never a call to the origin
+or any backend.
 
-The core Terraform module holds 65 managed resources.
+The core Terraform module holds 64 managed resources; the edge module holds 15.
 
 ---
 
@@ -45,7 +47,7 @@ API, one CloudFront distribution.
 | `seal_event` | EventBridge Scheduler, one-shot | 10 s | Folds shard counts into offsets; writes the seal |
 | `read` | API Gateway | 10 s | Serves `GET /v1/status` and `GET /v1/queue_num` |
 | `controller` | EventBridge Scheduler, `rate(1 minute)` | 30 s | Meters admission; expires positions |
-| `generate_token` | API Gateway | 30 s | Checks the position; records the arrival; signs the cookies |
+| `generate_token` | API Gateway | 10 s | Checks the position; records the arrival; signs the session cookie the edge gate verifies |
 | `admin` | API Gateway | 10 s | Axum operator UI and control plane |
 
 Every function runs `provided.al2023` at 256 MB on the architecture named in
@@ -339,79 +341,78 @@ zero yields a cutoff of zero and expires nothing.
 advances to the highest position expired — the highest position, not a count, because the
 attribute names a position.
 
-### 6.3 Minting the cookies
+### 6.3 Minting the session cookie
 
 `POST /v1/generate_token` takes `request_id` from the query string or the JSON body. It reads
 `Positions` first; a live-join row is authoritative and the `PreQueue` lookup is skipped when one
 answers.
 
-`decide` refuses in this order: admission control not `Open`, phase not `Active`, no registration,
-position not yet reached. A `Positions` row whose status is `completed`, `abandoned` or `expired`
-is `Spent` — permanent, so the client stops rather than keeps polling. The cursor is exclusive:
+`decide` refuses in this order: resolved admission control (`wr_common::resolve(stored_control,
+fail_open_until, now)`, issue #71) not `Open`, phase not `Active`, no registration, position not
+yet reached. A `Positions` row whose status is `completed`, `abandoned` or `expired` is `Spent` —
+permanent, so the client stops rather than keeps polling. The cursor is exclusive:
 `position >= serving_counter` means still queued.
 
 Refusals map to statuses the waiting page acts on: 425 still queued, 409 not admitting or not
 sealed, 404 not registered, 410 spent, 500 corrupt.
 
-The arrival is recorded before the cookies are signed. A visitor counted but not admitted
+The arrival is recorded before the cookie is signed. A visitor counted but not admitted
 understates the no-show rate. One admitted but not counted makes the controller over-release for
 every later interval. A failed arrival write is logged at error under the stable event name
 `arrival_record_failed` and the visitor is admitted anyway.
 
-The cookies are a CloudFront **custom** policy over `https://*`, signed RSA PKCS#1 v1.5 over
-SHA-256, defaulting to a one-hour lifetime:
+The credential is an HMAC-SHA256 `wr_common::crypto::Session` — the same wire format the
+authorizer's session cookie already used (ADR-0011), domain-separated from an admission token by
+a leading kind byte so neither validates as the other — set directly as a cookie, defaulting to a
+one-hour lifetime:
 
 ```
-CloudFront-Policy=<base64>; Path=/; Max-Age=3600; Secure; HttpOnly; SameSite=Lax
-CloudFront-Signature=<base64>; ...
-CloudFront-Key-Pair-Id=<id>; ...
-CloudFront-Hash-Algorithm=SHA256; ...
+<session_cookie_name>=<base64url(payload)>.<base64url(mac)>; Path=/; Max-Age=3600; Secure; HttpOnly; SameSite=Lax
 ```
 
-The base64 is CloudFront's variant, with `+/=` replaced by `-~_`.
-`CloudFront-Hash-Algorithm=SHA256` must be sent or CloudFront assumes SHA-1 and rejects every
-signature. `Path=/` with no `Domain` must be used or the browser never sends the cookies back on
-the protected request.
+`Path=/` with no `Domain` must be used or the browser never sends the cookie back on the
+protected request.
 
 The signing key is read from SSM Parameter Store once at cold start, inside the boosted init
-phase, so neither the TLS handshake nor the RSA key parse lands on a visitor's request.
+phase, so the TLS handshake does not land on a visitor's request. `generate_token` refuses to
+finish initializing if that key is still the Terraform-seeded placeholder literal
+(`wr_common::PLACEHOLDER_SIGNING_KEY`) — the only guard against `scripts/bootstrap_edge_gate.py`
+never having been run for this stack.
 
 ---
 
 ## 7. The gate
 
-The CloudFront default cache behaviour names `trusted_key_groups`. CloudFront verifies the signed
-cookies itself on every request to the protected origin. Caching is disabled there and an origin
-request policy forwards the session cookie, all viewer headers, and all query strings.
+A CloudFront Function (`cloudfront-js-2.0`, ADR-0021, issue #71) is associated with the default
+cache behaviour at `viewer-request`, reading its whole configuration and the signing secret from
+one CloudFront KeyValueStore. It decides locally, in this order:
 
-A refused visitor gets a 403, which a distribution-wide `custom_error_response` turns into:
+1. No rule in the KeyValueStore's ruleset matches → pass through untouched (`r: []` is dormancy).
+2. `enforce_from` (a scheduled go-live epoch) or `fail_open_until` (break-glass) is in the
+   future → pass through, marked `x-wr-gate: pending` / `failopen`.
+3. A valid session cookie for this event, not expired → pass through.
+4. Otherwise → refused with a reason: a navigation gets a 302 to the waiting page with
+   `?r=<reason>&next=<destination>`; an XHR/fetch gets 403 JSON with `x-wr-reason`.
+5. The gate itself throwing (an unreadable KeyValueStore, an unrecognised config version) →
+   pass through, marked `x-wr-gate-failed: true`. This is not the same thing as a
+   backend-unreachable fail-open (#58) — the function makes no network calls and cannot observe
+   that at all.
 
-```hcl
-custom_error_response {
-  error_code            = 403
-  response_code         = 200
-  response_page_path    = "/_wr/waiting.html"
-  error_caching_min_ttl = 0
-}
-```
-
-The waiting page is the correct answer to "you are not admitted yet", and a 403 body keeps
-browsers from rendering it as a normal page. `error_caching_min_ttl` must stay 0: CloudFront
-caches its own error responses, and a cached refusal keeps showing the waiting page to a visitor
-who has since been admitted.
+Caching is disabled on this behaviour and an origin request policy forwards the session cookie,
+all viewer headers, and all query strings. `x-wr-gate`/`x-wr-gate-failed` are stripped from the
+incoming request before any decision logic runs, since the protected behaviour forwards
+`allViewer` and a visitor's own request could otherwise carry a spoofed value.
 
 `/_wr/*` is its own behaviour against a private S3 bucket, outside the gate. Gating it would make
-the refusal loop.
-
-The client handles the loop that remains. A visitor holding cookies CloudFront refuses would
-bounce between the origin and the waiting page, so `waiting.js` counts bounces, retries the same
-pass up to five times, and then stops with an explanation rather than cycling.
+the refusal loop. The `next=` parameter on a redirect carries the visitor's original destination
+through the waiting page back to itself once admitted, which is what replaced the client-side
+bounce-guard loop the old signed-cookie gate needed (ADR-0020, superseded).
 
 ### The cache behaviours
 
 | Behaviour | Path | Cache policy | Cookies | Origin |
 |---|---|---|---|---|
-| Default | `/*` | CachingDisabled | session cookie forwarded | Protected origin, trusted key group |
+| Default | `/*` | CachingDisabled | session cookie forwarded | Protected origin, gated by the CloudFront Function |
 | Waiting page | `/_wr/*` | Cached | none | S3, ungated |
 | Polled | `/v1/status` | Min TTL 1 s, key: path | none | API Gateway |
 | Polled | `/v1/queue_num` | Min TTL 1 s, key: path + `event_id` + `request_id` | none | API Gateway |
@@ -594,11 +595,11 @@ number:    CloudFront [/v1/queue_num, Min TTL 1 s, keyed per visitor]
 admit:     CloudFront [/v1/generate_token, uncached, AllViewerExceptHostHeader]
              → API Gateway → generate_token
              → DynamoDB (check position, record arrival)
-             → 4 Set-Cookie headers
+             → 1 Set-Cookie header (HMAC session credential)
 
-protected: CloudFront [/*, trusted key group]
-             ├─ valid cookies    → customer origin (or the demo fixture)
-             └─ missing/expired  → 403 → rewritten 200 → /_wr/waiting.html
+protected: CloudFront [/*, CloudFront Function at viewer-request]
+             ├─ valid session cookie → customer origin (or the demo fixture)
+             └─ missing/expired       → 302/403 → /_wr/waiting.html
 
 seal:      EventBridge Scheduler at(seal_start_time)   [only if set]
              → seal_event → BatchGetItem ×10 → one guarded UpdateItem

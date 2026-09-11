@@ -125,6 +125,8 @@ resource "aws_lambda_function" "admin" {
       COUNTERS_TABLE = aws_dynamodb_table.counters.name
       TOKENS_TABLE   = aws_dynamodb_table.tokens.name
       EVENT_ID       = var.event_id
+      # Issue #71: mirrors fail_open_until to the edge gate's KeyValueStore.
+      EDGE_KVS_ARN = aws_cloudfront_key_value_store.gate.arn
       # API Gateway prefixes the path with the stage (e.g. /dev/admin); this
       # makes the Rust runtime strip it so the Axum routes match unprefixed.
       AWS_LAMBDA_HTTP_IGNORE_STAGE_IN_PATH = "true"

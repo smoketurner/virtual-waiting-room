@@ -13,7 +13,8 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true, features = ["std"] }
-reqwest = { workspace = true, features = ["json", "rustls-tls"] }
+reqwest = { workspace = true, features = ["json", "rustls-tls-webpki-roots-no-provider", "http2"] }
+rustls = { workspace = true, features = ["aws_lc_rs", "std", "tls12"] }
 serde_json = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync"] }
 

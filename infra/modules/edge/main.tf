@@ -85,6 +85,33 @@ resource "aws_cloudfront_origin_request_policy" "protected" {
   }
 }
 
+# --- Edge gate (issue #71) -----------------------------------------------
+# A CloudFront Function at viewer-request, decides locally from the
+# KeyValueStore (gate_kvs_arn) — no compute in the request path beyond the
+# function's own sub-millisecond budget, and it works against an origin we
+# cannot run code in. Replaces the CloudFront trusted-key-group gate
+# (ADR-0020, retired) with a decision point that can express #58's mechanism,
+# #60's dormancy, #66's rules, and #72/#73's refusal shaping.
+resource "aws_cloudfront_function" "gate" {
+  name    = "${var.name_prefix}-gate"
+  comment = "Virtual Waiting Room admission gate (issue #71)."
+  runtime = "cloudfront-js-2.0"
+  publish = true
+  code    = local.gate_js_source
+
+  key_value_store_associations = [var.gate_kvs_arn]
+}
+
+# Enforced, not merely documented (ADR-0021 §6): the function source is
+# entirely ASCII, so the character count local.gate_js_source's length()
+# returns is also its byte count against CloudFront's 10,240-byte ceiling.
+check "gate_function_size" {
+  assert {
+    condition     = length(local.gate_js_source) < 10240
+    error_message = "gate.js rendered source is ${length(local.gate_js_source)} bytes, at or over the CloudFront Function 10,240-byte limit."
+  }
+}
+
 # --- Distribution -------------------------------------------------------------
 
 resource "aws_cloudfront_distribution" "this" {
@@ -155,11 +182,16 @@ resource "aws_cloudfront_distribution" "this" {
     origin_request_policy_id = local.protected_origin_request_policy
     compress                 = true
 
-    # The gate. CloudFront verifies the admission cookies at the edge and
-    # refuses anyone without them, so no compute sits in the request path and
-    # the origin never sees an un-admitted visitor. Refusals are 403s, mapped to
-    # the waiting page by custom_error_response below.
-    trusted_key_groups = var.trusted_key_group_ids
+    # The gate (issue #71). Associated with this behaviour only, never
+    # distribution-wide: Functions bill per invocation, and a
+    # distribution-wide association would bill every /status poll from every
+    # waiter, which dominates the cost model at a million waiters. Every
+    # other behaviour below has its own ordered_cache_behavior, so this is
+    # correct by construction — asserted by tests/gate_association.tftest.hcl.
+    function_association {
+      event_type   = "viewer-request"
+      function_arn = aws_cloudfront_function.gate.arn
+    }
   }
 
   # The waiting room's pages. Deliberately outside the gate: this is what a
@@ -239,20 +271,10 @@ resource "aws_cloudfront_distribution" "this" {
     }
   }
 
-  # A refused visitor is shown the waiting page rather than CloudFront's error.
-  # The 200 is deliberate: the page is the correct answer to "you are not
-  # admitted yet", and a 403 body would keep browsers from rendering it as a
-  # normal page.
-  #
-  # error_caching_min_ttl must stay 0. CloudFront caches its own error responses,
-  # and a cached refusal would keep showing the waiting page to a visitor who has
-  # since been admitted.
-  custom_error_response {
-    error_code            = 403
-    response_code         = 200
-    response_page_path    = local.waiting_page_path
-    error_caching_min_ttl = 0
-  }
+  # No custom_error_response (issue #71, closes #64): the gate itself decides
+  # a refusal's shape — a 302 to the waiting page for navigation, 403 JSON for
+  # XHR (#72) — so origin 403s reach the visitor unrewritten instead of being
+  # mapped to the waiting page regardless of which origin produced them.
 
   restrictions {
     geo_restriction {

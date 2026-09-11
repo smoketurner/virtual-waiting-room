@@ -1,0 +1,233 @@
+// The admission gate, at viewer-request on the protected behaviour only
+// (issue #71). Decides locally: no backend call, no network access.
+//
+// EVENT_ID, SESSION_COOKIE and WAITING_PATH are templated in by Terraform
+// rather than carried in the KeyValueStore value, so a change to any of them
+// republishes this function in the same apply as generate_token — see
+// docs/adr/0021-edge-function-gate.md and docs/DEPLOY.md.
+import cf from 'cloudfront';
+import crypto from 'crypto';
+
+var kvs = cf.kvs();
+var KIND_SESSION = 0x02;
+var EVENT_ID = '${event_id}';
+var SESSION_COOKIE = '${session_cookie_name}';
+var WAITING_PATH = '${waiting_path}';
+
+// The protected behaviour forwards allViewer, so a visitor's own request can
+// carry these; strip them before any decision logic or a spoofed value
+// reaches the origin looking legitimate.
+function stripSpoofableHeaders(request) {
+    delete request.headers['x-wr-gate'];
+    delete request.headers['x-wr-gate-failed'];
+}
+
+// No timing-safe comparison in this runtime: HMAC both digests under the
+// same key and compare those, instead of comparing the received MAC.
+function macEquals(secret, a, b) {
+    var ha = crypto.createHmac('sha256', secret);
+    ha.update(a);
+    var hb = crypto.createHmac('sha256', secret);
+    hb.update(b);
+    return ha.digest('base64url') === hb.digest('base64url');
+}
+
+var BASE64URL_RE = /^[A-Za-z0-9_-]+$/;
+
+// Node accepts padding, drops non-alphabet bytes, and accepts '+'/'/' where
+// Rust's URL_SAFE_NO_PAD rejects all three; reject them here first.
+function strictBase64url(s) {
+    if (!BASE64URL_RE.test(s)) {
+        return null;
+    }
+    return Buffer.from(s, 'base64url');
+}
+
+// base64url(payload).base64url(mac), MAC over kind || payload. Mirrors
+// wr_common::crypto byte for byte (frozen format, no version byte: a kind
+// byte already domain-separates, ADR-0021 DEPART-2).
+//
+// Three corrections against the ADR-0021 spike's verify(): trailing payload
+// bytes are rejected (Rust requires cursor.at_end()); the two u64 fields are
+// read as a 16-bit zero-check plus a 48-bit read, not readUInt32BE(at+4),
+// which silently read the low half of a 64-bit big-endian value; and
+// base64url is decoded strictly (strictBase64url above).
+function verify(credential, kind, secret) {
+    var dot = credential.indexOf('.');
+    if (dot < 1) {
+        return null;
+    }
+    var payload = strictBase64url(credential.substring(0, dot));
+    var mac = strictBase64url(credential.substring(dot + 1));
+    if (!payload || !mac || mac.length === 0) {
+        return null;
+    }
+
+    var hmac = crypto.createHmac('sha256', secret);
+    hmac.update(Buffer.concat([Buffer.from([kind]), payload]));
+    if (!macEquals(secret, hmac.digest('base64url'), mac.toString('base64url'))) {
+        return null;
+    }
+
+    var at = 0;
+    var len = payload.length;
+    if (at + 2 > len) { return null; }
+    var eventLen = payload.readUInt16BE(at);
+    at += 2;
+    if (at + eventLen > len) { return null; }
+    var eventId = payload.toString('utf8', at, at + eventLen);
+    at += eventLen;
+
+    if (at + 2 > len) { return null; }
+    var reqLen = payload.readUInt16BE(at);
+    at += 2;
+    if (at + reqLen > len) { return null; }
+    at += reqLen; // request_id: not read by the gate
+
+    // issued_at: not read by the gate, but still walked and range-checked.
+    if (at + 8 > len) { return null; }
+    if (payload.readUInt16BE(at) !== 0) { return null; }
+    at += 8;
+
+    if (at + 8 > len) { return null; }
+    if (payload.readUInt16BE(at) !== 0) { return null; }
+    at += 2;
+    var expiresAt = payload.readUIntBE(at, 6);
+    at += 6;
+
+    if (at !== len) {
+        return null; // trailing bytes: Rust's decode_session rejects these
+    }
+    return { eventId: eventId, expiresAt: expiresAt };
+}
+
+// Compact rules: ["p",prefix] | ["h",name,value] | ["c",name] | ["u",substring].
+// Mirrors wr_common::rules::ProtectionRule::matches. eq_ignore_ascii_case
+// (Rust) and toLowerCase() (here) diverge on non-ASCII input, so the shared
+// wire encoding alone does not prove rule agreement — the conformance
+// vectors do.
+function matches(rule, request) {
+    var headers = request.headers || {};
+    var cookies = request.cookies || {};
+    if (rule[0] === 'p') {
+        return request.uri.indexOf(rule[1]) === 0;
+    }
+    if (rule[0] === 'h') {
+        var h = headers[rule[1].toLowerCase()];
+        return !!h && h.value.toLowerCase() === rule[2].toLowerCase();
+    }
+    if (rule[0] === 'c') {
+        return !!cookies[rule[1]];
+    }
+    if (rule[0] === 'u') {
+        var ua = headers['user-agent'];
+        return !!ua && ua.value.indexOf(rule[1]) >= 0;
+    }
+    return false;
+}
+
+function wantsHtml(request) {
+    var headers = request.headers || {};
+    var mode = headers['sec-fetch-mode'];
+    if (mode && mode.value !== 'navigate') {
+        return false;
+    }
+    var accept = headers['accept'];
+    return !accept || accept.value.indexOf('text/html') >= 0;
+}
+
+// #72: XHR gets 403 JSON with a header, not an HTML page; navigation gets a
+// 302. #73: every refusal carries a reason, as x-wr-reason and as ?r=. next=
+// preserves the destination (validated by waiting.js: one leading '/', never
+// '//host') so it can send the visitor on once admitted.
+function refuse(request, reason) {
+    if (wantsHtml(request)) {
+        var next = '&next=' + encodeURIComponent(request.uri);
+        return {
+            statusCode: 302,
+            statusDescription: 'Found',
+            headers: {
+                'location': { value: WAITING_PATH + '?r=' + reason + next },
+                'cache-control': { value: 'no-store' },
+                'x-wr-reason': { value: reason }
+            }
+        };
+    }
+    return {
+        statusCode: 403,
+        statusDescription: 'Forbidden',
+        headers: {
+            'content-type': { value: 'application/json' },
+            'cache-control': { value: 'no-store' },
+            'x-wr-reason': { value: reason },
+            'x-wr-waiting-room': { value: WAITING_PATH },
+            'access-control-expose-headers': { value: 'x-wr-reason,x-wr-waiting-room' }
+        },
+        body: '{"queued":true,"reason":"' + reason + '","waitingRoom":"' + WAITING_PATH + '"}'
+    };
+}
+
+async function handler(event) {
+    var request = event.request;
+    stripSpoofableHeaders(request);
+    try {
+        // cfg.r === [] is dormancy (#60): every request matches no rule.
+        var cfg = await kvs.get('c', { format: 'json' });
+        if (cfg.v !== 1) {
+            throw new Error('unrecognized gate config version');
+        }
+
+        var protectedByRule = false;
+        for (var i = 0; i < cfg.r.length; i++) {
+            if (matches(cfg.r[i], request)) {
+                protectedByRule = true;
+                break;
+            }
+        }
+        if (!protectedByRule) {
+            return request;
+        }
+
+        var now = Math.floor(Date.now() / 1000);
+
+        // enforce_from: restrictive changes normally take effect on receipt;
+        // this is the one exception, so go-live can be scheduled to the same
+        // instant on every edge instead of arriving over the propagation
+        // window. 0 = enforce on receipt.
+        if (cfg.s && now < cfg.s) {
+            request.headers['x-wr-gate'] = { value: 'pending' };
+            return request;
+        }
+        // fail_open_until: permissive changes are a timestamp evaluated
+        // against this edge's own clock, so skew can only delay relief.
+        if (cfg.f && now < cfg.f) {
+            request.headers['x-wr-gate'] = { value: 'failopen' };
+            return request;
+        }
+
+        var cookie = (request.cookies || {})[SESSION_COOKIE];
+        if (!cookie) {
+            return refuse(request, 'none');
+        }
+
+        var secret = await kvs.get('k', { format: 'string' });
+        var session = verify(cookie.value, KIND_SESSION, secret);
+        if (!session) {
+            return refuse(request, 'signature');
+        }
+        if (session.eventId !== EVENT_ID) {
+            return refuse(request, 'event');
+        }
+        if (now >= session.expiresAt) {
+            return refuse(request, 'expired');
+        }
+        return request;
+    } catch (e) {
+        // The gate being broken is not #58 (backend unreachable) — this
+        // function makes no network calls and cannot observe that at all.
+        // Pass through, matching ADR-0021 §3.3 step 6.
+        console.log('gate threw: ' + e);
+        request.headers['x-wr-gate-failed'] = { value: 'true' };
+        return request;
+    }
+}

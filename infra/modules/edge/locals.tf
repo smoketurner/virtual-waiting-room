@@ -59,4 +59,13 @@ locals {
   # position, so it must stay fresh. Not a separate knob - min TTL is the one
   # load-bearing value (ADR-0013).
   polled_default_ttl = var.polled_min_ttl_seconds
+
+  # The edge gate (issue #71): event_id, session_cookie_name and the waiting
+  # path are templated into the function's own source rather than carried in
+  # the KeyValueStore value, so Terraform stays their single source of truth.
+  gate_js_source = templatefile("${path.module}/functions/gate.js.tftpl", {
+    event_id            = var.event_id
+    session_cookie_name = var.session_cookie_name
+    waiting_path        = local.waiting_page_path
+  })
 }

@@ -185,6 +185,21 @@ data "aws_iam_policy_document" "admin" {
     resources = [aws_ssm_parameter.oidc_client_secret.arn]
   }
 
+  # Issue #71: mirrors fail_open_until to the edge gate's KeyValueStore.
+  # Data-plane actions on the store's own ARN, distinct from the
+  # cloudfront:* control-plane permissions (which this role does not hold —
+  # it never creates or deletes the store, only reads and writes its keys).
+  statement {
+    sid    = "WriteEdgeGateConfig"
+    effect = "Allow"
+    actions = [
+      "cloudfront-keyvaluestore:DescribeKeyValueStore",
+      "cloudfront-keyvaluestore:GetKey",
+      "cloudfront-keyvaluestore:PutKey",
+    ]
+    resources = [aws_cloudfront_key_value_store.gate.arn]
+  }
+
   statement {
     sid    = "Logs"
     effect = "Allow"
@@ -284,10 +299,10 @@ data "aws_iam_policy_document" "generate_token" {
   }
 
   statement {
-    sid       = "ReadSignerKey"
+    sid       = "ReadSigningKey"
     effect    = "Allow"
     actions   = ["ssm:GetParameter"]
-    resources = [aws_ssm_parameter.cf_signer_key.arn]
+    resources = [aws_ssm_parameter.signing_key.arn]
   }
 
   statement {

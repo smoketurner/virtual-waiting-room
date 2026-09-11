@@ -6,7 +6,7 @@ use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
 use aws_sdk_dynamodb::types::AttributeValue;
 use wr_common::expr::event_key;
-use wr_common::{AdmissionControl, Phase};
+use wr_common::{Phase, StoredControl};
 
 use crate::{ControlState, Store, StoreError};
 
@@ -63,7 +63,8 @@ impl Store for DynamoStore {
             participant_count: num("participant_count"),
             target_rate: num("target_rate").and_then(|n| u32::try_from(n).ok()),
             message: item.get("message").and_then(|v| v.as_s().ok()).cloned(),
-            admission_control: admission_control_from(item),
+            stored_control: stored_control_from(item),
+            fail_open_until: num("fail_open_until").unwrap_or(0),
             last_action: str_attr("last_action"),
             last_action_by: str_attr("last_action_by"),
             last_action_at: str_attr("last_action_at"),
@@ -148,11 +149,11 @@ impl Store for DynamoStore {
         send_guarded(req, "message").await
     }
 
-    async fn set_admission_control(
+    async fn set_stored_control(
         &self,
         event_id: &str,
-        from: AdmissionControl,
-        to: AdmissionControl,
+        from: StoredControl,
+        to: StoredControl,
         action: crate::AdminAction,
         actor: &str,
         now_ms: u64,
@@ -160,8 +161,9 @@ impl Store for DynamoStore {
         // The write applies only from the expected prior value, so a transition
         // another operator already made is a Conflict rather than a second
         // apply. An event that has never been written carries no attribute at
-        // all, which reads as `open`.
-        let control_guard = if from == AdmissionControl::Open {
+        // all, which reads as `open`. Never touches fail_open_until — the two
+        // are orthogonal (issue #71).
+        let control_guard = if from == StoredControl::Open {
             "(attribute_not_exists(admission_control) OR admission_control = :from)"
         } else {
             "admission_control = :from"
@@ -184,6 +186,31 @@ impl Store for DynamoStore {
         // cutoff as `set_rate` and `set_message`.
         req = guard_debounce(req, now_ms);
         send_guarded(req, "admission_control").await
+    }
+
+    async fn set_fail_open_until(
+        &self,
+        event_id: &str,
+        until: u64,
+        action: crate::AdminAction,
+        actor: &str,
+        now_ms: u64,
+    ) -> Result<(), StoreError> {
+        // Unconditional (break-glass), unlike set_stored_control: the operator
+        // must always be able to engage or clear it, mirroring
+        // force_maintenance rather than the guarded pause/resume pair.
+        let mut req = self
+            .client
+            .update_item()
+            .table_name(&self.counters_table)
+            .set_key(Some(event_key(event_id)))
+            .update_expression(
+                "SET fail_open_until = :u, last_action = :a, last_action_by = :by, \
+                 last_action_at = :at, last_action_epoch_ms = :ms",
+            )
+            .expression_attribute_values(":u", AttributeValue::N(until.to_string()));
+        req = apply_audit_values(req, action, actor, now_ms);
+        send_guarded(req, "fail_open_until").await
     }
 
     async fn force_maintenance(
@@ -215,16 +242,17 @@ impl Store for DynamoStore {
     }
 }
 
-/// Reads the stored admission control off a `Counters` item, keeping all three
-/// states distinct. Absent or unparsable resolves to `Open`: that is the state an
-/// event is created in and the value no operator action has written.
-fn admission_control_from(
-    item: &std::collections::HashMap<String, AttributeValue>,
-) -> AdmissionControl {
+/// Reads the stored admission control off a `Counters` item. Absent or
+/// unparsable — including a legacy "`fail_open`" string left by a table written
+/// before issue #71 — resolves to `Open`: that is the state an event is
+/// created in and the value no operator action has written, and the epoch
+/// (`fail_open_until`) is the sole authority for fail-open now, so a stale
+/// string carries no window to reopen.
+fn stored_control_from(item: &std::collections::HashMap<String, AttributeValue>) -> StoredControl {
     item.get("admission_control")
         .and_then(|v| v.as_s().ok())
         .and_then(|s| s.parse().ok())
-        .unwrap_or(AdmissionControl::Open)
+        .unwrap_or(StoredControl::Open)
 }
 
 type UpdateReq = aws_sdk_dynamodb::operation::update_item::builders::UpdateItemFluentBuilder;
@@ -325,34 +353,31 @@ mod tests {
 
     #[test]
     fn every_stored_control_reads_back_as_itself() {
-        for control in [
-            AdmissionControl::Open,
-            AdmissionControl::Paused,
-            AdmissionControl::FailOpen,
-        ] {
+        for control in [StoredControl::Open, StoredControl::Paused] {
             assert_eq!(
-                admission_control_from(&item(Some(control.as_wire_str()))),
+                stored_control_from(&item(Some(control.as_wire_str()))),
                 control
             );
         }
     }
 
     #[test]
-    fn fail_open_does_not_read_back_as_open() {
-        // The distinction the dashboard depends on: a stored fail_open must not
-        // arrive as the normal admitting state, which is what testing only for
-        // equality with `paused` would produce.
-        let control = admission_control_from(&item(Some("fail_open")));
-        assert_ne!(control, AdmissionControl::Open);
-        assert_eq!(control, AdmissionControl::FailOpen);
+    fn a_legacy_fail_open_string_now_reads_back_as_open() {
+        // INVERTED from the pre-#71 invariant: fail-open is no longer a
+        // storable string at all (StoredControl has two values), so a
+        // "fail_open" string left by a table written before this change must
+        // decay to Open — the epoch (fail_open_until) is the sole authority
+        // now, and a stale string carries no window to reopen.
+        let control = stored_control_from(&item(Some("fail_open")));
+        assert_eq!(control, StoredControl::Open);
     }
 
     #[test]
     fn absent_or_unknown_control_defaults_to_open() {
-        assert_eq!(admission_control_from(&item(None)), AdmissionControl::Open);
+        assert_eq!(stored_control_from(&item(None)), StoredControl::Open);
         assert_eq!(
-            admission_control_from(&item(Some("nonsense"))),
-            AdmissionControl::Open
+            stored_control_from(&item(Some("nonsense"))),
+            StoredControl::Open
         );
         // A non-string attribute is as unusable as a missing one.
         let mut wrong_type = item(None);
@@ -360,7 +385,7 @@ mod tests {
             "admission_control".to_owned(),
             AttributeValue::N("1".to_owned()),
         );
-        assert_eq!(admission_control_from(&wrong_type), AdmissionControl::Open);
+        assert_eq!(stored_control_from(&wrong_type), StoredControl::Open);
     }
 
     #[test]
