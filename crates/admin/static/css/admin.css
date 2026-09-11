@@ -149,6 +149,29 @@ body {
   grid-column: 1 / -1;
 }
 
+/* The emergency controls sit side by side so the card does not tower over its
+   neighbours and leave the row ragged. Each keeps its own explanation, and the
+   separators run vertically between them rather than horizontally across. */
+.controls-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+  gap: 24px;
+}
+
+.controls-row .control + .control {
+  border-left: 1px solid var(--vouch-border);
+  padding-left: 24px;
+}
+
+@media (max-width: 52rem) {
+  .controls-row .control + .control {
+    border-left: 0;
+    border-top: 1px solid var(--vouch-border);
+    padding-left: 0;
+    padding-top: 24px;
+  }
+}
+
 .card {
   background: var(--vouch-surface);
   border: 1px solid var(--vouch-border);
