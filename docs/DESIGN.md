@@ -559,6 +559,8 @@ serves the previous value if the origin is slow.
 | `/admin/rate` | Set target admission rate |
 | `/admin/message` | Publish an operator message to waiting visitors |
 | `/admin/reset` | Reset event state |
+| `/admin/pause` | Pause admissions (reversible; queue and configured rate preserved) |
+| `/admin/resume` | Resume admissions, restoring the configured rate |
 | `/admin/rules` | Update protection rules |
 | `/metrics` | Event metrics as JSON |
 | `/update_session` | Report session completion or abandonment |
