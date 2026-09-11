@@ -4,9 +4,14 @@
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::types::AttributeValue;
 use lambda_http::{Body, Error, Request, RequestExt, Response, service_fn};
-use read::{QueueNumError, ResolvedQueueNum, queue_num, status};
+use read::{CountersCache, QueueNumError, ResolvedQueueNum, queue_num, status};
 use wr_common::expr::event_key;
 use wr_common::{Counters, PreQueueItem};
+
+/// How long one execution environment holds the `Counters` item. Matched to the
+/// edge's own TTL on the polled behaviours, so a reader is never staler than
+/// what `CloudFront` is already serving for the same document.
+const COUNTERS_TTL: std::time::Duration = std::time::Duration::from_secs(1);
 
 struct Ctx {
     client: Client,
@@ -14,6 +19,7 @@ struct Ctx {
     prequeue_table: String,
     positions_table: String,
     event_id: String,
+    counters_cache: CountersCache,
 }
 
 #[tokio::main]
@@ -32,6 +38,7 @@ async fn main() -> Result<(), Error> {
         prequeue_table: std::env::var("PREQUEUE_TABLE")?,
         positions_table: std::env::var("POSITIONS_TABLE")?,
         event_id: std::env::var("EVENT_ID")?,
+        counters_cache: CountersCache::new(COUNTERS_TTL),
     };
 
     lambda_http::run(service_fn(|req: Request| route(&ctx, req))).await
@@ -111,6 +118,13 @@ fn position_response(position: Option<u64>) -> (u16, serde_json::Value) {
 }
 
 async fn load_counters(ctx: &Ctx) -> Result<Option<Counters>, Error> {
+    // Both endpoints read this one item, and /queue_num is answered per visitor
+    // so the edge cannot collapse it. Without this the whole waiting room's
+    // polling lands on a single DynamoDB partition key.
+    if let Some(hit) = ctx.counters_cache.get(std::time::Instant::now()) {
+        return Ok(hit);
+    }
+
     let out = ctx
         .client
         .get_item()
@@ -118,10 +132,16 @@ async fn load_counters(ctx: &Ctx) -> Result<Option<Counters>, Error> {
         .set_key(Some(event_key(&ctx.event_id)))
         .send()
         .await?;
-    let Some(item) = out.item() else {
-        return Ok(None);
-    };
-    Ok(Some(Counters::from_item(&ctx.event_id, item)))
+    let counters = out
+        .item()
+        .map(|item| Counters::from_item(&ctx.event_id, item));
+
+    // Stamped after the read, not before: the value is only as fresh as the
+    // moment it arrived, and a slow read must not be credited a full TTL it
+    // already spent in flight.
+    ctx.counters_cache
+        .put(std::time::Instant::now(), counters.clone());
+    Ok(counters)
 }
 
 async fn load_prequeue(ctx: &Ctx, request_id: &str) -> Result<Option<PreQueueItem>, Error> {
