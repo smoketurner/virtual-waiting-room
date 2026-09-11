@@ -278,8 +278,8 @@ fn negatives() -> Vec<NegativeVector> {
     ]
 }
 
-fn rules() -> Vec<RuleVector> {
-    let req = |path: &str, headers: &[(&str, &str)], cookies: &[(&str, &str)]| RuleRequest {
+fn req(path: &str, headers: &[(&str, &str)], cookies: &[(&str, &str)]) -> RuleRequest {
+    RuleRequest {
         path: path.to_owned(),
         headers: headers
             .iter()
@@ -289,9 +289,11 @@ fn rules() -> Vec<RuleVector> {
             .iter()
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect(),
-    };
+    }
+}
 
-    vec![
+fn rules() -> Vec<RuleVector> {
+    let mut all = vec![
         RuleVector {
             name: "path_prefix_matches".into(),
             rule: serde_json::json!(["p", "/checkout"]),
@@ -303,6 +305,34 @@ fn rules() -> Vec<RuleVector> {
             rule: serde_json::json!(["p", "/checkout"]),
             request: req("/about", &[], &[]),
             matches: false,
+        },
+        // Reproduced against the shipped gate during implementation review
+        // (SEC-H2 / S3): each of these evaded the rule before path
+        // normalization landed. Kept as vectors so a future change cannot
+        // silently reopen any of them in either language.
+        RuleVector {
+            name: "path_prefix_matches_case_folded".into(),
+            rule: serde_json::json!(["p", "/checkout"]),
+            request: req("/CHECKOUT", &[], &[]),
+            matches: true,
+        },
+        RuleVector {
+            name: "path_prefix_matches_percent_encoded".into(),
+            rule: serde_json::json!(["p", "/checkout"]),
+            request: req("/%63heckout", &[], &[]),
+            matches: true,
+        },
+        RuleVector {
+            name: "path_prefix_matches_doubled_leading_slash".into(),
+            rule: serde_json::json!(["p", "/checkout"]),
+            request: req("//checkout", &[], &[]),
+            matches: true,
+        },
+        RuleVector {
+            name: "path_prefix_matches_leading_dot_segment".into(),
+            rule: serde_json::json!(["p", "/checkout"]),
+            request: req("/./checkout", &[], &[]),
+            matches: true,
         },
         RuleVector {
             name: "cookie_present".into(),
@@ -316,6 +346,15 @@ fn rules() -> Vec<RuleVector> {
             request: req("/", &[], &[]),
             matches: false,
         },
+    ];
+    all.extend(rules_by_header());
+    all
+}
+
+/// The user-agent, cookie and header matchers. Split from [`rules`] only to
+/// keep each function under the line ceiling.
+fn rules_by_header() -> Vec<RuleVector> {
+    vec![
         RuleVector {
             name: "user_agent_substring".into(),
             rule: serde_json::json!(["u", "HeadlessChrome"]),

@@ -41,8 +41,6 @@ crates/                       Rust workspace — one crate per Lambda + shared l
                               KeyValueStore writer (edge.rs)
   authorizer/                 The alternative origin gate
 scripts/
-  bootstrap_edge_gate.py       Writes the signing secret to SSM and the edge gate's
-                              KeyValueStore in one run (issue #71)
 examples/                     Deployable example + generated variable reference — not built
 openapi/                      OpenAPI spec (N8) — not built
 ```

@@ -30,17 +30,17 @@ resource "aws_cloudfrontkeyvaluestore_key" "config" {
   }
 }
 
-# 'k': the signing secret, byte-identical to aws_ssm_parameter.signing_key.
-# Both start on the same placeholder literal and are overwritten together,
-# out of band, by scripts/bootstrap_edge_gate.py — see main.tf's
-# aws_ssm_parameter.signing_key for why a placeholder rather than a
-# Terraform-generated secret (it would land in state).
+# 'k': the signing secret, byte-identical to aws_ssm_parameter.signing_key
+# because both read the same generated value. The gate verifies what
+# generate_token mints, so the two must agree; taking them from one source
+# makes disagreement unrepresentable rather than something to detect.
+#
+# The key is deliberately not in the function's own code: cloudfront:GetFunction
+# returns that code to anyone holding a permission nobody treats as
+# secret-bearing, and CloudFront retains function versions, so every key ever
+# used would persist. A KeyValueStore value is replaced, not versioned.
 resource "aws_cloudfrontkeyvaluestore_key" "secret" {
   key                 = "k"
   key_value_store_arn = aws_cloudfront_key_value_store.gate.arn
-  value               = "PLACEHOLDER-overwrite-out-of-band" # nosemgrep: not a real secret
-
-  lifecycle {
-    ignore_changes = [value]
-  }
+  value               = random_bytes.signing_key.base64
 }

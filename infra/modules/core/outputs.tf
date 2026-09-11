@@ -85,7 +85,7 @@ output "api_gateway_domain_name" {
 
 
 output "gate_kvs_arn" {
-  description = "ARN of the edge gate's CloudFront KeyValueStore (issue #71). The edge module associates its CloudFront Function with it; scripts/bootstrap_edge_gate.py writes the signing secret to it."
+  description = "ARN of the edge gate's CloudFront KeyValueStore (issue #71). The edge module associates its CloudFront Function with it."
   value       = aws_cloudfront_key_value_store.gate.arn
 }
 

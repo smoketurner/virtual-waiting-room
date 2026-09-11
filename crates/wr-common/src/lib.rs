@@ -19,7 +19,7 @@ pub mod items;
 pub mod permutation;
 pub mod rules;
 
-pub use crypto::{AdmissionToken, PLACEHOLDER_SIGNING_KEY, Session, SigningKey, VerifyError};
+pub use crypto::{AdmissionToken, Session, SigningKey, VerifyError};
 pub use ids::{
     AdmissionControl, EventId, IllegalControl, Phase, RequestId, ServingState, StoredControl,
     UnknownControl, UnknownPhase, resolve, serving_state,

@@ -26,14 +26,6 @@ use aws_lc_rs::hmac;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 
-/// The literal Terraform seeds `aws_ssm_parameter.signing_key` and the gate's
-/// `KeyValueStore` secret with (`infra/modules/core/main.tf`), overwritten out
-/// of band by `scripts/bootstrap_edge_gate.py`. Every Lambda that signs or
-/// verifies with the signing key refuses to start if it reads this literal —
-/// a bootstrap that never ran leaves both stores agreeing on a secret
-/// published in this repository, which is silent and total (issue #71 C2).
-pub const PLACEHOLDER_SIGNING_KEY: &str = "PLACEHOLDER-overwrite-out-of-band";
-
 /// A credential kind tag, the first signed byte so the two credentials are
 /// domain-separated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

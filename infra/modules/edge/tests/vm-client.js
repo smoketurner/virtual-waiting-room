@@ -31,7 +31,7 @@ function jsonResponse(status, body) {
  * advance it with `client.clock.now = ...` between calls — the script only
  * ever reads time through `Date.now()`, which this harness redirects to it.
  */
-function loadClient({ route, now }) {
+function loadClient({ route, now, locationSearch }) {
   const clock = { now: now || 1_700_000_000_000 };
   const calls = [];
   const timers = [];
@@ -51,7 +51,10 @@ function loadClient({ route, now }) {
   const win = {
     localStorage: storageOf(),
     sessionStorage: storageOf(),
-    location: { replace: (url) => { win.location.replacedTo = url; } },
+    location: {
+      search: locationSearch || "",
+      replace: (url) => { win.location.replacedTo = url; },
+    },
     setTimeout: (fn, ms) => {
       const id = nextTimerId++;
       timers.push({ id, fn, ms, cancelled: false });

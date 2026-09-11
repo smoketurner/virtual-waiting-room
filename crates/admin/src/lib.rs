@@ -601,13 +601,53 @@ where
     Ok(())
 }
 
+/// Reserves headroom in a *ruleset* write for `s` and `f` growing to their
+/// worst-case realistic width (a 10-digit epoch each: `apply_fail_open`
+/// bounds `f` to `now + MAX_FAIL_OPEN_MINUTES` minutes, comfortably under
+/// 10 digits for the foreseeable future). `apply_fail_open` only grows `f`
+/// on a document that otherwise already validated, so if a ruleset alone
+/// were allowed to consume the full [`MAX_CONFIG_BYTES`] ceiling, engaging
+/// break-glass could fail to write at exactly the moment it is needed
+/// (review finding: fail-open blocked by ruleset size). Not applied inside
+/// [`encode_gate_config`] itself, which `apply_fail_open`/`apply_recover`
+/// call directly and which must be allowed the full ceiling.
+const RULES_WRITE_CEILING: usize = MAX_CONFIG_BYTES - 20;
+
+/// Runs a read-modify-write against the edge `KeyValueStore` with one retry
+/// against a **fresh** read: `mutate` is applied to whatever `read_config`
+/// currently returns, written, and — if that write is rejected (a
+/// concurrent writer's change landed first, so the precondition this write
+/// assumed is stale) — the whole read-modify-write is redone once against a
+/// fresh read rather than retrying the same now-stale document, which would
+/// silently clobber whichever change landed first (review finding: the
+/// `KeyValueStore` write retried with a stale document instead of re-reading).
+/// This still retries on any write failure, not narrowly a precondition
+/// conflict — acceptable for a low-frequency, operator-triggered write with
+/// a bounded retry count of one, and simpler than threading a
+/// conflict-vs-other-error distinction through [`EdgeConfigStore`].
+async fn edge_read_modify_write<E, F>(edge: &E, mutate: F) -> Result<GateConfig, EdgeStoreError>
+where
+    E: EdgeConfigStore,
+    F: Fn(&mut GateConfig),
+{
+    let mut cfg = edge.read_config().await?;
+    mutate(&mut cfg);
+    if edge.write_config(&cfg).await.is_ok() {
+        return Ok(cfg);
+    }
+    let mut cfg = edge.read_config().await?;
+    mutate(&mut cfg);
+    edge.write_config(&cfg).await?;
+    Ok(cfg)
+}
+
 /// Engages fail-open (issue #71): the break-glass bypass, until
 /// `now_secs + minutes * 60`. Legal from any `StoredControl` — pausing and
 /// fail-open are orthogonal, so a paused event can still be fail-opened.
 /// Writes the edge's `KeyValueStore` mirror first: a crash between the two
 /// writes then leaves the edge open with the machinery still minting and
 /// counting, whereas `DynamoDB`-first would stop `generate_token` while the
-/// edge still enforced (ADR-0021 §4.2).
+/// edge still enforced.
 ///
 /// # Errors
 ///
@@ -632,12 +672,7 @@ pub async fn apply_fail_open<S: Store, E: EdgeConfigStore>(
     let now_secs = now_ms / 1000;
     let until = now_secs.saturating_add(u64::from(minutes).saturating_mul(60));
 
-    let mut cfg = edge
-        .read_config()
-        .await
-        .map_err(|e| StoreError::Backend(e.to_string()))?;
-    cfg.fail_open_until = until;
-    edge.write_config(&cfg)
+    edge_read_modify_write(edge, |cfg| cfg.fail_open_until = until)
         .await
         .map_err(|e| StoreError::Backend(e.to_string()))?;
 
@@ -652,7 +687,7 @@ pub async fn apply_fail_open<S: Store, E: EdgeConfigStore>(
 /// window lands in `Paused`, not `Open` — `apply_resume` is the separate
 /// action for that. Writes `DynamoDB` first: a crash between the two writes
 /// then leaves the machinery running and the edge open only until the
-/// already-stamped expiry, which is self-consistent (ADR-0021 §4.2).
+/// already-stamped expiry, which is self-consistent.
 ///
 /// # Errors
 ///
@@ -672,12 +707,7 @@ pub async fn apply_recover<S: Store, E: EdgeConfigStore>(
         .set_fail_open_until(event_id, 0, AdminAction::Recover, actor, now_ms)
         .await?;
 
-    let mut cfg = edge
-        .read_config()
-        .await
-        .map_err(|e| StoreError::Backend(e.to_string()))?;
-    cfg.fail_open_until = 0;
-    edge.write_config(&cfg)
+    edge_read_modify_write(edge, |cfg| cfg.fail_open_until = 0)
         .await
         .map_err(|e| StoreError::Backend(e.to_string()))?;
     Ok(())
@@ -686,8 +716,10 @@ pub async fn apply_recover<S: Store, E: EdgeConfigStore>(
 /// Replaces the edge gate's ruleset (issue #71). The `KeyValueStore` is the
 /// sole store for `rules` — this reads the current config, keeps
 /// `enforce_from` and `fail_open_until` exactly as they were, replaces only
-/// `rules`, and validates the whole document through [`encode_gate_config`]
-/// before writing anything, so a rejected ruleset never partially lands.
+/// `rules`, and validates a snapshot through [`encode_gate_config`] against
+/// [`RULES_WRITE_CEILING`] (not the full ceiling — see its doc comment)
+/// before writing anything, so a rejected ruleset never partially lands and
+/// a later `apply_fail_open` can always still write.
 ///
 /// Write order: the `KeyValueStore` first, then the audit stamp — the store
 /// is authoritative, so the record only ever describes a change that
@@ -710,25 +742,49 @@ pub async fn apply_set_rules<S: Store, E: EdgeConfigStore>(
         return Err(ActionError::NotFound.into());
     }
 
-    let mut cfg = edge
+    // Validate against a snapshot first, so a bad ruleset is rejected before
+    // any write is attempted. encode_gate_config runs again inside every
+    // write_config call too, so a config that drifted invalid between this
+    // read and the real write (s/f changing size) is still caught — just
+    // with a less specific error, and only in the vanishingly unlikely case
+    // of another admin action landing in between.
+    let mut probe = edge
         .read_config()
         .await
         .map_err(|e| StoreError::Backend(e.to_string()))?;
-    cfg.rules = rules;
-    let encoded = encode_gate_config(&cfg).map_err(|e| ActionError::InvalidRules(e.to_string()))?;
+    probe.rules = rules.clone();
+    let encoded =
+        encode_gate_config(&probe).map_err(|e| ActionError::InvalidRules(e.to_string()))?;
+    if encoded.len() > RULES_WRITE_CEILING {
+        return Err(ActionError::InvalidRules(format!(
+            "ruleset is {} bytes, over the {RULES_WRITE_CEILING}-byte limit reserved so a \
+             later fail-open can always still be written",
+            encoded.len()
+        ))
+        .into());
+    }
 
-    edge.write_config(&cfg)
+    let cfg = edge_read_modify_write(edge, |cfg| cfg.rules.clone_from(&rules))
         .await
         .map_err(|e| StoreError::Backend(e.to_string()))?;
 
-    let digest = rules_digest(&encoded);
+    // cfg was just written successfully via this exact encoder, so
+    // re-encoding it here cannot fail; the fallback is defensive, not a
+    // realistic path.
+    let digest = match encode_gate_config(&cfg) {
+        Ok(encoded) => rules_digest(&encoded),
+        Err(_) => String::new(),
+    };
     if let Err(e) = store
         .set_rules_audit(event_id, &digest, cfg.rules.len(), actor, now_ms)
         .await
     {
         // Non-fatal: the KeyValueStore write already landed and is what the
         // gate reads. A missed audit stamp costs the dashboard's "last
-        // changed by X at T" line, not correctness.
+        // changed by X at T" line, not correctness. cloudfront-keyvaluestore
+        // writes are data-plane and outside CloudTrail management events, so
+        // this log line — under a stable event name a metric filter can
+        // alarm on — is the only trail a failed stamp leaves.
         tracing::error!(
             error = %e,
             event = "rules_audit_failed",
@@ -741,15 +797,15 @@ pub async fn apply_set_rules<S: Store, E: EdgeConfigStore>(
 /// The first 16 hex characters of SHA-256 over the exact string that was
 /// `PutKey`'d, for the audit trail's `rules_digest` field.
 fn rules_digest(encoded: &str) -> String {
+    use std::fmt::Write as _;
+
     use aws_lc_rs::digest::{SHA256, digest};
     let hash = digest(&SHA256, encoded.as_bytes());
-    hash.as_ref()[..8]
-        .iter()
-        .fold(String::with_capacity(16), |mut out, byte| {
-            use std::fmt::Write as _;
-            let _ = write!(out, "{byte:02x}");
-            out
-        })
+    let mut out = String::with_capacity(16);
+    for byte in &hash.as_ref()[..8] {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 /// Parses the operator-facing ruleset form, one rule per line: `p <prefix>`,
@@ -908,6 +964,13 @@ mod tests {
     struct FakeEdgeStore {
         cfg: Mutex<GateConfig>,
         writes: Mutex<Vec<u64>>,
+        /// Armed before the call under test: the *next* `write_config`
+        /// fails once and moves this value into `pending_injection`.
+        fail_next_write_then_inject: Mutex<Option<GateConfig>>,
+        /// Set by a failing write above; spliced into `cfg` on the very next
+        /// `read_config`, simulating a concurrent writer's change landing
+        /// between this write's failure and this call's retry-read.
+        pending_injection: Mutex<Option<GateConfig>>,
     }
 
     impl Default for FakeEdgeStore {
@@ -920,12 +983,17 @@ mod tests {
                     rules: Vec::new(),
                 }),
                 writes: Mutex::new(Vec::new()),
+                fail_next_write_then_inject: Mutex::new(None),
+                pending_injection: Mutex::new(None),
             }
         }
     }
 
     impl EdgeConfigStore for FakeEdgeStore {
         fn read_config(&self) -> impl Future<Output = Result<GateConfig, EdgeStoreError>> + Send {
+            if let Some(injected) = self.pending_injection.lock().unwrap().take() {
+                *self.cfg.lock().unwrap() = injected;
+            }
             std::future::ready(Ok(self.cfg.lock().unwrap().clone()))
         }
 
@@ -933,6 +1001,10 @@ mod tests {
             &self,
             cfg: &GateConfig,
         ) -> impl Future<Output = Result<(), EdgeStoreError>> + Send {
+            if let Some(injected) = self.fail_next_write_then_inject.lock().unwrap().take() {
+                *self.pending_injection.lock().unwrap() = Some(injected);
+                return std::future::ready(Err(EdgeStoreError("simulated conflict".to_owned())));
+            }
             *self.cfg.lock().unwrap() = cfg.clone();
             self.writes.lock().unwrap().push(cfg.fail_open_until);
             std::future::ready(Ok(()))
@@ -1592,6 +1664,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fail_open_retry_re_reads_instead_of_clobbering_a_concurrent_write() {
+        // Review finding: the retry re-put the same stale document instead
+        // of re-reading, so a concurrent operator's change (here, a rules
+        // update) landing between this write's failure and its retry would
+        // be silently lost. The fix re-reads before retrying.
+        let store = FakeStore::with_phase(Phase::Active);
+        let edge = FakeEdgeStore::default();
+        let concurrent = GateConfig {
+            v: 1,
+            enforce_from: 0,
+            fail_open_until: 0,
+            rules: vec![ProtectionRule::PathPrefix("/concurrent".to_owned())],
+        };
+        *edge.fail_next_write_then_inject.lock().unwrap() = Some(concurrent.clone());
+
+        apply_fail_open(&store, &edge, "evt", "10", "op@x", 0)
+            .await
+            .unwrap();
+
+        let final_cfg = edge.cfg.lock().unwrap().clone();
+        assert_eq!(
+            final_cfg.rules, concurrent.rules,
+            "the concurrent writer's rules must survive the retry"
+        );
+        assert!(
+            final_cfg.fail_open_until > 0,
+            "this action's own mutation must still apply on top of the concurrent change"
+        );
+    }
+
+    #[tokio::test]
     async fn fail_open_is_legal_while_paused() {
         let store = FakeStore {
             control: Mutex::new(StoredControl::Paused),
@@ -1624,6 +1727,85 @@ mod tests {
             apply_fail_open(&store, &edge, "evt", &over, "op@x", 0).await,
             Err(ApplyError::Action(ActionError::InvalidDuration))
         ));
+    }
+
+    /// A ruleset of 7 path-prefix rules at 122 bytes each: legal under
+    /// `MAX_RULES`/`MAX_PATH_PREFIX_BYTES`, and its encoded document (942
+    /// bytes) fits under the full `MAX_CONFIG_BYTES` ceiling (950) but not
+    /// under `RULES_WRITE_CEILING` (930) — the case `apply_set_rules` must
+    /// reject even though `encode_gate_config` alone would accept it.
+    fn ruleset_between_the_two_ceilings() -> Vec<ProtectionRule> {
+        (0..7)
+            .map(|_| ProtectionRule::PathPrefix(format!("/{}", "a".repeat(121))))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn set_rules_rejects_a_ruleset_that_would_block_a_later_fail_open() {
+        // Review finding: apply_fail_open re-encodes the whole document
+        // through encode_gate_config with `f` at its current width, so a
+        // ruleset that fits the full ceiling today can still overflow once
+        // `f` grows to a real epoch — break-glass would then fail to write
+        // at exactly the moment it is needed. apply_set_rules must refuse
+        // this ruleset up front, before either write.
+        let rules = ruleset_between_the_two_ceilings();
+        let probe_cfg = GateConfig {
+            v: 1,
+            enforce_from: 0,
+            fail_open_until: 0,
+            rules: rules.clone(),
+        };
+        let encoded = encode_gate_config(&probe_cfg).unwrap();
+        assert!(
+            encoded.len() > RULES_WRITE_CEILING && encoded.len() <= MAX_CONFIG_BYTES,
+            "fixture must sit strictly between the two ceilings, got {} bytes",
+            encoded.len()
+        );
+
+        let store = FakeStore::with_phase(Phase::Active);
+        let edge = FakeEdgeStore::default();
+        let err = apply_set_rules(&store, &edge, "evt", rules, "op@x", 0)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ApplyError::Action(ActionError::InvalidRules(_))
+        ));
+        assert!(
+            edge.cfg.lock().unwrap().rules.is_empty(),
+            "a rejected ruleset must not be written"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_ruleset_accepted_by_set_rules_can_always_still_be_fail_opened() {
+        // The other half of the same guarantee: a ruleset apply_set_rules
+        // does accept must never later block apply_fail_open, however wide
+        // `f` grows within the range apply_fail_open can produce.
+        let store = FakeStore::with_phase(Phase::Active);
+        let edge = FakeEdgeStore::default();
+        // One fewer rule than the rejected fixture: comfortably under
+        // RULES_WRITE_CEILING.
+        let rules: Vec<ProtectionRule> = (0..6)
+            .map(|_| ProtectionRule::PathPrefix(format!("/{}", "a".repeat(121))))
+            .collect();
+        apply_set_rules(&store, &edge, "evt", rules, "op@x", 0)
+            .await
+            .unwrap();
+
+        // now_ms picked so now_secs is a realistic 10-digit epoch and the
+        // engaged window is the maximum the form allows.
+        apply_fail_open(
+            &store,
+            &edge,
+            "evt",
+            &MAX_FAIL_OPEN_MINUTES.to_string(),
+            "op@x",
+            9_999_999_999_000,
+        )
+        .await
+        .unwrap();
+        assert!(edge.cfg.lock().unwrap().fail_open_until > 0);
     }
 
     #[tokio::test]
@@ -1908,6 +2090,25 @@ mod tests {
             .map(|i| ProtectionRule::PathPrefix(format!("/p{i}")))
             .collect();
         assert!(encode_gate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn encoder_rejects_a_config_over_the_byte_ceiling() {
+        // 8 path-prefix rules at 122 bytes each (legal under MAX_RULES and
+        // MAX_PATH_PREFIX_BYTES individually) encode to well over
+        // MAX_CONFIG_BYTES — the direct case testing.md flagged as
+        // uncovered: TooLarge from too many bytes, not too many rules.
+        let mut cfg = empty_config();
+        cfg.rules = (0..8)
+            .map(|_| ProtectionRule::PathPrefix(format!("/{}", "a".repeat(121))))
+            .collect();
+        assert!(matches!(
+            encode_gate_config(&cfg),
+            Err(GateConfigError::TooLarge {
+                max: MAX_CONFIG_BYTES,
+                ..
+            })
+        ));
     }
 
     #[test]

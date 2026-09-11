@@ -75,6 +75,13 @@ pub struct Dashboard {
     /// `operator_email` and `csp_nonce` are. Not part of the JSON state view.
     #[serde(skip)]
     pub rules_text: String,
+    /// Set by the handler when the `KeyValueStore` read behind [`Self::rules_text`]
+    /// failed. The template hides the rules form in that case rather than
+    /// showing what looks like an empty (dormant) ruleset — submitting that
+    /// form would overwrite the real ruleset with an empty one. Not part of
+    /// the JSON state view.
+    #[serde(skip)]
+    pub rules_load_failed: bool,
 }
 
 impl Dashboard {
@@ -126,6 +133,7 @@ impl Dashboard {
             csp_nonce: String::new(),
             operator_email: String::new(),
             rules_text: String::new(),
+            rules_load_failed: false,
         }
     }
 }
@@ -177,6 +185,29 @@ mod tests {
         assert!(html.contains(">active<"));
         assert!(html.contains("Doors open at noon"));
         assert!(html.contains("500"));
+    }
+
+    #[test]
+    fn a_failed_ruleset_read_hides_the_rules_form_instead_of_showing_it_empty() {
+        // Critic finding: an empty textarea from a real read failure is
+        // indistinguishable from a genuinely empty (dormant) ruleset, and
+        // submitting it would overwrite the real one. The form must not
+        // render at all in that case.
+        let mut view = Dashboard::from_state(&state(), 0);
+        view.rules_load_failed = true;
+        let html = view.render().unwrap();
+        assert!(!html.contains("action=\"/admin/rules\""));
+        assert!(html.contains("Could not read the current ruleset"));
+    }
+
+    #[test]
+    fn a_successful_ruleset_read_shows_the_form_not_the_error() {
+        let mut view = Dashboard::from_state(&state(), 0);
+        view.rules_text = "p /checkout".to_owned();
+        let html = view.render().unwrap();
+        assert!(html.contains("action=\"/admin/rules\""));
+        assert!(html.contains("p /checkout"));
+        assert!(!html.contains("Could not read the current ruleset"));
     }
 
     #[test]

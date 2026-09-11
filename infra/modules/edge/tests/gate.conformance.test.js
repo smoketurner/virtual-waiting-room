@@ -40,9 +40,15 @@ const KIND_SESSION = 0x02;
 
 const vectors = JSON.parse(fs.readFileSync(VECTORS_PATH, "utf8"));
 
-/** The original secret bytes, as the KeyValueStore's 'string' format returns them. */
+/**
+ * The original secret bytes, as a Buffer. Must stay a Buffer, not a decoded
+ * string: `createHmac` reads a string argument as UTF-8, and round-tripping
+ * arbitrary bytes through `.toString("binary")` (latin1) only agrees with
+ * the original bytes for all-ASCII input — true of the fixed test key here,
+ * not of a real `secrets.token_urlsafe` secret in general.
+ */
 function secretFrom(keyHex) {
-  return Buffer.from(keyHex, "hex").toString("binary");
+  return Buffer.from(keyHex, "hex");
 }
 
 test("conformance vectors file is non-empty", () => {

@@ -150,52 +150,29 @@
   var eventId = null;
   var admitting = false;
 
-  // Admission is a navigation away from this page, so if the page loads again
-  // straight afterwards the pass was not accepted — the cookies did not stick,
-  // or the edge refused them. Without this the page redeems, navigates, is
-  // refused, loads again, and redeems again as fast as the network allows.
-  var REDEEM_KEY = "vwr_redeemed_at";
-  var BOUNCE_KEY = "vwr_bounces";
-  var BOUNCE_WINDOW_MS = 30000;
-  // A refused pass is usually temporary — a newly rotated signing key takes a
-  // few minutes to reach every edge, and an edge that has not learned it yet
-  // refuses a cookie that is otherwise perfectly valid. So back off and try the
-  // same pass again rather than tearing through the join-poll-redeem cycle at
-  // network speed, and only give up after the delay has covered that window.
-  var BOUNCE_RETRY_MS = 8000;
-  var MAX_BOUNCE_RETRIES = 5;
-
-  function sessionGet(key) {
+  // Where a successful redemption navigates: the request the gate refused
+  // before sending this visitor here, preserved across the round trip by its
+  // own next= query parameter (docs/adr/0021-edge-function-gate.md §8) —
+  // this replaces a client-side bounce guard, which needed a loop to survive
+  // in the first place because nothing used to carry the destination through
+  // the redirect. Falls back to "/" when next is absent or unsafe: a direct
+  // visit to the waiting page carries no next, and a value starting "//"
+  // would navigate off-site rather than to a same-origin path.
+  function nextDestination() {
+    var match = /[?&]next=([^&]*)/.exec(window.location.search || "");
+    if (!match) {
+      return "/";
+    }
+    var next;
     try {
-      return window.sessionStorage.getItem(key);
+      next = decodeURIComponent(match[1]);
     } catch (e) {
-      return null;
+      return "/";
     }
-  }
-
-  function sessionSet(key, value) {
-    try {
-      window.sessionStorage.setItem(key, value);
-    } catch (e) {
-      /* storage unavailable; the loop guard degrades to off */
+    if (next.charAt(0) !== "/" || next.charAt(1) === "/") {
+      return "/";
     }
-  }
-
-  function noteRedeem() {
-    sessionSet(REDEEM_KEY, String(Date.now()));
-  }
-
-  /// How many times in a row this page has loaded straight after a redeem that
-  /// should have navigated away. Zero means this is a normal arrival.
-  function bounceCount() {
-    var at = parseInt(sessionGet(REDEEM_KEY) || "0", 10);
-    if (!at || Date.now() - at > BOUNCE_WINDOW_MS) {
-      sessionSet(BOUNCE_KEY, "0");
-      return 0;
-    }
-    var n = parseInt(sessionGet(BOUNCE_KEY) || "0", 10) + 1;
-    sessionSet(BOUNCE_KEY, String(n));
-    return n;
+    return next;
   }
 
   function jitter() {
@@ -550,9 +527,8 @@
     }).then(function (res) {
       if (res.status === 200 && res.body.admitted) {
         say("You're through", "Taking you to the site…");
-        noteRedeem();
         // Replace so the waiting page does not sit in the back history.
-        window.location.replace("/");
+        window.location.replace(nextDestination());
         return;
       }
       // Not admitted after all: the cursor moved back, the position expired, or
@@ -789,30 +765,6 @@
       });
   }
 
-  var bounces = bounceCount();
-  if (bounces > 0) {
-    // The pass exists and was refused. Hold it and try the same one again
-    // shortly; re-running the queue would take a second place in line for a
-    // visitor who already has one.
-    if (bounces <= MAX_BOUNCE_RETRIES) {
-      say("Almost through", "Getting you in — one moment.");
-      noteRedeem();
-      window.setTimeout(function () {
-        window.location.replace("/");
-      }, BOUNCE_RETRY_MS);
-      return;
-    }
-    stop();
-    say(
-      "We couldn't get you through",
-      "You were admitted, but the pass kept being refused on the way back."
-    );
-    el.note.textContent =
-      "Reload to try again. If it keeps happening, check that cookies are enabled for this site.";
-    el.note.className = "note error";
-    return;
-  }
-
   // A hidden tab is stopped outright (schedule() above) rather than polled
   // at a slower rate: browsers throttle it only after minutes and only some
   // of them, so stopping is the only way to actually save the requests.
@@ -823,9 +775,7 @@
   //
   // Registered here rather than earlier: the first tick() below always runs
   // regardless of visibility — a page loaded into a background tab still has
-  // to join(), and claiming a place is not deferrable — and a bounce-retry
-  // page above never polls at all, so it has no schedule for this listener
-  // to restart.
+  // to join(), and claiming a place is not deferrable.
   document.addEventListener("visibilitychange", function () {
     if (stopped) {
       return;

@@ -129,7 +129,7 @@ spike.
 | Compute | Lambda (Rust, arm64) — the seven functions above |
 | State | DynamoDB on-demand + PITR: `Counters`, `PreQueue`, `Positions`, `Tokens` |
 | Scheduling | EventBridge Scheduler (T−0 seal, controller every minute × six passes via durable waits) |
-| Secrets | **SSM Parameter Store SecureString** — the per-deployment HMAC signing key (mirrored to the edge gate's CloudFront KeyValueStore by `scripts/bootstrap_edge_gate.py`, issue #71) and the OIDC client secret. Not Secrets Manager: a SecureString is free where a secret is $0.40/mo, which N1 does not allow |
+| Secrets | **SSM Parameter Store SecureString** — the per-deployment HMAC signing key (Terraform generates it and writes the same value to the edge gate's CloudFront KeyValueStore, issue #71) and the OIDC client secret. Not Secrets Manager: a SecureString is free where a secret is $0.40/mo, which N1 does not allow |
 | Metrics | CloudWatch. EMF emission and the shipped dashboard are **not built** (F5.1) |
 
 **No VPC by default** — all services are IAM-authenticated public endpoints (no NAT, no VPC

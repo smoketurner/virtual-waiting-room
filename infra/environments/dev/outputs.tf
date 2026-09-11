@@ -70,7 +70,7 @@ output "waiting_room_page_url" {
 }
 
 output "gate_kvs_arn" {
-  description = "ARN of the edge gate's CloudFront KeyValueStore (issue #71). Read by scripts/bootstrap_edge_gate.py."
+  description = "ARN of the edge gate's CloudFront KeyValueStore (issue #71)."
   value       = module.core.gate_kvs_arn
 }
 

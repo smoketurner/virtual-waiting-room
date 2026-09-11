@@ -1,10 +1,9 @@
 // The admission gate, at viewer-request on the protected behaviour only
 // (issue #71). Decides locally: no backend call, no network access.
 //
-// EVENT_ID, SESSION_COOKIE and WAITING_PATH are templated in by Terraform
-// rather than carried in the KeyValueStore value, so a change to any of them
-// republishes this function in the same apply as generate_token — see
-// docs/adr/0021-edge-function-gate.md and docs/DEPLOY.md.
+// Source bytes are a hard deployment limit here (10,240, not adjustable), so
+// comments are kept to what stops a specific bug being reintroduced. The
+// reasoning lives in docs/adr/0021-edge-function-gate.md.
 import cf from 'cloudfront';
 import crypto from 'crypto';
 
@@ -14,16 +13,13 @@ var EVENT_ID = '${event_id}';
 var SESSION_COOKIE = '${session_cookie_name}';
 var WAITING_PATH = '${waiting_path}';
 
-// The protected behaviour forwards allViewer, so a visitor's own request can
-// carry these; strip them before any decision logic or a spoofed value
-// reaches the origin looking legitimate.
+// The protected behaviour forwards allViewer, so a visitor can send these.
 function stripSpoofableHeaders(request) {
     delete request.headers['x-wr-gate'];
     delete request.headers['x-wr-gate-failed'];
 }
 
-// No timing-safe comparison in this runtime: HMAC both digests under the
-// same key and compare those, instead of comparing the received MAC.
+// No timing-safe compare here: HMAC both digests and compare those.
 function macEquals(secret, a, b) {
     var ha = crypto.createHmac('sha256', secret);
     ha.update(a);
@@ -34,8 +30,7 @@ function macEquals(secret, a, b) {
 
 var BASE64URL_RE = /^[A-Za-z0-9_-]+$/;
 
-// Node accepts padding, drops non-alphabet bytes, and accepts '+'/'/' where
-// Rust's URL_SAFE_NO_PAD rejects all three; reject them here first.
+// Node accepts padding, junk bytes and '+'/'/'; Rust rejects all three.
 function strictBase64url(s) {
     if (!BASE64URL_RE.test(s)) {
         return null;
@@ -44,14 +39,7 @@ function strictBase64url(s) {
 }
 
 // base64url(payload).base64url(mac), MAC over kind || payload. Mirrors
-// wr_common::crypto byte for byte (frozen format, no version byte: a kind
-// byte already domain-separates, ADR-0021 DEPART-2).
-//
-// Three corrections against the ADR-0021 spike's verify(): trailing payload
-// bytes are rejected (Rust requires cursor.at_end()); the two u64 fields are
-// read as a 16-bit zero-check plus a 48-bit read, not readUInt32BE(at+4),
-// which silently read the low half of a 64-bit big-endian value; and
-// base64url is decoded strictly (strictBase64url above).
+// wr_common::crypto byte for byte.
 function verify(credential, kind, secret) {
     var dot = credential.indexOf('.');
     if (dot < 1) {
@@ -84,10 +72,9 @@ function verify(credential, kind, secret) {
     if (at + reqLen > len) { return null; }
     at += reqLen; // request_id: not read by the gate
 
-    // issued_at: not read by the gate, but still walked and range-checked.
     if (at + 8 > len) { return null; }
     if (payload.readUInt16BE(at) !== 0) { return null; }
-    at += 8;
+    at += 8; // issued_at: not read, but walked and range-checked
 
     if (at + 8 > len) { return null; }
     if (payload.readUInt16BE(at) !== 0) { return null; }
@@ -101,27 +88,54 @@ function verify(credential, kind, secret) {
     return { eventId: eventId, expiresAt: expiresAt };
 }
 
-// Compact rules: ["p",prefix] | ["h",name,value] | ["c",name] | ["u",substring].
-// Mirrors wr_common::rules::ProtectionRule::matches. eq_ignore_ascii_case
-// (Rust) and toLowerCase() (here) diverge on non-ASCII input, so the shared
-// wire encoding alone does not prove rule agreement — the conformance
-// vectors do.
+// Own-property only: a rule named "constructor" would otherwise be truthy
+// with no .value, throwing and passing every request through.
+function ownProperty(obj, key) {
+    return Object.prototype.hasOwnProperty.call(obj, key) ? obj[key] : undefined;
+}
+
+// CloudFront sends the raw path to the origin, so a rule must not be evaded
+// by an encoding the origin treats as equivalent. Not a full RFC 3986
+// resolver: ".." segments are deliberately not resolved.
+function normalizedPath(uri) {
+    var decoded = uri;
+    try {
+        decoded = decodeURIComponent(uri);
+    } catch (e) {
+        decoded = uri; // malformed percent-encoding: compare the raw URI
+    }
+    decoded = decoded.replace(/^\/+/, '/').replace(/^\/\.\//, '/');
+    return decoded.toLowerCase();
+}
+
+function queryString(qs) {
+    var parts = [];
+    for (var key in qs) {
+        if (Object.prototype.hasOwnProperty.call(qs, key) && qs[key] && typeof qs[key].value === 'string') {
+            parts.push(encodeURIComponent(key) + '=' + encodeURIComponent(qs[key].value));
+        }
+    }
+    return parts.length ? '?' + parts.join('&') : '';
+}
+
+// ["p",prefix] | ["h",name,value] | ["c",name] | ["u",substring]. Mirrors
+// wr_common::rules::ProtectionRule::matches; vectors prove they agree.
 function matches(rule, request) {
     var headers = request.headers || {};
     var cookies = request.cookies || {};
     if (rule[0] === 'p') {
-        return request.uri.indexOf(rule[1]) === 0;
+        return normalizedPath(request.uri).indexOf(rule[1].toLowerCase()) === 0;
     }
     if (rule[0] === 'h') {
-        var h = headers[rule[1].toLowerCase()];
-        return !!h && h.value.toLowerCase() === rule[2].toLowerCase();
+        var h = ownProperty(headers, rule[1].toLowerCase());
+        return !!h && typeof h.value === 'string' && h.value.toLowerCase() === rule[2].toLowerCase();
     }
     if (rule[0] === 'c') {
-        return !!cookies[rule[1]];
+        return ownProperty(cookies, rule[1]) !== undefined;
     }
     if (rule[0] === 'u') {
-        var ua = headers['user-agent'];
-        return !!ua && ua.value.indexOf(rule[1]) >= 0;
+        var ua = ownProperty(headers, 'user-agent');
+        return !!ua && typeof ua.value === 'string' && ua.value.indexOf(rule[1]) >= 0;
     }
     return false;
 }
@@ -136,13 +150,11 @@ function wantsHtml(request) {
     return !accept || accept.value.indexOf('text/html') >= 0;
 }
 
-// #72: XHR gets 403 JSON with a header, not an HTML page; navigation gets a
-// 302. #73: every refusal carries a reason, as x-wr-reason and as ?r=. next=
-// preserves the destination (validated by waiting.js: one leading '/', never
-// '//host') so it can send the visitor on once admitted.
+// XHR gets 403 JSON (#72), navigation a 302; both carry a reason (#73).
 function refuse(request, reason) {
     if (wantsHtml(request)) {
-        var next = '&next=' + encodeURIComponent(request.uri);
+        var destination = request.uri + queryString(request.querystring);
+        var next = '&next=' + encodeURIComponent(destination);
         return {
             statusCode: 302,
             statusDescription: 'Found',
@@ -190,16 +202,12 @@ async function handler(event) {
 
         var now = Math.floor(Date.now() / 1000);
 
-        // enforce_from: restrictive changes normally take effect on receipt;
-        // this is the one exception, so go-live can be scheduled to the same
-        // instant on every edge instead of arriving over the propagation
-        // window. 0 = enforce on receipt.
+        // enforce_from: one scheduled instant on every edge, not a window.
         if (cfg.s && now < cfg.s) {
             request.headers['x-wr-gate'] = { value: 'pending' };
             return request;
         }
-        // fail_open_until: permissive changes are a timestamp evaluated
-        // against this edge's own clock, so skew can only delay relief.
+        // fail_open_until: skew can only delay relief, never shorten it.
         if (cfg.f && now < cfg.f) {
             request.headers['x-wr-gate'] = { value: 'failopen' };
             return request;
@@ -223,9 +231,7 @@ async function handler(event) {
         }
         return request;
     } catch (e) {
-        // The gate being broken is not #58 (backend unreachable) — this
-        // function makes no network calls and cannot observe that at all.
-        // Pass through, matching ADR-0021 §3.3 step 6.
+        // The gate being broken, not #58: no network calls happen here.
         console.log('gate threw: ' + e);
         request.headers['x-wr-gate-failed'] = { value: 'true' };
         return request;

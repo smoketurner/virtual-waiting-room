@@ -42,7 +42,9 @@ impl ProtectionRule {
     #[must_use]
     pub fn matches<R: RequestView + ?Sized>(&self, req: &R) -> bool {
         match self {
-            Self::PathPrefix(prefix) => req.path().starts_with(prefix.as_str()),
+            Self::PathPrefix(prefix) => {
+                normalized_path(req.path()).starts_with(prefix.to_ascii_lowercase().as_str())
+            }
             Self::Header { name, value } => req
                 .header(name)
                 .is_some_and(|actual| actual.eq_ignore_ascii_case(value)),
@@ -52,6 +54,49 @@ impl ProtectionRule {
                 .is_some_and(|ua| ua.contains(needle.as_str())),
         }
     }
+}
+
+/// Percent-decodes ASCII `%XX` escapes; a `%` not followed by two valid hex
+/// digits is left as a literal byte, mirroring
+/// `infra/modules/edge/functions/gate.js.tftpl`'s
+/// decode-and-fall-back-to-the-raw-URI-on-throw behaviour.
+fn percent_decode(s: &str) -> Vec<u8> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3])
+            && let Ok(byte) = u8::from_str_radix(hex, 16)
+        {
+            out.push(byte);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Normalizes a path the same way `gate.js.tftpl`'s `normalizedPath` does:
+/// percent-decoded, case-folded, with a leading run of `/` collapsed to one
+/// and a leading `/./` stripped. Defence in depth against a `PathPrefix`
+/// rule being evaded by an encoding an origin would treat as equivalent to
+/// the rule's own prefix — not a full RFC 3986 path resolver, so `..`-segment
+/// resolution is deliberately not attempted.
+fn normalized_path(path: &str) -> String {
+    let decoded = String::from_utf8_lossy(&percent_decode(path)).into_owned();
+    let collapsed = if let Some(rest) = decoded.strip_prefix('/') {
+        format!("/{}", rest.trim_start_matches('/'))
+    } else {
+        decoded
+    };
+    let deslashed = collapsed
+        .strip_prefix("/./")
+        .map_or_else(|| collapsed.clone(), |rest| format!("/{rest}"));
+    deslashed.to_ascii_lowercase()
 }
 
 /// Whether any rule protects this request.
@@ -174,11 +219,11 @@ impl TryFrom<RuleWire> for ProtectionRule {
                 "p" => Ok(Self::PathPrefix(a)),
                 "c" => Ok(Self::Cookie(a)),
                 "u" => Ok(Self::UserAgent(a)),
-                _ => Err(UnknownRuleTag(tag)),
+                _other => Err(UnknownRuleTag(tag)),
             },
             RuleWire::Three((tag, name, value)) => match tag.as_str() {
                 "h" => Ok(Self::Header { name, value }),
-                _ => Err(UnknownRuleTag(tag)),
+                _other => Err(UnknownRuleTag(tag)),
             },
         }
     }
@@ -250,6 +295,31 @@ mod tests {
     }
 
     #[test]
+    fn path_prefix_evasions_reproduced_in_review_are_now_caught() {
+        // SEC-H2 / S3: a case change, a percent-encoded character, a doubled
+        // leading slash, or a leading dot-segment must not evade the rule —
+        // each previously reached the origin ungated.
+        let rule = ProtectionRule::PathPrefix("/checkout".to_owned());
+        for evasion in [
+            "/CHECKOUT",
+            "/Checkout",
+            "/%63heckout",
+            "//checkout",
+            "/./checkout",
+        ] {
+            assert!(rule.matches(&req(evasion)), "evaded via {evasion:?}");
+        }
+        assert!(!rule.matches(&req("/other")));
+    }
+
+    #[test]
+    fn normalized_path_leaves_malformed_percent_encoding_as_is() {
+        // "%zz" is not valid hex; the raw bytes are kept rather than the
+        // match failing outright, mirroring gate.js.tftpl's try/catch.
+        assert_eq!(normalized_path("/foo%zzbar"), "/foo%zzbar");
+    }
+
+    #[test]
     fn each_rule_kind_matches_its_own_attribute() {
         let path = ProtectionRule::PathPrefix("/buy".to_owned());
         let header = ProtectionRule::Header {
@@ -292,6 +362,12 @@ mod tests {
     #[test]
     fn matches_any_is_false_for_an_empty_ruleset() {
         assert!(!matches_any(&[], &req("/anything")));
+    }
+
+    #[test]
+    fn matches_any_is_true_when_a_rule_matches() {
+        let rules = vec![ProtectionRule::PathPrefix("/checkout".to_owned())];
+        assert!(matches_any(&rules, &req("/checkout/pay")));
     }
 
     #[test]
@@ -400,6 +476,22 @@ mod tests {
             validate_rule_fields(&rules),
             Err(RuleFieldError::TooLong {
                 field: "header value",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn validate_rule_fields_rejects_a_header_name_over_its_limit() {
+        let long_name = "n".repeat(MAX_HEADER_NAME_BYTES + 1);
+        let rules = vec![ProtectionRule::Header {
+            name: long_name,
+            value: "ok".to_owned(),
+        }];
+        assert!(matches!(
+            validate_rule_fields(&rules),
+            Err(RuleFieldError::TooLong {
+                field: "header name",
                 ..
             })
         ));

@@ -7,9 +7,7 @@
 //! request to the protected origin.
 //!
 //! The signing key is read from SSM once at cold start, in the boosted Init
-//! phase, so the TLS handshake does not land on a visitor's request. This
-//! Lambda refuses to start if that key is still the Terraform-seeded
-//! placeholder — see [`wr_common::PLACEHOLDER_SIGNING_KEY`].
+//! phase, so the TLS handshake does not land on a visitor's request.
 
 use std::env;
 
@@ -17,7 +15,7 @@ use generate_token::dynamo::DynamoStore;
 use generate_token::{DEFAULT_SESSION_TTL_SECS, Denied, Store, decide};
 use lambda_http::{Body, Error, Request, RequestExt, Response, run, service_fn};
 use tracing::{error, info};
-use wr_common::{PLACEHOLDER_SIGNING_KEY, Session, SigningKey};
+use wr_common::{Session, SigningKey};
 
 /// Resolved once at cold start and shared across invocations.
 struct AppState {
@@ -58,19 +56,6 @@ async fn init() -> Result<AppState, Error> {
         .parameter()
         .and_then(aws_sdk_ssm::types::Parameter::value)
         .ok_or("signing key parameter is empty")?;
-    // Validation at a system boundary (the SSM read), not the storage layer:
-    // a bootstrap that never ran leaves SSM and the gate's KeyValueStore
-    // secret agreeing on this literal, so the gate would verify correctly
-    // against a key published in this repository with no symptom until an
-    // operator starts enforcing. Refusing to initialize is loud and
-    // alarmable; minting cookies under a published key is not.
-    if key_material == PLACEHOLDER_SIGNING_KEY {
-        return Err(
-            "signing key parameter still holds the Terraform placeholder; \
-                     run scripts/bootstrap_edge_gate.py before serving traffic"
-                .into(),
-        );
-    }
     let key = SigningKey::new(key_material.as_bytes());
 
     Ok(AppState {

@@ -363,10 +363,15 @@ async fn dashboard(State(state): State<Shared>, headers: HeaderMap) -> Response 
             // ControlState, so the current ruleset is a second read. A
             // failure here must not break the whole dashboard — the operator
             // still needs to see phase/rate/message/admission — so it is
-            // logged and the form renders empty rather than erroring out.
+            // logged and the rules form is hidden rather than shown empty:
+            // an empty textarea is indistinguishable from a real dormant
+            // ruleset, and submitting it would overwrite the real one.
             match state.edge.read_config().await {
                 Ok(cfg) => view.rules_text = format_rules(&cfg.rules),
-                Err(e) => tracing::warn!(error = %e, "could not read the current ruleset"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not read the current ruleset");
+                    view.rules_load_failed = true;
+                }
             }
             match view.render() {
                 Ok(html) => {

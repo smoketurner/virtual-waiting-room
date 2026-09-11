@@ -126,6 +126,15 @@ test("no credential, XHR: 403 JSON with reason=none, no redirect", async () => {
   assert.equal(body.reason, "none");
 });
 
+test("credential minted under a different key: refused with reason=signature", async () => {
+  const gate = loadGate({ kvs: { c: protectedConfig(), k: "a-different-deployments-key" } });
+  const cred = validSessionCredential();
+  const req = event("/checkout", { headers: { accept: "text/html" }, cookies: { [COOKIE]: cred } });
+  const result = await gate.handler(req);
+  assert.equal(result.statusCode, 302);
+  assert.equal(result.headers["x-wr-reason"].value, "signature");
+});
+
 test("tampered credential: refused with reason=signature", async () => {
   const gate = loadGate({ kvs: { c: protectedConfig(), k: SECRET } });
   const bad = `${validSessionCredential().split(".")[0]}.AAAA`;

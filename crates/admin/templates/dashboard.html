@@ -178,6 +178,9 @@
         <p class="sub">Which requests the edge gate covers. One rule per line; empty (no lines) means dormant — every request passes through untouched.</p>
       </div>
       <div class="card-body">
+        {% if rules_load_failed %}
+        <p class="status status-error">Could not read the current ruleset from the edge gate's KeyValueStore. Set rules is disabled until this succeeds — submitting an unseen ruleset here could overwrite the real one with an empty one. Reload to retry.</p>
+        {% else %}
         <form method="post" action="/admin/rules">
           <div class="form-field">
             <label for="rules">Rules</label>
@@ -192,6 +195,7 @@
           </div>
           <button type="submit" title="Replace the edge gate's ruleset with what is in the box above.">Set rules</button>
         </form>
+        {% endif %}
       </div>
     </section>
 

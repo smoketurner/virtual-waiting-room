@@ -374,10 +374,9 @@ one-hour lifetime:
 protected request.
 
 The signing key is read from SSM Parameter Store once at cold start, inside the boosted init
-phase, so the TLS handshake does not land on a visitor's request. `generate_token` refuses to
-finish initializing if that key is still the Terraform-seeded placeholder literal
-(`wr_common::PLACEHOLDER_SIGNING_KEY`) — the only guard against `scripts/bootstrap_edge_gate.py`
-never having been run for this stack.
+phase, so the TLS handshake does not land on a visitor's request. Terraform generates that key and
+writes it to both SSM and the gate's KeyValueStore in the same apply, so the minting and verifying
+sides always hold the same value.
 
 ---
 

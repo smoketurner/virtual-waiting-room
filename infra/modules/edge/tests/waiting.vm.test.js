@@ -339,3 +339,48 @@ test("target_rate is zero, position known and ahead > 0: interval is the floor",
   const ms = client.lastTimer().ms;
   assert.ok(ms >= FLOOR && ms <= FLOOR * 1.3, `expected the floor with rate zero, got ${ms}`);
 });
+
+// --- redemption navigation (ADR-0021 §8: next= replaces the bounce guard) --
+
+/**
+ * Routes an admitted visitor through to `/v1/generate_token`: `serving_position`
+ * ahead of `position` is what makes `redeem()` fire (`position < serving_position`).
+ */
+function admittedRoute() {
+  return (url) => {
+    if (url.startsWith("/v1/status")) {
+      return jsonResponse(200, activeStatus({ serving_position: 100 }));
+    }
+    if (url.startsWith("/v1/queue_num")) {
+      return jsonResponse(200, { position: 50, live_join: true });
+    }
+    if (url.startsWith("/v1/generate_token")) {
+      return jsonResponse(200, { admitted: true });
+    }
+    return jsonResponse(200, {}); // /v1/join
+  };
+}
+
+test("a successful redemption navigates to the gate's next= destination", async () => {
+  const client = loadClient({
+    route: admittedRoute(),
+    locationSearch: "?r=none&next=%2Fcheckout%3Fid%3D1",
+  });
+  await client.flush();
+  assert.equal(client.win.location.replacedTo, "/checkout?id=1");
+});
+
+test("a successful redemption falls back to / when next is absent", async () => {
+  const client = loadClient({ route: admittedRoute() });
+  await client.flush();
+  assert.equal(client.win.location.replacedTo, "/");
+});
+
+test("a successful redemption rejects a next= that would navigate off-site", async () => {
+  const client = loadClient({
+    route: admittedRoute(),
+    locationSearch: "?next=" + encodeURIComponent("//evil.example/phish"),
+  });
+  await client.flush();
+  assert.equal(client.win.location.replacedTo, "/");
+});

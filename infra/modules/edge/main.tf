@@ -100,15 +100,39 @@ resource "aws_cloudfront_function" "gate" {
   code    = local.gate_js_source
 
   key_value_store_associations = [var.gate_kvs_arn]
+
+  tags = var.tags
+
+  # A tags-only change to this resource fails apply with a 412
+  # PreconditionFailed on PublishFunction, because the Update handler reuses a
+  # stale ETag when tags are the only diff
+  # (hashicorp/terraform-provider-aws#49572). Omitting `tags` does not avoid
+  # it: the provider sets default_tags, so this function is tagged either way
+  # and a change to those tags still produces the tags-only diff. Ignoring both
+  # attributes is what actually prevents it — the tags applied at create stay
+  # put, and a later tag change is a no-op here rather than a failed apply.
+  lifecycle {
+    ignore_changes = [tags, tags_all]
+
+    # The ceiling is not adjustable and CloudFront rejects the publish, so
+    # fail here rather than at apply.
+    precondition {
+      condition     = length(local.gate_js_source) <= 10240
+      error_message = "gate.js is ${length(local.gate_js_source)} bytes, over CloudFront's 10,240-byte function limit."
+    }
+  }
 }
 
-# Enforced, not merely documented (ADR-0021 §6): the function source is
-# entirely ASCII, so the character count local.gate_js_source's length()
-# returns is also its byte count against CloudFront's 10,240-byte ceiling.
-check "gate_function_size" {
+# The function source is entirely ASCII, so length() is also its byte count
+# against CloudFront's 10,240-byte ceiling. A check block warns rather than
+# blocks, which is what the headroom signal wants: the hard stop is the
+# resource's own precondition below. Both exist because a single assertion at
+# the ceiling gives no notice — the budget went from 16% headroom to over the
+# limit in one round of fixes, with nothing said until it was already broken.
+check "gate_function_headroom" {
   assert {
-    condition     = length(local.gate_js_source) < 10240
-    error_message = "gate.js rendered source is ${length(local.gate_js_source)} bytes, at or over the CloudFront Function 10,240-byte limit."
+    condition     = length(local.gate_js_source) < 9000
+    error_message = "gate.js is ${length(local.gate_js_source)} bytes of the 10,240 CloudFront allows. Past 9,000 there is not enough headroom left for a routine change; trim it before adding more."
   }
 }
 

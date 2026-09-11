@@ -19,7 +19,7 @@ use authorizer::{
 };
 use lambda_http::{Body, Error, Request as HttpRequest, RequestExt, Response, run, service_fn};
 use tracing::{error, info, warn};
-use wr_common::{PLACEHOLDER_SIGNING_KEY, SigningKey};
+use wr_common::SigningKey;
 
 /// Resolved once at cold start and shared across invokes.
 struct AppState {
@@ -65,16 +65,6 @@ async fn init() -> Result<AppState, Error> {
         .parameter()
         .and_then(aws_sdk_ssm::types::Parameter::value)
         .ok_or("signing key parameter is empty")?;
-    // See generate_token/src/main.rs's init() for why this refuses to start
-    // rather than proceeding: it is the only guard that catches a bootstrap
-    // that never ran, which the bootstrap script itself cannot detect.
-    if key_material == PLACEHOLDER_SIGNING_KEY {
-        return Err(
-            "signing key parameter still holds the Terraform placeholder; \
-                     run scripts/bootstrap_edge_gate.py before serving traffic"
-                .into(),
-        );
-    }
     let key = SigningKey::new(key_material.as_bytes());
 
     let session_cookie_name =

@@ -60,6 +60,11 @@ variable "session_cookie_name" {
   description = "Name of the session cookie the authorizer sets. Forwarded to the protected origin on the default behaviour; never forwarded on polled or write behaviours (ADR-0013)."
   type        = string
   default     = "vwr_session"
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9_-]+$", var.session_cookie_name))
+    error_message = "session_cookie_name must be alphanumeric, '_', or '-' only: it is templated into a single-quoted JavaScript string literal in the gate's CloudFront Function source (issue #71), and a quote, backslash, or newline here would inject script rather than fail cleanly."
+  }
 }
 
 # --- Distribution -------------------------------------------------------------
@@ -93,4 +98,9 @@ variable "gate_kvs_arn" {
 variable "event_id" {
   description = "The event id a session credential must carry. Templated into the CloudFront Function's source (not carried in the KeyValueStore value)."
   type        = string
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9_-]+$", var.event_id))
+    error_message = "event_id must be alphanumeric, '_', or '-' only: it is templated into a single-quoted JavaScript string literal in the gate's CloudFront Function source (issue #71), and a quote, backslash, or newline here would inject script rather than fail cleanly."
+  }
 }

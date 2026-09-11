@@ -139,6 +139,58 @@
       "matches": false
     },
     {
+      "name": "path_prefix_matches_case_folded",
+      "rule": [
+        "p",
+        "/checkout"
+      ],
+      "request": {
+        "path": "/CHECKOUT",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": true
+    },
+    {
+      "name": "path_prefix_matches_percent_encoded",
+      "rule": [
+        "p",
+        "/checkout"
+      ],
+      "request": {
+        "path": "/%63heckout",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": true
+    },
+    {
+      "name": "path_prefix_matches_doubled_leading_slash",
+      "rule": [
+        "p",
+        "/checkout"
+      ],
+      "request": {
+        "path": "//checkout",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": true
+    },
+    {
+      "name": "path_prefix_matches_leading_dot_segment",
+      "rule": [
+        "p",
+        "/checkout"
+      ],
+      "request": {
+        "path": "/./checkout",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": true
+    },
+    {
       "name": "cookie_present",
       "rule": [
         "c",
