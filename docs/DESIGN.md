@@ -728,7 +728,32 @@ late`) measures **2.14x** blended (1,769 → 827 client requests), below the tab
 minutes-long harness run gives each visitor only a handful of polls where the model's hour-long
 event gives hundreds, so the harness's fixed one-shot costs (join, `queue_num`, `generate_token`)
 are a structurally larger share of its total than of the model's — a property of measuring at
-harness timescales, not evidence against the table below.
+harness timescales, not evidence against the table below. (The harness also always drives
+`intervalForPosition` off the fixed `--target-rate` rather than a locally measured rate the way
+`waiting.js` itself prefers once it has 30 s of samples — benign against the harness's own stub,
+which ramps `serving_position` at exactly that constant rate, but it means a harness run cannot
+show what happens when a real controller's admitted rate diverges from its published
+`target_rate`.)
+
+**Mind the settings when running the harness yourself.** This issue's own "Measuring it"
+guidance — `make load VISITORS=1000000 SECONDS=90` — measures only **1.83x**, not because the
+design underperforms but because a 90-second run is dominated by the ~60-second first-ask spread
+window (`FIRST_ASK_MAX_SPREAD_MS`): no visitor's position is known yet during it, so hold-position
+and backoff poll identically at the floor, and the run ends before most visitors leave that
+window. A configuration that actually exercises the policy — most of the run spent with a known
+position, a real wait remaining, and the cohort not yet fully drained —
+(`--visitors 1000000 --countdown 60 --seconds 560 --target-rate 200 --arrival late`) measures
+**3.83x**, the closest empirical match to the 3.9x modelled above. Stopping at the literal
+reference command and its 1.83x would understate the design's own effect.
+
+Reshaping a run between those two points moves the same code from 1.83x through 2.66x to 3.83x,
+converging on the modelled ratio rather than diverging from it.
+
+One further limit bounds what the harness can be asked to show: it counts requests only, with no
+per-visitor admission timestamps, so it cannot measure time-to-admission at all. That the
+near-front cadence does not regress is therefore an argument from the code rather than a
+measurement — the floor is an unconditional lower bound, identical to the fixed interval this
+client used before, on both the client and the harness's mirror of it.
 
 | hidden share | baseline | adaptive | ratio | vs. Business 125M/month |
 |---|---|---|---|---|
