@@ -17,6 +17,12 @@ reqwest = { workspace = true, features = ["json", "rustls-tls"] }
 serde_json = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync"] }
 
+[dev-dependencies]
+# Paused virtual time for the end-to-end poll-count comparison test: it drives
+# real run()/Edge traffic through several simulated minutes in milliseconds of
+# wall clock, instead of sleeping for real.
+tokio = { workspace = true, features = ["test-util"] }
+
 [lints.clippy]
 # The measurements are this tool's whole output and they are read by a person at
 # a terminal, not shipped to a log aggregator. Everything else in the workspace

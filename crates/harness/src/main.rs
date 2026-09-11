@@ -13,6 +13,7 @@
 //! ```text
 //! harness --visitors 500 --seconds 120 --origin http://127.0.0.1:9000/lambda-url/bootstrap
 //! harness --visitors 500 --seconds 120 --polling every-tick   # before holding positions
+//! harness --visitors 3000 --seconds 120 --countdown 60 --polling backoff --target-rate 50  # #69
 //! ```
 //!
 //! With no `--origin` it serves its own stub, so the request pattern can be
@@ -41,6 +42,11 @@ struct Args {
     polling: Polling,
     arrival: Arrival,
     origin: Option<String>,
+    /// Visitors admitted per second. Drives the built-in stub's moving
+    /// `serving_position` and, under `--polling backoff`, the client's own
+    /// interval calculation — both read the same value, the way a real
+    /// event's controller and client both work from `target_rate`.
+    target_rate: u64,
 }
 
 fn parse_args() -> Result<Args> {
@@ -51,6 +57,7 @@ fn parse_args() -> Result<Args> {
         polling: Polling::HoldPosition,
         arrival: Arrival::Uniform,
         origin: None,
+        target_rate: 500,
     };
     let mut argv = std::env::args().skip(1);
     while let Some(flag) = argv.next() {
@@ -59,6 +66,7 @@ fn parse_args() -> Result<Args> {
             "--visitors" => args.visitors = value()?.parse().context("--visitors")?,
             "--seconds" => args.seconds = value()?.parse().context("--seconds")?,
             "--countdown" => args.countdown = value()?.parse().context("--countdown")?,
+            "--target-rate" => args.target_rate = value()?.parse().context("--target-rate")?,
             "--arrival" => {
                 args.arrival = match value()?.as_str() {
                     "uniform" => Arrival::Uniform,
@@ -72,9 +80,10 @@ fn parse_args() -> Result<Args> {
                     "hold-position" => Polling::HoldPosition,
                     "every-tick" => Polling::EveryTick,
                     "derive-position" => Polling::DerivePosition,
+                    "backoff" => Polling::Backoff,
                     other => {
                         anyhow::bail!(
-                            "--polling must be hold-position, every-tick or derive-position: {other}"
+                            "--polling must be hold-position, every-tick, derive-position or backoff: {other}"
                         )
                     }
                 }
@@ -95,6 +104,9 @@ async fn main() -> Result<()> {
         .build()
         .context("building the origin client")?;
     let origin_hits = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let target_rate = args.target_rate;
+    let countdown_secs = args.countdown;
+    let stub_started = std::time::Instant::now();
 
     let hits = Arc::clone(&origin_hits);
     let origin = Arc::new(move |path: String| {
@@ -108,10 +120,39 @@ async fn main() -> Result<()> {
                 // so the request pattern is measurable on its own.
                 None => {
                     if path.starts_with("/v1/status") {
+                        let elapsed_secs = stub_started.elapsed().as_secs();
+                        if elapsed_secs < countdown_secs {
+                            // Countdown still running: no cursor yet, matching
+                            // the real server's `closed` serving_state before
+                            // the seal. Without this row --polling backoff's
+                            // ceiling-during-closed branch never fires and the
+                            // measured saving is 2.6x smaller than the
+                            // client's actual countdown-phase behaviour.
+                            (
+                                200,
+                                r#"{"event_id":"harness","phase":"pre_queue","serving_state":"closed","serving_position":0}"#
+                                    .to_owned(),
+                            )
+                        } else {
+                            // A moving cursor, offset by the countdown so the
+                            // drain starts at T-0 rather than at process
+                            // start — so --polling backoff has a
+                            // shrinking "ahead" to react to: every visitor's
+                            // /status shares this one path-keyed cache entry,
+                            // so they all see the same cursor advance, the
+                            // way a real controller does.
+                            let serving = target_rate * (elapsed_secs - countdown_secs);
+                            (
+                                200,
+                                format!(
+                                    r#"{{"event_id":"harness","phase":"active","serving_state":"running","serving_position":{serving},"target_rate":{target_rate}}}"#
+                                ),
+                            )
+                        }
+                    } else if let Some(position) = position_from_query(&path) {
                         (
                             200,
-                            r#"{"event_id":"harness","phase":"active","serving_state":"running","serving_position":1}"#
-                                .to_owned(),
+                            format!(r#"{{"position":{position},"live_join":true}}"#),
                         )
                     } else {
                         (200, r#"{"position":42,"live_join":true}"#.to_owned())
@@ -140,6 +181,7 @@ async fn main() -> Result<()> {
             Polling::HoldPosition => "hold-position",
             Polling::EveryTick => "every-tick",
             Polling::DerivePosition => "derive-position",
+            Polling::Backoff => "backoff",
         },
         args.origin.as_deref().unwrap_or("(built-in stub)")
     );
@@ -150,6 +192,7 @@ async fn main() -> Result<()> {
         countdown_ms: args.countdown * 1000,
         arrival: args.arrival,
         deadline,
+        target_rate: args.target_rate,
     };
     println!(
         "  first-ask spread: {:.0}s",
@@ -175,6 +218,17 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Reconstructs a simulated visitor's own position from the hex suffix of
+/// the synthetic request id `main` assigns it (`format!("...{n:012x}")`),
+/// so the built-in stub answers `/v1/queue_num` with a real, distinct
+/// position per visitor instead of the constant every other polling mode is
+/// indifferent to. `--polling backoff` needs a real "ahead" to react to.
+fn position_from_query(path: &str) -> Option<u64> {
+    let id = path.split("request_id=").nth(1)?;
+    let hex = id.rsplit('-').next()?;
+    u64::from_str_radix(hex, 16).ok()
+}
+
 async fn report(edge: &Edge, visitors: usize, seconds: u64, countdown_s: u64) {
     let minutes = seconds as f64 / 60.0;
     let per = visitors as f64 * minutes;
@@ -182,13 +236,23 @@ async fn report(edge: &Edge, visitors: usize, seconds: u64, countdown_s: u64) {
     println!("\n  endpoint        client    origin      hits  collapsed   origin/visitor/min");
     println!("  ---------------------------------------------------------------------------");
     let mut total_origin = 0u64;
+    let mut total_client = 0u64;
     for (endpoint, client, origin, hits, collapsed) in edge.snapshot().await {
         total_origin += origin;
+        total_client += client;
         println!(
             "  {endpoint:<14} {client:>7} {origin:>9} {hits:>9} {collapsed:>10}   {:>8.2}",
             origin as f64 / per
         );
     }
+    // What visitors sent, not what reached the origin: /status collapses
+    // heavily regardless of poll rate, so this is the number that actually
+    // moves between polling modes.
+    println!(
+        "\n  client requests per visitor per minute, all endpoints: {:.2}",
+        total_client as f64 / per
+    );
+    println!("  total client requests, all endpoints: {total_client}");
     println!(
         "\n  origin requests per visitor per minute, all endpoints: {:.2}",
         total_origin as f64 / per

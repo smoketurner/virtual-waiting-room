@@ -411,7 +411,7 @@ skipped number.
 | `max_expired_position` | N | Highest expired position |
 | `phase` | S | `idle` / `pre_queue` / `active` / `post_event` / `maintenance` |
 | `admission_control` | S | Operator's live intent: `open` / `paused` / `fail_open` (ADR-0019), which with `phase` derives the visitor-facing `ServingState` |
-| `target_rate` | N | Operator-set admissions per minute |
+| `target_rate` | N | Operator-set admission rate, in visitors per second |
 | `shuffle_seed` | B | 256-bit permutation key, written once at T−0 |
 | `participant_count` | N | Pre-queue cohort size, the permutation domain |
 | `operator_message` | S | Delivered in `/status` |
@@ -530,7 +530,7 @@ observe a TTL-pending item apply a `FilterExpression` on `expires_at`.
 
 | Path | Min TTL | Cache key | Cookies | Purpose |
 |---|---|---|---|---|
-| `/status` | 1 s | path only | none | Phase, serving position, admission rate, operator message; after T−0 also `shuffle_seed`, `participant_count`, `prequeue_offsets` |
+| `/status` | 1 s | path only | none | Phase, serving position, admission rate, operator message, adaptive poll policy ([#69](https://github.com/smoketurner/virtual-waiting-room/issues/69), ADR-0023); after T−0 also `shuffle_seed`, `participant_count`, `prequeue_offsets` |
 | `/queue_num` | 1 s | path + `event_id`, `request_id` | none | Own position; 404 means re-join |
 | `/queue_pos_expiry` | 1 s | path + `event_id`, `request_id` | none | Seconds until position lapses — **not routed yet** |
 | `/public_key` | 1 s | path + `event_id` | none | Signature verification material — **not routed yet** |
@@ -628,6 +628,14 @@ Broadcasting a message to 1,000,000 waiting visitors costs one `UpdateItem` and 
 additional requests; delivery completes within one cache TTL. Estimated wait is computed from
 the measured admission rate, so it tracks operator rate changes during an event.
 
+**Pause/resume and `fail_open` propagation ([#69](https://github.com/smoketurner/virtual-waiting-room/issues/69), ADR-0023).** The adaptive poll interval widens how long a paused
+visitor can go before noticing a change: a near-front visitor's paused interval stays bounded by
+their own distance to the front (as short as the floor), but a deep-queue visitor sits at the
+poll ceiling. If the operator resolves a pause into `fail_open`, a deep-queue visitor can see it
+up to the ceiling's ~39 s late (30 s interval plus jitter) rather than the old fixed ~6.5 s. This
+is accepted for the O4 runbook: those visitors were already waiting far longer than 39 s, and a
+near-front visitor — the one for whom a fast reaction matters most — still sees it promptly.
+
 ---
 
 ## 10. Failure behaviour
@@ -686,25 +694,133 @@ different topology, not a configuration flag, and is priced separately.
 
 ## 12. Cost
 
-For a 1,000,000-visitor event at 10-second polling.
+For a 1,000,000-visitor event. `waiting.js` polls adaptively since
+[#69](https://github.com/smoketurner/virtual-waiting-room/issues/69) (ADR-0023): the interval
+scales with a visitor's own distance to the front rather than staying fixed, which is why this
+section is a model with named assumptions rather than one number — the request volume it
+produces genuinely depends on how the cohort behaves, not just on how many visitors there are.
 
-**These figures do not describe the shipped client.** `waiting.js` polls every 5 seconds with up
-to 1.5 s of jitter (`POLL_MS = 5000`, `JITTER_MS = 1500`), so real request volume is roughly
-double the table below and every request-driven line with it. The table is kept as the modelled
-baseline until it is recomputed against the client that actually ships
-([#69](https://github.com/smoketurner/virtual-waiting-room/issues/69)), which also proposes
-making the interval a function of distance from the front rather than a constant.
+### Model and baseline
 
-| Component | Driver | Approximate |
+1,000,000 visitors, a 60-minute countdown with a late-arrival shape (mean 10 minutes on the page
+before the seal, drawn from `u^0.2`), then a 20-minute drain at 833/s (mean wait 10 minutes) —
+1.2×10⁹ visitor-seconds spent on the page in total. Per-visitor one-shot costs (join,
+`queue_num`, `generate_token`, the HTML/CSS/JS themselves) add roughly 6M requests, independent
+of how the wait is spent.
+
+The **baseline** is a hidden tab polling at the throttled rate Chrome 88+ applies after five
+minutes hidden (roughly 60 s): the assumption most favourable to the baseline, since Safari and
+Firefox throttle less aggressively and a less-throttled hidden tab only makes the baseline worse
+relative to the adaptive client. The adaptive client sends **zero** requests while a tab is
+hidden (§3 of ADR-0023) — with the caveats in the next section.
+
+### Both bounds: foreground-only upper bound, and the hidden-share sensitivity
+
+The harness (`crates/harness`) models all-foreground visitors — it has no way to represent a
+backgrounded tab — so the table below is a **model figure, not something the harness reproduces
+directly**. What the harness settles is the mechanism the table is built on, not its blended
+magnitude: a run shaped like this section's polling model (`--visitors 4000 --seconds 60
+--countdown 30 --target-rate 1 --arrival late`) measures **4.60x** on `/status` alone (24,683
+hold-position requests against 5,362 under backoff), against this section's modelled
+polling-component ratio of 209M/49M ≈ **4.27x** — genuine, checkable corroboration. One named
+end-to-end configuration (`--visitors 300 --seconds 40 --countdown 15 --target-rate 2 --arrival
+late`) measures **2.14x** blended (1,769 → 827 client requests), below the table's 3.9x: a
+minutes-long harness run gives each visitor only a handful of polls where the model's hour-long
+event gives hundreds, so the harness's fixed one-shot costs (join, `queue_num`, `generate_token`)
+are a structurally larger share of its total than of the model's — a property of measuring at
+harness timescales, not evidence against the table below.
+
+| hidden share | baseline | adaptive | ratio | vs. Business 125M/month |
+|---|---|---|---|---|
+| 0 — **foreground-only upper bound** | ~215M | ~55M | 3.9x | baseline **1.7x over**; adaptive has 56% headroom |
+| 0.25 | ~168M | ~43M | 3.9x | baseline 1.3x over |
+| 0.5 | ~120M | ~31M | 3.9x | baseline lands just under the allowance |
+
+**The ratio is invariant in the hidden share, scoped to the desktop-Chrome throttle used for the
+baseline above.** The adaptive client removes hidden requests entirely while the baseline keeps
+paying the throttled rate, and those two effects happen to cancel out across hidden share for
+this model — arithmetic the model states directly, independent of what a foreground-only harness
+can measure.
+
+**It does move under a harsher throttle, and the harsher direction is the one that matters.**
+iOS Safari suspends a backgrounded tab's JavaScript within seconds and may discard and reload the
+page entirely on return — there the baseline pays close to zero while hidden too, same as the
+adaptive client, and the ratio compresses: 3.90 at hidden share 0, **3.62 at 0.5, 3.19 at 0.75**,
+falling toward 1.0 in the limit of an all-hidden cohort. The design still clears N10 comfortably
+at every point on this range — the point is that mobile is plausibly the majority on a consumer
+ticket drop, and mobile is where the ratio is weakest, not strongest.
+
+**"Hidden costs zero" is not quite accurate.** It is zero requests while hidden, plus one poll on
+every return to the tab (the rate-guarded `visibilitychange` handler, ADR-0023), plus roughly
+five requests (HTML, CSS, JS, `/status`, `/queue_num`) on every iOS tab discard-and-reload.
+Negligible for a visitor who checks back a handful of times; not negligible for one who is
+constantly flapping between tabs, which is exactly the flapping case the rate guard bounds at the
+floor rather than the interval collapsing further.
+
+**Scope every absolute and every ratio to the model that produced it.** "Exceeds Business by
+1.7x" is true at hidden share 0 and false at 0.5 — it must not be stated as if it always holds.
+
+### Component ratios: shape-independent; the blend is not
+
+Countdown-phase polling and drain-phase (queue) polling see different ratios under the same
+adaptive rule — 6.0x for the countdown component, 3.25x for the queue component — because the two
+phases put very different distributions of "distance to the front" in front of visitors: queue
+waits are uniform over `[0, 1200 s]` as a direct consequence of the fixed 20-minute drain, not of
+any assumption about arrival timing. The blended ratio for a whole event therefore ranges from
+3.25x (a cohort that is all queue, no countdown) to 6.0x (all countdown), depending on the mix —
+and the mix depends on the arrival shape. An **early**-arrival shape (mean 50 minutes on the page,
+rather than the late-arrival 10 minutes used above) gives roughly 632M baseline and 125M adaptive
+requests: a 5.0x blend that lands exactly on the Business plan's allowance. Every ratio quoted
+anywhere in this document is for a named component or a named mix; a bare ratio with neither
+named is not comparable to any of these.
+
+### No T−0 herd
+
+Seal discovery — when a pre-queue registrant first learns their position — is spread uniformly
+over roughly 39 seconds. The seal itself is a single instant, not spread over time; the spread
+comes from every registrant's poll phase already being uniformly distributed across their own
+30–39 second ceiling interval (`policy.ceilingMs` plus proportional jitter) at the moment the seal
+lands, because each client started polling — and so picked its own random phase — at whatever
+point during the countdown it registered. `scheduleFirstAsk` then layers an independent uniform
+60-second spread on top of that. The convolution of the two has a peak density of 1/60 per
+second: the same as today's spread alone, never higher, with a wider total spread. Peak
+`/queue_num` requests per second is therefore unchanged by this design, addressing the herd
+concern raised against an earlier version of this design
+([#84](https://github.com/smoketurner/virtual-waiting-room/issues/84)).
+
+### Pricing corrections
+
+CloudFront's Business and Premium plans bundle **self-identifying bots only** in their flat
+Bot Control allowance — a crawler that announces itself. The "$1,230 Targeted" figure below is
+for **advanced, obfuscated bot detection**, which is Custom-pricing only and cannot be purchased
+on a plan at any tier; only WAF's own charge is bundled by the plans. Re-verify
+[hashicorp/terraform-provider-aws#45450](https://github.com/hashicorp/terraform-provider-aws/issues/45450)
+before restating the PAYG-only caveat below rather than carrying it forward on trust — it was
+open as of this writing but its status is exactly the kind of external fact that goes stale.
+
+Recomputed against the model above at the foreground-only bound (215M baseline requests), the
+rate PAYG CloudFront charges for HTTPS requests
+([$0.0100 per 10,000](https://aws.amazon.com/cloudfront/pricing/), US/Europe price class), and
+the $0.60-per-million WAF inspection fee stated in §8:
+
+| Component | Driver | Approximate (baseline, no adaptive polling) |
 |---|---|---|
-| CloudFront requests | poll interval × visitors × wait | $92 |
-| WAF + Bot Control | same request volume | $87 + $123 (Common) or $1,230 (Targeted) |
+| CloudFront requests | poll interval × visitors × wait (see model above) | $215 |
+| WAF + Bot Control | same request volume | $129 + $123 (Common, bundled bot detection) or $1,230 (Targeted, Custom pricing only) |
 | DynamoDB pre-warming | target write rate | billed per event |
 | API Gateway | cache misses only, ~3/visitor | $10 |
 | SQS, Lambda, DynamoDB writes | joins | negligible |
 
-The client poll interval is the dominant variable, multiplying CloudFront, WAF and Bot
-Control charges together.
+These two rows are the *baseline* — what the same event costs **without** this design's adaptive
+polling, at the foreground-only bound. The client poll interval remains the dominant variable,
+multiplying CloudFront and WAF charges together (Bot Control's flat tiers do not scale with
+request volume); adaptive polling divides that multiplier by the ratios in the sensitivity table
+above rather than eliminating it — so the deployed CloudFront and WAF lines are these figures
+divided by roughly 3.9x at hidden share 0. That divisor drifts slightly higher across the tabled
+hidden shares under the desktop-Chrome throttle the table assumes (3.90 → 3.95 → 4.01), but it
+moves the other way under the iOS suspension case above — 3.62x at hidden share 0.5, 3.19x at
+0.75 — and mobile is plausibly the majority of a consumer ticket drop, so do not assume the
+larger divisor.
 
 Two choices are computed per client rather than assumed: CloudFront flat-rate versus
 pay-as-you-go (PAYG) pricing, and Bot Control Common versus Targeted. Both are recorded as
@@ -718,6 +834,26 @@ flat-rate plan ([hashicorp/terraform-provider-aws#45450](https://github.com/hash
 — configurable in the console, not in the provider). Until that lands (PR #49235), deployments
 are PAYG; a flat-rate plan is selected manually per event and cancelled afterwards (the O4
 runbook covers post-event cancellation).
+
+### The floor is a client-side guard, not an anti-abuse control
+
+Every number in this section assumes a client that honours `policy.floorMs`. Nothing server-side
+enforces it: `Date.now()` is visitor-controlled, and a client that ignores the floor — or one
+whose clock is moved forward — polls as fast as it likes. This cost model therefore rests on a
+client-side constant, the same way it already rests on browsers actually running the shipped
+`waiting.js` rather than a hand-written poller. Rate limiting at true abuse volumes is the edge's
+job (WAF, above), not the floor's; the floor exists to keep an honest client's own request rate
+proportional to its wait, not to stop a dishonest one.
+
+### Rolling back a bad policy
+
+Because `adoptPolicy` keeps the last good policy rather than reverting to the fixed interval on a
+later bad read (ADR-0023, "last-known-good on withdrawal"), an already-adaptive client cannot be
+walked back to the fixed interval by simply removing the `poll_floor_ms`/`poll_ceiling_ms`/
+`poll_divisor` entries from `terraform.tfvars` — every client that already adopted the old policy
+keeps using it. The rollback procedure for a bad policy is to **publish corrected values**, not to
+withdraw them: a client that already adopted a policy adopts the correction on its next `/status`
+poll, the same way it adopted the original.
 
 ---
 
@@ -759,6 +895,7 @@ Which section implements which requirement from [`REQUIREMENTS.md`](./REQUIREMEN
 | N7 — edge bot mitigation | §8 |
 | N8 — OpenAPI specification | §8 |
 | N9 — event isolation | §11 |
+| N10 — client polling cost scales with distance to the front | §8, §12 |
 | O1 — pre-warming | §5.3 |
 | O2, O3, O6 — quota increases, load test, cost model | §12 |
 | O4 — mid-event operator control | §9 |

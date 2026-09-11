@@ -4,7 +4,10 @@
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::types::AttributeValue;
 use lambda_http::{Body, Error, Request, RequestExt, Response, service_fn};
-use read::{CountersCache, QueueNumError, ResolvedQueueNum, queue_num, status};
+use read::{
+    CountersCache, PollPolicy, QueueNumError, ResolvedQueueNum, parse_poll_policy, queue_num,
+    status,
+};
 use wr_common::expr::event_key;
 use wr_common::{Counters, PreQueueItem};
 
@@ -20,6 +23,9 @@ struct Ctx {
     positions_table: String,
     event_id: String,
     counters_cache: CountersCache,
+    /// The adaptive poll policy (#69), parsed once at cold start
+    /// from Terraform-set env vars. `None` when any is absent or invalid.
+    poll_policy: Option<PollPolicy>,
 }
 
 #[tokio::main]
@@ -39,9 +45,36 @@ async fn main() -> Result<(), Error> {
         positions_table: std::env::var("POSITIONS_TABLE")?,
         event_id: std::env::var("EVENT_ID")?,
         counters_cache: CountersCache::new(COUNTERS_TTL),
+        poll_policy: load_poll_policy(),
     };
 
     lambda_http::run(service_fn(|req: Request| route(&ctx, req))).await
+}
+
+/// Reads the three poll-policy env vars and parses them, warning if any was
+/// present but the whole policy was rejected — otherwise a typo'd Terraform
+/// value is indistinguishable in `CloudWatch` from a deliberate omission, and
+/// both silently fall back to the client's fixed interval.
+fn load_poll_policy() -> Option<PollPolicy> {
+    let floor_ms = std::env::var("POLL_FLOOR_MS").ok();
+    let ceiling_ms = std::env::var("POLL_CEILING_MS").ok();
+    let divisor = std::env::var("POLL_DIVISOR").ok();
+    let any_set = floor_ms.is_some() || ceiling_ms.is_some() || divisor.is_some();
+
+    let policy = parse_poll_policy(
+        floor_ms.as_deref(),
+        ceiling_ms.as_deref(),
+        divisor.as_deref(),
+    );
+    if policy.is_none() && any_set {
+        tracing::warn!(
+            poll_floor_ms = %floor_ms.as_deref().unwrap_or("<unset>"),
+            poll_ceiling_ms = %ceiling_ms.as_deref().unwrap_or("<unset>"),
+            poll_divisor = %divisor.as_deref().unwrap_or("<unset>"),
+            "poll policy env vars present but rejected; falling back to the client's fixed interval"
+        );
+    }
+    policy
 }
 
 async fn route(ctx: &Ctx, req: Request) -> Result<Response<Body>, Error> {
@@ -59,7 +92,7 @@ async fn handle_status(ctx: &Ctx) -> Result<Response<Body>, Error> {
     let Some(counters) = load_counters(ctx).await? else {
         return json(404, &serde_json::json!({ "error": "event not found" }));
     };
-    json(200, &status(&counters))
+    json(200, &status(&counters, ctx.poll_policy))
 }
 
 async fn handle_queue_num(ctx: &Ctx, req: &Request) -> Result<Response<Body>, Error> {

@@ -225,21 +225,28 @@ Closing it costs a `PreQueue` `GetItem` on every live join.
   "participant_count": 1000000,
   "prequeue_offsets": [0, 99873, ...],
   "message": "...",
-  "target_rate": 500
+  "target_rate": 500,
+  "poll_policy": { "floor_ms": 5000, "ceiling_ms": 30000, "divisor": 10 }
 }
 ```
 
 `serving_state` is derived from `(phase, admission_control)` and never stored, so it cannot drift.
-`target_rate` is **visitors per second**. `message`, `participant_count`, `prequeue_offsets` and
-`target_rate` are omitted when unset.
+`target_rate` is **visitors per second**. `message`, `participant_count`, `prequeue_offsets`,
+`target_rate` and `poll_policy` are omitted when unset. `poll_policy` (#69, ADR-0023) is a
+Terraform-set deploy-time value, not something an operator changes mid-event through the admin
+surface.
 
 The seed is **not** published here. A client cannot compute its own position; it asks
 `/v1/queue_num`.
 
-### 5.2 The client asks for its number once
+### 5.2 The client asks for its number once, and polls less often the further back it is
 
-`waiting.js` polls every 5,000 milliseconds plus up to 1,500 milliseconds of jitter. Each tick
-fetches `/v1/status`. It fetches `/v1/queue_num` only while it does not yet know its position.
+`waiting.js` computes its own poll interval from `poll_policy` and its distance to the front
+(#69, ADR-0023): `clamp(floorMs, ceilingMs, aheadSeconds * 1000 / divisor)`, jittered by a
+proportional fraction (`interval * (1 + random() * 0.3)`). With no `poll_policy` published, floor
+and ceiling both default to 5,000 ms with a divisor of 1, reproducing the fixed 5 s (plus jitter)
+interval every client used before #69. Each tick fetches `/v1/status`. It fetches `/v1/queue_num`
+only while it does not yet know its position.
 
 A position never changes once known. A pre-queue registrant's comes from the sealed permutation
 and a live joiner's from a claimed row. Only the cursor moves, and `/v1/status` carries it.
@@ -248,6 +255,11 @@ and a live joiner's from a claimed row. Only the cursor moves, and `/v1/status` 
 concurrent misses into one origin fetch. `/v1/queue_num` is keyed on `event_id` and `request_id`,
 so it cannot collapse — and it is asked once per visitor rather than once per poll. Origin load
 stays flat as the room grows.
+
+The client also stops polling outright while its tab is hidden (the Page Visibility API) and
+catches up the moment it becomes visible again, rate-guarded so a visitor rapidly switching tabs
+cannot poll faster than the floor, and serialized against the poll already in flight so a
+visibility-triggered restart cannot start a second `join()` for the same visitor.
 
 Everyone learns their number at the same moment, so the client waits a random slice of
 `min(60_000, participants / 5000 × 1000)` milliseconds before asking. At 1,000,000 participants
@@ -477,7 +489,6 @@ uniformity test uses a different threshold and does not assert a specific χ².
 | `DESIGN.md` says | The code does |
 |---|---|
 | `/status` publishes `shuffle_seed` after the seal | `StatusResponse` has no seed field. Only `/v1/queue_num` resolves a position |
-| `target_rate` is admissions per minute | `target_rate` is visitors per **second**; the interval target is `rate × 10` |
 | `/queue_pos_expiry` and `/public_key` exist, unrouted | Neither is declared. An endpoint with no implementation is not declared at all |
 | WAF with Bot Control and ASN matching is deployed by default | `modules/edge` creates no WAF |
 | Each event gets its own SQS queue and reserved concurrency | One queue, one event per deployment, no `reserved_concurrent_executions` anywhere |

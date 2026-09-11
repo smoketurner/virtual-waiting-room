@@ -102,3 +102,24 @@ variable "oidc_allowed_emails" {
   type        = string
   default     = ""
 }
+
+# --- Adaptive poll policy (#69) -------------------------------------
+# Published on /status; see modules/core/variables.tf for the full rationale.
+
+variable "poll_floor_ms" {
+  description = "Minimum client poll interval in milliseconds."
+  type        = number
+  default     = 5000
+}
+
+variable "poll_ceiling_ms" {
+  description = "Maximum client poll interval in milliseconds."
+  type        = number
+  default     = 30000
+}
+
+variable "poll_divisor" {
+  description = "Divides a visitor's estimated wait (seconds) into their poll interval."
+  type        = number
+  default     = 10
+}

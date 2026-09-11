@@ -30,6 +30,11 @@ module "core" {
   oidc_client_id      = var.oidc_client_id
   oidc_redirect_uri   = var.oidc_redirect_uri
   oidc_allowed_emails = var.oidc_allowed_emails
+
+  # Adaptive poll policy (#69), published on /status.
+  poll_floor_ms   = var.poll_floor_ms
+  poll_ceiling_ms = var.poll_ceiling_ms
+  poll_divisor    = var.poll_divisor
 }
 
 # demo-origin: a stand-in for the customer's protected origin. This is the dev

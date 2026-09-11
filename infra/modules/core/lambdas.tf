@@ -75,6 +75,10 @@ resource "aws_lambda_function" "read" {
       PREQUEUE_TABLE  = aws_dynamodb_table.prequeue.name
       POSITIONS_TABLE = aws_dynamodb_table.positions.name
       EVENT_ID        = var.event_id
+      # Adaptive poll policy (#69), published verbatim on /status.
+      POLL_FLOOR_MS   = tostring(var.poll_floor_ms)
+      POLL_CEILING_MS = tostring(var.poll_ceiling_ms)
+      POLL_DIVISOR    = tostring(var.poll_divisor)
     })
   }
 

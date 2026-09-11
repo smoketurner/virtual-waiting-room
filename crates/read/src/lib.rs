@@ -77,6 +77,56 @@ impl CountersCache {
     }
 }
 
+/// The adaptive poll policy published on `/status` (#69): the
+/// floor, ceiling, and divisor `waiting.js` clamps its poll interval to.
+/// Terraform-set, not an admin lever — see the ADR for why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PollPolicy {
+    pub floor_ms: u32,
+    pub ceiling_ms: u32,
+    pub divisor: u32,
+}
+
+/// Sanity bounds a published policy must fall within, mirroring
+/// `waiting.js`'s own `MIN_MS`/`MAX_MS`/`MAX_DIVISOR` check. `read` enforces
+/// the same range as the client rather than relying solely on Terraform's
+/// `validation` blocks, so a direct Lambda environment edit or a second
+/// Terraform root cannot publish a policy every client would reject anyway.
+const MIN_INTERVAL_MS: u32 = 1_000;
+const MAX_INTERVAL_MS: u32 = 300_000;
+const MAX_DIVISOR: u32 = 1_000;
+
+/// Parses the three poll-policy environment variables into a [`PollPolicy`],
+/// or `None` if any is absent, fails to parse as `u32`, falls outside
+/// [`MIN_INTERVAL_MS`]/[`MAX_INTERVAL_MS`]/[`MAX_DIVISOR`], or describes an
+/// inverted clamp (`ceiling_ms < floor_ms`).
+///
+/// All-or-nothing: the server never sends a partial policy, so a client
+/// cannot tell which field to trust in one, and `/status` omits the whole
+/// object rather than publish one this function could already tell is wrong.
+#[must_use]
+pub fn parse_poll_policy(
+    floor_ms: Option<&str>,
+    ceiling_ms: Option<&str>,
+    divisor: Option<&str>,
+) -> Option<PollPolicy> {
+    let floor_ms: u32 = floor_ms?.parse().ok()?;
+    let ceiling_ms: u32 = ceiling_ms?.parse().ok()?;
+    let divisor: u32 = divisor?.parse().ok()?;
+    if !(MIN_INTERVAL_MS..=MAX_INTERVAL_MS).contains(&floor_ms)
+        || !(MIN_INTERVAL_MS..=MAX_INTERVAL_MS).contains(&ceiling_ms)
+        || !(1..=MAX_DIVISOR).contains(&divisor)
+        || ceiling_ms < floor_ms
+    {
+        return None;
+    }
+    Some(PollPolicy {
+        floor_ms,
+        ceiling_ms,
+        divisor,
+    })
+}
+
 /// The `/status` payload — one document the countdown and queue pages poll.
 /// Seal outputs appear only once the event is active.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -111,6 +161,10 @@ pub struct StatusResponse {
     /// the movement it observes once it has enough of it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_rate: Option<u32>,
+    /// The adaptive poll policy (#69), absent when Terraform has
+    /// not set one — the client then keeps its own fixed-interval default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poll_policy: Option<PollPolicy>,
 }
 
 /// A resolved `/queue_num` response.
@@ -138,9 +192,10 @@ pub enum ResolvedQueueNum {
     Straggler,
 }
 
-/// Builds the `/status` payload from the counters item.
+/// Builds the `/status` payload from the counters item and the deploy-time
+/// poll policy (`None` when Terraform has not set one).
 #[must_use]
-pub fn status(counters: &Counters) -> StatusResponse {
+pub fn status(counters: &Counters, poll_policy: Option<PollPolicy>) -> StatusResponse {
     StatusResponse {
         event_id: counters.event_id.clone(),
         phase: counters.phase,
@@ -150,6 +205,7 @@ pub fn status(counters: &Counters) -> StatusResponse {
         prequeue_offsets: counters.prequeue_offsets,
         message: counters.message.clone(),
         target_rate: counters.target_rate,
+        poll_policy,
     }
 }
 
@@ -251,7 +307,7 @@ mod tests {
             target_rate: None,
             admission_control: AdmissionControl::Open,
         };
-        let json = serde_json::to_value(status(&counters)).unwrap();
+        let json = serde_json::to_value(status(&counters, None)).unwrap();
         assert_eq!(json["phase"], "pre_queue");
         assert!(json.get("participant_count").is_none());
         assert!(json.get("prequeue_offsets").is_none());
@@ -263,7 +319,7 @@ mod tests {
         // client that cannot read it from /status cannot construct a request
         // that passes the edge validator.
         let counters = sealed_counters([1; SHARDS], [7u8; 32]);
-        let json = serde_json::to_value(status(&counters)).unwrap();
+        let json = serde_json::to_value(status(&counters, None)).unwrap();
         assert_eq!(json["event_id"], "evt-1");
         assert!(json["event_id"].as_str().is_some_and(|s| !s.is_empty()));
     }
@@ -271,7 +327,7 @@ mod tests {
     #[test]
     fn status_exposes_seal_outputs_when_active() {
         let counters = sealed_counters([2, 2, 2, 2, 2, 0, 0, 0, 0, 0], [3u8; 32]);
-        let json = serde_json::to_value(status(&counters)).unwrap();
+        let json = serde_json::to_value(status(&counters, None)).unwrap();
         assert_eq!(json["phase"], "active");
         assert_eq!(json["participant_count"], 10);
         assert_eq!(json["serving_position"], 5);
@@ -282,14 +338,14 @@ mod tests {
     fn status_surfaces_the_broadcast_message_when_set() {
         let mut counters = sealed_counters([1; SHARDS], [7u8; 32]);
         counters.message = Some("Doors open at noon".to_owned());
-        let json = serde_json::to_value(status(&counters)).unwrap();
+        let json = serde_json::to_value(status(&counters, None)).unwrap();
         assert_eq!(json["message"], "Doors open at noon");
     }
 
     #[test]
     fn status_omits_the_message_when_absent() {
         let counters = sealed_counters([1; SHARDS], [7u8; 32]);
-        let json = serde_json::to_value(status(&counters)).unwrap();
+        let json = serde_json::to_value(status(&counters, None)).unwrap();
         assert!(json.get("message").is_none());
     }
 
@@ -297,7 +353,7 @@ mod tests {
     fn status_publishes_the_target_rate_when_set() {
         let mut counters = sealed_counters([1; SHARDS], [7u8; 32]);
         counters.target_rate = Some(250);
-        let json = serde_json::to_value(status(&counters)).unwrap();
+        let json = serde_json::to_value(status(&counters, None)).unwrap();
         assert_eq!(json["target_rate"], 250);
     }
 
@@ -307,8 +363,179 @@ mod tests {
         // zero": the first means the operator has not started admitting and no
         // estimate can be made, the second would read as an infinite wait.
         let counters = sealed_counters([1; SHARDS], [7u8; 32]);
-        let json = serde_json::to_value(status(&counters)).unwrap();
+        let json = serde_json::to_value(status(&counters, None)).unwrap();
         assert!(json.get("target_rate").is_none());
+    }
+
+    #[test]
+    fn status_omits_poll_policy_when_unset() {
+        let counters = sealed_counters([1; SHARDS], [7u8; 32]);
+        let json = serde_json::to_value(status(&counters, None)).unwrap();
+        assert!(json.get("poll_policy").is_none());
+    }
+
+    #[test]
+    fn status_publishes_poll_policy_when_set() {
+        let counters = sealed_counters([1; SHARDS], [7u8; 32]);
+        let policy = PollPolicy {
+            floor_ms: 5000,
+            ceiling_ms: 30000,
+            divisor: 10,
+        };
+        let json = serde_json::to_value(status(&counters, Some(policy))).unwrap();
+        assert_eq!(json["poll_policy"]["floor_ms"], 5000);
+        assert_eq!(json["poll_policy"]["ceiling_ms"], 30000);
+        assert_eq!(json["poll_policy"]["divisor"], 10);
+    }
+
+    #[test]
+    fn parse_poll_policy_accepts_a_valid_policy() {
+        assert_eq!(
+            parse_poll_policy(Some("5000"), Some("30000"), Some("10")),
+            Some(PollPolicy {
+                floor_ms: 5000,
+                ceiling_ms: 30000,
+                divisor: 10,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_poll_policy_rejects_when_any_field_is_missing() {
+        // All-or-nothing: the server never sends a partial policy, so a
+        // client would have no sound default for whichever piece is missing.
+        assert_eq!(parse_poll_policy(None, Some("30000"), Some("10")), None);
+        assert_eq!(parse_poll_policy(Some("5000"), None, Some("10")), None);
+        assert_eq!(parse_poll_policy(Some("5000"), Some("30000"), None), None);
+        assert_eq!(parse_poll_policy(None, None, None), None);
+    }
+
+    #[test]
+    fn parse_poll_policy_rejects_unparseable_numbers() {
+        assert_eq!(
+            parse_poll_policy(Some("not-a-number"), Some("30000"), Some("10")),
+            None
+        );
+        assert_eq!(
+            parse_poll_policy(Some("5000"), Some("30000"), Some("-1")),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_poll_policy_rejects_a_zero_divisor() {
+        assert_eq!(
+            parse_poll_policy(Some("5000"), Some("30000"), Some("0")),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_poll_policy_rejects_an_inverted_clamp() {
+        // ceiling < floor describes no valid interval at all; guessing at a
+        // repair is worse than treating the whole document as wrong.
+        assert_eq!(
+            parse_poll_policy(Some("30000"), Some("5000"), Some("10")),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_poll_policy_accepts_an_equal_floor_and_ceiling() {
+        // The fixed-interval case: floor == ceiling is a valid, degenerate
+        // clamp, not an inversion.
+        assert_eq!(
+            parse_poll_policy(Some("5000"), Some("5000"), Some("1")),
+            Some(PollPolicy {
+                floor_ms: 5000,
+                ceiling_ms: 5000,
+                divisor: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_poll_policy_rejects_values_outside_the_sanity_bounds() {
+        // Mirrors waiting.js's own MIN_MS/MAX_MS/MAX_DIVISOR check: a
+        // policy that is in-range numerically but outside the range every
+        // client already enforces must not reach /status either.
+        assert_eq!(
+            parse_poll_policy(Some("999"), Some("30000"), Some("10")),
+            None,
+            "floor below MIN_INTERVAL_MS"
+        );
+        assert_eq!(
+            parse_poll_policy(Some("5000"), Some("300001"), Some("10")),
+            None,
+            "ceiling above MAX_INTERVAL_MS"
+        );
+        assert_eq!(
+            parse_poll_policy(Some("5000"), Some("30000"), Some("1001")),
+            None,
+            "divisor above MAX_DIVISOR"
+        );
+        assert_eq!(
+            parse_poll_policy(Some("5000"), Some("30000"), Some("0")),
+            None,
+            "divisor below 1"
+        );
+        assert_eq!(
+            parse_poll_policy(Some("1000"), Some("300000"), Some("1000")),
+            Some(PollPolicy {
+                floor_ms: 1000,
+                ceiling_ms: 300_000,
+                divisor: 1000,
+            }),
+            "the bounds themselves are inclusive"
+        );
+    }
+
+    #[test]
+    fn poll_policy_wire_field_names_are_frozen() {
+        // waiting.js's adoptPolicy reads these three literal keys
+        // (p.floor_ms, p.ceiling_ms, p.divisor) off the /status document.
+        // Renaming any of them here ships silently and degrades every
+        // visitor to the fixed interval, with nothing else to catch it —
+        // this pins the contract the way the repo's other frozen wire
+        // encodings already do (.kiro/steering/testing.md).
+        let policy = PollPolicy {
+            floor_ms: 1,
+            ceiling_ms: 2,
+            divisor: 3,
+        };
+        assert_eq!(
+            serde_json::to_value(policy).unwrap(),
+            serde_json::json!({ "floor_ms": 1, "ceiling_ms": 2, "divisor": 3 })
+        );
+    }
+
+    // --- Property tests -------------------------------------------------
+
+    use proptest::prelude::{any, prop_assert_eq, proptest};
+
+    proptest! {
+        #[test]
+        fn parse_poll_policy_matches_its_stated_contract(
+            floor in any::<u32>(),
+            ceiling in any::<u32>(),
+            divisor in any::<u32>(),
+        ) {
+            let result = parse_poll_policy(
+                Some(&floor.to_string()),
+                Some(&ceiling.to_string()),
+                Some(&divisor.to_string()),
+            );
+            let expected_some = (MIN_INTERVAL_MS..=MAX_INTERVAL_MS).contains(&floor)
+                && (MIN_INTERVAL_MS..=MAX_INTERVAL_MS).contains(&ceiling)
+                && (1..=MAX_DIVISOR).contains(&divisor)
+                && ceiling >= floor;
+            prop_assert_eq!(result.is_some(), expected_some);
+            if let Some(policy) = result {
+                prop_assert_eq!(policy.floor_ms, floor);
+                prop_assert_eq!(policy.ceiling_ms, ceiling);
+                prop_assert_eq!(policy.divisor, divisor);
+            }
+        }
     }
 
     #[test]
@@ -316,17 +543,17 @@ mod tests {
         // Active event -> running; pause it -> paused; fail-open -> fail_open.
         let mut counters = sealed_counters([1; SHARDS], [7u8; 32]);
         assert_eq!(
-            serde_json::to_value(status(&counters)).unwrap()["serving_state"],
+            serde_json::to_value(status(&counters, None)).unwrap()["serving_state"],
             "running"
         );
         counters.admission_control = AdmissionControl::Paused;
         assert_eq!(
-            serde_json::to_value(status(&counters)).unwrap()["serving_state"],
+            serde_json::to_value(status(&counters, None)).unwrap()["serving_state"],
             "paused"
         );
         counters.admission_control = AdmissionControl::FailOpen;
         assert_eq!(
-            serde_json::to_value(status(&counters)).unwrap()["serving_state"],
+            serde_json::to_value(status(&counters, None)).unwrap()["serving_state"],
             "fail_open"
         );
     }
@@ -337,7 +564,7 @@ mod tests {
         let mut counters = sealed_counters([1; SHARDS], [7u8; 32]);
         counters.phase = Phase::Idle;
         assert_eq!(
-            serde_json::to_value(status(&counters)).unwrap()["serving_state"],
+            serde_json::to_value(status(&counters, None)).unwrap()["serving_state"],
             "closed"
         );
     }

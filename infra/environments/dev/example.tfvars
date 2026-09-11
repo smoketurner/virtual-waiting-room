@@ -36,3 +36,12 @@ oidc_issuer         = "https://us.vouch.sh"
 oidc_client_id      = ""
 oidc_redirect_uri   = "" # e.g. https://<host>/admin/callback
 oidc_allowed_emails = "" # comma-separated; "" = deny all (fail closed)
+
+# --- Adaptive poll policy (#69, ADR-0023) -------------------------------------
+# Published on /status; waiting.js clamps its poll interval to these, polling
+# less often the further a visitor is from the front. Omitting all three (or
+# leaving this section out) makes the client fall back to the fixed 5s
+# interval it always used.
+poll_floor_ms   = 5000
+poll_ceiling_ms = 30000
+poll_divisor    = 10

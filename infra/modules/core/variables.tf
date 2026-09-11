@@ -175,3 +175,65 @@ variable "env" {
     error_message = "env must be lowercase alphanumeric or hyphen, starting with a letter (valid API Gateway stage name)."
   }
 }
+
+# --- Adaptive poll policy (#69) -------------------------------------
+# Published on /status so waiting.js can space polls out with distance from
+# the front instead of every waiting visitor polling at the same fixed
+# interval regardless of their own wait. A Terraform variable rather than an
+# admin lever: a value set here reaches every client on their next 1-second
+# /status miss, exactly as fast as an admin form would, for three env reads
+# instead of a Store method, a route, a form, and their own debounce/audit
+# surface — and it costs zero Terraform resources against the N6 ceiling.
+
+variable "poll_floor_ms" {
+  description = "Minimum client poll interval in milliseconds: the front of the queue never waits longer than this to learn it has been admitted, and it is also the interval used before a position or admission rate is known. The default (5000) matches the fixed interval every client used before #69. It is also the per-visitor request-rate multiplier the cost model in DESIGN.md §12 is built on — lowering it raises every waiting visitor's request rate against the operator's own CloudFront allowance."
+  type        = number
+  default     = 5000
+
+  validation {
+    condition     = var.poll_floor_ms >= 1000 && var.poll_floor_ms <= 300000
+    error_message = "poll_floor_ms must be between 1,000 and 300,000 milliseconds."
+  }
+
+  validation {
+    condition     = floor(var.poll_floor_ms) == var.poll_floor_ms
+    error_message = "poll_floor_ms must be a whole number of milliseconds — a fractional value fails read's u32 parse and silently disables the whole policy."
+  }
+}
+
+variable "poll_ceiling_ms" {
+  description = "Maximum client poll interval in milliseconds, reached by a visitor far from the front. Below 30,000 the client's own rate-measurement window (two samples spanning 30s) takes one extra poll to converge — not a break, just worth knowing before setting it low."
+  type        = number
+  default     = 30000
+
+  validation {
+    condition     = var.poll_ceiling_ms >= 1000 && var.poll_ceiling_ms <= 300000
+    error_message = "poll_ceiling_ms must be between 1,000 and 300,000 milliseconds."
+  }
+
+  validation {
+    condition     = var.poll_ceiling_ms >= var.poll_floor_ms
+    error_message = "poll_ceiling_ms must be >= poll_floor_ms."
+  }
+
+  validation {
+    condition     = floor(var.poll_ceiling_ms) == var.poll_ceiling_ms
+    error_message = "poll_ceiling_ms must be a whole number of milliseconds — a fractional value fails read's u32 parse and silently disables the whole policy."
+  }
+}
+
+variable "poll_divisor" {
+  description = "Divides a visitor's estimated wait, in seconds, into their poll interval in milliseconds per second of wait: a visitor who can see N seconds left polls roughly every N/divisor seconds, clamped to [poll_floor_ms, poll_ceiling_ms]."
+  type        = number
+  default     = 10
+
+  validation {
+    condition     = var.poll_divisor >= 1 && var.poll_divisor <= 1000
+    error_message = "poll_divisor must be between 1 and 1,000."
+  }
+
+  validation {
+    condition     = floor(var.poll_divisor) == var.poll_divisor
+    error_message = "poll_divisor must be a whole number — a fractional value fails read's u32 parse and silently disables the whole policy."
+  }
+}
