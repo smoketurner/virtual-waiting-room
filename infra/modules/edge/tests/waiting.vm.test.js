@@ -384,3 +384,29 @@ test("a successful redemption rejects a next= that would navigate off-site", asy
   await client.flush();
   assert.equal(client.win.location.replacedTo, "/");
 });
+
+test("the status timestamp is stamped from the clock once a position is known", async () => {
+  const client = loadClient({
+    route: route(() => activeStatus({ serving_position: 10 }), 500),
+  });
+  await client.flush();
+
+  assert.equal(
+    client.elements.updated.hidden,
+    false,
+    "the freshness line appears alongside the bar"
+  );
+  assert.equal(
+    client.elements["updated-at"].textContent,
+    new Date(client.clock.now).toLocaleTimeString(),
+    "stamped from the injected clock, not the wall clock"
+  );
+
+  // It answers "is this page still live", so it has to move on a later poll
+  // even when nothing else on the page changes.
+  const first = client.elements["updated-at"].textContent;
+  client.clock.now += 60_000;
+  client.fireLastTimer();
+  await client.flush();
+  assert.notEqual(client.elements["updated-at"].textContent, first);
+});

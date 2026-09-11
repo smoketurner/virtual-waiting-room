@@ -80,14 +80,22 @@ h1 {
   color: var(--muted);
 }
 
+/* Two or four across, never three: there are four stats, and a three-column
+   grid leaves the fourth alone beside an empty cell. */
 .card {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(2, 1fr);
   gap: 1px;
   background: var(--line);
   border: 1px solid var(--line);
   border-radius: 12px;
   overflow: hidden;
+}
+
+@media (min-width: 34rem) {
+  .card {
+    grid-template-columns: repeat(4, 1fr);
+  }
 }
 
 .stat {
@@ -108,21 +116,77 @@ h1 {
   font-variant-numeric: tabular-nums;
 }
 
+/* Segmented rather than a smooth fill: discrete ticks read as a line of people
+   advancing, and make a small change between polls visible where a continuous
+   bar of this length would not. */
 .bar {
-  margin-top: 16px;
-  height: 6px;
-  border-radius: 999px;
+  margin: 0 0 20px;
+  height: 26px;
+  border-radius: 5px;
   background: var(--accent-soft);
-  overflow: hidden;
+  border: 1px solid var(--line);
+  padding: 3px;
 }
 
 .fill {
+  position: relative;
   height: 100%;
   width: 0;
-  border-radius: 999px;
-  background: var(--accent);
+  min-width: 3px;
+  border-radius: 2px;
+  background: repeating-linear-gradient(
+    90deg,
+    var(--accent) 0 9px,
+    transparent 9px 13px
+  );
   /* Eases between polls so the queue reads as moving rather than jumping. */
   transition: width 600ms ease;
+}
+
+/* Rides the leading edge, so it advances with the fill and needs no separate
+   position of its own. */
+.marker {
+  position: absolute;
+  right: -4px;
+  top: 50%;
+  transform: translateY(-50%);
+  height: 16px;
+  width: 10px;
+  fill: var(--ink);
+}
+
+.updated {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin: 16px 0 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.pulse {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: pulse 2s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  50% {
+    opacity: 0.25;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fill {
+    transition: none;
+  }
+
+  .pulse {
+    animation: none;
+  }
 }
 
 .broadcast {
