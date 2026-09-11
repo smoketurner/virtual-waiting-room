@@ -122,7 +122,8 @@ h1 {
    advancing, and make a small change between polls visible where a continuous
    bar of this length would not. */
 .bar {
-  margin: 0 0 20px;
+  /* Top margin leaves room for the marker, which rides above the track. */
+  margin: 30px 0 20px;
   height: 34px;
   border-radius: 8px;
   background: var(--accent-soft);
@@ -145,15 +146,16 @@ h1 {
   transition: width 900ms cubic-bezier(0.4, 0, 0.2, 1);
 }
 
-/* Centred on the leading edge, so it sits half on the filled side and half on
-   the empty one and is never clipped by either. Being inside .fill means it
-   travels with the same transition and needs no animation of its own. */
+/* Above the track rather than on it: over the fill the emoji sits on a solid
+   block of the same colour and cannot be read. Horizontally it is centred on
+   the leading edge. Being inside .fill means it travels with the same
+   transition and needs no animation of its own. */
 .marker {
   position: absolute;
   right: 0;
-  top: 50%;
-  transform: translate(50%, -50%);
-  font-size: 21px;
+  bottom: calc(100% + 6px);
+  transform: translateX(50%);
+  font-size: 22px;
   line-height: 1;
 }
 
