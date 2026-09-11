@@ -740,14 +740,12 @@ guidance — `make load VISITORS=1000000 SECONDS=90` — measures only **1.83x**
 design underperforms but because a 90-second run is dominated by the ~60-second first-ask spread
 window (`FIRST_ASK_MAX_SPREAD_MS`): no visitor's position is known yet during it, so hold-position
 and backoff poll identically at the floor, and the run ends before most visitors leave that
-window. A configuration that actually exercises the policy — most of the run spent with a known
-position, a real wait remaining, and the cohort not yet fully drained —
-(`--visitors 1000000 --countdown 60 --seconds 560 --target-rate 200 --arrival late`) measures
-**3.83x**, the closest empirical match to the 3.9x modelled above. Stopping at the literal
-reference command and its 1.83x would understate the design's own effect.
-
-Reshaping a run between those two points moves the same code from 1.83x through 2.66x to 3.83x,
-converging on the modelled ratio rather than diverging from it.
+window. Reshaping the run to spend more time with a position known, a real wait remaining, and
+the cohort not yet fully drained moves the same code from 1.83x through **2.66x**
+(`--countdown 180 --arrival late --target-rate 833 --seconds 480`) to **3.83x**
+(`--countdown 60 --arrival late --target-rate 200 --seconds 560`) — the closest empirical match
+to the 3.9x modelled above, converging on it rather than diverging from it. Stopping at the
+literal reference command and its 1.83x would understate the design's own effect.
 
 One further limit bounds what the harness can be asked to show: it counts requests only, with no
 per-visitor admission timestamps, so it cannot measure time-to-admission at all. That the
