@@ -3875,6 +3875,7 @@ dependencies = [
  "aws-lc-rs",
  "aws-sdk-dynamodb",
  "base64 0.23.1",
+ "jsonwebtoken",
  "proptest",
  "serde",
  "serde_dynamo",

@@ -36,7 +36,6 @@ const VECTORS_PATH = path.join(
   "vectors",
   "session.json"
 );
-const KIND_SESSION = 0x02;
 
 const vectors = JSON.parse(fs.readFileSync(VECTORS_PATH, "utf8"));
 
@@ -60,7 +59,7 @@ test("conformance vectors file is non-empty", () => {
 for (const v of vectors.positives) {
   test(`positive: ${v.name}`, () => {
     const gate = loadGate();
-    const result = gate.verify(v.credential, KIND_SESSION, secretFrom(v.key_hex));
+    const result = gate.verify(v.credential, secretFrom(v.key_hex));
     assert.notEqual(result, null, `vector ${v.name} was rejected`);
     assert.equal(result.eventId, v.event_id, `vector ${v.name} event id`);
     assert.equal(result.expiresAt, v.expires_at, `vector ${v.name} expires_at`);
@@ -70,7 +69,7 @@ for (const v of vectors.positives) {
 for (const v of vectors.negatives) {
   test(`negative: ${v.name}`, () => {
     const gate = loadGate();
-    const result = gate.verify(v.credential, KIND_SESSION, secretFrom(v.key_hex));
+    const result = gate.verify(v.credential, secretFrom(v.key_hex));
     assert.equal(result, null, `vector ${v.name} was unexpectedly accepted`);
   });
 }

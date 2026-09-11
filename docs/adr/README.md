@@ -27,6 +27,8 @@ One record per decision. Each states the context, the decision, and its conseque
 | [0020](0020-cloudfront-signed-cookie-gate.md) | Gate the protected origin with CloudFront signed cookies |
 | [0021](0021-edge-function-gate.md) | Move the gate to a CloudFront Function (supersedes 0020) |
 | [0022](0022-durable-controller-cadence.md) | Build the controller's 10-second cadence from durable waits |
+| [0023](0023-adaptive-poll-interval.md) | Scale the client poll interval with distance to the front |
+| [0024](0024-jws-credentials.md) | Carry credentials as a JWS (amends 0011) |
 
 ## Open
 

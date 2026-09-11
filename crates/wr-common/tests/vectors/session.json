@@ -8,7 +8,7 @@
       "issued_at": 1700000000,
       "expires_at": 1700003600,
       "now": 1700000001,
-      "credential": "AAVzbW9rZQAkMDE4ZjNhMmItN2M5ZC03ZTFmLWFiY2QtMDEyMzQ1Njc4OWFiAAAAAGVT8QAAAAAAZVP_EA.GhYXmifnu5FCFkhrfxhwa77_NAlxqxZQZYaU5l2rpic"
+      "credential": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJhdWQiOiJzbW9rZSIsInN1YiI6IjAxOGYzYTJiLTdjOWQtN2UxZi1hYmNkLTAxMjM0NTY3ODlhYiIsImV4cCI6MTcwMDAwMzYwMCwiaWF0IjoxNzAwMDAwMDAwfQ.A3eRZmuifVkUr0x4w9T6jE3a_YIjeSwdhfCUUlOtMV8"
     },
     {
       "name": "empty_event_id",
@@ -18,7 +18,7 @@
       "issued_at": 0,
       "expires_at": 1000,
       "now": 500,
-      "credential": "AAAAAnIxAAAAAAAAAAAAAAAAAAAD6A.ezwImwLnaoH1v2lRCNF2NM3KCQuJkrMOqptCK1kX14Y"
+      "credential": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJhdWQiOiIiLCJzdWIiOiJyMSIsImV4cCI6MTAwMCwiaWF0IjowfQ.PBSdRE6JP9x_gD6w_PIRBihy6Pp5_Z_36vrgXiIHBMg"
     },
     {
       "name": "multibyte_event_id",
@@ -28,7 +28,7 @@
       "issued_at": 0,
       "expires_at": 1000,
       "now": 500,
-      "credential": "ABrDqXbDqW5lbWVudC3ml6XmnKzoqp4t8J-OqwACcjEAAAAAAAAAAAAAAAAAAAPo.rmflAY7KdB6CEjLbZUXDy_02WayEpuCqBhRouimi0oI"
+      "credential": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJhdWQiOiLDqXbDqW5lbWVudC3ml6XmnKzoqp4t8J-OqyIsInN1YiI6InIxIiwiZXhwIjoxMDAwLCJpYXQiOjB9.YhbXQhYvptQ7xy1o-ZYTYYpkZsZgTGieAQ149RZEHtE"
     },
     {
       "name": "expires_at_above_u32",
@@ -38,7 +38,7 @@
       "issued_at": 0,
       "expires_at": 4294979641,
       "now": 4294967296,
-      "credential": "AAVzbW9rZQACcjEAAAAAAAAAAAAAAAEAADA5.kDAJlV_XInJ2A3eiYN0KaxWYM0DU7mU0z-D6kix1UdM"
+      "credential": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJhdWQiOiJzbW9rZSIsInN1YiI6InIxIiwiZXhwIjo0Mjk0OTc5NjQxLCJpYXQiOjB9.v4LeHzRMdMWwlyG-P3-Oko3AJ9AkbxSd_wxPvMHxMcw"
     },
     {
       "name": "near_max_length_ids",
@@ -48,7 +48,7 @@
       "issued_at": 0,
       "expires_at": 1000,
       "now": 500,
-      "credential": "ASxycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnIBLHJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycgAAAAAAAAAAAAAAAAAAA-g.eVc1ZcZT2RZ-tgLbxCe5oY7_GvessNDAukobOnHnfg8"
+      "credential": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJhdWQiOiJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnIiLCJzdWIiOiJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnIiLCJleHAiOjEwMDAsImlhdCI6MH0.zniNHxcOfLJMLQ_V1xT0qJdNc5AmNc5XN42mM0JyLwM"
     },
     {
       "name": "expires_at_boundary",
@@ -58,7 +58,7 @@
       "issued_at": 0,
       "expires_at": 1000,
       "now": 999,
-      "credential": "AAVzbW9rZQACcjEAAAAAAAAAAAAAAAAAAAPo.5u9S-tnfTYZXmUi7Yd6n27B7FdBB7qKmAVEJWgoUzBY"
+      "credential": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJhdWQiOiJzbW9rZSIsInN1YiI6InIxIiwiZXhwIjoxMDAwLCJpYXQiOjB9.cAV77K6JPYyYQoD5sA8zONep0gPvxNrgc3MIao6-UaA"
     }
   ],
   "negatives": [

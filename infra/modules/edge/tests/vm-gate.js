@@ -92,8 +92,8 @@ function loadGate({ event_id, session_cookie_name, waiting_path, kvs, now } = {}
     kvsCalls,
     /** Calls the shipped handler(event) and returns its settled result. */
     handler: (event) => ctx.handler(event),
-    /** Calls the shipped verify(credential, kind, secret) directly. */
-    verify: (credential, kind, secret) => ctx.verify(credential, kind, secret),
+    /** Calls the shipped verify(credential, secret) directly. */
+    verify: (credential, secret) => ctx.verify(credential, secret),
     /** Calls the shipped matches(rule, request) directly. */
     matches: (rule, request) => ctx.matches(rule, request),
   };
