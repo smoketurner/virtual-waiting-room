@@ -214,7 +214,7 @@ async fn main() -> Result<()> {
         task.await.context("a visitor task panicked")?;
     }
 
-    report(&edge, args.visitors, args.seconds, args.countdown).await;
+    report(&edge, args.seconds, args.countdown, &tally).await;
     Ok(())
 }
 
@@ -229,9 +229,22 @@ fn position_from_query(path: &str) -> Option<u64> {
     u64::from_str_radix(hex, 16).ok()
 }
 
-async fn report(edge: &Edge, visitors: usize, seconds: u64, countdown_s: u64) {
-    let minutes = seconds as f64 / 60.0;
-    let per = visitors as f64 * minutes;
+/// Prints what the run measured, normalized by visitor-minutes.
+///
+/// The denominator is the time visitors were actually present and polling, not
+/// `visitors × run length`. Under `--countdown`/`--arrival` a visitor sleeps
+/// until their arrival offset and issues no requests before it, so charging
+/// them for the whole run divides real requests by imaginary waiting and
+/// understates every per-visitor rate — by ~1.5x for a uniform arrival over
+/// half the run, more under `Arrival::Late`.
+async fn report(edge: &Edge, seconds: u64, countdown_s: u64, tally: &VisitorTally) {
+    let per = tally.active_ms.load(Ordering::Relaxed) as f64 / 60_000.0;
+    if per == 0.0 {
+        println!("\n  no visitor was ever present: every arrival offset landed past the deadline.");
+        println!("  --countdown must be shorter than --seconds for anyone to poll.");
+        return;
+    }
+    println!("\n  visitor-minutes (time present and polling): {per:.1}");
 
     println!("\n  endpoint        client    origin      hits  collapsed   origin/visitor/min");
     println!("  ---------------------------------------------------------------------------");
