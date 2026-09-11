@@ -146,15 +146,16 @@ h1 {
 }
 
 /* Rides the leading edge, so it advances with the fill and needs no separate
-   position of its own. */
+   position of its own. An emoji rather than a drawn glyph: it is one character
+   in a page that ships no fonts and no images, and it reads as a person at a
+   size a hand-drawn figure does not. */
 .marker {
   position: absolute;
-  right: -4px;
+  right: -10px;
   top: 50%;
   transform: translateY(-50%);
-  height: 16px;
-  width: 10px;
-  fill: var(--ink);
+  font-size: 17px;
+  line-height: 1;
 }
 
 .updated {
