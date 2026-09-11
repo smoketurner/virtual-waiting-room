@@ -740,12 +740,33 @@ guidance — `make load VISITORS=1000000 SECONDS=90` — measures only **1.83x**
 design underperforms but because a 90-second run is dominated by the ~60-second first-ask spread
 window (`FIRST_ASK_MAX_SPREAD_MS`): no visitor's position is known yet during it, so hold-position
 and backoff poll identically at the floor, and the run ends before most visitors leave that
-window. Reshaping the run to spend more time with a position known, a real wait remaining, and
-the cohort not yet fully drained moves the same code from 1.83x through **2.66x**
-(`--countdown 180 --arrival late --target-rate 833 --seconds 480`) to **3.83x**
-(`--countdown 60 --arrival late --target-rate 200 --seconds 560`) — the closest empirical match
-to the 3.9x modelled above, converging on it rather than diverging from it. Stopping at the
-literal reference command and its 1.83x would understate the design's own effect.
+window. Stopping at the literal reference command and its 1.83x would understate the design's own
+effect.
+
+**Measured, the countdown component comes in below this model.** The two configurations that
+genuinely exercise it — a countdown long enough that visitors spend real time inside `closed`,
+drained at the 833/s this section models — measure **2.66x** (`--countdown 180 --arrival late
+--target-rate 833 --seconds 480`, 58,323,285 → 21,916,029) and **2.88x** (the same with
+`--arrival uniform`, 68,757,884 → 23,878,829). Both are below the blended 3.9x above, and well
+below the 6.0x this section attributes to the countdown alone. A third configuration
+(`--countdown 60 --arrival late --target-rate 200 --seconds 560`) measures 3.83x, but it should
+**not** be read as confirming the model: a 200/s drain leaves the queue barely moving, so that run
+is dominated by deep-queue visitors sitting at the ceiling, and its closeness to 3.9x is a
+coincidence of the queue component rather than corroboration of the countdown one.
+
+Treat the table below as a model whose direction is measured and whose magnitude is optimistic.
+Substituting the measured 2.66x-2.88x for its modelled 3.9x, against its own ~215M baseline,
+lands adaptive nearer 75-81M — still inside the Business allowance, but with roughly 35-40%
+headroom rather than the 56% the table states. The full-event baseline itself has not been
+re-derived from measurement; an 80-100 minute event is impractical to simulate, so these runs are
+8-9 minute slices of it.
+
+Arrival shape moved this the opposite way from the intuition, for the second time in this
+project's measurements (the first was [#84](https://github.com/smoketurner/virtual-waiting-room/issues/84)):
+**uniform arrival saves more than late arrival**, 2.88x against 2.66x. Late arrivers turn up near
+the end of the countdown, so they see only a short slice of `closed` before it flips — about one
+ceiling-length poll either way, whatever interval they chose. Uniform arrivers sit inside
+`closed` longer, so the floor-versus-ceiling difference compounds across more polls.
 
 One further limit bounds what the harness can be asked to show: it counts requests only, with no
 per-visitor admission timestamps, so it cannot measure time-to-admission at all. That the
