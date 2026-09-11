@@ -1225,7 +1225,7 @@ mod tests {
         });
         let store = FakeStore::new(state, Vec::new());
 
-        let outcome = run_pass(&store, "evt").await.unwrap();
+        let outcome = run_pass(&store, "evt", 1_000_000).await.unwrap();
         assert!(
             matches!(outcome, PassOutcome::Ran { .. }),
             "a stuck event must recover, not fail the pass: {outcome:?}"
@@ -1292,7 +1292,7 @@ mod tests {
             },
         ];
         let store = FakeStore::losing_race(stale_loser_state(10), due);
-        let outcome = run_pass(&store, "evt").await.unwrap();
+        let outcome = run_pass(&store, "evt", 1_000_000).await.unwrap();
         assert_eq!(
             outcome,
             PassOutcome::Ran {
@@ -1338,7 +1338,7 @@ mod tests {
         ];
         // First pass: loses the race; expiry skipped, nothing marked.
         let loser = FakeStore::losing_race(stale_loser_state(10), due.clone());
-        let first = run_pass(&loser, "evt").await.unwrap();
+        let first = run_pass(&loser, "evt", 1_000_000).await.unwrap();
         assert_eq!(
             first,
             PassOutcome::Ran {
@@ -1363,7 +1363,7 @@ mod tests {
             smoothed_rate: 0.15,
         });
         let winner = FakeStore::new(won_state, due);
-        let second = run_pass(&winner, "evt").await.unwrap();
+        let second = run_pass(&winner, "evt", 1_000_000).await.unwrap();
         assert_eq!(
             second,
             PassOutcome::Ran {
@@ -1405,7 +1405,7 @@ mod tests {
             },
         ];
         let store = FakeStore::new(stale_loser_state(10), due);
-        let outcome = run_pass(&store, "evt").await.unwrap();
+        let outcome = run_pass(&store, "evt", 1_000_000).await.unwrap();
         assert_eq!(
             outcome,
             PassOutcome::Ran {

@@ -187,7 +187,7 @@ mod tests {
             (Phase::Maintenance, "maintenance"),
         ] {
             s.phase = phase;
-            assert_eq!(Dashboard::from_state(&s).phase, wire);
+            assert_eq!(Dashboard::from_state(&s, 0).phase, wire);
         }
     }
 
@@ -197,7 +197,7 @@ mod tests {
         // admin.css defines; `status-prequeue` would render unstyled.
         let mut s = state();
         s.phase = Phase::PreQueue;
-        let html = Dashboard::from_state(&s).render().unwrap();
+        let html = Dashboard::from_state(&s, 0).render().unwrap();
         assert!(html.contains("status-pre_queue"), "{html}");
         assert!(html.contains(">pre_queue<"), "{html}");
     }
