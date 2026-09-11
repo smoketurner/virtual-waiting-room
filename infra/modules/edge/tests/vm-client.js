@@ -94,7 +94,17 @@ function loadClient({ route, now, locationSearch }) {
     document: doc,
     crypto: { getRandomValues: (a) => a.fill(7) },
     fetch: fetchImpl,
-    Date: { now: () => clock.now },
+    // A real Date, but anchored to the test's clock: `Date.now()` and a bare
+    // `new Date()` both read `clock.now`, so a timestamp the page renders is
+    // deterministic instead of the wall clock.
+    Date: class extends Date {
+      constructor(...args) {
+        super(...(args.length ? args : [clock.now]));
+      }
+      static now() {
+        return clock.now;
+      }
+    },
     Math,
     console,
   });

@@ -80,6 +80,8 @@
     ahead: document.getElementById("ahead"),
     eta: document.getElementById("eta"),
     bar: document.getElementById("bar"),
+    updated: document.getElementById("updated"),
+    updatedAt: document.getElementById("updated-at"),
     fill: document.getElementById("fill"),
     broadcast: document.getElementById("broadcast"),
     note: document.getElementById("note"),
@@ -485,6 +487,14 @@
       el.fill.style.width = "100.0%";
     }
 
+    // Stamped from the client's own clock on each successful poll. It answers
+    // "is this page still live, or has it silently stopped updating" — the
+    // question a visitor watching an unchanging number actually has.
+    if (!el.bar.hidden) {
+      el.updated.hidden = false;
+      el.updatedAt.textContent = new Date().toLocaleTimeString();
+    }
+
     // The headline follows the admission rule, not `ahead`. A visitor is
     // admitted once position < serving, but `ahead` reaches zero one release
     // earlier — so keying the headline off `ahead` promises entry while the
@@ -634,6 +644,7 @@
         if (s.serving_state === "closed") {
           el.stats.hidden = true;
           el.bar.hidden = true;
+          el.updated.hidden = true;
           // A closed event has not dealt this visitor a number, and if one was
           // held from an earlier run of the same page it belongs to a cohort
           // that no longer exists — an operator who resets an event seals a new
