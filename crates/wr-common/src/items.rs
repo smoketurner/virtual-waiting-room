@@ -82,6 +82,12 @@ pub struct Counters {
     /// Operator broadcast text shown to waiting visitors. Absent until an
     /// operator sets it; cleared by setting it empty.
     pub message: Option<String>,
+    /// The operator's target admission rate in visitors per second. Absent
+    /// until an operator sets one, which is also how the controller reads "do
+    /// not admit anyone yet". Waiting visitors are shown a wait estimate
+    /// derived from it before enough of the cursor's own movement has been
+    /// observed to measure the real rate.
+    pub target_rate: Option<u32>,
     /// The operator's live admission override (ADR-0019): `Open` / `Paused` /
     /// `FailOpen`. Replaces the former `admission_paused` + `fail_open` booleans
     /// so an illegal combination cannot be stored.
@@ -196,6 +202,7 @@ impl Counters {
             shuffle_seed,
             participant_count: num("participant_count"),
             prequeue_offsets,
+            target_rate: num("target_rate").and_then(|n| u32::try_from(n).ok()),
             message: item
                 .get("message")
                 .and_then(|v| v.as_s().ok())
@@ -308,6 +315,7 @@ mod tests {
             participant_count: None,
             prequeue_offsets: None,
             message: None,
+            target_rate: None,
             admission_control: AdmissionControl::Open,
         }
     }
@@ -349,7 +357,34 @@ mod tests {
         assert!(counters.participant_count.is_none());
         assert!(counters.prequeue_offsets.is_none());
         assert!(counters.message.is_none());
+        // Absent, not zero: no rate set is how the controller reads "admit
+        // nobody yet", which a defaulted 0 would be indistinguishable from
+        // only by accident.
+        assert!(counters.target_rate.is_none());
         assert_eq!(counters.admission_control, AdmissionControl::Open);
+    }
+
+    #[test]
+    fn from_item_reads_the_operator_target_rate() {
+        let mut item = HashMap::new();
+        item.insert(
+            "target_rate".to_owned(),
+            AttributeValue::N("250".to_owned()),
+        );
+        assert_eq!(Counters::from_item("evt-1", &item).target_rate, Some(250));
+    }
+
+    #[test]
+    fn from_item_rejects_a_target_rate_too_large_for_u32() {
+        // Stored numbers are unbounded, the field is not. A value that does not
+        // fit reads as unset rather than wrapping into a small rate that would
+        // silently throttle the event.
+        let mut item = HashMap::new();
+        item.insert(
+            "target_rate".to_owned(),
+            AttributeValue::N("4294967296".to_owned()),
+        );
+        assert!(Counters::from_item("evt-1", &item).target_rate.is_none());
     }
 
     #[test]

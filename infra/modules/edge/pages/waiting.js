@@ -27,6 +27,7 @@
     position: document.getElementById("position"),
     serving: document.getElementById("serving"),
     ahead: document.getElementById("ahead"),
+    eta: document.getElementById("eta"),
     bar: document.getElementById("bar"),
     fill: document.getElementById("fill"),
     broadcast: document.getElementById("broadcast"),
@@ -236,9 +237,27 @@
   var knownPosition = null;
   var knownLiveJoin = false;
 
+  // Progress is shown against where this visitor started, not against the whole
+  // cohort. Someone who joined 900,000 deep in a million-person queue is moving
+  // steadily, but a cohort-wide bar would sit near empty and appear stuck for
+  // the entire wait.
+  var aheadAtStart = null;
+
+  // The wait currently on screen, held so it is not allowed to drift upward on
+  // noise. See settleWait.
+  var shownWait = null;
+
   function forgetPosition() {
     knownPosition = null;
     knownLiveJoin = false;
+    // The bar measures travel from where this visitor started, so a new place
+    // in line needs a new starting point — keeping the old one would show
+    // progress already made towards a position they no longer hold.
+    aheadAtStart = null;
+    // A new place is further back, so the honest estimate jumps up. Clearing
+    // this lets it: the rise band exists to absorb noise, and holding a wait
+    // from the abandoned place would suppress a real and much longer one.
+    shownWait = null;
   }
 
   // Everyone learns their number at once when the event opens, so asking the
@@ -267,6 +286,109 @@
     firstAskAt = Date.now() + Math.floor(Math.random() * spread);
   }
 
+  // How fast the cursor is actually moving, in positions per second, measured
+  // from /status rather than taken on trust. The operator's target rate says
+  // what the origin was asked to absorb; the controller then corrects releases
+  // against the share of admitted visitors who never arrive, so the cursor's
+  // real speed is not the target. A visitor should be told what is happening,
+  // not what was intended.
+  //
+  // Measured across a window rather than between consecutive polls. The cursor
+  // moves in steps — it jumps once per control interval and sits still in
+  // between — so a rate taken from one pair of polls alternates between a spike
+  // and a stall, and the estimate built on it swings by minutes either way.
+  // Comparing the ends of a window that spans several intervals averages the
+  // steps out without needing to know the interval.
+  var RATE_WINDOW_MS = 60000;
+  var RATE_MIN_SPAN_MS = 30000;
+  var cursorSamples = [];
+
+  function observeCursor(serving) {
+    var now = Date.now();
+    // The cursor never retreats in normal operation. If it does, the event was
+    // reset underneath us and every sample describes a queue that is gone.
+    if (
+      cursorSamples.length &&
+      serving < cursorSamples[cursorSamples.length - 1].serving
+    ) {
+      cursorSamples = [];
+      shownWait = null;
+    }
+    cursorSamples.push({ at: now, serving: serving });
+    while (
+      cursorSamples.length > 2 &&
+      now - cursorSamples[0].at > RATE_WINDOW_MS
+    ) {
+      cursorSamples.shift();
+    }
+  }
+
+  function measuredRate() {
+    if (cursorSamples.length < 2) {
+      return null;
+    }
+    var first = cursorSamples[0];
+    var last = cursorSamples[cursorSamples.length - 1];
+    var seconds = (last.at - first.at) / 1000;
+    // Under a span this short the window may not contain a whole control
+    // interval, and a rate read off a partial one is worse than the operator's
+    // declared target.
+    if (seconds < RATE_MIN_SPAN_MS / 1000) {
+      return null;
+    }
+    var moved = last.serving - first.serving;
+    return moved > 0 ? moved / seconds : null;
+  }
+
+  // The estimate falls freely and rises only when the queue has genuinely
+  // slowed. Anything smaller than the band is measurement noise, and a wait
+  // that creeps upward in front of someone reads as the system losing their
+  // place — the one thing this page exists to reassure them about.
+  var WAIT_RISE_BAND = 1.25;
+
+  function settleWait(seconds) {
+    if (shownWait === null || seconds <= shownWait) {
+      shownWait = seconds;
+    } else if (seconds > shownWait * WAIT_RISE_BAND) {
+      shownWait = seconds;
+    }
+    return shownWait;
+  }
+
+  // Deliberately coarse. The inputs are a smoothed rate and a queue whose
+  // drain the operator can change at any moment, so a figure to the second
+  // claims precision that is not there, and a countdown that visibly stalls
+  // reads as broken.
+  function humanWait(seconds) {
+    if (seconds < 30) {
+      return "under a minute";
+    }
+    var minutes = Math.ceil(seconds / 60);
+    if (minutes <= 60) {
+      return "about " + minutes + " min";
+    }
+    var hours = Math.round(seconds / 3600);
+    return "over " + hours + (hours === 1 ? " hour" : " hours");
+  }
+
+  function renderEta(ahead, targetRate) {
+    // Prefer what was observed; fall back to the operator's target so the first
+    // poll says something, rather than leaving a dash for the half minute it
+    // takes to watch the cursor move.
+    var rate = measuredRate();
+    if (rate === null && targetRate > 0) {
+      rate = targetRate;
+    }
+    if (!rate || rate <= 0) {
+      // No rate set means the operator is not admitting anyone yet, which is
+      // not a long wait — it is an unknown one, and saying so is honest.
+      el.eta.textContent = "—";
+      return;
+    }
+    el.eta.textContent =
+      ahead === 0 ? "any moment" : humanWait(settleWait(ahead / rate));
+  }
+
   function forgetJoin() {
     misses = 0;
     forgetPosition();
@@ -277,18 +399,26 @@
     }
   }
 
-  function renderQueue(position, serving, participants) {
+  function renderQueue(position, serving, participants, targetRate) {
     el.stats.hidden = false;
     el.position.textContent = position.toLocaleString();
     el.serving.textContent = serving.toLocaleString();
     var ahead = Math.max(0, position - serving);
     el.ahead.textContent = ahead.toLocaleString();
+    renderEta(ahead, targetRate);
 
-    // Progress is only meaningful once the cohort size is known.
-    if (participants && participants > 0) {
+    if (aheadAtStart === null) {
+      aheadAtStart = ahead;
+    }
+    // A visitor already at the front has nothing to travel, so any fraction
+    // would be arbitrary; show the bar full rather than empty.
+    if (aheadAtStart > 0) {
       el.bar.hidden = false;
-      var done = Math.min(100, Math.max(0, (serving / participants) * 100));
-      el.fill.style.width = done.toFixed(1) + "%";
+      var done = ((aheadAtStart - ahead) / aheadAtStart) * 100;
+      el.fill.style.width = Math.min(100, Math.max(0, done)).toFixed(1) + "%";
+    } else if (participants && participants > 0) {
+      el.bar.hidden = false;
+      el.fill.style.width = "100.0%";
     }
 
     // The headline follows the admission rule, not `ahead`. A visitor is
@@ -380,6 +510,10 @@
         }
         var s = res.body;
         showBroadcast(s.message);
+        // Sampled from every poll, including the ones before this visitor knows
+        // their own number, so an estimate is ready the moment there is
+        // something to estimate.
+        observeCursor(s.serving_position);
         eventId = s.event_id || eventId;
         if (!eventId) {
           // Nothing to join yet; the next poll tries again.
@@ -473,7 +607,8 @@
             renderQueue(
               q.body.position,
               s.serving_position,
-              s.participant_count
+              s.participant_count,
+              s.target_rate
             );
             if (q.body.position < s.serving_position) {
               return redeem().then(function () {
