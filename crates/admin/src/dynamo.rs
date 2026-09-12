@@ -5,6 +5,7 @@ use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
 use aws_sdk_dynamodb::types::AttributeValue;
+use jiff::Timestamp;
 use wr_common::expr::event_key;
 use wr_common::{Phase, StoredControl};
 
@@ -68,10 +69,15 @@ impl Store for DynamoStore {
             last_action: str_attr("last_action"),
             last_action_by: str_attr("last_action_by"),
             last_action_at: str_attr("last_action_at"),
-            last_action_epoch_ms: item
+            // A stored epoch outside the range of an instant is dropped here
+            // rather than carried inland: the debounce guard is the only
+            // reader, and a value it cannot subtract from would reject every
+            // later action. Absent and unusable mean the same thing.
+            last_action_time: item
                 .get("last_action_epoch_ms")
                 .and_then(|v| v.as_n().ok())
-                .and_then(|n| n.parse().ok()),
+                .and_then(|n| n.parse().ok())
+                .and_then(|ms| Timestamp::from_millisecond(ms).ok()),
             starts_at: num(wr_common::STARTS_AT_ATTR),
             starts_at_timezone: str_attr(wr_common::STARTS_AT_TZ_ATTR),
         }))
@@ -84,7 +90,7 @@ impl Store for DynamoStore {
         to: Phase,
         action: crate::AdminAction,
         actor: &str,
-        now_ms: u64,
+        now: Timestamp,
     ) -> Result<(), StoreError> {
         // Guarded on the expected phase (lost-race safety) but NOT debounced —
         // like force_maintenance, the operator's lifecycle/recovery move must
@@ -101,7 +107,7 @@ impl Store for DynamoStore {
             .condition_expression("phase = :from")
             .expression_attribute_values(":to", AttributeValue::S(to.as_wire_str().to_owned()))
             .expression_attribute_values(":from", AttributeValue::S(from.as_wire_str().to_owned()));
-        req = apply_audit_values(req, action, actor, now_ms)?;
+        req = apply_audit_values(req, action, actor, now);
         send_guarded(req, "phase").await
     }
 
@@ -111,7 +117,7 @@ impl Store for DynamoStore {
         expected: Option<u32>,
         rate: u32,
         actor: &str,
-        now_ms: u64,
+        now: Timestamp,
     ) -> Result<(), StoreError> {
         let mut req = self
             .client
@@ -123,9 +129,9 @@ impl Store for DynamoStore {
                  last_action_at = :at, last_action_epoch_ms = :ms",
             )
             .expression_attribute_values(":r", AttributeValue::N(rate.to_string()));
-        req = apply_audit_values(req, crate::AdminAction::SetRate, actor, now_ms)?;
+        req = apply_audit_values(req, crate::AdminAction::SetRate, actor, now);
         req = guard_expected_rate(req, expected);
-        req = guard_debounce(req, now_ms);
+        req = guard_debounce(req, now);
         send_guarded(req, "rate").await
     }
 
@@ -134,7 +140,7 @@ impl Store for DynamoStore {
         event_id: &str,
         message: &str,
         actor: &str,
-        now_ms: u64,
+        now: Timestamp,
     ) -> Result<(), StoreError> {
         let mut req = self
             .client
@@ -146,8 +152,8 @@ impl Store for DynamoStore {
                  last_action_at = :at, last_action_epoch_ms = :ms",
             )
             .expression_attribute_values(":m", AttributeValue::S(message.to_owned()));
-        req = apply_audit_values(req, crate::AdminAction::SetMessage, actor, now_ms)?;
-        req = guard_debounce(req, now_ms);
+        req = apply_audit_values(req, crate::AdminAction::SetMessage, actor, now);
+        req = guard_debounce(req, now);
         send_guarded(req, "message").await
     }
 
@@ -158,7 +164,7 @@ impl Store for DynamoStore {
         to: StoredControl,
         action: crate::AdminAction,
         actor: &str,
-        now_ms: u64,
+        now: Timestamp,
     ) -> Result<(), StoreError> {
         // The write applies only from the expected prior value, so a transition
         // another operator already made is a Conflict rather than a second
@@ -182,11 +188,11 @@ impl Store for DynamoStore {
             .expression_attribute_values(":to", AttributeValue::S(to.as_wire_str().to_owned()))
             .expression_attribute_values(":from", AttributeValue::S(from.as_wire_str().to_owned()))
             .condition_expression(control_guard);
-        req = apply_audit_values(req, action, actor, now_ms)?;
+        req = apply_audit_values(req, action, actor, now);
         // The debounce boundary lives in the single shared `guard_debounce`
         // helper so the admission-control transition uses the same inclusive
         // cutoff as `set_rate` and `set_message`.
-        req = guard_debounce(req, now_ms);
+        req = guard_debounce(req, now);
         send_guarded(req, "admission_control").await
     }
 
@@ -196,7 +202,7 @@ impl Store for DynamoStore {
         until: u64,
         action: crate::AdminAction,
         actor: &str,
-        now_ms: u64,
+        now: Timestamp,
     ) -> Result<(), StoreError> {
         // Unconditional (break-glass), unlike set_stored_control: the operator
         // must always be able to engage or clear it, mirroring
@@ -211,7 +217,7 @@ impl Store for DynamoStore {
                  last_action_at = :at, last_action_epoch_ms = :ms",
             )
             .expression_attribute_values(":u", AttributeValue::N(until.to_string()));
-        req = apply_audit_values(req, action, actor, now_ms)?;
+        req = apply_audit_values(req, action, actor, now);
         send_guarded(req, "fail_open_until").await
     }
 
@@ -221,7 +227,7 @@ impl Store for DynamoStore {
         starts_at: Option<(u64, &str)>,
         action: crate::AdminAction,
         actor: &str,
-        now_ms: u64,
+        now: Timestamp,
     ) -> Result<(), StoreError> {
         const AUDIT: &str = "last_action = :a, last_action_by = :by, \
                              last_action_at = :at, last_action_epoch_ms = :ms";
@@ -245,10 +251,10 @@ impl Store for DynamoStore {
             None => req.update_expression(format!("SET {AUDIT} REMOVE {at_attr}, {tz_attr}")),
         };
 
-        req = apply_audit_values(req, action, actor, now_ms)?;
+        req = apply_audit_values(req, action, actor, now);
         // Debounced like set_rate and set_message: scheduling is a routine
         // control, not the break-glass that set_fail_open_until is.
-        req = guard_debounce(req, now_ms);
+        req = guard_debounce(req, now);
         send_guarded(req, wr_common::STARTS_AT_ATTR).await
     }
 
@@ -258,7 +264,7 @@ impl Store for DynamoStore {
         rules_digest: &str,
         rules_count: usize,
         actor: &str,
-        now_ms: u64,
+        now: Timestamp,
     ) -> Result<(), StoreError> {
         // Unconditional, like set_fail_open_until: the ruleset itself already
         // landed in the KeyValueStore by the time this runs, so there is
@@ -274,7 +280,7 @@ impl Store for DynamoStore {
             )
             .expression_attribute_values(":d", AttributeValue::S(rules_digest.to_owned()))
             .expression_attribute_values(":c", AttributeValue::N(rules_count.to_string()));
-        req = apply_audit_values(req, crate::AdminAction::SetRules, actor, now_ms)?;
+        req = apply_audit_values(req, crate::AdminAction::SetRules, actor, now);
         send_guarded(req, "rules_audit").await
     }
 
@@ -283,7 +289,7 @@ impl Store for DynamoStore {
         event_id: &str,
         from: Phase,
         actor: &str,
-        now_ms: u64,
+        now: Timestamp,
     ) -> Result<(), StoreError> {
         // Guarded on the expected phase (lost-race safety) but NOT debounced —
         // the emergency stop must always apply.
@@ -302,7 +308,7 @@ impl Store for DynamoStore {
             )
             .condition_expression("phase = :from")
             .expression_attribute_values(":from", AttributeValue::S(from.as_wire_str().to_owned()));
-        req = apply_audit_values(req, crate::AdminAction::ForceMaintenance, actor, now_ms)?;
+        req = apply_audit_values(req, crate::AdminAction::ForceMaintenance, actor, now);
         send_guarded(req, "force_maintenance").await
     }
 }
@@ -325,43 +331,27 @@ type UpdateReq = aws_sdk_dynamodb::operation::update_item::builders::UpdateItemF
 /// Stamps the shared audit + epoch values onto a mutation.
 ///
 /// The row records the same instant twice — `last_action_at` for an operator
-/// to read and `last_action_epoch_ms` for the debounce guard to compare — so
-/// both are rendered from `now_ms` or neither is written. A timestamp that
-/// cannot be rendered fails the mutation instead of falling back to a
-/// different instant, which would leave the two attributes making
-/// contradictory claims about when the action happened.
-///
-/// # Errors
-///
-/// [`StoreError::Backend`] if `now_ms` is not a representable instant.
+/// to read and `last_action_epoch_ms` for the debounce guard to compare — and
+/// both are derived here from one [`Timestamp`], so the two attributes cannot
+/// disagree about when the action happened. Neither conversion can fail: a
+/// `Timestamp` spans at most ±9999 years, which is well inside the range of
+/// both the rendered string and the epoch-millis integer.
 fn apply_audit_values(
     req: UpdateReq,
     action: crate::AdminAction,
     actor: &str,
-    now_ms: u64,
-) -> Result<UpdateReq, StoreError> {
-    let at = audit_timestamp(now_ms)?;
-    Ok(req
-        .expression_attribute_values(":a", AttributeValue::S(action.as_str().to_owned()))
+    now: Timestamp,
+) -> UpdateReq {
+    req.expression_attribute_values(":a", AttributeValue::S(action.as_str().to_owned()))
         .expression_attribute_values(":by", AttributeValue::S(actor.to_owned()))
-        .expression_attribute_values(":at", AttributeValue::S(at))
-        .expression_attribute_values(":ms", AttributeValue::N(now_ms.to_string())))
+        .expression_attribute_values(":at", AttributeValue::S(audit_timestamp(now)))
+        .expression_attribute_values(":ms", AttributeValue::N(now.as_millisecond().to_string()))
 }
 
-/// Renders epoch-millis as the `YYYY-MM-DDTHH:MM:SSZ` string an operator reads
+/// Renders an instant as the `YYYY-MM-DDTHH:MM:SSZ` string an operator reads
 /// off the dashboard.
-///
-/// # Errors
-///
-/// [`StoreError::Backend`] if `now_ms` is past the range of representable
-/// instants. Failing is the point: the alternative is a stand-in date that
-/// disagrees with the epoch written beside it in the same row.
-fn audit_timestamp(now_ms: u64) -> Result<String, StoreError> {
-    let at = i64::try_from(now_ms)
-        .ok()
-        .and_then(|ms| jiff::Timestamp::from_millisecond(ms).ok())
-        .ok_or_else(|| StoreError::Backend(format!("{now_ms} is not a representable instant")))?;
-    Ok(at.strftime("%Y-%m-%dT%H:%M:%SZ").to_string())
+fn audit_timestamp(now: Timestamp) -> String {
+    now.strftime("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 /// Adds the expected-prior-rate guard (lost-race safety).
@@ -375,21 +365,15 @@ fn guard_expected_rate(req: UpdateReq, expected: Option<u32>) -> UpdateReq {
 }
 
 /// The debounce predicate appended to every guarded mutation. Inclusive at
-/// the cutoff (`<= :cutoff`): with `cutoff = now_ms - DEBOUNCE_MS`,
+/// the cutoff (`<= :cutoff`): with `cutoff = now - DEBOUNCE`,
 /// `last_action_epoch_ms <= cutoff` is the same inequality as
-/// `now_ms - last_action_epoch_ms >= DEBOUNCE_MS`, which is exactly what the
+/// `now - last_action_epoch_ms >= DEBOUNCE`, which is exactly what the
 /// in-process `debounce_check` accepts. A mutation at the boundary (`delta ==
-/// DEBOUNCE_MS`) must succeed on both halves of the guard — a strict `<` here
+/// DEBOUNCE`) must succeed on both halves of the guard — a strict `<` here
 /// would reject it and surface a misleading HTTP 409 instead of the expected
 /// success.
-///
-/// The third clause matches [`crate::debounce_check`]'s treatment of a stamp
-/// later than now: it describes no prior action, so it does not hold the
-/// window open. Without it a stamp in the future — the far side of a clock
-/// jump — would satisfy neither of the first two clauses and reject every
-/// mutation from then on, with nothing to bring it back into the past.
-const DEBOUNCE_PREDICATE: &str = "(attribute_not_exists(last_action_epoch_ms) \
-     OR last_action_epoch_ms <= :cutoff OR last_action_epoch_ms > :now)";
+const DEBOUNCE_PREDICATE: &str =
+    "(attribute_not_exists(last_action_epoch_ms) OR last_action_epoch_ms <= :cutoff)";
 
 /// Composes [`DEBOUNCE_PREDICATE`] with any existing condition via `AND`. Pure
 /// so the inclusive boundary is unit-testable without a `DynamoDB` client; the
@@ -401,17 +385,19 @@ fn combine_debounce(existing: Option<&str>) -> String {
     }
 }
 
-/// Adds the debounce guard (a prior mutation at least `DEBOUNCE_MS` ago),
-/// composing with any existing condition via AND.
-fn guard_debounce(req: UpdateReq, now_ms: u64) -> UpdateReq {
-    let cutoff = now_ms.saturating_sub(crate::DEBOUNCE_MS).to_string();
+/// Adds the debounce guard (a prior mutation at least [`crate::DEBOUNCE`]
+/// ago), composing with any existing condition via AND.
+fn guard_debounce(req: UpdateReq, now: Timestamp) -> UpdateReq {
+    let cutoff = now
+        .as_millisecond()
+        .saturating_sub(crate::DEBOUNCE_MILLIS)
+        .to_string();
     let combined = match req.get_condition_expression().clone() {
         Some(c) => combine_debounce(Some(c.as_str())),
         None => combine_debounce(None),
     };
     req.condition_expression(combined)
         .expression_attribute_values(":cutoff", AttributeValue::N(cutoff))
-        .expression_attribute_values(":now", AttributeValue::N(now_ms.to_string()))
 }
 
 /// Sends a guarded update, mapping a failed condition to `Conflict`.
@@ -432,6 +418,8 @@ async fn send_guarded(req: UpdateReq, what: &str) -> Result<(), StoreError> {
 
 #[cfg(test)]
 mod tests {
+    #![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
+
     use super::*;
 
     fn item(control: Option<&str>) -> std::collections::HashMap<String, AttributeValue> {
@@ -488,9 +476,9 @@ mod tests {
 
     #[test]
     fn debounce_predicate_is_inclusive_at_the_cutoff() {
-        // With `cutoff = now_ms - DEBOUNCE_MS`, the DynamoDB condition must
-        // accept the exact boundary `delta == DEBOUNCE_MS`, matching the
-        // in-process `debounce_check` (which rejects only `delta < DEBOUNCE_MS`).
+        // With `cutoff = now - DEBOUNCE`, the DynamoDB condition must
+        // accept the exact boundary `delta == DEBOUNCE`, matching the
+        // in-process `debounce_check` (which rejects only `delta < DEBOUNCE`).
         // Reverting to the strict `< :cutoff` rejects the boundary and surfaces a
         // misleading HTTP 409 instead of the expected success.
         assert!(
@@ -510,47 +498,32 @@ mod tests {
         assert_eq!(
             combine_debounce(Some("target_rate = :exp")).as_str(),
             "target_rate = :exp AND (attribute_not_exists(last_action_epoch_ms) \
-             OR last_action_epoch_ms <= :cutoff OR last_action_epoch_ms > :now)"
+             OR last_action_epoch_ms <= :cutoff)"
         );
         // `set_message` has no prior guard: the predicate stands alone.
         assert_eq!(combine_debounce(None).as_str(), DEBOUNCE_PREDICATE);
     }
 
     #[test]
-    fn debounce_predicate_ignores_a_stamp_later_than_now() {
-        // Without this clause a stamp in the future satisfies neither
-        // `attribute_not_exists` nor `<= :cutoff`, so every debounced action —
-        // rate, message, pause, resume, rules, start time — is rejected from
-        // then on, and no later action can move the stamp back into the past.
-        assert!(
-            DEBOUNCE_PREDICATE.contains("last_action_epoch_ms > :now"),
-            "debounce predicate must tolerate a stamp later than now, got: {DEBOUNCE_PREDICATE}"
-        );
-    }
-
-    #[test]
     fn the_audit_timestamp_matches_the_epoch_written_beside_it() {
-        // Both attributes describe one instant, so the rendered string has to
-        // be that instant and not a stand-in for it.
+        // `last_action_at` and `last_action_epoch_ms` are one instant recorded
+        // twice, so the rendered string has to be the same instant the epoch
+        // is — both are derived from one `Timestamp` for exactly this reason.
+        let now = Timestamp::from_millisecond(1_788_000_000_000).unwrap();
+        assert_eq!(audit_timestamp(now), "2026-08-29T10:40:00Z");
+        assert_eq!(now.as_millisecond(), 1_788_000_000_000);
+
         assert_eq!(
-            audit_timestamp(1_788_000_000_000).ok(),
-            Some("2026-08-29T10:40:00Z".to_owned())
-        );
-        assert_eq!(
-            audit_timestamp(0).ok(),
-            Some("1970-01-01T00:00:00Z".to_owned())
+            audit_timestamp(Timestamp::UNIX_EPOCH),
+            "1970-01-01T00:00:00Z"
         );
     }
 
     #[test]
-    fn an_unrepresentable_timestamp_is_refused_not_substituted() {
-        // The saturated case: rendering it as the epoch would write
-        // 1970-01-01 next to an epoch-millis of u64::MAX in the same row, two
-        // claims about one action that cannot both be true.
-        let refused = audit_timestamp(u64::MAX);
-        assert!(
-            matches!(refused, Err(StoreError::Backend(_))),
-            "an unrepresentable instant must fail the mutation, got: {refused:?}"
-        );
+    fn an_epoch_beyond_an_instant_cannot_be_stamped() {
+        // The stamp that used to lock the control plane out: an epoch-millis
+        // no instant can hold has no `Timestamp` to travel as, so it cannot
+        // reach the audit row or the debounce guard in the first place.
+        assert!(Timestamp::from_millisecond(i64::MAX).is_err());
     }
 }

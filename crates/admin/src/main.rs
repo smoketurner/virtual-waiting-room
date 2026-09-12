@@ -10,6 +10,7 @@
 //! makes the runtime strip the stage before axum routes, so routes are declared
 //! unprefixed.
 
+use std::future::Future;
 use std::sync::Arc;
 
 use admin::dynamo::DynamoStore;
@@ -21,17 +22,19 @@ use admin::templates::Dashboard;
 use admin::{
     ApplyError, EdgeConfigStore, apply_fail_open, apply_message, apply_pause, apply_phase,
     apply_rate, apply_recover, apply_reset, apply_resume, apply_set_rules, apply_start_time,
-    format_rules, parse_rules,
+    epoch_seconds, format_rules, parse_rules,
 };
 use askama::Template;
 use axum::Form;
 use axum::Router;
-use axum::extract::{Path, Query, State};
+use axum::extract::{FromRequestParts, Path, Query, State};
+use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use jiff::Timestamp;
 use lambda_http::Error;
 use openidconnect::core::CoreResponseType;
 use openidconnect::{
@@ -360,14 +363,15 @@ async fn logout(State(state): State<Shared>, headers: HeaderMap) -> Response {
 // --- Admin routes (session-gated) ---------------------------------------------
 
 /// Renders the dashboard from current control state. Unauthenticated -> login.
-async fn dashboard(State(state): State<Shared>, headers: HeaderMap) -> Response {
+async fn dashboard(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    RequestTime(now): RequestTime,
+) -> Response {
     let Some(session) = authed(&state, &headers).await else {
         return Redirect::to("/admin/login").into_response();
     };
-    let Some(now) = now_ms() else {
-        return server_error(CLOCK_UNREADABLE);
-    };
-    match state.store_load(now / 1000).await {
+    match state.store_load(now).await {
         Ok(Some(mut view)) => {
             view.csp_nonce = admin::security::nonce();
             view.operator_email = session.email;
@@ -401,14 +405,15 @@ async fn dashboard(State(state): State<Shared>, headers: HeaderMap) -> Response 
 
 /// Current control state as JSON for the dashboard's poller. Session-gated like
 /// the dashboard; returns the same view the HTML renders.
-async fn state_json(State(state): State<Shared>, headers: HeaderMap) -> Response {
+async fn state_json(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    RequestTime(now): RequestTime,
+) -> Response {
     if authed(&state, &headers).await.is_none() {
         return (StatusCode::UNAUTHORIZED, "not authenticated").into_response();
     }
-    let Some(now) = now_ms() else {
-        return server_error(CLOCK_UNREADABLE);
-    };
-    match state.store_load(now / 1000).await {
+    match state.store_load(now).await {
         Ok(Some(view)) => axum::Json(view).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, "event not found").into_response(),
         Err(e) => server_error(&e),
@@ -423,13 +428,11 @@ struct PhaseForm {
 async fn set_phase(
     State(state): State<Shared>,
     headers: HeaderMap,
+    RequestTime(now): RequestTime,
     Form(form): Form<PhaseForm>,
 ) -> Response {
     let Some(session) = authed(&state, &headers).await else {
         return Redirect::to("/admin/login").into_response();
-    };
-    let Some(now) = now_ms() else {
-        return server_error(CLOCK_UNREADABLE);
     };
     finish(
         apply_phase(
@@ -452,13 +455,11 @@ struct RateForm {
 async fn set_rate(
     State(state): State<Shared>,
     headers: HeaderMap,
+    RequestTime(now): RequestTime,
     Form(form): Form<RateForm>,
 ) -> Response {
     let Some(session) = authed(&state, &headers).await else {
         return Redirect::to("/admin/login").into_response();
-    };
-    let Some(now) = now_ms() else {
-        return server_error(CLOCK_UNREADABLE);
     };
     finish(
         apply_rate(
@@ -481,13 +482,11 @@ struct MessageForm {
 async fn set_message(
     State(state): State<Shared>,
     headers: HeaderMap,
+    RequestTime(now): RequestTime,
     Form(form): Form<MessageForm>,
 ) -> Response {
     let Some(session) = authed(&state, &headers).await else {
         return Redirect::to("/admin/login").into_response();
-    };
-    let Some(now) = now_ms() else {
-        return server_error(CLOCK_UNREADABLE);
     };
     finish(
         apply_message(
@@ -515,13 +514,11 @@ struct StartTimeForm {
 async fn set_start_time(
     State(state): State<Shared>,
     headers: HeaderMap,
+    RequestTime(now): RequestTime,
     Form(form): Form<StartTimeForm>,
 ) -> Response {
     let Some(session) = authed(&state, &headers).await else {
         return Redirect::to("/admin/login").into_response();
-    };
-    let Some(now) = now_ms() else {
-        return server_error(CLOCK_UNREADABLE);
     };
     finish(
         apply_start_time(
@@ -537,34 +534,37 @@ async fn set_start_time(
     )
 }
 
-async fn reset(State(state): State<Shared>, headers: HeaderMap) -> Response {
+async fn reset(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    RequestTime(now): RequestTime,
+) -> Response {
     let Some(session) = authed(&state, &headers).await else {
         return Redirect::to("/admin/login").into_response();
-    };
-    let Some(now) = now_ms() else {
-        return server_error(CLOCK_UNREADABLE);
     };
     finish(apply_reset(&state.store, &state.event_id, &session.email, now).await)
 }
 
 /// Holds admission while the queue keeps forming. Reversible, no confirmation.
-async fn pause(State(state): State<Shared>, headers: HeaderMap) -> Response {
+async fn pause(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    RequestTime(now): RequestTime,
+) -> Response {
     let Some(session) = authed(&state, &headers).await else {
         return Redirect::to("/admin/login").into_response();
-    };
-    let Some(now) = now_ms() else {
-        return server_error(CLOCK_UNREADABLE);
     };
     finish(apply_pause(&state.store, &state.event_id, &session.email, now).await)
 }
 
 /// Resume admission after a pause.
-async fn resume(State(state): State<Shared>, headers: HeaderMap) -> Response {
+async fn resume(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    RequestTime(now): RequestTime,
+) -> Response {
     let Some(session) = authed(&state, &headers).await else {
         return Redirect::to("/admin/login").into_response();
-    };
-    let Some(now) = now_ms() else {
-        return server_error(CLOCK_UNREADABLE);
     };
     finish(apply_resume(&state.store, &state.event_id, &session.email, now).await)
 }
@@ -579,13 +579,11 @@ struct FailOpenForm {
 async fn fail_open(
     State(state): State<Shared>,
     headers: HeaderMap,
+    RequestTime(now): RequestTime,
     Form(form): Form<FailOpenForm>,
 ) -> Response {
     let Some(session) = authed(&state, &headers).await else {
         return Redirect::to("/admin/login").into_response();
-    };
-    let Some(now) = now_ms() else {
-        return server_error(CLOCK_UNREADABLE);
     };
     finish(
         apply_fail_open(
@@ -602,12 +600,13 @@ async fn fail_open(
 
 /// Clears the fail-open epoch. Not "resume": under the split this only
 /// clears the epoch, so a pause queued during the window still applies.
-async fn recover(State(state): State<Shared>, headers: HeaderMap) -> Response {
+async fn recover(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    RequestTime(now): RequestTime,
+) -> Response {
     let Some(session) = authed(&state, &headers).await else {
         return Redirect::to("/admin/login").into_response();
-    };
-    let Some(now) = now_ms() else {
-        return server_error(CLOCK_UNREADABLE);
     };
     finish(
         apply_recover(
@@ -637,6 +636,7 @@ struct RulesForm {
 async fn set_rules(
     State(state): State<Shared>,
     headers: HeaderMap,
+    RequestTime(now): RequestTime,
     Form(form): Form<RulesForm>,
 ) -> Response {
     let Some(session) = authed(&state, &headers).await else {
@@ -645,9 +645,6 @@ async fn set_rules(
     let rules = match parse_rules(&form.rules) {
         Ok(rules) => rules,
         Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
-    };
-    let Some(now) = now_ms() else {
-        return server_error(CLOCK_UNREADABLE);
     };
     finish(
         apply_set_rules(
@@ -662,19 +659,37 @@ async fn set_rules(
     )
 }
 
-/// Current epoch-millis for the audit stamp + debounce guard, or `None` if the
-/// clock cannot be read forward from the epoch.
+/// The instant a request is served at, and the instant its action is stamped
+/// with.
 ///
-/// `None` rather than a sentinel: this value is stamped onto the event as
-/// `last_action_epoch_ms` and every later debounced action is compared against
-/// it, so a made-up number is not a degraded reading — it is a wrong one that
-/// the control plane then believes. A saturated stamp sits in the future
-/// forever and rejects every subsequent change as too soon.
-fn now_ms() -> Option<u64> {
-    let since_epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?;
-    u64::try_from(since_epoch.as_millis()).ok()
+/// The one fallible clock reading in the control plane, taken once per request
+/// by the extractor below. Everything downstream takes a [`Timestamp`], which
+/// spans at most ±9999 years, so the audit stamp, the debounce comparison and
+/// the epoch written to `DynamoDB` are all total after this point — there is
+/// nowhere left for a made-up number to enter and be believed.
+#[derive(Clone, Copy)]
+struct RequestTime(Timestamp);
+
+/// Reads the clock as an extractor, so a handler that needs the time is handed
+/// one that exists rather than deciding what to do without it. A clock outside
+/// the range of a `Timestamp` rejects the request with a 500 before the
+/// handler runs.
+///
+/// `Timestamp::now()` is the obvious constructor and the wrong one: it panics
+/// on such a clock, where this answers the request.
+impl<S: Send + Sync> FromRequestParts<S> for RequestTime {
+    type Rejection = Response;
+
+    fn from_request_parts(
+        _parts: &mut Parts,
+        _state: &S,
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        std::future::ready(
+            Timestamp::try_from(std::time::SystemTime::now())
+                .map(RequestTime)
+                .map_err(|_| server_error(CLOCK_UNREADABLE)),
+        )
+    }
 }
 
 /// A route whose backing plane (authorizer / sessions) is not in the MVP.
@@ -741,9 +756,10 @@ async fn static_asset(headers: HeaderMap, Path(path): Path<String>) -> Response 
 
 impl AppState {
     /// Loads control state and maps it to the dashboard view, resolved at
-    /// `now` (epoch seconds).
-    async fn store_load(&self, now: u64) -> Result<Option<Dashboard>, String> {
+    /// `now`.
+    async fn store_load(&self, now: Timestamp) -> Result<Option<Dashboard>, String> {
         use admin::Store;
+        let now = epoch_seconds(now);
         self.store
             .load(&self.event_id)
             .await
@@ -775,7 +791,7 @@ fn finish(result: Result<(), ApplyError>) -> Response {
     }
 }
 
-/// Logged when [`now_ms`] cannot produce a timestamp. Every operator action
+/// Logged when [`now`] cannot produce a timestamp. Every operator action
 /// stamps one and is guarded against the last one, so there is no action to
 /// take without a clock.
 const CLOCK_UNREADABLE: &str = "system clock is not readable";
