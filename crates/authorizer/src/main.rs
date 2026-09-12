@@ -187,7 +187,6 @@ async fn carry_out<S: Store>(
         }
         Decision::SetSessionAndForward {
             set_cookie,
-            arrival_shard,
             request_id,
             expires_at,
             stripped_path,
@@ -203,12 +202,22 @@ async fn carry_out<S: Store>(
                     return Ok(redirect(&cfg.waiting_room_url));
                 }
             }
-            if let Err(e) = store.record_arrival(&cfg.event_id, arrival_shard).await {
-                // Non-fatal: admit the visitor; the controller tolerates a
-                // missed arrival count better than we tolerate blocking them.
-                warn!(error = %e, "failed to record arrival; admitting anyway");
+            // Drawn at random (issue #59) rather than hashed from request_id,
+            // so it is drawn here rather than in the pure `decide`.
+            match wr_common::Shard::random() {
+                Ok(shard) => {
+                    if let Err(e) = store.record_arrival(&cfg.event_id, shard).await {
+                        // Non-fatal: admit the visitor; the controller
+                        // tolerates a missed arrival count better than we
+                        // tolerate blocking them.
+                        warn!(error = %e, "failed to record arrival; admitting anyway");
+                    }
+                    info!(shard = shard.index(), "admitted via token");
+                }
+                Err(e) => {
+                    warn!(error = %e, "failed to draw a random shard; admitting without recording arrival");
+                }
             }
-            info!(shard = arrival_shard, "admitted via token");
             Ok(set_session(&set_cookie, &stripped_path))
         }
         Decision::FailOpenBypass { set_cookie } => {
@@ -313,6 +322,7 @@ mod tests {
     use authorizer::dynamo::{Store, StoreError};
     use authorizer::{Config, Decision, ProtectionRule, SessionMode, UnreachablePolicy};
     use lambda_http::{Body, Response};
+    use wr_common::Shard;
 
     /// What [`FakeStore::reserve_token`] returns, to drive each replay branch.
     #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
@@ -346,12 +356,12 @@ mod tests {
         fn record_arrival(
             &self,
             event_id: &str,
-            shard: usize,
+            shard: Shard,
         ) -> impl Future<Output = Result<(), StoreError>> + Send {
             self.arrivals
                 .lock()
                 .unwrap()
-                .push((event_id.to_owned(), shard));
+                .push((event_id.to_owned(), shard.index()));
             let err = *self.arrival_err.lock().unwrap();
             std::future::ready(if err {
                 Err(StoreError::Backend("injected arrival failure".to_owned()))
@@ -398,7 +408,6 @@ mod tests {
     fn token_decision() -> Decision {
         Decision::SetSessionAndForward {
             set_cookie: "vwr_session=abc; Max-Age=3600; HttpOnly".to_owned(),
-            arrival_shard: 3,
             request_id: REQ.to_owned(),
             expires_at: TOKEN_EXPIRES,
             stripped_path: "/tickets".to_owned(),
@@ -424,11 +433,12 @@ mod tests {
             store.reservations.lock().unwrap().as_slice(),
             &[(REQ.to_owned(), TOKEN_EXPIRES)]
         );
-        // The arrival was recorded for the event and shard after the reservation.
-        assert_eq!(
-            store.arrivals.lock().unwrap().as_slice(),
-            &[("smoke".to_owned(), 3)]
-        );
+        // The arrival was recorded for the event, on a randomly drawn shard,
+        // after the reservation.
+        let arrivals = store.arrivals.lock().unwrap();
+        assert_eq!(arrivals.len(), 1);
+        assert_eq!(arrivals[0].0, "smoke");
+        assert!(arrivals[0].1 < wr_common::SHARDS);
     }
 
     #[tokio::test]

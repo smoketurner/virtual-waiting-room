@@ -101,7 +101,7 @@ async fn handle(state: &AppState, req: Request) -> Result<Response<Body>, Error>
     };
 
     let now = now_secs();
-    let grant = match decide(&counters, &request_id, prequeue.as_ref(), position_row, now) {
+    let grant = match decide(&counters, prequeue.as_ref(), position_row, now) {
         Ok(grant) => grant,
         Err(denied) => return refusal(&denied),
     };
@@ -109,19 +109,30 @@ async fn handle(state: &AppState, req: Request) -> Result<Response<Body>, Error>
     // Recorded before the cookie is handed out: a visitor counted but not
     // admitted only understates the no-show rate, whereas one admitted but not
     // counted makes the controller over-release for every later interval.
-    if let Err(e) = state
-        .store
-        .record_arrival(&state.event_id, grant.arrival_shard)
-        .await
-    {
-        // Non-fatal for this visitor: the controller tolerates a missed
-        // arrival better than the visitor tolerates being refused at their
-        // turn. Logged at error with a stable event name because the damage is
-        // cumulative and silent — every uncounted arrival inflates the measured
-        // no-show rate, and the controller answers that by releasing more
-        // people than the origin agreed to serve. Attach a metric filter to
-        // `arrival_record_failed` to alarm on it.
-        error!(error = %e, event = "arrival_record_failed", "failed to record arrival; admitting anyway");
+    //
+    // The shard is drawn at random per admission (issue #59) rather than
+    // hashed from `request_id`, so it is drawn here rather than by `decide`,
+    // which stays a pure function of the queue state. A draw failure is
+    // logged and swallowed for the same reason a record failure is: the
+    // controller tolerates a missed arrival better than the visitor tolerates
+    // being refused at their turn.
+    match wr_common::Shard::random() {
+        Ok(shard) => {
+            if let Err(e) = state.store.record_arrival(&state.event_id, shard).await {
+                // Non-fatal for this visitor: the controller tolerates a
+                // missed arrival better than the visitor tolerates being
+                // refused at their turn. Logged at error with a stable event
+                // name because the damage is cumulative and silent — every
+                // uncounted arrival inflates the measured no-show rate, and
+                // the controller answers that by releasing more people than
+                // the origin agreed to serve. Attach a metric filter to
+                // `arrival_record_failed` to alarm on it.
+                error!(error = %e, event = "arrival_record_failed", "failed to record arrival; admitting anyway");
+            }
+        }
+        Err(e) => {
+            error!(error = %e, event = "arrival_shard_draw_failed", "failed to draw a random shard; admitting without recording arrival");
+        }
     }
 
     let expires_at = now.saturating_add(state.session_ttl_secs);
@@ -138,11 +149,7 @@ async fn handle(state: &AppState, req: Request) -> Result<Response<Body>, Error>
         state.session_ttl_secs
     );
 
-    info!(
-        position = grant.position,
-        shard = grant.arrival_shard,
-        "admitted"
-    );
+    info!(position = grant.position, "admitted");
 
     let body = serde_json::to_string(&serde_json::json!({
         "admitted": true,

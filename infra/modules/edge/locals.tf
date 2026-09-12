@@ -41,8 +41,12 @@ locals {
   polled_status_path = "/v1/status"
   polled_keyed_paths = ["/v1/queue_num"]
 
-  # Uncached write behaviour path patterns: ingest and token minting.
-  write_paths = ["/v1/join", "/v1/generate_token"]
+  # Uncached write behaviour path patterns: token minting. /v1/join has its
+  # own behaviour below (issue #59) because it alone needs the CloudFront-
+  # generated viewer headers, which are not viewer headers the managed
+  # AllViewerExceptHostHeader policy forwards.
+  write_paths = ["/v1/generate_token"]
+  join_path   = "/v1/join"
 
   # Admin control plane (ADR-0016): the operator dashboard + OIDC login, plus its
   # static assets. Served by the admin Lambda; uncached, all methods, forward
@@ -68,6 +72,17 @@ locals {
     session_cookie_name = var.session_cookie_name
     waiting_path        = local.waiting_page_path
   })
+
+  # The waiting page's client (issue #59): only entry_ticket_cookie_name is
+  # templated in, so the custom-domain ticket-delivery path reads the cookie
+  # name Terraform knows without hardcoding it twice.
+  waiting_js_source = templatefile("${path.module}/pages/waiting.js.tftpl", {
+    entry_ticket_cookie_name = var.entry_ticket_cookie_name
+  })
+
+  # A custom domain is served only when both an alias and a certificate are
+  # configured; see the paired variable validations in variables.tf.
+  use_custom_domain = length(var.aliases) > 0
 }
 
 # Guards the redirect loop the waiting.js bounce guard used to absorb: the

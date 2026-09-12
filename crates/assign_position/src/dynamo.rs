@@ -1,16 +1,16 @@
 //! The `aws-sdk-dynamodb`-backed [`Store`] implementation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::put_item::PutItemError;
-use aws_sdk_dynamodb::types::{AttributeValue, ReturnValue};
+use aws_sdk_dynamodb::types::{AttributeValue, KeysAndAttributes, ReturnValue};
 use wr_common::expr::{
-    SHARD_COUNT_ATTR, claim_live_block_update, claim_prequeue_block_update,
-    claim_prequeue_block_values, event_key, not_exists_condition, prequeue_shard_key,
+    Condition, Key, POSITIONS_KEY_ATTR, SHARD_COUNT_ATTR, SHARD_INDEX_ATTR, STATUS_ATTR,
+    STATUS_EXPIRED, Update,
 };
-use wr_common::{Counters, PositionItem, PositionStatus, PreQueueItem};
+use wr_common::{Counters, PositionItem, PositionStatus, PreQueueItem, Shard, Telemetry};
 
 use crate::{PositionWrite, PreQueueWrite, Store, StoreError, WriteOutcome};
 
@@ -18,6 +18,9 @@ use crate::{PositionWrite, PreQueueWrite, Store, StoreError, WriteOutcome};
 /// hygiene only: whether a position is still claimable is decided by the
 /// controller against the admission cursor, not by this.
 const POSITION_TTL_SECS: u64 = 86_400;
+
+/// The maximum number of keys `BatchGetItem` accepts in one call.
+const BATCH_GET_LIMIT: usize = 100;
 
 /// A live `DynamoDB` store bound to the counters, pre-queue, and positions
 /// tables.
@@ -45,15 +48,27 @@ impl DynamoStore {
     }
 }
 
+/// `Some(telemetry)` unless every field is absent, in which case the `v`
+/// attribute is omitted entirely rather than writing an empty map.
+fn telemetry_or_none(telemetry: Telemetry) -> Option<Telemetry> {
+    (telemetry != Telemetry::default()).then_some(telemetry)
+}
+
 impl Store for DynamoStore {
     async fn claim_block(&self, event_id: &str, n: u64) -> Result<u64, StoreError> {
+        // `ALL_NEW` returns the value after the add, so the claimed block is
+        // `[end - n + 1, end]`.
+        let claim = Update::new()
+            .add("queue_counter", AttributeValue::N(n.to_string()))
+            .build();
         let out = self
             .client
             .update_item()
             .table_name(&self.counters_table)
-            .set_key(Some(event_key(event_id)))
-            .update_expression(claim_live_block_update())
-            .expression_attribute_values(":n", AttributeValue::N(n.to_string()))
+            .set_key(Some(Key::Event { event_id }.build()))
+            .update_expression(claim.expression)
+            .set_expression_attribute_names(Some(claim.names))
+            .set_expression_attribute_values(Some(claim.values))
             .return_values(ReturnValue::AllNew)
             .send()
             .await
@@ -76,20 +91,31 @@ impl Store for DynamoStore {
             entry_time: now,
             status: PositionStatus::Issued,
             ttl: now.saturating_add(POSITION_TTL_SECS),
+            v: telemetry_or_none(write.telemetry.clone()),
         };
         let attrs: HashMap<String, AttributeValue> =
             serde_dynamo::to_item(&item).map_err(|e| StoreError(format!("serialize: {e}")))?;
 
-        let result = self
+        let mut request = self
             .client
             .put_item()
             .table_name(&self.positions_table)
-            .set_item(Some(attrs))
-            .condition_expression(not_exists_condition("request_id"))
-            .send()
-            .await;
+            .set_item(Some(attrs));
+        // Widened for a derived request_id so a re-join can reclaim a row the
+        // controller expired; `completed` and `abandoned` stay terminal.
+        let guard = Condition::attribute_not_exists(POSITIONS_KEY_ATTR);
+        let guard = if write.allow_expired_overwrite {
+            guard.or_equals(STATUS_ATTR, AttributeValue::S(STATUS_EXPIRED.to_owned()))
+        } else {
+            guard
+        }
+        .build();
+        request = request
+            .condition_expression(guard.expression)
+            .set_expression_attribute_names(Some(guard.names))
+            .set_expression_attribute_values(Some(guard.values));
 
-        match result {
+        match request.send().await {
             Ok(_) => Ok(WriteOutcome::Written),
             Err(SdkError::ServiceError(se))
                 if matches!(se.err(), PutItemError::ConditionalCheckFailedException(_)) =>
@@ -108,7 +134,7 @@ impl Store for DynamoStore {
             // Consistent: the batch's routing decision (live vs. pre-queue)
             // and the fix-up's straggler check both need the freshest write.
             .consistent_read(true)
-            .set_key(Some(event_key(event_id)))
+            .set_key(Some(Key::Event { event_id }.build()))
             .send()
             .await
             .map_err(|e| StoreError(format!("get_item counters: {e}")))?;
@@ -119,16 +145,28 @@ impl Store for DynamoStore {
     async fn claim_prequeue_block(
         &self,
         event_id: &str,
-        shard: usize,
+        shard: Shard,
         count: u64,
     ) -> Result<u64, StoreError> {
+        // Stamps which shard this is alongside the add, so a reader that
+        // fetched a batch of shards does not have to take the key apart.
+        // `ALL_NEW` returns the count after the add; the block is
+        // `[n - count, n - 1]`.
+        let claim = Update::new()
+            .set(
+                SHARD_INDEX_ATTR,
+                AttributeValue::N(shard.index().to_string()),
+            )
+            .add(SHARD_COUNT_ATTR, AttributeValue::N(count.to_string()))
+            .build();
         let out = self
             .client
             .update_item()
             .table_name(&self.counters_table)
-            .set_key(Some(prequeue_shard_key(event_id, shard)))
-            .update_expression(claim_prequeue_block_update())
-            .set_expression_attribute_values(Some(claim_prequeue_block_values(shard, count)))
+            .set_key(Some(Key::PrequeueShard { event_id, shard }.build()))
+            .update_expression(claim.expression)
+            .set_expression_attribute_names(Some(claim.names))
+            .set_expression_attribute_values(Some(claim.values))
             .return_values(ReturnValue::AllNew)
             .send()
             .await
@@ -141,27 +179,36 @@ impl Store for DynamoStore {
             .and_then(|s| s.parse::<u64>().ok())
             .ok_or_else(|| StoreError("shard count missing in ALL_NEW".to_owned()))?;
 
-        first_local_index(shard, end, count)
+        first_local_index(shard.index(), end, count)
     }
 
     async fn put_prequeue(&self, write: &PreQueueWrite) -> Result<WriteOutcome, StoreError> {
-        let shard = u8::try_from(write.shard)
-            .map_err(|_| StoreError(format!("shard {} out of range", write.shard)))?;
+        let shard = u8::try_from(write.shard.index())
+            .map_err(|_err| StoreError(format!("shard {} out of range", write.shard.index())))?;
         let item = PreQueueItem {
             r: write.request_id.clone(),
             s: shard,
             l: write.local_index,
             t: now_epoch_secs(),
+            v: telemetry_or_none(write.telemetry.clone()),
         };
         let attrs: HashMap<String, AttributeValue> =
             serde_dynamo::to_item(&item).map_err(|e| StoreError(format!("serialize: {e}")))?;
 
+        let guard = Condition::attribute_not_exists(
+            Key::Prequeue {
+                request_id: &write.request_id,
+            }
+            .attr(),
+        )
+        .build();
         let result = self
             .client
             .put_item()
             .table_name(&self.prequeue_table)
             .set_item(Some(attrs))
-            .condition_expression(not_exists_condition("r"))
+            .condition_expression(guard.expression)
+            .set_expression_attribute_names(Some(guard.names))
             .send()
             .await;
 
@@ -174,6 +221,49 @@ impl Store for DynamoStore {
             }
             Err(e) => Err(StoreError(format!("put_item prequeue: {e}"))),
         }
+    }
+
+    async fn registered_ids(&self, request_ids: &[String]) -> Result<HashSet<String>, StoreError> {
+        let mut found = HashSet::new();
+        for chunk in request_ids.chunks(BATCH_GET_LIMIT) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let keys_and_attrs = KeysAndAttributes::builder()
+                .set_keys(Some(
+                    chunk
+                        .iter()
+                        .map(|id| Key::Prequeue { request_id: id }.build())
+                        .collect(),
+                ))
+                .consistent_read(true)
+                .projection_expression("r")
+                .build()
+                .map_err(|e| StoreError(format!("keys_and_attributes: {e}")))?;
+
+            let out = self
+                .client
+                .batch_get_item()
+                .request_items(&self.prequeue_table, keys_and_attrs)
+                .send()
+                .await
+                .map_err(|e| StoreError(format!("batch_get_item: {e}")))?;
+
+            // Unprocessed keys degrade to "unknown" by simply not appearing
+            // in `found`: the caller treats an id's absence as "claim
+            // anyway", the same degrade a store error gets.
+            if let Some(items) = out
+                .responses()
+                .and_then(|responses| responses.get(&self.prequeue_table))
+            {
+                for item in items {
+                    if let Some(id) = item.get("r").and_then(|v| v.as_s().ok()) {
+                        found.insert(id.clone());
+                    }
+                }
+            }
+        }
+        Ok(found)
     }
 }
 
@@ -223,5 +313,15 @@ mod tests {
         // value cannot be trusted to reconstruct a first index, so this must
         // be a StoreError, never a saturated (and silently wrong) 0.
         assert!(first_local_index(3, 2, 5).is_err());
+    }
+
+    #[test]
+    fn telemetry_or_none_omits_an_entirely_empty_value() {
+        assert_eq!(telemetry_or_none(Telemetry::default()), None);
+        let present = Telemetry {
+            c: Some("US".to_owned()),
+            ..Telemetry::default()
+        };
+        assert_eq!(telemetry_or_none(present.clone()), Some(present));
     }
 }

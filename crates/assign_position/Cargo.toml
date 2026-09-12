@@ -29,5 +29,9 @@ tracing = { workspace = true, default-features = true }
 tracing-subscriber = { workspace = true, features = ["fmt", "env-filter", "json"] }
 wr-common = { workspace = true }
 
+[dev-dependencies]
+base64 = { workspace = true, features = ["std"] }
+jsonwebtoken = { workspace = true, features = ["aws_lc_rs"] }
+
 [lints]
 workspace = true

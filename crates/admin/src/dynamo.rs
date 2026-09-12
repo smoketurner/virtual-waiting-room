@@ -8,7 +8,7 @@ use aws_sdk_dynamodb::types::AttributeValue;
 use jiff::Timestamp;
 
 use crate::arrival::ArrivalTime;
-use wr_common::expr::event_key;
+use wr_common::expr::Key;
 use wr_common::{Phase, StoredControl};
 
 use crate::{ControlState, Store, StoreError};
@@ -35,7 +35,7 @@ impl Store for DynamoStore {
             .client
             .get_item()
             .table_name(&self.counters_table)
-            .set_key(Some(event_key(event_id)))
+            .set_key(Some(Key::Event { event_id }.build()))
             .send()
             .await
             .map_err(|e| StoreError::Backend(format!("get_item: {e}")))?;
@@ -101,7 +101,7 @@ impl Store for DynamoStore {
             .client
             .update_item()
             .table_name(&self.counters_table)
-            .set_key(Some(event_key(event_id)))
+            .set_key(Some(Key::Event { event_id }.build()))
             .update_expression(
                 "SET phase = :to, last_action = :a, last_action_by = :by, \
                  last_action_at = :at, last_action_epoch_ms = :ms",
@@ -125,7 +125,7 @@ impl Store for DynamoStore {
             .client
             .update_item()
             .table_name(&self.counters_table)
-            .set_key(Some(event_key(event_id)))
+            .set_key(Some(Key::Event { event_id }.build()))
             .update_expression(
                 "SET target_rate = :r, last_action = :a, last_action_by = :by, \
                  last_action_at = :at, last_action_epoch_ms = :ms",
@@ -148,7 +148,7 @@ impl Store for DynamoStore {
             .client
             .update_item()
             .table_name(&self.counters_table)
-            .set_key(Some(event_key(event_id)))
+            .set_key(Some(Key::Event { event_id }.build()))
             .update_expression(
                 "SET message = :m, last_action = :a, last_action_by = :by, \
                  last_action_at = :at, last_action_epoch_ms = :ms",
@@ -182,7 +182,7 @@ impl Store for DynamoStore {
             .client
             .update_item()
             .table_name(&self.counters_table)
-            .set_key(Some(event_key(event_id)))
+            .set_key(Some(Key::Event { event_id }.build()))
             .update_expression(
                 "SET admission_control = :to, last_action = :a, last_action_by = :by, \
                  last_action_at = :at, last_action_epoch_ms = :ms",
@@ -213,7 +213,7 @@ impl Store for DynamoStore {
             .client
             .update_item()
             .table_name(&self.counters_table)
-            .set_key(Some(event_key(event_id)))
+            .set_key(Some(Key::Event { event_id }.build()))
             .update_expression(
                 "SET fail_open_until = :u, last_action = :a, last_action_by = :by, \
                  last_action_at = :at, last_action_epoch_ms = :ms",
@@ -239,7 +239,7 @@ impl Store for DynamoStore {
             .client
             .update_item()
             .table_name(&self.counters_table)
-            .set_key(Some(event_key(event_id)));
+            .set_key(Some(Key::Event { event_id }.build()));
 
         // Clearing REMOVEs both attributes instead of writing a zero, so the
         // read path can still tell an unscheduled event from one whose start
@@ -275,7 +275,7 @@ impl Store for DynamoStore {
             .client
             .update_item()
             .table_name(&self.counters_table)
-            .set_key(Some(event_key(event_id)))
+            .set_key(Some(Key::Event { event_id }.build()))
             .update_expression(
                 "SET rules_digest = :d, rules_count = :c, last_action = :a, \
                  last_action_by = :by, last_action_at = :at, last_action_epoch_ms = :ms",
@@ -299,7 +299,7 @@ impl Store for DynamoStore {
             .client
             .update_item()
             .table_name(&self.counters_table)
-            .set_key(Some(event_key(event_id)))
+            .set_key(Some(Key::Event { event_id }.build()))
             .update_expression(
                 "SET phase = :to, last_action = :a, last_action_by = :by, \
                  last_action_at = :at, last_action_epoch_ms = :ms",

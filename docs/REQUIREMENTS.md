@@ -28,7 +28,7 @@ activation queues first-in, first-out (FIFO).
 | ID | Requirement | Acceptance |
 |---|---|---|
 | F1.1 | During the pre-queue phase, visitors MUST be held on a countdown page rather than assigned a queue position. Registering a visitor's place MUST cost one row write per visitor, plus a share of one amortised shard-counter claim per batch. | A visitor arriving at T−10min sees a countdown and is registered; no `Positions` item — and no queue position — exists until the event opens. |
-| F1.2 | The pre-queue countdown page MUST be servable entirely from content delivery network (CDN) cache, so that repeated page views make zero calls to API Gateway, DynamoDB, or Simple Queue Service (SQS). Registration MUST be a separate, one-time direct write from the edge to the ingest queue, with no compute in the path. | Origin request count from page views during the pre-queue phase is independent of visitor count; each visitor registers exactly once, deduplicated across reloads wherever the browser permits persistent client-side storage (a browser that denies it, e.g. private browsing, re-registers on every reload — a known gap, not a guarantee this requirement makes), with no Lambda in that write's path. |
+| F1.2 | The pre-queue countdown page MUST be servable entirely from content delivery network (CDN) cache, so that repeated page views make zero calls to API Gateway, DynamoDB, or Simple Queue Service (SQS). Registration MUST be a separate, one-time direct write from the edge to the ingest queue, with no compute in the path. | Origin request count from page views during the pre-queue phase is independent of visitor count; each visitor registers exactly once, deduplicated across reloads: the client stores its identifier across a chain of localStorage, a first-party cookie and sessionStorage, and `assign_position` reads which identifiers already hold a row before claiming a pre-queue index, so a browser that denies every storage tier no longer burns an index per reload. Two residuals: with no entry ticket configured a storage-denied visitor still mints a fresh identifier and so takes a *new* place rather than recovering their old one, and two reloads landing in different invocations within the batching window can each claim. With a ticket the identifier is derived and needs no storage at all. No Lambda in the write's path. |
 | F1.3 | At T−0 the system MUST assign queue positions to pre-queue participants in **randomized** order, and the ordering MUST NOT be predictable before that moment. | Assigned position shows no correlation with registration time; positions are uniformly distributed; the permutation key does not exist before T−0. |
 | F1.4 | Position assignment for pre-queue participants MUST complete promptly at the scheduled start. | 1,000,000 participants assigned in one write; elapsed time independent of cohort size. |
 | F1.5 | The randomization MUST be auditable after the fact. | A third party given the published seed, participant count, and registration indices recomputes every position and reproduces the ordering exactly. |
@@ -83,9 +83,21 @@ activation queues first-in, first-out (FIFO).
 
 | ID | Requirement | Acceptance |
 |---|---|---|
-| F6.1 | The system MUST support gating **queue entry** on a client-issued signed identifier — a membership ID, promo code, or order reference. | A visitor without a valid identifier cannot join the queue. |
-| F6.2 | The identifier MUST be signed by the client, not by the waiting room. | The waiting room verifies a signature over data it never stores. |
-| F6.3 | Bot-blocking decisions SHOULD be enforceable at event start rather than during the pre-queue. | An operator can choose to admit suspected bots to the pre-queue and block them at randomization. |
+| F6.1 | The system MUST support gating **queue entry** on a client-issued signed entry ticket carrying an opaque per-identity subject, and MUST derive the visitor's `request_id` from that subject so one identity holds one position. | With a ticket configured, N registrations under one identity yield exactly one position, and a registration with a missing, invalid, expired or wrong-audience ticket is discarded without the client learning so at join time. |
+| F6.2 | The ticket MUST be signed by the client, not by the waiting room, and the subject MUST be opaque — the waiting room never receives the underlying identifier. | The waiting room holds only a public key and verifies a signature over a subject it cannot reverse. The subject's opaqueness is shape-checked (22–256 base64url characters), which is a customer obligation the wire format cannot enforce. |
+| F6.3 | Bot-blocking decisions SHOULD be enforceable at event start rather than during the pre-queue. | **Not built.** Join-time telemetry (viewer address, ASN, country, JA4 fingerprint, user agent) is captured on every registration row, which is the input such a decision would need, but nothing consumes it and no classification or seal-time mitigation exists. Deferred on cost: the mechanism depends on WAF Bot Control, which the deployment does not enable. |
+
+**What F6.1 does and does not bound.** It moves the constraint from "how many identifiers can
+you mint?" to "how many identities can you obtain?" — a farm holding N legitimate identities
+still receives N positions. Its value is therefore inherited from the customer's identity
+system, and it is inapplicable where there is no prior relationship to sign about: a public
+onsale open to anyone has no party who can vouch that a visitor is distinct. Such a deployment
+runs without a ticket and is a bare raffle, where registration volume converts linearly into
+expected share of the front of the queue
+([ADR-0001](adr/0001-randomize-pre-queue-assignment.md),
+[ADR-0026](adr/0026-entry-tickets.md)). Bounding volume without an identity needs a different
+mechanism — proof of work, or behavioural classification over the telemetry F6.3 describes —
+and neither is built.
 
 
 ---

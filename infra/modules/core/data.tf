@@ -54,10 +54,13 @@ data "aws_iam_policy_document" "assign_position" {
   }
 
   statement {
-    sid    = "WritePrequeue"
+    sid    = "ReadAndWritePrequeue"
     effect = "Allow"
     actions = [
       "dynamodb:PutItem",
+      # Reads which request ids already hold a row, so a reload does not burn a
+      # fresh pre-queue index (issue #59).
+      "dynamodb:BatchGetItem",
     ]
     resources = [aws_dynamodb_table.prequeue.arn]
   }

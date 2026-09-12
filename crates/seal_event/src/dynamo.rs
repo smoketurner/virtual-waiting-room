@@ -6,10 +6,8 @@ use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
 use aws_sdk_dynamodb::types::AttributeValue;
-use wr_common::expr::{
-    event_key, prequeue_shard_key, seal_guard, seal_update, shard_count_of, shard_index_of,
-};
-use wr_common::{Phase, SHARDS};
+use wr_common::expr::{Condition, Key, Update};
+use wr_common::{Phase, SHARDS, Shard, shard_count_of, shard_index_of};
 
 use crate::{SealValues, Store, StoreError};
 
@@ -36,7 +34,8 @@ impl Store for DynamoStore {
         // registration writes do not contend, which means the seal has to
         // gather them.
         let keys: Vec<_> = (0..SHARDS)
-            .map(|shard| prequeue_shard_key(event_id, shard))
+            .filter_map(Shard::new)
+            .map(|shard| Key::PrequeueShard { event_id, shard }.build())
             .collect();
 
         let request = aws_sdk_dynamodb::types::KeysAndAttributes::builder()
@@ -79,26 +78,42 @@ impl Store for DynamoStore {
             .map(|o| AttributeValue::N(o.to_string()))
             .collect();
 
+        let count = AttributeValue::N(values.participant_count.to_string());
+        // queue_counter takes the cohort size too: the live-join sequence
+        // starts behind the whole pre-queue cohort, or `ADD queue_counter`
+        // would hand a post-seal joiner position 1, already owned inside
+        // `[0, N)`.
+        let seal = Update::new()
+            .set(
+                "shuffle_seed",
+                AttributeValue::B(aws_sdk_dynamodb::primitives::Blob::new(values.seed)),
+            )
+            .set("participant_count", count.clone())
+            .set("queue_counter", count)
+            .set("prequeue_offsets", AttributeValue::L(offsets_list))
+            .set(
+                "phase",
+                AttributeValue::S(Phase::Active.as_wire_str().to_owned()),
+            )
+            .build();
+
+        // The seed is written by the seal and nothing else, so its absence
+        // means "not yet sealed" and a double-fire is rejected rather than
+        // reseeding.
+        let guard = Condition::attribute_not_exists("shuffle_seed").build();
+
+        let mut names = seal.names;
+        names.extend(guard.names);
+
         let result = self
             .client
             .update_item()
             .table_name(&self.counters_table)
-            .set_key(Some(event_key(event_id)))
-            .update_expression(seal_update())
-            .condition_expression(seal_guard())
-            .expression_attribute_values(
-                ":seed",
-                AttributeValue::B(aws_sdk_dynamodb::primitives::Blob::new(values.seed)),
-            )
-            .expression_attribute_values(
-                ":n",
-                AttributeValue::N(values.participant_count.to_string()),
-            )
-            .expression_attribute_values(":offsets", AttributeValue::L(offsets_list))
-            .expression_attribute_values(
-                ":active",
-                AttributeValue::S(Phase::Active.as_wire_str().to_owned()),
-            )
+            .set_key(Some(Key::Event { event_id }.build()))
+            .update_expression(seal.expression)
+            .condition_expression(guard.expression)
+            .set_expression_attribute_names(Some(names))
+            .set_expression_attribute_values(Some(seal.values))
             .send()
             .await;
 

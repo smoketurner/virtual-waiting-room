@@ -145,9 +145,9 @@ resource "aws_s3_object" "waiting_style" {
 resource "aws_s3_object" "waiting_script" {
   bucket        = aws_s3_bucket.waiting.id
   key           = "_wr/waiting.js"
-  content       = file("${path.module}/pages/waiting.js")
+  content       = local.waiting_js_source
   content_type  = "text/javascript; charset=utf-8"
   cache_control = "max-age=0, s-maxage=300"
-  etag          = filemd5("${path.module}/pages/waiting.js")
+  etag          = md5(local.waiting_js_source)
   tags          = var.tags
 }

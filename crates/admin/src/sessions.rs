@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::types::AttributeValue;
-use wr_common::expr::{TOKENS_TTL_ATTR, oidc_session_key, pkce_transaction_key};
+use wr_common::expr::{Key, TOKENS_TTL_ATTR};
 
 use crate::arrival::ArrivalTime;
 
@@ -117,7 +117,7 @@ impl SessionStore {
         self.client
             .put_item()
             .table_name(&self.tokens_table)
-            .set_item(Some(pkce_transaction_key(state)))
+            .set_item(Some(Key::PkceTransaction { state }.build()))
             .item(
                 "pkce_verifier",
                 AttributeValue::S(pending.pkce_verifier.clone()),
@@ -146,7 +146,7 @@ impl SessionStore {
             .client
             .delete_item()
             .table_name(&self.tokens_table)
-            .set_key(Some(pkce_transaction_key(state)))
+            .set_key(Some(Key::PkceTransaction { state }.build()))
             .return_values(aws_sdk_dynamodb::types::ReturnValue::AllOld)
             .send()
             .await
@@ -171,7 +171,7 @@ impl SessionStore {
         self.client
             .put_item()
             .table_name(&self.tokens_table)
-            .set_item(Some(oidc_session_key(&id)))
+            .set_item(Some(Key::OidcSession { session_id: &id }.build()))
             .item("subject", AttributeValue::S(session.subject.clone()))
             .item("email", AttributeValue::S(session.email.clone()))
             .item(TOKENS_TTL_ATTR, AttributeValue::N(expires.to_string()))
@@ -196,7 +196,7 @@ impl SessionStore {
             .client
             .get_item()
             .table_name(&self.tokens_table)
-            .set_key(Some(oidc_session_key(id)))
+            .set_key(Some(Key::OidcSession { session_id: id }.build()))
             .send()
             .await
             .map_err(|e| SessionError::Backend(format!("load_session: {e}")))?;
@@ -228,7 +228,7 @@ impl SessionStore {
         self.client
             .delete_item()
             .table_name(&self.tokens_table)
-            .set_key(Some(oidc_session_key(id)))
+            .set_key(Some(Key::OidcSession { session_id: id }.build()))
             .send()
             .await
             .map_err(|e| SessionError::Backend(format!("delete_session: {e}")))?;

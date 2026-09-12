@@ -325,6 +325,7 @@ mod tests {
             s,
             l,
             t: 1_788_000_000,
+            v: None,
         }
     }
 
@@ -776,6 +777,7 @@ mod tests {
             s: SHARDS as u8,
             l: 0,
             t: 1_788_000_000,
+            v: None,
         };
         assert_eq!(queue_num(&counters, &bad), Err(QueueNumError::BadShard));
     }

@@ -1,13 +1,21 @@
 //! Batch processing for the `assign_position` Lambda: live-join positions and
 //! pre-queue registration.
 //!
-//! Consumes a batch of enqueued join messages. Each batch reads the event's
-//! `Counters` item once (a strongly consistent `GetItem`) to decide which of
-//! two paths every valid record in the batch takes, or to reject the batch
-//! outright when no `Counters` item exists yet:
+//! Consumes a batch of enqueued join messages. Each record is classified
+//! first (issue #59): its body must parse, its `event_id` must match, and
+//! under [`EntryPolicy::Ticketed`] it must carry a ticket that verifies and a
+//! `request_id` that equals the value derived from the ticket's subject. A
+//! record that fails any of these is a permanent [`DropReason`] — counted and
+//! logged, never retried, never dead-lettered, since no redelivery makes
+//! attacker-chosen or malformed input valid.
+//!
+//! Each batch then reads the event's `Counters` item once (a strongly
+//! consistent `GetItem`) to decide which of two paths every accepted record in
+//! the batch takes, or to reject the batch outright when no `Counters` item
+//! exists yet:
 //!
 //! - **Rejected (unconfigured event)** — no `Counters` item exists, so the
-//!   event has not been set up. Every valid record is failed and claims
+//!   event has not been set up. Every accepted record is failed and claims
 //!   nothing, surfacing the state as a hard failure rather than letting a
 //!   pre-seal live join increment `queue_counter` before the seal `SET`s it
 //!   to the cohort size (an unconditional `SET` that would discard the
@@ -15,11 +23,11 @@
 //!   the same numeric position).
 //! - **Live join** — the event is sealed, or its phase is anything but
 //!   `PreQueue`. Allocates one contiguous block of queue positions with one
-//!   counter increment and writes one `Positions` row per valid record.
+//!   counter increment and writes one `Positions` row per accepted record.
 //! - **Pre-queue** — the event is not sealed and its phase is `PreQueue`.
-//!   Groups the batch's valid records by shard (`hash(request_id) % 10`) and
-//!   claims one contiguous block of local indices per shard, then writes one
-//!   `PreQueue` row per record.
+//!   Deduplicates by `request_id` (within the batch, and against any row a
+//!   prior invocation already wrote) and claims one contiguous block of local
+//!   indices on one randomly drawn shard for whatever remains.
 //!
 //! The branch is decided on the seal outputs ([`wr_common::Counters::sealed`]),
 //! never on phase alone: an operator can walk the phase back to `PreQueue`
@@ -41,58 +49,78 @@
 //! The batch logic is generic over the [`Store`] port so it runs without AWS;
 //! the SDK-backed implementation lives in `dynamo`.
 
+use std::collections::HashSet;
 use std::future::Future;
 
 use serde::Deserialize;
-use wr_common::{Assignment, Counters, Phase, SHARDS, shard_for};
+use wr_common::{Assignment, Counters, EntryPolicy, Phase, Shard, Telemetry, TicketError};
 
 pub mod dynamo;
 
-/// A join message body enqueued by the ingest API. Only the two fields the
-/// request validator already required are read.
+/// A join message body enqueued by the ingest API.
 #[derive(Debug, Clone, Deserialize)]
 pub struct JoinMessage {
     pub request_id: String,
     pub event_id: String,
+    /// The client-carried entry ticket, present only under
+    /// [`EntryPolicy::Ticketed`]. Absent on an open deployment.
+    #[serde(default)]
+    pub ticket: Option<String>,
 }
 
-/// One record from the SQS batch: the message id (for failure reporting) and
-/// the raw body to parse.
+/// One record from the SQS batch: the message id (for failure reporting), the
+/// raw body to parse, and the join-time telemetry `main.rs` lifted from the
+/// record's message attributes.
 #[derive(Debug, Clone)]
 pub struct BatchRecord {
     pub message_id: String,
     pub body: String,
+    pub telemetry: Telemetry,
 }
 
-/// A position write to attempt: the request and the queue position it claimed.
+/// A position write to attempt: the request, the queue position it claimed,
+/// and the telemetry to attach to the row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PositionWrite {
     pub request_id: String,
     pub position: u64,
+    pub telemetry: Telemetry,
+    /// Whether the write may overwrite an existing row whose `status` is
+    /// `expired` (issue #59). A re-join with a derived `request_id` would
+    /// otherwise never be able to reclaim the id a controller-expired live
+    /// join left behind, permanently stranding a visitor whose reload advice
+    /// says "take a new place in line". Excluded for a request id that also
+    /// holds a `PreQueue` row, so a fixed-up straggler's expired live
+    /// position cannot be resurrected out from under the read path, which
+    /// prefers that `PreQueue` row and would keep serving the stale value.
+    pub allow_expired_overwrite: bool,
 }
 
-/// A pre-queue registration write to attempt: the request and the `(shard,
-/// local index)` it claimed.
+/// A pre-queue registration write to attempt: the request, the `(shard, local
+/// index)` it claimed, and the telemetry to attach to the row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreQueueWrite {
     pub request_id: String,
-    pub shard: usize,
+    pub shard: Shard,
     pub local_index: u64,
+    pub telemetry: Telemetry,
 }
 
 /// The persistence port the batch logic drives.
 pub trait Store {
     /// `ADD queue_counter :n` with `ALL_NEW` for one event, returning the block
     /// end. The claimed block is `[end - n + 1, end]`. `n` is the count of
-    /// valid records and is always `>= 1` when called.
+    /// accepted records and is always `>= 1` when called.
     fn claim_block(
         &self,
         event_id: &str,
         n: u64,
     ) -> impl Future<Output = Result<u64, StoreError>> + Send;
 
-    /// Writes one position row with `attribute_not_exists(request_id)`. A
-    /// conditional-check failure (a duplicate request id) is reported as
+    /// Writes one position row with [`PositionWrite::allow_expired_overwrite`]
+    /// choosing the condition: `attribute_not_exists(request_id)` alone, or
+    /// widened with `OR status = expired`. A conditional-check failure (a
+    /// duplicate, or a non-expired row already claiming the id) is reported as
     /// `Ok(WriteOutcome::Duplicate)`, not an error — the position is simply
     /// abandoned, which is a permitted gap.
     fn put_position(
@@ -115,7 +143,7 @@ pub trait Store {
     fn claim_prequeue_block(
         &self,
         event_id: &str,
-        shard: usize,
+        shard: Shard,
         count: u64,
     ) -> impl Future<Output = Result<u64, StoreError>> + Send;
 
@@ -126,13 +154,34 @@ pub trait Store {
         &self,
         write: &PreQueueWrite,
     ) -> impl Future<Output = Result<WriteOutcome, StoreError>> + Send;
+
+    /// Reads which of `request_ids` already have a `PreQueue` row, via one
+    /// consistent `BatchGetItem` (issue #59). Used two ways: to skip a
+    /// pre-queue claim for an id that already registered (a browser that
+    /// denies every storage tier re-sends the join on each reload, and
+    /// without this check each reload burned a fresh index), and to keep a
+    /// live-join expired-row overwrite from resurrecting a straggler who also
+    /// holds a `PreQueue` row (see [`PositionWrite::allow_expired_overwrite`]).
+    ///
+    /// This is an optimization over the authoritative `attribute_not_exists`
+    /// guard, never a substitute for it: a store error, or an id
+    /// `BatchGetItem` could not confirm (`UnprocessedKeys`), degrades to
+    /// "unknown" — simply absent from the returned set — so the caller falls
+    /// through to attempting the claim exactly as it would with no dedupe at
+    /// all, never losing a registration to a failed read.
+    fn registered_ids(
+        &self,
+        request_ids: &[String],
+    ) -> impl Future<Output = Result<HashSet<String>, StoreError>> + Send;
 }
 
 /// The result of a single conditional position or pre-queue write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteOutcome {
     Written,
-    /// The `attribute_not_exists` guard rejected a duplicate request id.
+    /// The write's condition rejected it: a duplicate request id, or (for a
+    /// live-join write) a row already claiming the id whose status is not
+    /// `expired`.
     Duplicate,
 }
 
@@ -148,65 +197,191 @@ pub struct BatchOutcome {
     pub failures: Vec<String>,
 }
 
-/// Parses `body` and returns the join message if `request_id` is a valid
-/// `UUIDv7`; `None` marks the record invalid (its position is never claimed).
-#[must_use]
-pub fn parse_valid(body: &str) -> Option<JoinMessage> {
-    let msg: JoinMessage = serde_json::from_str(body).ok()?;
-    if is_uuid_v7(&msg.request_id) {
-        Some(msg)
-    } else {
-        None
+/// Why a record was permanently rejected: never retried, never
+/// dead-lettered, since no redelivery makes attacker-chosen or malformed
+/// input valid. Counted by [`DropCounts`] and logged once per batch under the
+/// fixed field names a metric filter keys on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropReason {
+    /// The body did not parse as JSON, or a required field was missing or the
+    /// wrong shape (including a malformed ticket under a ticketed policy, and
+    /// a malformed `request_id` under an open one).
+    BadShape,
+    /// The message's `event_id` does not match this deployment's.
+    WrongEvent,
+    /// A ticketed deployment received a join with no ticket.
+    NoTicket,
+    /// The ticket's signature does not verify under the configured key.
+    BadSignature,
+    /// The ticket has expired.
+    Expired,
+    /// The ticket is not yet valid (`nbf` in the future).
+    NotYetValid,
+    /// The ticket's `aud` does not name this event.
+    WrongAudience,
+    /// The ticket's `sub` fails the opaque-subject shape check.
+    BadSubject,
+    /// The supplied `request_id` does not equal the value derived from the
+    /// ticket's verified subject.
+    IdMismatch,
+}
+
+/// Per-reason drop counts for one batch, logged under fixed field names so a
+/// `CloudWatch` metric filter can extract `total` mechanically.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct DropCounts {
+    bad_shape: u64,
+    wrong_event: u64,
+    no_ticket: u64,
+    bad_signature: u64,
+    expired: u64,
+    not_yet_valid: u64,
+    wrong_audience: u64,
+    bad_subject: u64,
+    id_mismatch: u64,
+}
+
+impl DropCounts {
+    fn record(&mut self, reason: DropReason) {
+        match reason {
+            DropReason::BadShape => self.bad_shape += 1,
+            DropReason::WrongEvent => self.wrong_event += 1,
+            DropReason::NoTicket => self.no_ticket += 1,
+            DropReason::BadSignature => self.bad_signature += 1,
+            DropReason::Expired => self.expired += 1,
+            DropReason::NotYetValid => self.not_yet_valid += 1,
+            DropReason::WrongAudience => self.wrong_audience += 1,
+            DropReason::BadSubject => self.bad_subject += 1,
+            DropReason::IdMismatch => self.id_mismatch += 1,
+        }
+    }
+
+    fn total(&self) -> u64 {
+        self.bad_shape
+            + self.wrong_event
+            + self.no_ticket
+            + self.bad_signature
+            + self.expired
+            + self.not_yet_valid
+            + self.wrong_audience
+            + self.bad_subject
+            + self.id_mismatch
     }
 }
 
-/// Checks the canonical `8-4-4-4-12` hex form with version nibble `7` and a
-/// variant nibble in `8..=b`. Rejects anything else so a malformed or spoofed
-/// id claims no position.
-#[must_use]
-pub fn is_uuid_v7(id: &str) -> bool {
-    let bytes = id.as_bytes();
-    if bytes.len() != 36 {
-        return false;
+/// The outcome of classifying one record.
+enum RecordVerdict {
+    /// Take a position.
+    Accept(JoinMessage),
+    /// Permanently unacceptable. Counted and logged; never retried, never
+    /// dead-lettered.
+    Reject(DropReason),
+}
+
+/// Parses and validates one record's body against `policy`.
+///
+/// Order: shape, then envelope `event_id`, then (under a ticketed policy)
+/// the ticket itself, then the derived id. An open policy only shape-checks
+/// `request_id`, exactly as the pre-issue-#59 `UUIDv7` check did, except the
+/// shape it accepts is no longer pinned to version 7 (nothing in this
+/// deployment depends on that ordering).
+fn classify_record(body: &str, policy: &EntryPolicy, event_id: &str, now: u64) -> RecordVerdict {
+    let msg: JoinMessage = match serde_json::from_str(body) {
+        Ok(msg) => msg,
+        Err(_err) => return RecordVerdict::Reject(DropReason::BadShape),
+    };
+    if msg.event_id != event_id {
+        return RecordVerdict::Reject(DropReason::WrongEvent);
     }
-    for (i, &b) in bytes.iter().enumerate() {
-        let ok = match i {
-            8 | 13 | 18 | 23 => b == b'-',
-            14 => b == b'7', // version nibble
-            19 => matches!(b, b'8'..=b'9' | b'a'..=b'b' | b'A'..=b'B'), // variant nibble
-            _ => b.is_ascii_hexdigit(),
-        };
-        if !ok {
-            return false;
+
+    match policy {
+        EntryPolicy::Open => {
+            if wr_common::is_uuid_shape(&msg.request_id) {
+                RecordVerdict::Accept(msg)
+            } else {
+                RecordVerdict::Reject(DropReason::BadShape)
+            }
+        }
+        EntryPolicy::Ticketed(key) => {
+            let Some(ticket) = msg.ticket.as_deref() else {
+                return RecordVerdict::Reject(DropReason::NoTicket);
+            };
+            let subject = match wr_common::verify_ticket(key, ticket, event_id, now) {
+                Ok(subject) => subject,
+                Err(TicketError::Malformed) => return RecordVerdict::Reject(DropReason::BadShape),
+                Err(TicketError::BadSignature) => {
+                    return RecordVerdict::Reject(DropReason::BadSignature);
+                }
+                Err(TicketError::Expired) => return RecordVerdict::Reject(DropReason::Expired),
+                Err(TicketError::NotYetValid) => {
+                    return RecordVerdict::Reject(DropReason::NotYetValid);
+                }
+                Err(TicketError::WrongAudience) => {
+                    return RecordVerdict::Reject(DropReason::WrongAudience);
+                }
+                Err(TicketError::BadSubject) => {
+                    return RecordVerdict::Reject(DropReason::BadSubject);
+                }
+            };
+            let derived = wr_common::derive_request_id(event_id, &subject);
+            if msg.request_id != derived {
+                return RecordVerdict::Reject(DropReason::IdMismatch);
+            }
+            RecordVerdict::Accept(msg)
         }
     }
-    true
 }
 
 /// Processes one SQS batch.
 ///
-/// Every record whose body is malformed, whose `request_id` is not a
-/// `UUIDv7`, or whose `event_id` does not match `event_id` is an immediate
-/// batch failure and claims nothing. The remaining valid records all take the
-/// same path — live join or pre-queue — decided once from the event's
-/// `Counters` item (see the module docs). A `Counters` read failure, or a
-/// missing `Counters` item (the event has not been set up yet), fails every
-/// valid record and claims nothing.
+/// Every record that fails [`classify_record`] is counted, logged once per
+/// batch, and dropped without becoming a batch failure — an attacker-chosen or
+/// malformed record is not something a retry ever fixes. The remaining
+/// accepted records all take the same path — live join or pre-queue — decided
+/// once from the event's `Counters` item (see the module docs). A `Counters`
+/// read failure, or a missing `Counters` item (the event has not been set up
+/// yet), fails every accepted record and claims nothing.
+///
+/// `shard` is drawn once by the caller for the whole invocation (issue #59):
+/// it is server-random rather than derived from `request_id`, so a batch that
+/// takes the pre-queue path claims one contiguous block on this one shard
+/// rather than grouping by shard and claiming up to ten. It is unused on the
+/// live-join path.
 pub async fn process_batch<S: Store>(
     store: &S,
     event_id: &str,
+    policy: &EntryPolicy,
+    shard: Shard,
+    now: u64,
     records: &[BatchRecord],
 ) -> BatchOutcome {
     let mut outcome = BatchOutcome::default();
+    let mut drops = DropCounts::default();
     let mut valid = Vec::new();
     for record in records {
-        match parse_valid(&record.body) {
-            Some(msg) if msg.event_id == event_id => valid.push((record.message_id.clone(), msg)),
-            Some(_) | None => {
-                tracing::warn!(message_id = %record.message_id, "invalid join record");
-                outcome.failures.push(record.message_id.clone());
+        match classify_record(&record.body, policy, event_id, now) {
+            RecordVerdict::Accept(msg) => {
+                valid.push((record.message_id.clone(), msg, record.telemetry.clone()));
             }
+            RecordVerdict::Reject(reason) => drops.record(reason),
         }
+    }
+
+    if drops.total() > 0 {
+        tracing::warn!(
+            event = "join_dropped",
+            bad_shape = drops.bad_shape,
+            wrong_event = drops.wrong_event,
+            no_ticket = drops.no_ticket,
+            bad_signature = drops.bad_signature,
+            expired = drops.expired,
+            not_yet_valid = drops.not_yet_valid,
+            wrong_audience = drops.wrong_audience,
+            bad_subject = drops.bad_subject,
+            id_mismatch = drops.id_mismatch,
+            total = drops.total(),
+            "dropped invalid join records"
+        );
     }
 
     if valid.is_empty() {
@@ -217,7 +392,7 @@ pub async fn process_batch<S: Store>(
         Ok(Some(c)) => c,
         Ok(None) => {
             // No `Counters` item: the event has not been set up yet. Failing
-            // every valid record prevents a pre-seal live join from
+            // every accepted record prevents a pre-seal live join from
             // incrementing `queue_counter` before the seal `SET`s it to the
             // cohort size — an unconditional `SET` that would discard the
             // increment and let a later cohort member (or post-seal live
@@ -230,14 +405,14 @@ pub async fn process_batch<S: Store>(
                 valid = valid.len(),
                 "no Counters item; failing batch until the event is set up"
             );
-            for (message_id, _) in &valid {
+            for (message_id, _, _) in &valid {
                 outcome.failures.push(message_id.clone());
             }
             return outcome;
         }
         Err(err) => {
             tracing::error!(error = %err, "counters read failed; retrying batch");
-            for (message_id, _) in &valid {
+            for (message_id, _, _) in &valid {
                 outcome.failures.push(message_id.clone());
             }
             return outcome;
@@ -253,26 +428,55 @@ pub async fn process_batch<S: Store>(
     if live_path {
         process_live_batch(store, event_id, valid, &mut outcome).await;
     } else {
-        process_prequeue_batch(store, event_id, valid, &mut outcome).await;
+        process_prequeue_batch(store, event_id, shard, valid, &mut outcome).await;
     }
 
     outcome
 }
 
+/// Degrades a [`Store::registered_ids`] failure to "unknown" — an empty set,
+/// so every caller falls through to attempting its claim exactly as it would
+/// with no dedupe at all. This is the "unknown, claim anyway" degrade path:
+/// the authoritative `attribute_not_exists` guard (or, for a live-join
+/// overwrite, the widened status check) still catches an actual duplicate.
+async fn registered_ids_or_unknown<S: Store>(store: &S, request_ids: &[String]) -> HashSet<String> {
+    match store.registered_ids(request_ids).await {
+        Ok(ids) => ids,
+        Err(err) => {
+            tracing::warn!(error = %err, "registered_ids read failed; treating every id as unknown");
+            HashSet::new()
+        }
+    }
+}
+
 /// Claims one contiguous block of queue positions for the whole valid set and
 /// writes one `Positions` row per record.
+///
+/// Before writing, checks which request ids also hold a `PreQueue` row
+/// (issue #59, R4): those are excluded from the expired-row overwrite, so a
+/// fixed-up straggler's controller-expired live position cannot be
+/// resurrected out from under `/queue_num`, which prefers the `PreQueue` row
+/// and would otherwise keep answering with the stale, already-passed
+/// position while `generate_token` polls forever without ever reaching a
+/// terminal 410.
 async fn process_live_batch<S: Store>(
     store: &S,
     event_id: &str,
-    valid: Vec<(String, JoinMessage)>,
+    valid: Vec<(String, JoinMessage, Telemetry)>,
     outcome: &mut BatchOutcome,
 ) {
+    let ids: Vec<String> = valid
+        .iter()
+        .map(|(_, msg, _)| msg.request_id.clone())
+        .collect();
+    let has_prequeue_row = registered_ids_or_unknown(store, &ids).await;
+
     let n = valid.len() as u64;
     let end = match store.claim_block(event_id, n).await {
         Ok(end) => end,
         Err(err) => {
             tracing::error!(error = %err, "queue_counter claim failed; retrying batch");
-            for (message_id, _) in &valid {
+            for (message_id, _, _) in &valid {
                 outcome.failures.push(message_id.clone());
             }
             return;
@@ -284,13 +488,15 @@ async fn process_live_batch<S: Store>(
     // is a guard against a counter that was reset, never normal arithmetic.
     let start = end.saturating_sub(n).saturating_add(1);
 
-    for (offset, (message_id, msg)) in valid.into_iter().enumerate() {
+    for (offset, (message_id, msg, telemetry)) in valid.into_iter().enumerate() {
         let write = PositionWrite {
+            allow_expired_overwrite: !has_prequeue_row.contains(&msg.request_id),
             request_id: msg.request_id,
             // Saturating for the same reason `start` itself is: a wrapped
             // position is indistinguishable from a valid low one, never a
             // harmless gap.
             position: start.saturating_add(offset as u64),
+            telemetry,
         };
         if let Err(err) = store.put_position(&write).await {
             tracing::error!(error = %err, message_id = %message_id, "position write failed");
@@ -299,78 +505,101 @@ async fn process_live_batch<S: Store>(
     }
 }
 
-/// Groups the valid set by shard, claims one contiguous local-index block per
-/// shard, and writes one `PreQueue` row per record. Then checks whether the
-/// event sealed mid-batch and gives every row this invocation actually wrote
-/// that now resolves past its shard's count a real live position.
+/// Deduplicates the valid set by `request_id` (within the batch, and against
+/// any row a prior invocation already wrote), then claims one contiguous
+/// block of local indices on `shard` for whatever remains and writes one
+/// `PreQueue` row per record. Then checks whether the event sealed mid-batch
+/// and gives every row this invocation actually wrote that now resolves past
+/// the shard's count a real live position.
 async fn process_prequeue_batch<S: Store>(
     store: &S,
     event_id: &str,
-    valid: Vec<(String, JoinMessage)>,
+    shard: Shard,
+    valid: Vec<(String, JoinMessage, Telemetry)>,
     outcome: &mut BatchOutcome,
 ) {
-    let mut groups: Vec<Vec<(String, JoinMessage)>> = (0..SHARDS).map(|_| Vec::new()).collect();
-    for (message_id, msg) in valid {
-        let shard = shard_for(msg.request_id.as_bytes());
-        groups[shard].push((message_id, msg));
+    // In-batch dedupe: a browser that denies every storage tier re-sends the
+    // join on each poll while storage-denied, and (independently) up to the
+    // 1-second batching window can bundle several reloads of the same
+    // visitor. Keeping only the first occurrence claims one index for all of
+    // them rather than one each.
+    let mut seen_in_batch = HashSet::new();
+    let mut deduped = Vec::with_capacity(valid.len());
+    for (message_id, msg, telemetry) in valid {
+        if seen_in_batch.insert(msg.request_id.clone()) {
+            deduped.push((message_id, msg, telemetry));
+        }
     }
+
+    // Cross-invocation dedupe: an id that already has a PreQueue row from an
+    // earlier invocation claims nothing here — not a failure, not a claim, not
+    // a write. `attribute_not_exists(r)` on the write below stays the
+    // authoritative guard; this only avoids paying for the claim.
+    let ids: Vec<String> = deduped
+        .iter()
+        .map(|(_, msg, _)| msg.request_id.clone())
+        .collect();
+    let already_registered = registered_ids_or_unknown(store, &ids).await;
+    let group: Vec<(String, JoinMessage, Telemetry)> = deduped
+        .into_iter()
+        .filter(|(_, msg, _)| !already_registered.contains(&msg.request_id))
+        .collect();
+
+    if group.is_empty() {
+        return;
+    }
+
+    let count = group.len() as u64;
+    let start = match store.claim_prequeue_block(event_id, shard, count).await {
+        Ok(start) => start,
+        Err(err) => {
+            tracing::error!(error = %err, shard = shard.index(), "prequeue shard claim failed; retrying batch");
+            for (message_id, _, _) in &group {
+                outcome.failures.push(message_id.clone());
+            }
+            return;
+        }
+    };
 
     // What this invocation actually wrote (never a Duplicate — see the module
     // docs), carried into the fix-up below.
     let mut written = Vec::new();
 
-    for (shard, group) in groups.into_iter().enumerate() {
-        if group.is_empty() {
-            continue;
-        }
-        let count = group.len() as u64;
-        let start = match store.claim_prequeue_block(event_id, shard, count).await {
-            Ok(start) => start,
-            Err(err) => {
-                tracing::error!(error = %err, shard, "prequeue shard claim failed; retrying batch");
-                for (message_id, _) in &group {
-                    outcome.failures.push(message_id.clone());
-                }
-                continue;
-            }
+    for (offset, (message_id, msg, telemetry)) in group.into_iter().enumerate() {
+        let write = PreQueueWrite {
+            request_id: msg.request_id,
+            shard,
+            // Saturating: a wrapped local index would be a duplicate global
+            // index, not a gap, which is what the shard claim's own
+            // `checked_sub` guards against — but `start` and `count` are both
+            // small relative to `u64::MAX` here, so this is defensive, not
+            // reachable in practice.
+            local_index: start.saturating_add(offset as u64),
+            telemetry,
         };
-
-        for (offset, (message_id, msg)) in group.into_iter().enumerate() {
-            let write = PreQueueWrite {
-                request_id: msg.request_id,
-                shard,
-                // Saturating: a wrapped local index would be a duplicate
-                // global index, not a gap, which is what the shard claim's own
-                // `checked_sub` guards against — but `start` and `count` are
-                // both small relative to `u64::MAX` here, so this is
-                // defensive, not reachable in practice.
-                local_index: start.saturating_add(offset as u64),
-            };
-            match store.put_prequeue(&write).await {
-                Ok(WriteOutcome::Written) => written.push(write),
-                // Burned index: the authoritative row belongs to an earlier
-                // invocation with a different (shard, local index). Never
-                // classified below, and never a batch failure.
-                Ok(WriteOutcome::Duplicate) => {
-                    tracing::debug!(message_id = %message_id, "prequeue write was a duplicate; index burned");
-                }
-                Err(err) => {
-                    // Accepted residual: a write that timed out on the caller
-                    // side but actually landed is indistinguishable here from
-                    // one that truly failed, so it is classified as "no row"
-                    // and reported as a batch failure. Redelivery finds the
-                    // event sealed by then and takes the live path, which can
-                    // mint a second Positions row for a request id that
-                    // already holds a counted PreQueue row, demoting a visitor
-                    // who was counted into the cohort. The fix-up below cannot
-                    // catch it, because it only classifies writes this
-                    // invocation observed as Written. Closing it costs a
-                    // PreQueue GetItem per record on the live path, which is
-                    // not worth paying on every live join to guard against one
-                    // rare timing window; left open.
-                    tracing::error!(error = %err, message_id = %message_id, "prequeue write failed");
-                    outcome.failures.push(message_id);
-                }
+        match store.put_prequeue(&write).await {
+            Ok(WriteOutcome::Written) => written.push(write),
+            // Burned index: the authoritative row belongs to an earlier
+            // invocation with a different local index. Never classified
+            // below, and never a batch failure.
+            Ok(WriteOutcome::Duplicate) => {
+                tracing::debug!(message_id = %message_id, "prequeue write was a duplicate; index burned");
+            }
+            Err(err) => {
+                // Accepted residual: a write that timed out on the caller
+                // side but actually landed is indistinguishable here from one
+                // that truly failed, so it is classified as "no row" and
+                // reported as a batch failure. Redelivery finds the event
+                // sealed by then and takes the live path, which can mint a
+                // second Positions row for a request id that already holds a
+                // counted PreQueue row, demoting a visitor who was counted
+                // into the cohort. The fix-up below cannot catch it, because
+                // it only classifies writes this invocation observed as
+                // Written. Closing it costs a PreQueue GetItem per record on
+                // the live path, which is not worth paying on every live join
+                // to guard against one rare timing window; left open.
+                tracing::error!(error = %err, message_id = %message_id, "prequeue write failed");
+                outcome.failures.push(message_id);
             }
         }
     }
@@ -411,7 +640,9 @@ async fn fixup_stragglers<S: Store>(store: &S, event_id: &str, written: Vec<PreQ
         .into_iter()
         .filter(|write| {
             matches!(
-                sealed.offsets.assign(write.shard, write.local_index),
+                sealed
+                    .offsets
+                    .assign(write.shard.index(), write.local_index),
                 Assignment::LiveJoin
             )
         })
@@ -434,6 +665,10 @@ async fn fixup_stragglers<S: Store>(store: &S, event_id: &str, written: Vec<PreQ
         let position_write = PositionWrite {
             request_id: write.request_id,
             position: start.saturating_add(offset as u64),
+            telemetry: write.telemetry,
+            // A straggler fix-up is the first live write for this id; there
+            // is no row yet to collide with an expired one.
+            allow_expired_overwrite: true,
         };
         if let Err(err) = store.put_position(&position_write).await {
             tracing::error!(error = %err, "straggler position write failed; leaving to self-heal");
@@ -448,29 +683,15 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
-    use wr_common::{SealedOffsets, StoredControl};
+    use wr_common::{SHARDS, SealedOffsets, StoredControl};
 
     use super::*;
 
     const VALID_ID: &str = "018f3a2b-7c9d-7e1f-abcd-0123456789ab";
-    const V4_ID: &str = "018f3a2b-7c9d-4e1f-abcd-0123456789ab";
+    const BAD_SHAPE_ID: &str = "not-a-uuid";
 
-    /// Finds `n` `UUIDv7`-shaped ids that hash to `shard`, by varying a hex
-    /// suffix. Deterministic and fast: 10 shards, so a match lands within a
-    /// handful of tries on average. The varying group's leading nibble is
-    /// pinned to the valid variant range (`8`) so every generated id still
-    /// passes `is_uuid_v7`.
-    fn ids_on_shard(shard: usize, n: usize) -> Vec<String> {
-        let mut found = Vec::new();
-        let mut i: u32 = 0;
-        while found.len() < n {
-            let id = format!("018f3a2b-7c9d-7e1f-8{i:03x}-0123456789ab");
-            if shard_for(id.as_bytes()) == shard {
-                found.push(id);
-            }
-            i += 1;
-        }
-        found
+    fn shard(n: usize) -> Shard {
+        Shard::new(n).unwrap()
     }
 
     struct FakeStore {
@@ -498,6 +719,10 @@ mod tests {
         counters_sequence: Mutex<VecDeque<Option<Counters>>>,
         counters_fail_from_call: Option<u32>,
         counters_calls: Mutex<u32>,
+
+        /// Ids `registered_ids` reports as already holding a `PreQueue` row.
+        already_registered: Mutex<HashSet<String>>,
+        registered_ids_fails: bool,
     }
 
     impl Default for FakeStore {
@@ -519,6 +744,8 @@ mod tests {
                 ))])),
                 counters_fail_from_call: None,
                 counters_calls: Mutex::new(0),
+                already_registered: Mutex::new(HashSet::new()),
+                registered_ids_fails: false,
             }
         }
     }
@@ -587,15 +814,15 @@ mod tests {
         fn claim_prequeue_block(
             &self,
             _event_id: &str,
-            shard: usize,
+            shard: Shard,
             count: u64,
         ) -> impl std::future::Future<Output = Result<u64, StoreError>> + Send {
             let result = if self.prequeue_claim_fails {
                 Err(StoreError("shard claim down".to_owned()))
             } else {
                 let mut counters = self.shard_counters.lock().unwrap();
-                let start = counters[shard];
-                counters[shard] += count;
+                let start = counters[shard.index()];
+                counters[shard.index()] += count;
                 Ok(start)
             };
             std::future::ready(result)
@@ -620,12 +847,30 @@ mod tests {
                 };
             std::future::ready(result)
         }
+
+        fn registered_ids(
+            &self,
+            request_ids: &[String],
+        ) -> impl std::future::Future<Output = Result<HashSet<String>, StoreError>> + Send {
+            let result = if self.registered_ids_fails {
+                Err(StoreError("registered_ids down".to_owned()))
+            } else {
+                let already = self.already_registered.lock().unwrap();
+                Ok(request_ids
+                    .iter()
+                    .filter(|id| already.contains(*id))
+                    .cloned()
+                    .collect())
+            };
+            std::future::ready(result)
+        }
     }
 
     fn rec(message_id: &str, request_id: &str) -> BatchRecord {
         BatchRecord {
             message_id: message_id.to_owned(),
             body: format!(r#"{{"request_id":"{request_id}","event_id":"evt-1"}}"#),
+            telemetry: Telemetry::default(),
         }
     }
 
@@ -671,19 +916,25 @@ mod tests {
         }
     }
 
+    async fn run_open(store: &FakeStore, records: &[BatchRecord]) -> BatchOutcome {
+        process_batch(store, "evt-1", &EntryPolicy::Open, shard(0), 0, records).await
+    }
+
     // --- live path (unchanged behaviour) ------------------------------------
 
     #[test]
-    fn uuid_v7_validation() {
-        assert!(is_uuid_v7(VALID_ID));
-        assert!(!is_uuid_v7(V4_ID)); // wrong version nibble
-        assert!(!is_uuid_v7("not-a-uuid"));
-        assert!(!is_uuid_v7("018f3a2b7c9d7e1fabcd0123456789ab")); // no dashes
-        assert!(!is_uuid_v7("")); // empty
-        assert!(!is_uuid_v7("018f3a2b-7c9d-7e1f-abcd-0123456789ab-extra"));
-        // Variant nibble must be 8-b; 0-7, c-f are not RFC 4122 variant 1.
-        assert!(!is_uuid_v7("018f3a2b-7c9d-7e1f-0bcd-0123456789ab"));
-        assert!(is_uuid_v7("018f3a2b-7c9d-7e1f-bbcd-0123456789ab"));
+    fn open_policy_uuid_shape_validation() {
+        assert!(wr_common::is_uuid_shape(VALID_ID));
+        // A v4-shaped id is accepted too: the shape check no longer pins a
+        // version nibble (issue #59, M2).
+        assert!(wr_common::is_uuid_shape(
+            "018f3a2b-7c9d-4e1f-abcd-0123456789ab"
+        ));
+        assert!(!wr_common::is_uuid_shape(BAD_SHAPE_ID));
+        assert!(!wr_common::is_uuid_shape(
+            "018f3a2b7c9d7e1fabcd0123456789ab"
+        ));
+        assert!(!wr_common::is_uuid_shape(""));
     }
 
     #[tokio::test]
@@ -694,7 +945,7 @@ mod tests {
             rec("m2", "018f3a2b-7c9d-7e1f-8002-0123456789ab"),
             rec("m3", "018f3a2b-7c9d-7e1f-8003-0123456789ab"),
         ];
-        let outcome = process_batch(&store, "evt-1", &records).await;
+        let outcome = run_open(&store, &records).await;
         assert!(outcome.failures.is_empty());
         let writes = store.writes.lock().unwrap();
         let mut positions: Vec<u64> = writes.iter().map(|w| w.position).collect();
@@ -703,32 +954,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_records_are_failures_and_dont_consume_positions() {
+    async fn invalid_records_are_dropped_not_failed() {
         let store = FakeStore::default();
         let records = vec![
             rec("m1", VALID_ID),
             BatchRecord {
                 message_id: "m2".to_owned(),
                 body: "not json".to_owned(),
+                telemetry: Telemetry::default(),
             },
-            rec("m3", V4_ID), // valid json, wrong UUID version
+            rec("m3", BAD_SHAPE_ID),
         ];
-        let outcome = process_batch(&store, "evt-1", &records).await;
-        assert_eq!(outcome.failures, vec!["m2".to_owned(), "m3".to_owned()]);
+        let outcome = run_open(&store, &records).await;
+        // Rejected records are dropped, not retried or dead-lettered.
+        assert!(outcome.failures.is_empty());
         // Only the one valid record claimed a position: counter incremented by 1.
         assert_eq!(*store.counter.lock().unwrap(), 1);
         assert_eq!(store.writes.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
-    async fn all_invalid_claims_nothing() {
+    async fn all_invalid_claims_nothing_and_fails_nothing() {
         let store = FakeStore::default();
         let records = vec![BatchRecord {
             message_id: "m1".to_owned(),
             body: "garbage".to_owned(),
+            telemetry: Telemetry::default(),
         }];
-        let outcome = process_batch(&store, "evt-1", &records).await;
-        assert_eq!(outcome.failures, vec!["m1".to_owned()]);
+        let outcome = run_open(&store, &records).await;
+        assert!(outcome.failures.is_empty());
         assert_eq!(*store.counter.lock().unwrap(), 0);
     }
 
@@ -739,7 +993,7 @@ mod tests {
             ..FakeStore::default()
         };
         let records = vec![rec("m1", VALID_ID)];
-        let outcome = process_batch(&store, "evt-1", &records).await;
+        let outcome = run_open(&store, &records).await;
         assert_eq!(outcome.failures, vec!["m1".to_owned()]);
         assert!(store.writes.lock().unwrap().is_empty());
     }
@@ -755,7 +1009,7 @@ mod tests {
             rec("m2", "018f3a2b-7c9d-7e1f-8002-0123456789ab"),
             rec("m3", "018f3a2b-7c9d-7e1f-8003-0123456789ab"),
         ];
-        let outcome = process_batch(&store, "evt-1", &records).await;
+        let outcome = run_open(&store, &records).await;
         assert_eq!(outcome.failures, vec!["m2".to_owned()]);
         assert_eq!(store.writes.lock().unwrap().len(), 2);
     }
@@ -774,7 +1028,7 @@ mod tests {
             rec("m1", "018f3a2b-7c9d-7e1f-8001-0123456789ab"),
             rec("m2", "018f3a2b-7c9d-7e1f-8002-0123456789ab"),
         ];
-        let outcome = process_batch(&store, "evt-1", &records).await;
+        let outcome = run_open(&store, &records).await;
         assert!(outcome.failures.is_empty());
         let writes = store.writes.lock().unwrap();
         let mut positions: Vec<u64> = writes.iter().map(|w| w.position).collect();
@@ -803,7 +1057,7 @@ mod tests {
             rec("m2", "018f3a2b-7c9d-7e1f-8002-0123456789ab"),
             rec("m3", "018f3a2b-7c9d-7e1f-8003-0123456789ab"),
         ];
-        let outcome = process_batch(&store, "evt-1", &records).await;
+        let outcome = run_open(&store, &records).await;
         assert!(outcome.failures.is_empty());
         let writes = store.writes.lock().unwrap();
         for write in writes.iter() {
@@ -821,7 +1075,45 @@ mod tests {
         let dup = "018f3a2b-7c9d-7e1f-8009-0123456789ab";
         // Same id twice in one batch: second write is a Duplicate, not a failure.
         let records = vec![rec("m1", dup), rec("m2", dup)];
-        let outcome = process_batch(&store, "evt-1", &records).await;
+        let outcome = run_open(&store, &records).await;
+        assert!(outcome.failures.is_empty());
+        assert_eq!(store.writes.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_request_id_with_a_prequeue_row_does_not_get_the_expired_overwrite() {
+        // The R4 fix: a live-join write for an id that also holds a PreQueue
+        // row (the fixed-up-straggler case) must not be allowed to overwrite
+        // an expired row, or /queue_num (which prefers the PreQueue row) would
+        // keep serving a stale position forever.
+        let store = FakeStore::default();
+        let id = "018f3a2b-7c9d-7e1f-8001-0123456789ab".to_owned();
+        store.already_registered.lock().unwrap().insert(id.clone());
+        let records = vec![rec("m1", &id)];
+        run_open(&store, &records).await;
+        let writes = store.writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert!(!writes[0].allow_expired_overwrite);
+    }
+
+    #[tokio::test]
+    async fn an_id_with_no_prequeue_row_gets_the_expired_overwrite() {
+        let store = FakeStore::default();
+        let records = vec![rec("m1", "018f3a2b-7c9d-7e1f-8001-0123456789ab")];
+        run_open(&store, &records).await;
+        let writes = store.writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert!(writes[0].allow_expired_overwrite);
+    }
+
+    #[tokio::test]
+    async fn a_registered_ids_failure_degrades_to_claim_anyway() {
+        let store = FakeStore {
+            registered_ids_fails: true,
+            ..FakeStore::default()
+        };
+        let records = vec![rec("m1", VALID_ID)];
+        let outcome = run_open(&store, &records).await;
         assert!(outcome.failures.is_empty());
         assert_eq!(store.writes.lock().unwrap().len(), 1);
     }
@@ -837,7 +1129,7 @@ mod tests {
         let counters = sealed_counters([1, 0, 0, 0, 0, 0, 0, 0, 0, 0], Phase::PreQueue);
         *store.counters_sequence.lock().unwrap() = VecDeque::from([Some(counters)]);
         let records = vec![rec("m1", VALID_ID)];
-        let outcome = process_batch(&store, "evt-1", &records).await;
+        let outcome = run_open(&store, &records).await;
         assert!(outcome.failures.is_empty());
         assert_eq!(store.writes.lock().unwrap().len(), 1);
         assert!(store.prequeue_writes.lock().unwrap().is_empty());
@@ -855,18 +1147,26 @@ mod tests {
             *store.counters_sequence.lock().unwrap() =
                 VecDeque::from([Some(counters_with_phase(phase))]);
             let records = vec![rec("m1", VALID_ID)];
-            let outcome = process_batch(&store, "evt-1", &records).await;
+            let outcome = run_open(&store, &records).await;
             assert!(outcome.failures.is_empty(), "{phase:?}");
             assert_eq!(store.writes.lock().unwrap().len(), 1, "{phase:?}");
         }
     }
 
     #[tokio::test]
-    async fn mismatched_event_id_is_a_batch_failure() {
+    async fn mismatched_event_id_is_dropped_not_failed() {
         let store = FakeStore::default();
         let records = vec![rec("m1", VALID_ID)]; // rec() hardcodes event_id "evt-1"
-        let outcome = process_batch(&store, "evt-other", &records).await;
-        assert_eq!(outcome.failures, vec!["m1".to_owned()]);
+        let outcome = process_batch(
+            &store,
+            "evt-other",
+            &EntryPolicy::Open,
+            shard(0),
+            0,
+            &records,
+        )
+        .await;
+        assert!(outcome.failures.is_empty());
         assert_eq!(*store.counter.lock().unwrap(), 0);
     }
 
@@ -880,7 +1180,7 @@ mod tests {
             rec("m1", "018f3a2b-7c9d-7e1f-8001-0123456789ab"),
             rec("m2", "018f3a2b-7c9d-7e1f-8002-0123456789ab"),
         ];
-        let outcome = process_batch(&store, "evt-1", &records).await;
+        let outcome = run_open(&store, &records).await;
         assert_eq!(outcome.failures.len(), 2);
         assert!(store.writes.lock().unwrap().is_empty());
         assert!(store.prequeue_writes.lock().unwrap().is_empty());
@@ -902,7 +1202,7 @@ mod tests {
             rec("m1", "018f3a2b-7c9d-7e1f-8001-0123456789ab"),
             rec("m2", "018f3a2b-7c9d-7e1f-8002-0123456789ab"),
         ];
-        let outcome = process_batch(&store, "evt-1", &records).await;
+        let outcome = run_open(&store, &records).await;
         assert_eq!(outcome.failures, vec!["m1".to_owned(), "m2".to_owned()]);
         assert_eq!(
             *store.counter.lock().unwrap(),
@@ -913,101 +1213,6 @@ mod tests {
         assert!(store.prequeue_writes.lock().unwrap().is_empty());
     }
 
-    /// Reproduces the collision from the bug report end-to-end through the
-    /// `Store` port. A join that arrives before any `Counters` item exists is
-    /// now rejected (not routed to the live path), so it leaves no `Positions`
-    /// row to collide with the pre-queue cohort once the event is later set to
-    /// `PreQueue` and sealed. Before the fix, step (1) took the live path,
-    /// incremented `queue_counter`, and the seal's `SET queue_counter = :n`
-    /// overwrote it — handing a cohort member the same numeric position.
-    #[tokio::test]
-    async fn pre_seal_join_before_counters_item_does_not_collide_with_cohort() {
-        let store = FakeStore::default();
-
-        // (1) A join arrives before any `Counters` item exists: rejected, and
-        // it neither increments `queue_counter` nor writes a `Positions` row.
-        *store.counters_sequence.lock().unwrap() = VecDeque::from([None]);
-        let early = process_batch(
-            &store,
-            "evt-1",
-            &[rec("m1", "018f3a2b-7c9d-7e1f-8001-0123456789ab")],
-        )
-        .await;
-        assert_eq!(early.failures, vec!["m1".to_owned()]);
-        assert_eq!(
-            *store.counter.lock().unwrap(),
-            0,
-            "the pre-seal joiner must not increment queue_counter"
-        );
-        assert!(
-            store.writes.lock().unwrap().is_empty(),
-            "the pre-seal joiner must leave no Positions row to collide"
-        );
-
-        // (2) The admin sets phase = PreQueue; two cohort members register on
-        // shard 0. The pre-queue path claims local indices and never touches
-        // `queue_counter`.
-        *store.counters_sequence.lock().unwrap() =
-            VecDeque::from([Some(counters_with_phase(Phase::PreQueue))]);
-        let ids = ids_on_shard(0, 2);
-        let cohort: Vec<BatchRecord> = ids
-            .iter()
-            .enumerate()
-            .map(|(i, id)| rec(&format!("c{i}"), id))
-            .collect();
-        let outcome = process_batch(&store, "evt-1", &cohort).await;
-        assert!(outcome.failures.is_empty());
-        assert_eq!(store.prequeue_writes.lock().unwrap().len(), 2);
-        assert_eq!(
-            *store.counter.lock().unwrap(),
-            0,
-            "pre-queue registration never increments queue_counter"
-        );
-
-        // (3) The seal `SET`s queue_counter = N (N = 2). The PRP is a
-        // permutation of [0, 2), so the cohort occupies {0, 1}. Because the
-        // pre-seal joiner was rejected, no `Positions` row exists at {0, 1},
-        // so no numeric position is held by two visitors.
-        *store.counter.lock().unwrap() = 2; // the seal's unconditional `SET queue_counter = :n`
-        let live_positions: Vec<u64> = store
-            .writes
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|w| w.position)
-            .collect();
-        assert!(
-            live_positions.is_empty(),
-            "no pre-seal live Positions row collides with the cohort [0, 2)"
-        );
-
-        // (4) A post-seal live join lands strictly above the cohort
-        // (N + 1 = 3), never overlapping {0, 1} — the guard PR #57 intended.
-        *store.counters_sequence.lock().unwrap() = VecDeque::from([Some(sealed_counters(
-            [2, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            Phase::Active,
-        ))]);
-        let after = process_batch(
-            &store,
-            "evt-1",
-            &[rec("m2", "018f3a2b-7c9d-7e1f-8009-0123456789ab")],
-        )
-        .await;
-        assert!(after.failures.is_empty());
-        let live_positions: Vec<u64> = store
-            .writes
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|w| w.position)
-            .collect();
-        assert_eq!(
-            live_positions,
-            vec![3],
-            "post-seal live join starts at N + 1"
-        );
-    }
-
     // --- pre-queue path ------------------------------------------------------
 
     #[tokio::test]
@@ -1015,51 +1220,48 @@ mod tests {
         let store = FakeStore::default();
         *store.counters_sequence.lock().unwrap() =
             VecDeque::from([Some(counters_with_phase(Phase::PreQueue))]);
-        let ids = ids_on_shard(0, 3);
-        let records: Vec<BatchRecord> = ids
-            .iter()
-            .enumerate()
-            .map(|(i, id)| rec(&format!("m{i}"), id))
-            .collect();
-        let outcome = process_batch(&store, "evt-1", &records).await;
+        let records = vec![
+            rec("m0", "018f3a2b-7c9d-7e1f-8000-0123456789ab"),
+            rec("m1", "018f3a2b-7c9d-7e1f-8001-0123456789ab"),
+            rec("m2", "018f3a2b-7c9d-7e1f-8002-0123456789ab"),
+        ];
+        let outcome = run_open(&store, &records).await;
         assert!(outcome.failures.is_empty());
         assert_eq!(store.prequeue_writes.lock().unwrap().len(), 3);
         assert!(store.writes.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn records_sharing_a_shard_get_consecutive_local_indices() {
+    async fn records_in_one_batch_get_consecutive_local_indices_on_the_drawn_shard() {
         let store = FakeStore::default();
         *store.counters_sequence.lock().unwrap() =
             VecDeque::from([Some(counters_with_phase(Phase::PreQueue))]);
-        let shard0_ids = ids_on_shard(0, 2);
-        let shard1_ids = ids_on_shard(1, 2);
-        let records: Vec<BatchRecord> = shard0_ids
-            .iter()
-            .chain(shard1_ids.iter())
-            .enumerate()
-            .map(|(i, id)| rec(&format!("m{i}"), id))
-            .collect();
-        let outcome = process_batch(&store, "evt-1", &records).await;
+        let records = vec![
+            rec("m0", "018f3a2b-7c9d-7e1f-8000-0123456789ab"),
+            rec("m1", "018f3a2b-7c9d-7e1f-8001-0123456789ab"),
+            rec("m2", "018f3a2b-7c9d-7e1f-8002-0123456789ab"),
+            rec("m3", "018f3a2b-7c9d-7e1f-8003-0123456789ab"),
+        ];
+        let outcome =
+            process_batch(&store, "evt-1", &EntryPolicy::Open, shard(4), 0, &records).await;
         assert!(outcome.failures.is_empty());
 
         let writes = store.prequeue_writes.lock().unwrap();
-        for shard in [0usize, 1usize] {
-            let mut locals: Vec<u64> = writes
-                .iter()
-                .filter(|w| w.shard == shard)
-                .map(|w| w.local_index)
-                .collect();
-            locals.sort_unstable();
-            assert_eq!(locals, vec![0, 1], "shard {shard} local indices");
-        }
+        assert_eq!(writes.len(), 4);
         for write in writes.iter() {
-            assert_eq!(write.shard, shard_for(write.request_id.as_bytes()));
+            assert_eq!(
+                write.shard,
+                shard(4),
+                "every write lands on the drawn shard"
+            );
         }
+        let mut locals: Vec<u64> = writes.iter().map(|w| w.local_index).collect();
+        locals.sort_unstable();
+        assert_eq!(locals, vec![0, 1, 2, 3]);
     }
 
     #[tokio::test]
-    async fn a_shard_claim_failure_is_a_store_error_and_writes_nothing_for_that_group() {
+    async fn a_shard_claim_failure_is_a_store_error_and_writes_nothing() {
         let store = FakeStore {
             counters_sequence: Mutex::new(VecDeque::from([Some(counters_with_phase(
                 Phase::PreQueue,
@@ -1067,13 +1269,11 @@ mod tests {
             prequeue_claim_fails: true,
             ..FakeStore::default()
         };
-        let ids = ids_on_shard(0, 2);
-        let records: Vec<BatchRecord> = ids
-            .iter()
-            .enumerate()
-            .map(|(i, id)| rec(&format!("m{i}"), id))
-            .collect();
-        let outcome = process_batch(&store, "evt-1", &records).await;
+        let records = vec![
+            rec("m0", "018f3a2b-7c9d-7e1f-8000-0123456789ab"),
+            rec("m1", "018f3a2b-7c9d-7e1f-8001-0123456789ab"),
+        ];
+        let outcome = run_open(&store, &records).await;
         assert_eq!(outcome.failures.len(), 2);
         assert!(store.prequeue_writes.lock().unwrap().is_empty());
     }
@@ -1084,12 +1284,16 @@ mod tests {
     /// gap it leaves does not collide with a neighbour's index.
     #[tokio::test]
     async fn prequeue_write_failure_burns_a_local_index_without_colliding_others() {
-        let ids = ids_on_shard(0, 3);
+        let ids = [
+            "018f3a2b-7c9d-7e1f-8000-0123456789ab",
+            "018f3a2b-7c9d-7e1f-8001-0123456789ab",
+            "018f3a2b-7c9d-7e1f-8002-0123456789ab",
+        ];
         let store = FakeStore {
             counters_sequence: Mutex::new(VecDeque::from([Some(counters_with_phase(
                 Phase::PreQueue,
             ))])),
-            fail_prequeue_write_for: Some(ids[1].clone()),
+            fail_prequeue_write_for: Some(ids[1].to_owned()),
             ..FakeStore::default()
         };
         let records: Vec<BatchRecord> = ids
@@ -1097,7 +1301,7 @@ mod tests {
             .enumerate()
             .map(|(i, id)| rec(&format!("m{i}"), id))
             .collect();
-        let outcome = process_batch(&store, "evt-1", &records).await;
+        let outcome = run_open(&store, &records).await;
         assert_eq!(outcome.failures, vec!["m1".to_owned()]);
 
         let writes = store.prequeue_writes.lock().unwrap();
@@ -1117,17 +1321,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_request_id_in_one_prequeue_batch_burns_an_index_and_writes_no_position() {
+    async fn duplicate_request_id_in_one_prequeue_batch_is_deduped_and_burns_no_index() {
         let store = FakeStore::default();
         *store.counters_sequence.lock().unwrap() =
             VecDeque::from([Some(counters_with_phase(Phase::PreQueue))]);
-        let dup_id = ids_on_shard(0, 1).remove(0);
-        let records = vec![rec("m1", &dup_id), rec("m2", &dup_id)];
+        let dup_id = "018f3a2b-7c9d-7e1f-8000-0123456789ab";
+        let records = vec![rec("m1", dup_id), rec("m2", dup_id)];
 
-        // By the time the fix-up read runs, the event has sealed with this
-        // shard's count matching the one row that actually landed. The
-        // second (duplicate) local index would be a straggler if it were
-        // ever classified, but Duplicate outcomes are never classified.
         let mut counts = [0u64; SHARDS];
         counts[0] = 1;
         store
@@ -1136,13 +1336,40 @@ mod tests {
             .unwrap()
             .push_back(Some(sealed_counters(counts, Phase::Active)));
 
-        let outcome = process_batch(&store, "evt-1", &records).await;
+        let outcome = run_open(&store, &records).await;
         assert!(outcome.failures.is_empty());
-        assert_eq!(store.prequeue_writes.lock().unwrap().len(), 1);
+        assert_eq!(
+            store.prequeue_writes.lock().unwrap().len(),
+            1,
+            "in-batch dedupe claims one index for both copies"
+        );
         assert!(
             store.writes.lock().unwrap().is_empty(),
             "no Positions row for either copy"
         );
+        assert_eq!(
+            store.shard_counters.lock().unwrap()[0],
+            1,
+            "the duplicate must not burn a second index"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_id_that_already_has_a_prequeue_row_claims_nothing_on_reload() {
+        // The benign case #79 left open: a browser that denies every storage
+        // tier re-sends the join on each poll. Without this check every
+        // reload burned a fresh index; with it, only the first claims one.
+        let store = FakeStore::default();
+        *store.counters_sequence.lock().unwrap() =
+            VecDeque::from([Some(counters_with_phase(Phase::PreQueue))]);
+        let id = "018f3a2b-7c9d-7e1f-8000-0123456789ab".to_owned();
+        store.already_registered.lock().unwrap().insert(id.clone());
+
+        let records = vec![rec("m1", &id)];
+        let outcome = run_open(&store, &records).await;
+        assert!(outcome.failures.is_empty());
+        assert!(store.prequeue_writes.lock().unwrap().is_empty());
+        assert_eq!(store.shard_counters.lock().unwrap()[0], 0);
     }
 
     #[tokio::test]
@@ -1155,7 +1382,7 @@ mod tests {
             ..FakeStore::default()
         };
         let records = vec![rec("m1", VALID_ID)];
-        let outcome = process_batch(&store, "evt-1", &records).await;
+        let outcome = run_open(&store, &records).await;
         assert!(outcome.failures.is_empty());
         assert_eq!(store.prequeue_writes.lock().unwrap().len(), 1);
         assert!(store.writes.lock().unwrap().is_empty());
@@ -1167,13 +1394,13 @@ mod tests {
         *store.counters_sequence.lock().unwrap() =
             VecDeque::from([Some(counters_with_phase(Phase::PreQueue))]);
 
-        let counted_id = ids_on_shard(0, 1).remove(0);
-        let straggler_id = ids_on_shard(1, 1).remove(0);
+        let counted_id = "018f3a2b-7c9d-7e1f-8000-0123456789ab".to_owned();
+        let straggler_id = "018f3a2b-7c9d-7e1f-8001-0123456789ab".to_owned();
         let records = vec![rec("m1", &counted_id), rec("m2", &straggler_id)];
 
-        // Sealed at fix-up time: shard 0 (the counted id) has an issued count
-        // of 1, so its local index 0 is in range; shard 1 (the straggler)
-        // has an issued count of 0, so its local index 0 is already past it.
+        // Sealed at fix-up time: the drawn shard's issued count is 1, so local
+        // index 0 (the first write) is in range and local index 1 (the
+        // second) is already past it.
         let mut counts = [0u64; SHARDS];
         counts[0] = 1;
         store
@@ -1182,7 +1409,7 @@ mod tests {
             .unwrap()
             .push_back(Some(sealed_counters(counts, Phase::Active)));
 
-        let outcome = process_batch(&store, "evt-1", &records).await;
+        let outcome = run_open(&store, &records).await;
         assert!(outcome.failures.is_empty());
         assert_eq!(store.prequeue_writes.lock().unwrap().len(), 2);
 
@@ -1197,5 +1424,180 @@ mod tests {
             live_writes[0].position >= 1,
             "straggler position must be >= the cohort size"
         );
+    }
+
+    // --- entry ticket policy (issue #59) ------------------------------------
+
+    mod ticketed {
+        use wr_common::{EntryPolicy, TicketKey};
+
+        use super::*;
+
+        /// A real P-256 test key pair, generated once for these tests.
+        const X_B64: &str = "q_1C5Qxlm0UznPTg8b4ztGRqGDTPcXTowgzHboJ9WBc";
+        const Y_B64: &str = "50IwinLZ2kFdic8gGwFfQ2d6X6UI6s6V3ek9fcjPB-I";
+        const PRIVATE_KEY_PKCS8_B64: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgCM8Gu+5Pe7vq5HGC\
+             lTlTi057LV3NH5ii+Dukp6okfsyhRANCAASr/ULlDGWbRTOc9ODxvjO0ZGoYNM9xdOjCDMdugn1YF+dCMIpy\
+             2dpBXYnPIBsBX0Nnel+lCOrOld3pPX3Izwfi";
+
+        const SUBJECT: &str = "0123456789abcdefghijklmnopqrstuvwxyz-_ABCD";
+
+        fn ticket_key() -> TicketKey {
+            let json = format!(r#"{{"kty":"EC","crv":"P-256","x":"{X_B64}","y":"{Y_B64}"}}"#);
+            TicketKey::from_jwk_json(&json).unwrap()
+        }
+
+        fn policy() -> EntryPolicy {
+            EntryPolicy::Ticketed(ticket_key())
+        }
+
+        fn sign(event_id: &str, sub: &str, exp: u64) -> String {
+            use base64::Engine as _;
+            use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+            use serde::Serialize;
+
+            #[derive(Serialize)]
+            struct Claims<'a> {
+                aud: &'a str,
+                sub: &'a str,
+                exp: u64,
+            }
+            let der = base64::engine::general_purpose::STANDARD
+                .decode(PRIVATE_KEY_PKCS8_B64)
+                .unwrap();
+            let key = EncodingKey::from_ec_der(&der);
+            encode(
+                &Header::new(Algorithm::ES256),
+                &Claims {
+                    aud: event_id,
+                    sub,
+                    exp,
+                },
+                &key,
+            )
+            .unwrap()
+        }
+
+        fn rec_with_ticket(message_id: &str, request_id: &str, ticket: &str) -> BatchRecord {
+            BatchRecord {
+                message_id: message_id.to_owned(),
+                body: format!(
+                    r#"{{"request_id":"{request_id}","event_id":"evt-1","ticket":"{ticket}"}}"#
+                ),
+                telemetry: Telemetry::default(),
+            }
+        }
+
+        /// The `request_id` a valid, unexpired ticket for `sub` would derive
+        /// to, computed the same way `classify_record` does: verify, then
+        /// derive from the resulting subject.
+        fn expected_id(sub: &str) -> String {
+            let ticket = sign("evt-1", sub, 2_000_000_000);
+            let subject = wr_common::verify_ticket(&ticket_key(), &ticket, "evt-1", 0).unwrap();
+            wr_common::derive_request_id("evt-1", &subject)
+        }
+
+        #[tokio::test]
+        async fn n_registrations_under_one_identity_yield_one_position() {
+            let store = FakeStore::default();
+            let policy = policy();
+            let subject_id = expected_id(SUBJECT);
+
+            // Five fresh tickets, same subject: each derives the identical
+            // request_id, so the fifth "registration" is really four retries.
+            let records: Vec<BatchRecord> = (0..5)
+                .map(|i| {
+                    let ticket = sign("evt-1", SUBJECT, 2_000_000_000);
+                    rec_with_ticket(&format!("m{i}"), &subject_id, &ticket)
+                })
+                .collect();
+            let outcome =
+                process_batch(&store, "evt-1", &policy, shard(0), 1_000_000_000, &records).await;
+            assert!(outcome.failures.is_empty());
+            assert_eq!(
+                store.writes.lock().unwrap().len(),
+                1,
+                "five registrations under one identity yield exactly one position"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_tampered_request_id_is_dropped() {
+            let store = FakeStore::default();
+            let ticket = sign("evt-1", SUBJECT, 2_000_000_000);
+            // A client-chosen id that does not match the ticket's derivation.
+            let records = vec![rec_with_ticket("m1", VALID_ID, &ticket)];
+            let outcome = process_batch(
+                &store,
+                "evt-1",
+                &policy(),
+                shard(0),
+                1_000_000_000,
+                &records,
+            )
+            .await;
+            assert!(outcome.failures.is_empty());
+            assert!(store.writes.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_missing_ticket_is_dropped_without_client_visible_failure() {
+            let store = FakeStore::default();
+            let records = vec![rec("m1", VALID_ID)]; // no ticket field
+            let outcome = process_batch(
+                &store,
+                "evt-1",
+                &policy(),
+                shard(0),
+                1_000_000_000,
+                &records,
+            )
+            .await;
+            // 200 at join either way: never a batch failure.
+            assert!(outcome.failures.is_empty());
+            assert!(store.writes.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn an_expired_ticket_is_dropped() {
+            let store = FakeStore::default();
+            let policy = policy();
+            let ticket = sign("evt-1", SUBJECT, 1000);
+            let subject = wr_common::verify_ticket(&ticket_key(), &ticket, "evt-1", 500).unwrap();
+            let request_id = wr_common::derive_request_id("evt-1", &subject);
+            let records = vec![rec_with_ticket("m1", &request_id, &ticket)];
+            let outcome =
+                process_batch(&store, "evt-1", &policy, shard(0), 2_000_000_000, &records).await;
+            assert!(outcome.failures.is_empty());
+            assert!(store.writes.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn wrong_event_ticket_is_dropped() {
+            let store = FakeStore::default();
+            let ticket = sign("other-event", SUBJECT, 2_000_000_000);
+            let records = vec![rec_with_ticket("m1", VALID_ID, &ticket)];
+            let outcome = process_batch(
+                &store,
+                "evt-1",
+                &policy(),
+                shard(0),
+                1_000_000_000,
+                &records,
+            )
+            .await;
+            assert!(outcome.failures.is_empty());
+            assert!(store.writes.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn open_policy_still_behaves_exactly_as_before() {
+            let store = FakeStore::default();
+            let records = vec![rec("m1", VALID_ID)];
+            let outcome =
+                process_batch(&store, "evt-1", &EntryPolicy::Open, shard(0), 0, &records).await;
+            assert!(outcome.failures.is_empty());
+            assert_eq!(store.writes.lock().unwrap().len(), 1);
+        }
     }
 }

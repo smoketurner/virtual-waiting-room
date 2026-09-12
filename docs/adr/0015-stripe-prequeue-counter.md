@@ -33,11 +33,11 @@ Stripe `prequeue_counter` across a fixed **K = 10** shards, by design, for every
 each call site, and `event_id` may not contain `#`, or one event's shard key could collide with
 another event's item.
 
-- **Registration.** Each request during the pre-queue hashes to a shard
-  `s = hash(request_id) % 10`. `assign_position` groups a batch's requests by shard and issues one
-  `ADD n :count` / `ALL_NEW` per non-empty shard group — one round trip claims a whole group's
-  **local indices** within that shard, not one round trip per registrant — then writes
-  `PreQueue {r, s, l, t}` per request: the shard `s` and the local index `l`, never a global index.
+- **Registration.** Each `assign_position` invocation draws one shard `s` uniformly at random
+  (amended by [ADR-0026](0026-entry-tickets.md); it was `hash(request_id) % 10`). The invocation
+  issues a single `ADD n :count` / `ALL_NEW` against that shard — one round trip claims the whole
+  batch's **local indices** within it, not one per registrant — then writes `PreQueue {r, s, l, t}`
+  per request: the shard `s` and the local index `l`, never a global index.
   Ten partition keys are ten budgets, so the ceiling rises to ~10,000 registrations/second.
 - **Seal (T−0).** The seal gathers the 10 shard counts, computes **prefix offsets**
   `offset[s] = Σ counts[0..s)`, sets `participant_count = Σ counts` (= N), and stores the 10
@@ -77,9 +77,18 @@ shard attribute is the single letter `n`.
   This is the gaps-permitted property (F2.3), already true of a single counter; striping inherits
   it rather than introducing it. A burned pre-queue slot behaves like a live-join gap — the serving
   counter advances past an unclaimed position and the no-show controller (§7) absorbs it.
-- **Shard by `hash(request_id) % 10`, not round-robin.** A retried join hashes to the same shard, so
-  the `attribute_not_exists(r)` conditional rejects the duplicate and consumes no index —
-  idempotency (F2.5) is preserved. UUIDv7 hashed is uniform mod 10, so shards stay balanced.
+- **Draw the shard server-side at random, not from `hash(request_id)`.** The original scheme hashed
+  a *client-supplied* value with an unkeyed FNV-1a, so an attacker could retry ids until one landed
+  on a chosen shard — about ten tries — and thereby steer the seal's prefix offsets. A random draw
+  removes that control unconditionally rather than making it merely expensive.
+
+  Determinism was never load-bearing. Every caller uses the shard once at write time and the row
+  stores it, so a retry never needs to reproduce it. Idempotency (F2.5) comes from
+  `attribute_not_exists(r)` on the row, which holds whatever shard the retry lands on; what the
+  retry can now waste is a burned index, which the dedupe read
+  ([ADR-0026](0026-entry-tickets.md)) avoids in the common case and which the design already
+  tolerates. One draw per invocation rather than per record also collapses a batch from up to ten
+  shard claims to one.
 - `PreQueue` stores `{r, s, l, t}`. The global index is derived, never stored, so it cannot disagree
   with the offsets.
 - **The read side pays a small cost.** The seal and the controller each gather their ten shards with

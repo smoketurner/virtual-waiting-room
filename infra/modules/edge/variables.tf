@@ -104,3 +104,36 @@ variable "event_id" {
     error_message = "event_id must be alphanumeric, '_', or '-' only: it is templated into a single-quoted JavaScript string literal in the gate's CloudFront Function source (issue #71), and a quote, backslash, or newline here would inject script rather than fail cleanly."
   }
 }
+
+# --- Custom domain (issue #59) ------------------------------------------------
+# The expected shape for ticketed entry: the issuer's cookie needs a registrable
+# domain shared with the waiting room, which *.cloudfront.net cannot be. Without
+# one the ticket arrives in the URL fragment instead, so both must keep working.
+
+variable "aliases" {
+  description = "Alternate domain names (CNAMEs) for the distribution, e.g. [\"waiting.example.com\"]. Empty deploys on the default *.cloudfront.net domain, the ticket-delivery fallback."
+  type        = list(string)
+  default     = []
+}
+
+variable "acm_certificate_arn" {
+  description = "ARN of an ACM certificate (in us-east-1) covering every name in aliases. Required together with aliases; CloudFront rejects a custom domain with no certificate."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = (length(var.aliases) > 0) == (var.acm_certificate_arn != "")
+    error_message = "aliases and acm_certificate_arn must be set together or both left empty: CloudFront requires a certificate for every custom domain, and a certificate with no alias to serve is meaningless."
+  }
+}
+
+variable "entry_ticket_cookie_name" {
+  description = "Name of the cookie the customer's issuer sets on a custom domain, carrying the signed entry ticket (issue #59). Templated into waiting.js so the fallback fragment path and the cookie path share one client. Unused when no custom domain is configured."
+  type        = string
+  default     = "vwr_ticket"
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9_-]+$", var.entry_ticket_cookie_name))
+    error_message = "entry_ticket_cookie_name must be alphanumeric, '_', or '-' only: it is templated into a single-quoted JavaScript string literal in waiting.js, and a quote, backslash, or newline here would inject script rather than fail cleanly."
+  }
+}

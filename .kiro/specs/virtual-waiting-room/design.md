@@ -717,13 +717,53 @@ admission for every event in that deployment.
 
 ### Entry gating
 
-The client signs an identifier it already holds — membership number, promo code, order
-reference — and the waiting room verifies the signature at join time, storing nothing. This
-changes the problem from detecting automation to verifying a prior relationship.
+Optional, and off unless `entry_ticket_public_key` is configured
+([ADR-0026](../../../docs/adr/0026-entry-tickets.md)).
 
-Where an operator can identify likely bots during the pre-queue, blocking can be deferred to
-randomization rather than applied on arrival, so detection is not revealed while there is
-still time to modify a client and rejoin.
+The customer's own system mints an **entry ticket**: a compact ES256 JWS carrying `aud` (the
+event id), `exp`, and `sub` — an opaque per-identity value it derives itself, e.g.
+`base64url(HMAC-SHA256(pepper, identity ‖ event_id))`. The waiting room holds only the public
+key. `assign_position` verifies the ticket and derives
+
+```
+request_id = uuid_shape(SHA-256("vwr/rid/v1" ‖ 0x00 ‖ aud ‖ 0x00 ‖ sub)[0..16])
+```
+
+rejecting any record whose supplied `request_id` differs. The existing
+`attribute_not_exists(request_id)` guard then yields one position per identity with no new
+table and no new write.
+
+Three properties matter. **The identifier never reaches us** — the customer derives the subject
+themselves, so integrating needs no agreement about handling member data. **Verification is in
+the consumer, not the edge** — the join stays a direct API Gateway → SQS write with no compute,
+the ticket rides in the body, and a bad ticket still gets 200 so nothing is learned at join
+time. **An invalid ticket is a drop, not an error** — never retried, never dead-lettered, since
+no redelivery makes attacker-chosen input valid and five retries would deepen the cost
+asymmetry this exists to fix.
+
+Delivery is by cookie on a custom domain, or by URL fragment otherwise
+([ADR-0027](../../../docs/adr/0027-ticket-delivery-fragment-not-query.md)).
+
+**What this bounds, and what it does not.** It moves the constraint from minting identifiers to
+obtaining identities; a farm with N legitimate accounts still gets N positions. It is therefore
+worth whatever the customer's identity system is worth, and it is inapplicable to a public
+onsale where no prior relationship exists — that deployment runs unticketed, as a bare raffle
+in which volume converts linearly into share of the front of the queue. Bounding volume with no
+identity requires proof of work or behavioural classification, neither of which is built.
+
+### Deferred bot enforcement
+
+**Not built.** The intent is that where an operator can identify likely bots during the
+pre-queue, blocking is deferred to randomization rather than applied on arrival, so detection is
+not revealed while there is still time to modify a client and rejoin.
+
+What exists is the input: every registration row carries join-time telemetry — viewer address,
+ASN, country, JA4 fingerprint and user agent — captured as SQS message attributes on the
+compute-free join path. A farm running one automation toolkit across many addresses collapses to
+a handful of JA4 values, so the data supports the classification. **Nothing reads it.** There is
+no classifier, no operator action, and no seal-time mitigation. The mechanism as specified
+depends on WAF Bot Control for its labels, which this deployment does not enable on cost
+grounds.
 
 ### Web Application Firewall (WAF)
 

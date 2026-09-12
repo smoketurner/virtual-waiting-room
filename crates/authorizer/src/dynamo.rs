@@ -11,10 +11,8 @@ use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::put_item::PutItemError;
 use aws_sdk_dynamodb::types::AttributeValue;
-use wr_common::expr::{
-    TOKENS_TTL_ATTR, admission_token_key, arrivals_shard_key, increment_shard_update,
-    increment_shard_values,
-};
+use wr_common::Shard;
+use wr_common::expr::{Key, SHARD_COUNT_ATTR, SHARD_INDEX_ATTR, TOKENS_TTL_ATTR, Update};
 
 /// A side-effect failure. The handler treats a failure to record an arrival as
 /// non-fatal (the visitor is still admitted; the controller tolerates a missed
@@ -31,7 +29,7 @@ pub trait Store {
     fn record_arrival(
         &self,
         event_id: &str,
-        shard: usize,
+        shard: Shard,
     ) -> impl std::future::Future<Output = Result<(), StoreError>> + Send;
 
     /// Reserves a single-use admission token. Returns `true` if this call
@@ -62,15 +60,25 @@ impl DynamoStore {
 }
 
 impl Store for DynamoStore {
-    async fn record_arrival(&self, event_id: &str, shard: usize) -> Result<(), StoreError> {
+    async fn record_arrival(&self, event_id: &str, shard: Shard) -> Result<(), StoreError> {
+        // Stamps the shard's own index alongside the +1 so a reader that
+        // fetched a batch of shards knows which is which.
+        let bump = Update::new()
+            .set(
+                SHARD_INDEX_ATTR,
+                AttributeValue::N(shard.index().to_string()),
+            )
+            .add(SHARD_COUNT_ATTR, AttributeValue::N("1".to_owned()))
+            .build();
         // The shard is its own item, so arrivals do not contend with the
         // sequences on the Counters item.
         self.client
             .update_item()
             .table_name(&self.counters_table)
-            .set_key(Some(arrivals_shard_key(event_id, shard)))
-            .update_expression(increment_shard_update())
-            .set_expression_attribute_values(Some(increment_shard_values(shard)))
+            .set_key(Some(Key::ArrivalsShard { event_id, shard }.build()))
+            .update_expression(bump.expression)
+            .set_expression_attribute_names(Some(bump.names))
+            .set_expression_attribute_values(Some(bump.values))
             .send()
             .await
             .map_err(|e| StoreError::Backend(format!("record_arrival: {e}")))?;
@@ -82,7 +90,7 @@ impl Store for DynamoStore {
             .client
             .put_item()
             .table_name(&self.tokens_table)
-            .set_item(Some(admission_token_key(request_id)))
+            .set_item(Some(Key::AdmissionToken { request_id }.build()))
             .item(TOKENS_TTL_ATTR, AttributeValue::N(expires_at.to_string()))
             .condition_expression("attribute_not_exists(request_id)")
             .send()

@@ -67,6 +67,35 @@ resource "aws_cloudfront_cache_policy" "polled_keyed" {
 # it. This is the ONLY behaviour that forwards a cookie - doing so on a polled
 # behaviour would disable request collapsing (ADR-0013).
 
+# --- Origin request policy (/v1/join, issue #59) ------------------------------
+# The CloudFront-Viewer-* headers are generated, not viewer headers, so the
+# managed AllViewerExceptHostHeader policy never forwards them. A whitelist is
+# the only way to reach API Gateway with them.
+resource "aws_cloudfront_origin_request_policy" "join" {
+  name    = "${var.name_prefix}-join"
+  comment = "POST /v1/join: forward only the headers assign_position's telemetry needs."
+
+  cookies_config {
+    cookie_behavior = "none"
+  }
+  headers_config {
+    header_behavior = "whitelist"
+    headers {
+      items = [
+        "content-type",
+        "user-agent",
+        "CloudFront-Viewer-Address",
+        "CloudFront-Viewer-ASN",
+        "CloudFront-Viewer-Country",
+        "CloudFront-Viewer-JA4-Fingerprint",
+      ]
+    }
+  }
+  query_strings_config {
+    query_string_behavior = "none"
+  }
+}
+
 resource "aws_cloudfront_origin_request_policy" "protected" {
   name    = "${var.name_prefix}-protected"
   comment = "Protected origin: forward the session cookie and all viewer headers/query strings."

@@ -233,12 +233,18 @@ resource "aws_lambda_function" "assign_position" {
 
   environment {
     variables = merge(local.dynamo_lambda_env, {
-      COUNTERS_TABLE  = aws_dynamodb_table.counters.name
-      PREQUEUE_TABLE  = aws_dynamodb_table.prequeue.name
-      POSITIONS_TABLE = aws_dynamodb_table.positions.name
-      EVENT_ID        = var.event_id
+      COUNTERS_TABLE          = aws_dynamodb_table.counters.name
+      PREQUEUE_TABLE          = aws_dynamodb_table.prequeue.name
+      POSITIONS_TABLE         = aws_dynamodb_table.positions.name
+      EVENT_ID                = var.event_id
+      ENTRY_TICKET_PUBLIC_KEY = var.entry_ticket_public_key
     })
   }
+
+  # Terraform must own the log group before Lambda writes to it, or Lambda
+  # auto-creates an untagged, never-expiring one first and the join_dropped
+  # metric filter (logging.tf) has nothing to attach to.
+  depends_on = [aws_cloudwatch_log_group.assign_position]
 
   tags = var.tags
 }
@@ -307,8 +313,12 @@ resource "aws_api_gateway_model" "join" {
     required             = ["request_id", "event_id"]
     additionalProperties = false
     properties = {
-      request_id = { type = "string", minLength = 1, maxLength = 36 } # canonical UUIDv7 length
+      request_id = { type = "string", minLength = 1, maxLength = 36 } # canonical UUID length
       event_id   = { type = "string", minLength = 1 }
+      # Never add to `required`: rejecting an absent ticket here would tell an
+      # attacker whether the deployment is ticketed. assign_position enforces
+      # presence instead (issue #59).
+      ticket = { type = "string", maxLength = 4096 }
     }
   })
 }
@@ -363,8 +373,13 @@ resource "aws_api_gateway_integration" "join_sqs" {
     "integration.request.header.Content-Type" = "'application/x-www-form-urlencoded'"
   }
 
+  # SendMessage numbers MessageAttribute.N as a contiguous 1-based sequence and
+  # silently truncates at the first gap, so $n increments only when a value is
+  # present. An absent header must be skipped rather than sent empty: SQS
+  # rejects an empty StringValue, failing the whole send and dropping the join
+  # (issue #59).
   request_templates = {
-    "application/json" = "Action=SendMessage&MessageBody=$util.urlEncode($input.body)"
+    "application/json" = "Action=SendMessage&MessageBody=$util.urlEncode($input.body)#set($n=0)#if($input.params('CloudFront-Viewer-Address') != \"\")#set($n=$n+1)&MessageAttribute.$n.Name=va&MessageAttribute.$n.Value.DataType=String&MessageAttribute.$n.Value.StringValue=$util.urlEncode($input.params('CloudFront-Viewer-Address'))#end#if($input.params('CloudFront-Viewer-ASN') != \"\")#set($n=$n+1)&MessageAttribute.$n.Name=vn&MessageAttribute.$n.Value.DataType=String&MessageAttribute.$n.Value.StringValue=$util.urlEncode($input.params('CloudFront-Viewer-ASN'))#end#if($input.params('CloudFront-Viewer-Country') != \"\")#set($n=$n+1)&MessageAttribute.$n.Name=vc&MessageAttribute.$n.Value.DataType=String&MessageAttribute.$n.Value.StringValue=$util.urlEncode($input.params('CloudFront-Viewer-Country'))#end#if($input.params('CloudFront-Viewer-JA4-Fingerprint') != \"\")#set($n=$n+1)&MessageAttribute.$n.Name=vj&MessageAttribute.$n.Value.DataType=String&MessageAttribute.$n.Value.StringValue=$util.urlEncode($input.params('CloudFront-Viewer-JA4-Fingerprint'))#end#if($context.identity.userAgent != \"\")#set($n=$n+1)&MessageAttribute.$n.Name=vu&MessageAttribute.$n.Value.DataType=String&MessageAttribute.$n.Value.StringValue=$util.urlEncode($context.identity.userAgent)#end#if($context.requestId != \"\")#set($n=$n+1)&MessageAttribute.$n.Name=vq&MessageAttribute.$n.Value.DataType=String&MessageAttribute.$n.Value.StringValue=$util.urlEncode($context.requestId)#end"
   }
 }
 

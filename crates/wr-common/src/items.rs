@@ -28,11 +28,44 @@ pub enum PositionStatus {
     Expired,
 }
 
+/// Join-time signals `assign_position` lifts out of `CloudFront`'s viewer
+/// headers, carried as SQS message attributes rather than in the request body
+/// (issue #59). Reported, not attested: the regional API Gateway endpoint has
+/// no resource policy restricting it to `CloudFront`, so a caller that bypasses
+/// the edge can set these values itself. Nothing reads them yet — they exist so
+/// a farm is analysable after the fact and so a future mitigation has
+/// something to act on.
+///
+/// Single-letter field names for the same reason the striped counters use
+/// them: this rides inside `v` on every `PreQueue` and `Positions` row, and
+/// `DynamoDB` bills attribute names on every write.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct Telemetry {
+    /// `CloudFront-Viewer-Address`, verbatim (port included).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub a: Option<String>,
+    /// `CloudFront-Viewer-ASN`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub n: Option<String>,
+    /// `CloudFront-Viewer-Country`, ISO-3166-1 alpha-2.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub c: Option<String>,
+    /// `CloudFront-Viewer-JA4-Fingerprint`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub j: Option<String>,
+    /// `User-Agent`, truncated to 256 bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub u: Option<String>,
+    /// The API Gateway request id, for correlating a row back to access logs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub q: Option<String>,
+}
+
 /// A `PreQueue` row: shard `s` and local index `l` for a request, written at
 /// registration. The global index is derived on read, never stored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreQueueItem {
-    /// `request_id` (`UUIDv7`), the partition key.
+    /// `request_id`, the partition key.
     pub r: String,
     /// Shard index in `0..SHARDS`.
     pub s: u8,
@@ -40,6 +73,10 @@ pub struct PreQueueItem {
     pub l: u64,
     /// Registration timestamp, epoch seconds.
     pub t: u64,
+    /// Join-time telemetry, absent on a row written before issue #59 or on an
+    /// open (untelemetered) deployment.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub v: Option<Telemetry>,
 }
 
 /// A `Positions` row, written lazily when a visitor is admitted.
@@ -50,9 +87,10 @@ pub struct PositionItem {
     /// claimed from `queue_counter`; a pre-queue member's position is derived
     /// from the seed on read and never written here.
     pub queue_position: u64,
-    /// Server-stamped arrival time in epoch seconds. Authoritative: the
-    /// `UUIDv7` request id also carries a timestamp, but that one is
-    /// client-supplied and untrusted.
+    /// Server-stamped arrival time in epoch seconds. Authoritative: a
+    /// client-supplied request id may also carry a timestamp (a `UUIDv7`
+    /// shape), but that one is untrusted and, since issue #59, not even
+    /// guaranteed to be present.
     pub entry_time: u64,
     pub status: PositionStatus,
     /// Post-event storage reclamation only, never the expiry mechanism. A
@@ -61,6 +99,10 @@ pub struct PositionItem {
     /// deadline, because a deadline set when the position is issued expires
     /// people for waiting the length of the queue they are waiting in.
     pub ttl: u64,
+    /// Join-time telemetry, absent on a row written before issue #59 or on an
+    /// open (untelemetered) deployment.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub v: Option<Telemetry>,
 }
 
 /// The single `Counters` item for an event: all sequences, the sharded
@@ -260,11 +302,82 @@ pub enum ResolveError {
     BadShard,
 }
 
+/// Reads a shard item's own index, or `None` if it is missing or out of range.
+///
+/// Readers fetch shards in a batch and get them back in arbitrary order, so
+/// each item says which shard it is rather than having its key taken apart.
+#[must_use]
+pub fn shard_index_of<S: std::hash::BuildHasher>(
+    item: &HashMap<String, AttributeValue, S>,
+) -> Option<usize> {
+    let shard = item
+        .get(crate::expr::SHARD_INDEX_ATTR)
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<usize>().ok())?;
+    (shard < SHARDS).then_some(shard)
+}
+
+/// Reads a shard item's count, or `None` if the count attribute is absent,
+/// not a `Number`, or not a parseable `u64`.
+///
+/// `None` distinguishes "this item has no readable count" from "this shard has
+/// no item": a shard that nothing has written yields no item at all from a
+/// `BatchGetItem` response, so it never reaches a fold that could call this. A
+/// present item whose count cannot be read is therefore corruption, not an
+/// empty shard — callers that fold batch-get items must turn `None` into an
+/// error rather than silently zero the shard, reserving zero for a shard that
+/// never reached them because it had no item.
+#[must_use]
+pub fn shard_count_of<S: std::hash::BuildHasher>(
+    item: &HashMap<String, AttributeValue, S>,
+) -> Option<u64> {
+    item.get(crate::expr::SHARD_COUNT_ATTR)
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<u64>().ok())
+}
+
 #[cfg(test)]
 mod tests {
     #![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
 
     use super::*;
+
+    #[test]
+    fn a_shard_item_reports_its_own_index() {
+        // Readers fetch shards in a batch and get them back in arbitrary order,
+        // so each item says which shard it is rather than having its key taken
+        // apart to find out.
+        let item = HashMap::from([
+            (
+                crate::expr::SHARD_INDEX_ATTR.to_owned(),
+                AttributeValue::N("7".to_owned()),
+            ),
+            (
+                crate::expr::SHARD_COUNT_ATTR.to_owned(),
+                AttributeValue::N("42".to_owned()),
+            ),
+        ]);
+        assert_eq!(shard_index_of(&item), Some(7));
+        assert_eq!(shard_count_of(&item), Some(42));
+
+        // Out of range or absent is None, never a wrong shard.
+        let bad = HashMap::from([(
+            crate::expr::SHARD_INDEX_ATTR.to_owned(),
+            AttributeValue::N(SHARDS.to_string()),
+        )]);
+        assert_eq!(shard_index_of(&bad), None);
+        assert_eq!(shard_index_of(&HashMap::new()), None);
+        // An unreadable or absent count is None; callers reserve zero for an
+        // absent *item*, since a present item reaching a fold is never empty —
+        // a missing count on one is corruption, not a still-unwritten shard.
+        assert_eq!(shard_count_of(&HashMap::new()), None);
+        // A non-numeric count is corruption, not zero.
+        let corrupt = HashMap::from([(
+            crate::expr::SHARD_COUNT_ATTR.to_owned(),
+            AttributeValue::S("not a number".to_owned()),
+        )]);
+        assert_eq!(shard_count_of(&corrupt), None);
+    }
 
     #[test]
     fn prequeue_item_round_trips_through_attribute_values() {
@@ -273,11 +386,61 @@ mod tests {
             s: 7,
             l: 42,
             t: 1_788_000_000,
+            v: None,
         };
         let av: std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue> =
             serde_dynamo::to_item(&item).unwrap();
         let back: PreQueueItem = serde_dynamo::from_item(av).unwrap();
         assert_eq!(item, back);
+    }
+
+    #[test]
+    fn prequeue_item_round_trips_with_telemetry() {
+        let item = PreQueueItem {
+            r: "018f3a2b-7c9d-7e1f-abcd-0123456789ab".to_owned(),
+            s: 7,
+            l: 42,
+            t: 1_788_000_000,
+            v: Some(Telemetry {
+                a: Some("203.0.113.1:443".to_owned()),
+                n: Some("64500".to_owned()),
+                c: Some("US".to_owned()),
+                j: Some("t13d1516h2_8daaf6152771_02713d6af862".to_owned()),
+                u: Some("Mozilla/5.0".to_owned()),
+                q: Some("req-abc-123".to_owned()),
+            }),
+        };
+        let av: std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue> =
+            serde_dynamo::to_item(&item).unwrap();
+        let back: PreQueueItem = serde_dynamo::from_item(av).unwrap();
+        assert_eq!(item, back);
+    }
+
+    #[test]
+    fn a_row_written_before_telemetry_existed_still_deserializes() {
+        // A PreQueue row with no `v` attribute at all (written before issue
+        // #59, or by an untelemetered join) must still deserialize, with `v`
+        // defaulting to `None` rather than failing to parse.
+        let av = std::collections::HashMap::from([
+            (
+                "r".to_owned(),
+                aws_sdk_dynamodb::types::AttributeValue::S("req-1".to_owned()),
+            ),
+            (
+                "s".to_owned(),
+                aws_sdk_dynamodb::types::AttributeValue::N("3".to_owned()),
+            ),
+            (
+                "l".to_owned(),
+                aws_sdk_dynamodb::types::AttributeValue::N("1".to_owned()),
+            ),
+            (
+                "t".to_owned(),
+                aws_sdk_dynamodb::types::AttributeValue::N("1788000000".to_owned()),
+            ),
+        ]);
+        let item: PreQueueItem = serde_dynamo::from_item(av).unwrap();
+        assert!(item.v.is_none());
     }
 
     #[test]
@@ -288,6 +451,7 @@ mod tests {
             entry_time: 1_788_000_000,
             status: PositionStatus::Issued,
             ttl: 1_900_000_000,
+            v: None,
         };
         let av: std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue> =
             serde_dynamo::to_item(&item).unwrap();
@@ -313,6 +477,7 @@ mod tests {
             entry_time: 1_788_000_000,
             status: PositionStatus::Issued,
             ttl: 1_900_000_000,
+            v: None,
         };
         let av: std::collections::HashMap<String, AttributeValue> =
             serde_dynamo::to_item(&item).unwrap();
