@@ -190,6 +190,15 @@ resource "aws_api_gateway_deployment" "this" {
       aws_api_gateway_resource.join.id,
       aws_api_gateway_method.join_post.id,
       aws_api_gateway_integration.join_sqs.id,
+      # The join integration's id and the model's id are both stable across an
+      # in-place update, so hash their mutable config too — the same hazard the
+      # endpoint methods below carry. Without this, editing the SQS mapping
+      # template or the request schema leaves the stage serving the previous
+      # one, and join-time telemetry silently never arrives.
+      jsonencode(aws_api_gateway_integration.join_sqs.request_templates),
+      jsonencode(aws_api_gateway_integration.join_sqs.request_parameters),
+      aws_api_gateway_model.join.schema,
+      aws_api_gateway_method.join_post.request_validator_id,
       [for k in sort(keys(local.api_endpoints)) : local.endpoint_resource_id[k]],
       [for k in sort(keys(local.api_endpoints)) : aws_api_gateway_method.endpoint[k].id],
       [for k in sort(keys(local.api_endpoints)) : aws_api_gateway_integration.endpoint[k].id],
