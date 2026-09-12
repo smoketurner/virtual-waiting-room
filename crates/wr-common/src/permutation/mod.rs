@@ -26,7 +26,7 @@
 
 mod assembly;
 
-pub use assembly::{Assignment, SHARDS, SealError, SealedOffsets, shard_for};
+pub use assembly::{Assignment, RandError, SHARDS, SealError, SealedOffsets, Shard};
 
 use aws_lc_rs::hmac;
 

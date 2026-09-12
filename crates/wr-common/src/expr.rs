@@ -127,11 +127,21 @@ fn tokens_key(value: String) -> HashMap<String, AttributeValue> {
 /// # Panics
 ///
 /// Panics if `shard >= SHARDS`; callers pick the shard with
-/// [`crate::permutation::shard_for`], which is always in range.
+/// [`crate::permutation::Shard`], which is always in range.
 #[must_use]
 pub fn prequeue_shard_key(event_id: &str, shard: usize) -> HashMap<String, AttributeValue> {
     assert!(shard < SHARDS, "shard {shard} out of range 0..{SHARDS}");
     key(format!("EVT#{event_id}#PQ#{shard}"))
+}
+
+/// Partition key of a visitor's own `PreQueue` row: `r`, the bare
+/// `request_id`. Unlike the shard items above, `PreQueue` holds one kind of
+/// item and takes no tag — a tag here would disambiguate nothing while
+/// costing bytes in the partition key of every row, of which there is one per
+/// visitor.
+#[must_use]
+pub fn prequeue_key(request_id: &str) -> HashMap<String, AttributeValue> {
+    HashMap::from([("r".to_owned(), AttributeValue::S(request_id.to_owned()))])
 }
 
 /// Partition key of one arrivals shard, incremented when a visitor claims
@@ -246,6 +256,38 @@ pub fn claim_prequeue_block_values(shard: usize, count: u64) -> HashMap<String, 
 #[must_use]
 pub fn not_exists_condition(key_attr: &str) -> String {
     format!("attribute_not_exists({key_attr})")
+}
+
+/// `attribute_not_exists(<key>) OR #s = :expired` — the live-join write's
+/// idempotency guard, widened (issue #59) so a re-join with a *derived*
+/// `request_id` can reclaim a row the controller expired. Before a derived id,
+/// a re-join always minted a fresh `UUIDv7` and the plain
+/// [`not_exists_condition`] never needed to consider what an existing row's
+/// status was; now the same identity always re-derives the same id, so
+/// without this the "reload to take a new place in line" advice on a 410
+/// would be a lie for anyone whose row the controller had already expired.
+/// `Completed` and `Abandoned` rows stay terminal: only `#s = :expired`
+/// widens the guard, via [`status_attr_name`] and [`expired_status_value`].
+#[must_use]
+pub fn not_exists_or_expired_condition(key_attr: &str) -> String {
+    format!("attribute_not_exists({key_attr}) OR #s = :expired")
+}
+
+/// The `ExpressionAttributeNames` [`not_exists_or_expired_condition`] needs:
+/// `status` is a `DynamoDB` reserved word, so it must be referenced through a
+/// placeholder rather than written into the expression literally.
+#[must_use]
+pub fn status_attr_name() -> HashMap<String, String> {
+    HashMap::from([("#s".to_owned(), "status".to_owned())])
+}
+
+/// The `ExpressionAttributeValues` [`not_exists_or_expired_condition`] needs.
+#[must_use]
+pub fn expired_status_value() -> HashMap<String, AttributeValue> {
+    HashMap::from([(
+        ":expired".to_owned(),
+        AttributeValue::S("expired".to_owned()),
+    )])
 }
 
 /// The seal's single `SET` clause, writing every value the seal produces in one
@@ -481,6 +523,25 @@ mod tests {
             not_exists_condition("request_id"),
             "attribute_not_exists(request_id)"
         );
+    }
+
+    #[test]
+    fn the_widened_live_join_condition_binds_its_own_placeholders() {
+        let condition = not_exists_or_expired_condition("request_id");
+        assert_eq!(
+            condition,
+            "attribute_not_exists(request_id) OR #s = :expired"
+        );
+        assert_eq!(status_attr_name()["#s"], "status");
+        assert_eq!(
+            expired_status_value()[":expired"],
+            AttributeValue::S("expired".to_owned())
+        );
+    }
+
+    #[test]
+    fn prequeue_key_uses_the_bare_request_id() {
+        assert_eq!(key_string_of(&prequeue_key("req-1"), "r"), "req-1");
     }
 
     #[test]

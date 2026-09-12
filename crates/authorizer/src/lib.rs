@@ -126,11 +126,11 @@ pub enum Decision {
     Forward { refresh_cookie: Option<String> },
     /// A valid admission token was converted to a session. Reserve the
     /// single-use admission token first (denying any replay), then set this
-    /// signed session cookie, record an arrival for this shard, strip the token
-    /// from the URL, and forward.
+    /// signed session cookie, record an arrival on a shard the handler draws
+    /// at random (issue #59 — drawing it here would make `decide` depend on an
+    /// RNG and stop being pure), strip the token from the URL, and forward.
     SetSessionAndForward {
         set_cookie: String,
-        arrival_shard: usize,
         /// The single-use admission token's request id, which the handler
         /// reserves in the `Tokens` table before admitting. Surfaced here so
         /// the reservation can run in the handler, after the pure decision.
@@ -196,11 +196,9 @@ pub fn decide(
     {
         let session = mint_session(&admitted.request_id, cfg, now);
         let set_cookie = session_cookie(&session.sign(key), cfg);
-        let arrival_shard = wr_common::shard_for(admitted.request_id.as_bytes());
         let stripped_path = strip_token(&req.path);
         return Decision::SetSessionAndForward {
             set_cookie,
-            arrival_shard,
             request_id: admitted.request_id.clone(),
             expires_at: admitted.expires_at,
             stripped_path,
@@ -429,14 +427,12 @@ mod tests {
         match decide(&req, &cfg(), &key(), 2000, Reachability::Reachable) {
             Decision::SetSessionAndForward {
                 set_cookie,
-                arrival_shard,
                 request_id,
                 expires_at,
                 ..
             } => {
                 assert!(set_cookie.starts_with("vwr_session="));
                 assert!(set_cookie.contains("HttpOnly"));
-                assert!(arrival_shard < wr_common::SHARDS);
                 // The reservation inputs are surfaced to the handler so it can
                 // enforce single-use before minting the session.
                 assert_eq!(request_id, "018f3a2b-7c9d-7e1f-abcd-0123456789ab");

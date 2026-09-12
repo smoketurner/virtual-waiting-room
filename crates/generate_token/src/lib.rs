@@ -81,12 +81,13 @@ pub enum Denied {
     Corrupt,
 }
 
-/// An admitted visitor: the position that was reached and the arrival shard to
-/// count them under.
+/// An admitted visitor: the position that was reached. The arrival shard is no
+/// longer carried here (issue #59) — it is drawn at random by the caller
+/// rather than derived from `request_id`, which would make `decide` depend on
+/// an RNG and stop being a pure function of the queue state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Grant {
     pub position: u64,
-    pub arrival_shard: usize,
 }
 
 /// Decides whether the visitor may be admitted.
@@ -102,7 +103,6 @@ pub struct Grant {
 /// [`Denied`] describing which gate refused.
 pub fn decide(
     counters: &Counters,
-    request_id: &str,
     prequeue: Option<&PreQueueItem>,
     position_row: Option<(u64, PositionStatus)>,
     now: u64,
@@ -125,10 +125,7 @@ pub fn decide(
         });
     }
 
-    Ok(Grant {
-        position,
-        arrival_shard: wr_common::shard_for(request_id.as_bytes()),
-    })
+    Ok(Grant { position })
 }
 
 /// The visitor's position, from whichever path registered them. A live-join
@@ -202,28 +199,13 @@ mod tests {
     #[test]
     fn a_reached_position_is_admitted() {
         // Live joiner holding position 3, cursor past it.
-        let grant = decide(
-            &counters(10),
-            REQ,
-            None,
-            Some((3, PositionStatus::Issued)),
-            0,
-        )
-        .unwrap();
+        let grant = decide(&counters(10), None, Some((3, PositionStatus::Issued)), 0).unwrap();
         assert_eq!(grant.position, 3);
-        assert!(grant.arrival_shard < SHARDS);
     }
 
     #[test]
     fn a_position_not_yet_reached_is_refused() {
-        let err = decide(
-            &counters(3),
-            REQ,
-            None,
-            Some((7, PositionStatus::Issued)),
-            0,
-        )
-        .unwrap_err();
+        let err = decide(&counters(3), None, Some((7, PositionStatus::Issued)), 0).unwrap_err();
         assert_eq!(
             err,
             Denied::StillQueued {
@@ -238,26 +220,8 @@ mod tests {
         // serving_counter is the count released, so position N is admitted only
         // once the cursor has passed it. Off by one here admits one visitor too
         // many on every interval.
-        assert!(
-            decide(
-                &counters(5),
-                REQ,
-                None,
-                Some((4, PositionStatus::Issued)),
-                0
-            )
-            .is_ok()
-        );
-        assert!(
-            decide(
-                &counters(5),
-                REQ,
-                None,
-                Some((5, PositionStatus::Issued)),
-                0
-            )
-            .is_err()
-        );
+        assert!(decide(&counters(5), None, Some((4, PositionStatus::Issued)), 0).is_ok());
+        assert!(decide(&counters(5), None, Some((5, PositionStatus::Issued)), 0).is_err());
     }
 
     #[test]
@@ -265,7 +229,7 @@ mod tests {
         let mut c = counters(10);
         c.stored_control = StoredControl::Paused;
         assert_eq!(
-            decide(&c, REQ, None, Some((3, PositionStatus::Issued)), 0).unwrap_err(),
+            decide(&c, None, Some((3, PositionStatus::Issued)), 0).unwrap_err(),
             Denied::NotAdmitting
         );
     }
@@ -278,11 +242,11 @@ mod tests {
         let mut c = counters(10);
         c.fail_open_until = 1000;
         assert_eq!(
-            decide(&c, REQ, None, Some((3, PositionStatus::Issued)), 500).unwrap_err(),
+            decide(&c, None, Some((3, PositionStatus::Issued)), 500).unwrap_err(),
             Denied::NotAdmitting
         );
         // Once the epoch lapses, the stored Open control governs again.
-        assert!(decide(&c, REQ, None, Some((3, PositionStatus::Issued)), 1000).is_ok());
+        assert!(decide(&c, None, Some((3, PositionStatus::Issued)), 1000).is_ok());
     }
 
     #[test]
@@ -296,7 +260,7 @@ mod tests {
             let mut c = counters(10);
             c.phase = phase;
             assert_eq!(
-                decide(&c, REQ, None, Some((3, PositionStatus::Issued)), 0).unwrap_err(),
+                decide(&c, None, Some((3, PositionStatus::Issued)), 0).unwrap_err(),
                 Denied::NotAdmitting
             );
         }
@@ -310,7 +274,7 @@ mod tests {
             PositionStatus::Abandoned,
         ] {
             assert_eq!(
-                decide(&counters(10), REQ, None, Some((3, status)), 0).unwrap_err(),
+                decide(&counters(10), None, Some((3, status)), 0).unwrap_err(),
                 Denied::Spent
             );
         }
@@ -319,7 +283,7 @@ mod tests {
     #[test]
     fn an_unregistered_visitor_is_refused() {
         assert_eq!(
-            decide(&counters(10), REQ, None, None, 0).unwrap_err(),
+            decide(&counters(10), None, None, 0).unwrap_err(),
             Denied::NotRegistered
         );
     }
@@ -332,8 +296,9 @@ mod tests {
             s: 3,
             l: 1,
             t: 1_788_000_000,
+            v: None,
         };
-        let grant = decide(&c, REQ, Some(&row), None, 0).unwrap();
+        let grant = decide(&c, Some(&row), None, 0).unwrap();
         // Inside the sealed cohort.
         assert!(grant.position < c.participant_count.unwrap());
     }
@@ -349,9 +314,10 @@ mod tests {
             s: 0,
             l: 0,
             t: 1_788_000_000,
+            v: None,
         };
         assert_eq!(
-            decide(&c, REQ, Some(&row), None, 0).unwrap_err(),
+            decide(&c, Some(&row), None, 0).unwrap_err(),
             Denied::NotSealed
         );
     }
@@ -364,10 +330,10 @@ mod tests {
             s: 0,
             l: 0,
             t: 1_788_000_000,
+            v: None,
         };
         let grant = decide(
             &counters(100),
-            REQ,
             Some(&row),
             Some((42, PositionStatus::Issued)),
             0,

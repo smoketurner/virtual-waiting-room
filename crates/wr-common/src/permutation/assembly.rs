@@ -1,7 +1,9 @@
 //! Pre-queue index-space assembly.
 //!
 //! Registration stripes the pre-queue counter across `K = 10` shards: each
-//! join picks a shard `s = hash(request_id) % 10`, claims a local index `l` by
+//! join draws a shard `s` uniformly at random (issue #59 — a client-supplied
+//! `request_id` let an attacker steer `hash(request_id) % 10` in about ten
+//! tries, biasing the seal's prefix offsets), claims a local index `l` by
 //! atomically incrementing that shard's counter, and stores `(request_id, s,
 //! l)` — never a global index. Sealing the cohort reads the 10 shard counts,
 //! computes prefix offsets `offset[s] = Σ counts[0..s)` and cohort size `N = Σ
@@ -148,20 +150,56 @@ impl SealedOffsets {
     }
 }
 
-/// Selects the registration shard for a request id: `hash(request_id) % 10`.
+/// A registration shard index in `0..SHARDS`.
 ///
-/// Hashing (not round-robin) means a retried join lands on the same shard, so
-/// the same request id claims no second index. The hash need not be
-/// cryptographic; it need only spread request ids uniformly mod 10.
-#[must_use]
-pub fn shard_for(request_id: &[u8]) -> usize {
-    // FNV-1a over the id bytes, reduced mod SHARDS.
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for &byte in request_id {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+/// Drawn uniformly at random per Lambda invocation (issue #59) rather than
+/// hashed from `request_id`: a client-supplied id gave an attacker roughly ten
+/// tries to steer which shard — and, through it, the seal's prefix offsets —
+/// their registration landed on. Determinism was never load-bearing: every
+/// caller draws the value once at write time and the row stores it, so a
+/// retried claim never needs to reproduce the same shard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Shard(usize);
+
+/// Failure drawing random bytes for a [`Shard`]. Never silently defaulted —
+/// `unwrap_used` and `panic` are denied workspace-wide, so a caller must
+/// decide how to degrade (e.g. failing the batch, or skipping a non-essential
+/// arrival record).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("failed to draw random bytes for a shard")]
+pub struct RandError;
+
+impl Shard {
+    /// Draws a shard uniformly from `0..SHARDS` using `aws-lc-rs`'s system
+    /// RNG.
+    ///
+    /// Reduces a random `u64` mod `SHARDS` rather than rejection-sampling: the
+    /// bias this introduces is about `SHARDS / 2^64`, roughly `10^-19` per
+    /// shard, and shard balance affects only write spreading across partition
+    /// keys — never the permutation's bijectivity or uniformity, which are
+    /// proven independently in `crate::prp`.
+    ///
+    /// # Errors
+    ///
+    /// [`RandError`] if the underlying RNG call fails.
+    pub fn random() -> Result<Self, RandError> {
+        let mut bytes = [0u8; 8];
+        aws_lc_rs::rand::fill(&mut bytes).map_err(|_err| RandError)?;
+        let index = usize::try_from(u64::from_be_bytes(bytes) % SHARDS as u64).unwrap_or(0);
+        Ok(Self(index))
     }
-    usize::try_from(hash % SHARDS as u64).unwrap_or(0)
+
+    /// Builds a shard from a stored index, or `None` if it is out of range.
+    #[must_use]
+    pub fn new(index: usize) -> Option<Self> {
+        (index < SHARDS).then_some(Self(index))
+    }
+
+    /// The raw shard index, always `< SHARDS`.
+    #[must_use]
+    pub fn index(self) -> usize {
+        self.0
+    }
 }
 
 #[cfg(test)]
@@ -241,9 +279,17 @@ mod tests {
     }
 
     #[test]
-    fn retried_request_id_hashes_to_same_shard() {
-        let id = b"018f3a2b-7c9d-7e1f-abcd-0123456789ab";
-        assert_eq!(shard_for(id), shard_for(id));
+    fn random_shard_is_always_in_range() {
+        for _ in 0..1000 {
+            let shard = Shard::random().unwrap();
+            assert!(shard.index() < SHARDS);
+        }
+    }
+
+    #[test]
+    fn new_rejects_an_out_of_range_index() {
+        assert_eq!(Shard::new(SHARDS - 1).map(Shard::index), Some(SHARDS - 1));
+        assert_eq!(Shard::new(SHARDS), None);
     }
 
     /// For any per-shard counts, reconstructing every issued (shard, local

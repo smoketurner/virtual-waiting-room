@@ -13,6 +13,7 @@
 //! which layer a type happens to live in.
 
 pub mod crypto;
+pub mod entry;
 pub mod expr;
 pub mod ids;
 pub mod items;
@@ -20,6 +21,10 @@ pub mod permutation;
 pub mod rules;
 
 pub use crypto::{AdmissionToken, Session, SigningKey, VerifyError};
+pub use entry::{
+    EntryPolicy, KeyError, TicketError, TicketKey, TicketSubject, derive_request_id, is_uuid_shape,
+    verify_ticket,
+};
 pub use expr::{STARTS_AT_ATTR, STARTS_AT_TZ_ATTR};
 pub use ids::{
     AdmissionControl, EventId, IllegalControl, Phase, RequestId, ServingState, StoredControl,
@@ -27,8 +32,9 @@ pub use ids::{
 };
 pub use items::{
     Counters, PositionItem, PositionStatus, PreQueueItem, ResolveError, ResolvedPosition, Sealed,
+    Telemetry,
 };
-pub use permutation::{Assignment, SHARDS, SealError, SealedOffsets, Seed, prp, shard_for};
+pub use permutation::{Assignment, RandError, SHARDS, SealError, SealedOffsets, Seed, Shard, prp};
 pub use rules::{
     MAX_COOKIE_NAME_BYTES, MAX_HEADER_NAME_BYTES, MAX_HEADER_VALUE_BYTES, MAX_PATH_PREFIX_BYTES,
     MAX_USER_AGENT_BYTES, ProtectionRule, RequestView, RuleFieldError, RuleWire, matches_any,

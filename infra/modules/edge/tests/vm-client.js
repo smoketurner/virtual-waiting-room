@@ -16,7 +16,20 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 
-const SRC = path.join(__dirname, "..", "pages", "waiting.js");
+const SRC = path.join(__dirname, "..", "pages", "waiting.js.tftpl");
+
+/** The cookie name Terraform templates in; matches the module's variable default. */
+const ENTRY_TICKET_COOKIE_NAME = "vwr_ticket";
+
+/** Mirrors Terraform's `${var}` interpolation for the plain scalars this template uses. */
+function renderTemplate(source, values) {
+  return source.replace(/\$\{(\w+)\}/g, (_, name) => {
+    if (!(name in values)) {
+      throw new Error(`missing template value for \${${name}}`);
+    }
+    return values[name];
+  });
+}
 
 /** A `Response`-shaped value `getJSON`/`postJSON` can call `.json()` on. */
 function jsonResponse(status, body) {
@@ -108,7 +121,10 @@ function loadClient({ route, now, locationSearch }) {
     Math,
     console,
   });
-  vm.runInContext(fs.readFileSync(SRC, "utf8"), ctx, { filename: "waiting.js" });
+  const source = renderTemplate(fs.readFileSync(SRC, "utf8"), {
+    entry_ticket_cookie_name: ENTRY_TICKET_COOKIE_NAME,
+  });
+  vm.runInContext(source, ctx, { filename: "waiting.js" });
 
   return {
     win,
