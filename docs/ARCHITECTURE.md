@@ -228,6 +228,7 @@ Closing it costs a `PreQueue` `GetItem` on every live join.
   "serving_position": 41234,
   "participant_count": 1000000,
   "prequeue_offsets": [0, 99873, ...],
+  "shuffle_seed": "9f1c…",
   "message": "...",
   "target_rate": 500,
   "poll_policy": { "floor_ms": 5000, "ceiling_ms": 30000, "divisor": 10 }
@@ -236,12 +237,17 @@ Closing it costs a `PreQueue` `GetItem` on every live join.
 
 `serving_state` is derived from `(phase, admission_control)` and never stored, so it cannot drift.
 `target_rate` is **visitors per second**. `message`, `participant_count`, `prequeue_offsets`,
-`target_rate` and `poll_policy` are omitted when unset. `poll_policy` (#69, ADR-0023) is a
-Terraform-set deploy-time value, not something an operator changes mid-event through the admin
-surface.
+`shuffle_seed`, `target_rate` and `poll_policy` are omitted when unset. `poll_policy` (#69,
+ADR-0023) is a Terraform-set deploy-time value, not something an operator changes mid-event
+through the admin surface.
 
-The seed is **not** published here. A client cannot compute its own position; it asks
-`/v1/queue_num`.
+`shuffle_seed` is the 256-bit permutation key as lowercase hex, present only once the seal has
+written it — it does not exist earlier, so no registrant can pick a registration index that lands
+at the front. Publishing it with `participant_count` and `prequeue_offsets` is what lets an
+outside party recompute the whole ordering and check it.
+
+Holding the seed still does not tell a visitor their own position: that needs their shard and
+local index, which live in their `PreQueue` row. A client asks `/v1/queue_num` for it.
 
 ### 5.2 The client asks for its number once, and polls less often the further back it is
 
@@ -491,7 +497,6 @@ uniformity test uses a different threshold and does not assert a specific χ².
 
 | `DESIGN.md` says | The code does |
 |---|---|
-| `/status` publishes `shuffle_seed` after the seal | `StatusResponse` has no seed field. Only `/v1/queue_num` resolves a position |
 | `/queue_pos_expiry` and `/public_key` exist, unrouted | Neither is declared. An endpoint with no implementation is not declared at all |
 | WAF with Bot Control and ASN matching is deployed by default | `modules/edge` creates no WAF |
 | Each event gets its own SQS queue and reserved concurrency | One queue, one event per deployment, no `reserved_concurrent_executions` anywhere |

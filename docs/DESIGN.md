@@ -348,6 +348,9 @@ Given `shuffle_seed`, `participant_count`, `prequeue_offsets`, and the `(request
 tuples in `PreQueue`, any third party recomputes every global index `i = offset[s] + l` and
 every position, and confirms the ordering.
 
+The first three come from `/status`, where `shuffle_seed` is the 32 key bytes as lowercase hex
+and all three appear only once the seal has written them.
+
 Positions are written to `Positions` lazily, when a visitor is admitted, carrying
 `entry_time`, `status` and `expires_at` for the outflow controller. Only visitors who reach
 the front generate a row.

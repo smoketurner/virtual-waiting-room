@@ -33,6 +33,10 @@ aws_lambda_events = { version = "=1.2.0", default-features = false }
 axum = { version = "=0.8.9", default-features = false }
 base64 = { version = "=0.23.1", default-features = false }
 cookie = { version = "=0.18.2", default-features = false }
+# Renders the permutation seed for /status. Already in the tree as an
+# aws-sigv4 dependency, so depending on it directly adds nothing to the
+# artifact.
+hex = { version = "=0.4.3", default-features = false }
 # Timezone-aware scheduling (issue #128): converts the operator's local
 # wall-clock start time to the UTC epoch the waiting page counts down to.
 # The tz database is bundled into the binary rather than read from the

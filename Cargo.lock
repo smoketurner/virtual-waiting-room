@@ -2605,6 +2605,7 @@ dependencies = [
  "anyhow",
  "aws-config",
  "aws-sdk-dynamodb",
+ "hex",
  "lambda_http",
  "lambda_runtime",
  "proptest",
