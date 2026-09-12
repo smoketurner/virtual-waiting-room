@@ -191,6 +191,23 @@ pub struct Expression {
     pub values: HashMap<String, AttributeValue>,
 }
 
+impl Expression {
+    /// The names, or `None` when there are none. `DynamoDB` rejects an empty
+    /// `ExpressionAttributeNames` map rather than ignoring it, so a builder
+    /// that produced no names must send the field absent, not empty.
+    #[must_use]
+    pub fn names_or_none(&self) -> Option<HashMap<String, String>> {
+        (!self.names.is_empty()).then(|| self.names.clone())
+    }
+
+    /// The values, or `None` when there are none — see [`Expression::names_or_none`].
+    /// A condition such as a bare `attribute_not_exists` binds no values at all.
+    #[must_use]
+    pub fn values_or_none(&self) -> Option<HashMap<String, AttributeValue>> {
+        (!self.values.is_empty()).then(|| self.values.clone())
+    }
+}
+
 /// Builds an `UpdateExpression` together with its bindings.
 ///
 /// Every attribute is referenced through an allocated `#u<n>` name placeholder,
