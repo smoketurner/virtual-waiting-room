@@ -93,14 +93,12 @@ def uuid_v7() -> str:
     return f"{h[0:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
 
 
-def shard_of(request_id: str) -> int:
-    """FNV-1a over the request id, mod the shard count — the same deterministic
-    hash the pre-queue registration path uses so a retry lands on its shard."""
-    h = 0xCBF29CE484222325
-    for c in request_id.encode():
-        h ^= c
-        h = (h * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
-    return h % SHARDS
+def telemetry_of(item: dict) -> dict:
+    """The `v` map a row carries from join-time viewer headers (issue #59), as
+    plain strings. Empty when the attribute is absent."""
+    return {
+        k: next(iter(v.values())) for k, v in item.get("v", {}).get("M", {}).items()
+    }
 
 
 def api_get(api_url: str, path: str) -> dict:
@@ -149,7 +147,8 @@ def main() -> int:
         tables["positions"],
     )
     seal_fn = tf_output("seal_event_function_name")
-    print(f"API: {api_url}  event_id: {event_id}")
+    cf_host = tf_output("cloudfront_domain_name")
+    print(f"API: {api_url}  CDN: {cf_host}  event_id: {event_id}")
 
     if args.no_reset:
         say("2. Skipping the reset (--no-reset)")
@@ -198,11 +197,47 @@ def main() -> int:
         )
         return 1
 
+    # The shard is drawn server-side at random per invocation (issue #59), so
+    # there is no expected shard for a given id any more — only that it is in
+    # range and that no two registrations share a (shard, local index) pair,
+    # which is what the seal's prefix offsets turn into a unique position.
+    slots: dict[tuple[int, int], str] = {}
     for rid, item in rows.items():
-        assert int(item["s"]["N"]) == shard_of(rid), (rid, item)
+        shard = int(item["s"]["N"])
+        local = int(item["l"]["N"])
+        assert 0 <= shard < SHARDS, (rid, item)
+        assert (shard, local) not in slots, (
+            f"DUPLICATE slot s={shard} l={local}: {rid} and {slots[(shard, local)]}"
+        )
+        slots[(shard, local)] = rid
     print(
-        f"registered {len(ids)} pre-queue visitors; all rows landed on their expected shard"
+        f"registered {len(ids)} pre-queue visitors; {len(slots)} distinct (shard, index) slots"
     )
+
+    # Join-time telemetry rides as SQS message attributes and lands on the row.
+    # A row with no `v` means the API Gateway stage is serving a mapping
+    # template older than the one in this checkout — the failure is otherwise
+    # completely silent, since nothing reads the telemetry yet.
+    with_telemetry = [rid for rid, item in rows.items() if telemetry_of(item)]
+    if not with_telemetry:
+        print(
+            "ERROR: no PreQueue row carried a `v` attribute. The deployed stage is "
+            "probably serving a stale mapping template — check whether "
+            "aws_api_gateway_deployment is pending replacement in `make plan`.",
+            file=sys.stderr,
+        )
+        return 1
+    sample = telemetry_of(rows[with_telemetry[0]])
+    print(
+        f"telemetry present on {len(with_telemetry)}/{len(rows)} rows; "
+        f"sample keys={sorted(sample)}"
+    )
+    if "a" not in sample:
+        print(
+            "WARNING: no viewer address (`a`) on the sample row. Expected when "
+            "posting directly to the API; via CloudFront it should be set.",
+            file=sys.stderr,
+        )
 
     shard_total = 0
     for s in range(SHARDS):
@@ -249,6 +284,44 @@ def main() -> int:
     else:
         print("ERROR: no Positions row for the live join after 30s", file=sys.stderr)
         return 1
+
+    say("7. Join through CloudFront; confirm the viewer headers reach the row")
+    # Steps 3 and 6 post straight at API Gateway, which never sees a
+    # CloudFront-Viewer-* header — only the request id and user agent survive
+    # that path. Proving the telemetry works end to end needs the CDN, because
+    # the headers are generated there and forwarded by the /v1/join origin
+    # request policy.
+    cdn_rid = uuid_v7()
+    api_post(
+        f"https://{cf_host}", "/v1/join", {"request_id": cdn_rid, "event_id": event_id}
+    )
+    print(f"posted {cdn_rid} via CloudFront; waiting for the row")
+    cdn_item: dict = {}
+    for _ in range(15):
+        row = ddb.get_item(TableName=positions, Key={"request_id": {"S": cdn_rid}})
+        if "Item" in row:
+            cdn_item = row["Item"]
+            break
+        time.sleep(2)
+    if not cdn_item:
+        print(
+            "ERROR: no Positions row for the CloudFront join after 30s", file=sys.stderr
+        )
+        return 1
+
+    viewer = telemetry_of(cdn_item)
+    print(f"row telemetry: {json.dumps(viewer, sort_keys=True)}")
+    missing = [k for k in ("a", "c", "j") if k not in viewer]
+    if missing:
+        print(
+            f"ERROR: viewer telemetry missing {missing} (a=address, c=country, "
+            "j=JA4). Either the /v1/join origin request policy is not forwarding "
+            "the CloudFront-Viewer-* headers, or the stage is serving a stale "
+            "mapping template.",
+            file=sys.stderr,
+        )
+        return 1
+    print("viewer telemetry present: address, country and JA4 fingerprint all landed")
 
     say("SMOKE TEST PASSED")
     return 0
