@@ -6,6 +6,8 @@ use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
 use aws_sdk_dynamodb::types::AttributeValue;
 use jiff::Timestamp;
+
+use crate::arrival::ArrivalTime;
 use wr_common::expr::event_key;
 use wr_common::{Phase, StoredControl};
 
@@ -90,7 +92,7 @@ impl Store for DynamoStore {
         to: Phase,
         action: crate::AdminAction,
         actor: &str,
-        now: Timestamp,
+        now: ArrivalTime,
     ) -> Result<(), StoreError> {
         // Guarded on the expected phase (lost-race safety) but NOT debounced —
         // like force_maintenance, the operator's lifecycle/recovery move must
@@ -117,7 +119,7 @@ impl Store for DynamoStore {
         expected: Option<u32>,
         rate: u32,
         actor: &str,
-        now: Timestamp,
+        now: ArrivalTime,
     ) -> Result<(), StoreError> {
         let mut req = self
             .client
@@ -140,7 +142,7 @@ impl Store for DynamoStore {
         event_id: &str,
         message: &str,
         actor: &str,
-        now: Timestamp,
+        now: ArrivalTime,
     ) -> Result<(), StoreError> {
         let mut req = self
             .client
@@ -164,7 +166,7 @@ impl Store for DynamoStore {
         to: StoredControl,
         action: crate::AdminAction,
         actor: &str,
-        now: Timestamp,
+        now: ArrivalTime,
     ) -> Result<(), StoreError> {
         // The write applies only from the expected prior value, so a transition
         // another operator already made is a Conflict rather than a second
@@ -202,7 +204,7 @@ impl Store for DynamoStore {
         until: u64,
         action: crate::AdminAction,
         actor: &str,
-        now: Timestamp,
+        now: ArrivalTime,
     ) -> Result<(), StoreError> {
         // Unconditional (break-glass), unlike set_stored_control: the operator
         // must always be able to engage or clear it, mirroring
@@ -227,7 +229,7 @@ impl Store for DynamoStore {
         starts_at: Option<(u64, &str)>,
         action: crate::AdminAction,
         actor: &str,
-        now: Timestamp,
+        now: ArrivalTime,
     ) -> Result<(), StoreError> {
         const AUDIT: &str = "last_action = :a, last_action_by = :by, \
                              last_action_at = :at, last_action_epoch_ms = :ms";
@@ -264,7 +266,7 @@ impl Store for DynamoStore {
         rules_digest: &str,
         rules_count: usize,
         actor: &str,
-        now: Timestamp,
+        now: ArrivalTime,
     ) -> Result<(), StoreError> {
         // Unconditional, like set_fail_open_until: the ruleset itself already
         // landed in the KeyValueStore by the time this runs, so there is
@@ -289,7 +291,7 @@ impl Store for DynamoStore {
         event_id: &str,
         from: Phase,
         actor: &str,
-        now: Timestamp,
+        now: ArrivalTime,
     ) -> Result<(), StoreError> {
         // Guarded on the expected phase (lost-race safety) but NOT debounced —
         // the emergency stop must always apply.
@@ -340,12 +342,15 @@ fn apply_audit_values(
     req: UpdateReq,
     action: crate::AdminAction,
     actor: &str,
-    now: Timestamp,
+    now: ArrivalTime,
 ) -> UpdateReq {
     req.expression_attribute_values(":a", AttributeValue::S(action.as_str().to_owned()))
         .expression_attribute_values(":by", AttributeValue::S(actor.to_owned()))
-        .expression_attribute_values(":at", AttributeValue::S(audit_timestamp(now)))
-        .expression_attribute_values(":ms", AttributeValue::N(now.as_millisecond().to_string()))
+        .expression_attribute_values(":at", AttributeValue::S(audit_timestamp(now.timestamp())))
+        .expression_attribute_values(
+            ":ms",
+            AttributeValue::N(now.timestamp().as_millisecond().to_string()),
+        )
 }
 
 /// Renders an instant as the `YYYY-MM-DDTHH:MM:SSZ` string an operator reads
@@ -387,8 +392,9 @@ fn combine_debounce(existing: Option<&str>) -> String {
 
 /// Adds the debounce guard (a prior mutation at least [`crate::DEBOUNCE`]
 /// ago), composing with any existing condition via AND.
-fn guard_debounce(req: UpdateReq, now: Timestamp) -> UpdateReq {
+fn guard_debounce(req: UpdateReq, now: ArrivalTime) -> UpdateReq {
     let cutoff = now
+        .timestamp()
         .as_millisecond()
         .saturating_sub(crate::DEBOUNCE_MILLIS)
         .to_string();

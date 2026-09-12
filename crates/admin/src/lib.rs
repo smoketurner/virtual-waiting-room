@@ -7,8 +7,11 @@ use std::future::Future;
 
 use jiff::{SignedDuration, Timestamp};
 
+use crate::arrival::ArrivalTime;
+
 use wr_common::{IllegalControl, Phase, ProtectionRule, RuleFieldError, StoredControl};
 
+pub mod arrival;
 pub mod dynamo;
 pub mod edge;
 pub mod oidc;
@@ -173,7 +176,7 @@ pub trait Store {
         to: Phase,
         action: AdminAction,
         actor: &str,
-        now: Timestamp,
+        now: ArrivalTime,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
     /// Sets the admission target rate, guarded (ADR-0017 defensive controls):
@@ -187,7 +190,7 @@ pub trait Store {
         expected: Option<u32>,
         rate: u32,
         actor: &str,
-        now: Timestamp,
+        now: ArrivalTime,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
     /// Sets the operator broadcast message, guarded on the debounce window and
@@ -197,7 +200,7 @@ pub trait Store {
         event_id: &str,
         message: &str,
         actor: &str,
-        now: Timestamp,
+        now: ArrivalTime,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
     /// Writes or clears the scheduled event start (issue #128), guarded on the
@@ -213,7 +216,7 @@ pub trait Store {
         starts_at: Option<(u64, &str)>,
         action: AdminAction,
         actor: &str,
-        now: Timestamp,
+        now: ArrivalTime,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
     /// Moves the stored control from `from` to `to`, guarded on the stored
@@ -229,7 +232,7 @@ pub trait Store {
         to: StoredControl,
         action: AdminAction,
         actor: &str,
-        now: Timestamp,
+        now: ArrivalTime,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
     /// Sets the fail-open epoch unconditionally (break-glass: not guarded on
@@ -242,7 +245,7 @@ pub trait Store {
         until: u64,
         action: AdminAction,
         actor: &str,
-        now: Timestamp,
+        now: ArrivalTime,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
     /// Stamps the audit fields for a ruleset change (issue #71), plus
@@ -259,7 +262,7 @@ pub trait Store {
         rules_digest: &str,
         rules_count: usize,
         actor: &str,
-        now: Timestamp,
+        now: ArrivalTime,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
     /// Forces the maintenance phase, guarded on the expected current phase and
@@ -269,7 +272,7 @@ pub trait Store {
         event_id: &str,
         from: Phase,
         actor: &str,
-        now: Timestamp,
+        now: ArrivalTime,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 }
 
@@ -618,7 +621,7 @@ pub async fn apply_phase<S: Store>(
     event_id: &str,
     to: &str,
     actor: &str,
-    now: Timestamp,
+    now: ArrivalTime,
 ) -> Result<Phase, ApplyError> {
     let to = parse_phase(to)?;
     let Some(state) = store.load(event_id).await? else {
@@ -654,7 +657,7 @@ pub async fn apply_reset<S: Store>(
     store: &S,
     event_id: &str,
     actor: &str,
-    now: Timestamp,
+    now: ArrivalTime,
 ) -> Result<(), ApplyError> {
     let Some(state) = store.load(event_id).await? else {
         return Err(ActionError::NotFound.into());
@@ -672,25 +675,13 @@ pub async fn apply_reset<S: Store>(
 /// A stamp in the future describes no prior action, and nothing an operator
 /// does would move it back into the past, so treating it as recent would
 /// reject every later action for good.
-fn debounce_check(state: &ControlState, now: Timestamp) -> Result<(), ActionError> {
+fn debounce_check(state: &ControlState, now: ArrivalTime) -> Result<(), ActionError> {
     if let Some(last) = state.last_action_time
-        && (SignedDuration::ZERO..DEBOUNCE).contains(&now.duration_since(last))
+        && (SignedDuration::ZERO..DEBOUNCE).contains(&now.timestamp().duration_since(last))
     {
         return Err(ActionError::TooFast);
     }
     Ok(())
-}
-
-/// Epoch seconds, for the two places that work in them rather than in
-/// instants: the fail-open deadline the edge gate compares against its own
-/// clock, and the start-time validation.
-///
-/// A pre-epoch instant clamps to 0, which both read as already past — the
-/// safe direction for a deadline, since it withholds a fail-open window
-/// rather than granting an unbounded one.
-#[must_use]
-pub fn epoch_seconds(now: Timestamp) -> u64 {
-    u64::try_from(now.as_second()).unwrap_or(0)
 }
 
 /// Sets the admission target rate (guarded + debounced).
@@ -705,7 +696,7 @@ pub async fn apply_rate<S: Store>(
     event_id: &str,
     rate: &str,
     actor: &str,
-    now: Timestamp,
+    now: ArrivalTime,
 ) -> Result<u32, ApplyError> {
     let rate: u32 = rate.parse().map_err(|_| ActionError::InvalidRate)?;
     if rate == 0 {
@@ -738,7 +729,7 @@ pub async fn apply_pause<S: Store>(
     store: &S,
     event_id: &str,
     actor: &str,
-    now: Timestamp,
+    now: ArrivalTime,
 ) -> Result<(), ApplyError> {
     apply_control(
         store,
@@ -762,7 +753,7 @@ pub async fn apply_resume<S: Store>(
     store: &S,
     event_id: &str,
     actor: &str,
-    now: Timestamp,
+    now: ArrivalTime,
 ) -> Result<(), ApplyError> {
     apply_control(
         store,
@@ -786,7 +777,7 @@ async fn apply_control<S, T>(
     transition: T,
     action: AdminAction,
     actor: &str,
-    now: Timestamp,
+    now: ArrivalTime,
 ) -> Result<(), ApplyError>
 where
     S: Store,
@@ -863,7 +854,7 @@ pub async fn apply_fail_open<S: Store, E: EdgeConfigStore>(
     event_id: &str,
     minutes: &str,
     actor: &str,
-    now: Timestamp,
+    now: ArrivalTime,
 ) -> Result<(), ApplyError> {
     let minutes: u32 = minutes.parse().map_err(|_| ActionError::InvalidDuration)?;
     if minutes == 0 || minutes > MAX_FAIL_OPEN_MINUTES {
@@ -872,7 +863,7 @@ pub async fn apply_fail_open<S: Store, E: EdgeConfigStore>(
     if store.load(event_id).await?.is_none() {
         return Err(ActionError::NotFound.into());
     }
-    let now_secs = epoch_seconds(now);
+    let now_secs = now.epoch_seconds();
     let until = now_secs.saturating_add(u64::from(minutes).saturating_mul(60));
 
     edge_read_modify_write(edge, |cfg| cfg.fail_open_until = until)
@@ -901,7 +892,7 @@ pub async fn apply_recover<S: Store, E: EdgeConfigStore>(
     edge: &E,
     event_id: &str,
     actor: &str,
-    now: Timestamp,
+    now: ArrivalTime,
 ) -> Result<(), ApplyError> {
     if store.load(event_id).await?.is_none() {
         return Err(ActionError::NotFound.into());
@@ -947,7 +938,7 @@ pub async fn apply_start_time<S: Store, K: SealSchedule>(
     at: &str,
     timezone: &str,
     actor: &str,
-    now: Timestamp,
+    now: ArrivalTime,
 ) -> Result<(), ApplyError> {
     let Some(state) = store.load(event_id).await? else {
         return Err(ActionError::NotFound.into());
@@ -965,7 +956,7 @@ pub async fn apply_start_time<S: Store, K: SealSchedule>(
         return Ok(());
     }
 
-    let start = parse_start_time(at, timezone, epoch_seconds(now))?;
+    let start = parse_start_time(at, timezone, now.epoch_seconds())?;
     schedule
         .set_start_time(Some((&start.expression, &start.timezone)))
         .await
@@ -1005,7 +996,7 @@ pub async fn apply_set_rules<S: Store, E: EdgeConfigStore>(
     event_id: &str,
     rules: Vec<ProtectionRule>,
     actor: &str,
-    now: Timestamp,
+    now: ArrivalTime,
 ) -> Result<(), ApplyError> {
     if store.load(event_id).await?.is_none() {
         return Err(ActionError::NotFound.into());
@@ -1158,7 +1149,7 @@ pub async fn apply_message<S: Store>(
     event_id: &str,
     message: &str,
     actor: &str,
-    now: Timestamp,
+    now: ArrivalTime,
 ) -> Result<(), ApplyError> {
     let Some(state) = store.load(event_id).await? else {
         return Err(ActionError::NotFound.into());
@@ -1200,10 +1191,10 @@ mod tests {
 
     use super::*;
 
-    /// The instant `ms` milliseconds after the epoch. The tests below talk in
+    /// An arrival `ms` milliseconds after the epoch. The tests below talk in
     /// small round numbers because only the intervals between them matter.
-    fn ts(ms: i64) -> Timestamp {
-        Timestamp::from_millisecond(ms).unwrap()
+    fn ts(ms: i64) -> ArrivalTime {
+        ArrivalTime::for_test_millis(ms)
     }
 
     struct FakeStore {
@@ -1367,11 +1358,11 @@ mod tests {
 
         /// Stamps all four audit fields, mirroring `apply_audit_values` in the
         /// real store; every mutating method calls this.
-        fn stamp_audit(&self, action: AdminAction, actor: &str, now: Timestamp) {
+        fn stamp_audit(&self, action: AdminAction, actor: &str, now: ArrivalTime) {
             *self.last_action.lock().unwrap() = Some(action.as_str().to_owned());
             *self.last_action_by.lock().unwrap() = Some(actor.to_owned());
-            *self.last_action_at.lock().unwrap() = Some(now.to_string());
-            *self.last_time.lock().unwrap() = Some(now);
+            *self.last_action_at.lock().unwrap() = Some(now.timestamp().to_string());
+            *self.last_time.lock().unwrap() = Some(now.timestamp());
         }
     }
 
@@ -1411,7 +1402,7 @@ mod tests {
             to: Phase,
             action: AdminAction,
             actor: &str,
-            now: Timestamp,
+            now: ArrivalTime,
         ) -> impl Future<Output = Result<(), StoreError>> + Send {
             let result = if self.conflict {
                 Err(StoreError::Conflict)
@@ -1429,7 +1420,7 @@ mod tests {
             _expected: Option<u32>,
             rate: u32,
             actor: &str,
-            now: Timestamp,
+            now: ArrivalTime,
         ) -> impl Future<Output = Result<(), StoreError>> + Send {
             let result = if self.conflict {
                 Err(StoreError::Conflict)
@@ -1446,7 +1437,7 @@ mod tests {
             _event_id: &str,
             message: &str,
             actor: &str,
-            now: Timestamp,
+            now: ArrivalTime,
         ) -> impl Future<Output = Result<(), StoreError>> + Send {
             *self.message.lock().unwrap() = Some(message.to_owned());
             self.stamp_audit(AdminAction::SetMessage, actor, now);
@@ -1459,7 +1450,7 @@ mod tests {
             starts_at: Option<(u64, &str)>,
             action: AdminAction,
             actor: &str,
-            now: Timestamp,
+            now: ArrivalTime,
         ) -> impl Future<Output = Result<(), StoreError>> + Send {
             self.writes.lock().unwrap().push("dynamo");
             let result = if self.starts_at_write_fails {
@@ -1480,7 +1471,7 @@ mod tests {
             to: StoredControl,
             action: AdminAction,
             actor: &str,
-            now: Timestamp,
+            now: ArrivalTime,
         ) -> impl Future<Output = Result<(), StoreError>> + Send {
             // Mirrors the conditional write: the move applies only if the stored
             // value is still the one the caller read.
@@ -1502,7 +1493,7 @@ mod tests {
             until: u64,
             action: AdminAction,
             actor: &str,
-            now: Timestamp,
+            now: ArrivalTime,
         ) -> impl Future<Output = Result<(), StoreError>> + Send {
             let result = if self.conflict {
                 Err(StoreError::Conflict)
@@ -1520,7 +1511,7 @@ mod tests {
             rules_digest: &str,
             rules_count: usize,
             actor: &str,
-            now: Timestamp,
+            now: ArrivalTime,
         ) -> impl Future<Output = Result<(), StoreError>> + Send {
             let result = if self.conflict {
                 Err(StoreError::Conflict)
@@ -1537,7 +1528,7 @@ mod tests {
             _event_id: &str,
             _from: Phase,
             actor: &str,
-            now: Timestamp,
+            now: ArrivalTime,
         ) -> impl Future<Output = Result<(), StoreError>> + Send {
             let result = if self.conflict {
                 Err(StoreError::Conflict)
@@ -1885,7 +1876,7 @@ mod tests {
         let state = store.load("evt").await.unwrap().unwrap();
         assert_eq!(state.last_action.as_deref(), Some("set_phase"));
         assert_eq!(state.last_action_by.as_deref(), Some("op@x"));
-        assert_eq!(state.last_action_time, Some(ts(1_000)));
+        assert_eq!(state.last_action_time, Some(ts(1_000).timestamp()));
     }
 
     #[tokio::test]
@@ -1991,7 +1982,7 @@ mod tests {
         let state = store.load("evt").await.unwrap().unwrap();
         assert_eq!(state.last_action.as_deref(), Some("force_maintenance"));
         assert_eq!(state.last_action_by.as_deref(), Some("op@x"));
-        assert_eq!(state.last_action_time, Some(ts(1000)));
+        assert_eq!(state.last_action_time, Some(ts(1000).timestamp()));
     }
 
     #[tokio::test]
@@ -2008,7 +1999,7 @@ mod tests {
         let state = store.load("evt").await.unwrap().unwrap();
         assert_eq!(state.last_action.as_deref(), Some("force_maintenance"));
         assert_eq!(state.last_action_by.as_deref(), Some("op@x"));
-        assert_eq!(state.last_action_time, Some(ts(5_000)));
+        assert_eq!(state.last_action_time, Some(ts(5_000).timestamp()));
 
         // The dropdown's offered recovery path (next_phases(Maintenance)[0]).
         assert_eq!(
@@ -2026,7 +2017,7 @@ mod tests {
         let state = store.load("evt").await.unwrap().unwrap();
         assert_eq!(state.last_action.as_deref(), Some("set_phase"));
         assert_eq!(state.last_action_by.as_deref(), Some("op@y"));
-        assert_eq!(state.last_action_time, Some(ts(6_000)));
+        assert_eq!(state.last_action_time, Some(ts(6_000).timestamp()));
     }
 
     #[tokio::test]
@@ -2040,7 +2031,7 @@ mod tests {
         let state = store.load("evt").await.unwrap().unwrap();
         assert_eq!(state.last_action.as_deref(), Some("set_phase"));
         assert_eq!(state.last_action_by.as_deref(), Some("op@z"));
-        assert_eq!(state.last_action_time, Some(ts(7_000)));
+        assert_eq!(state.last_action_time, Some(ts(7_000).timestamp()));
     }
 
     #[tokio::test]
@@ -2055,7 +2046,7 @@ mod tests {
         let state = store.load("evt").await.unwrap().unwrap();
         assert_eq!(state.last_action.as_deref(), Some("set_phase"));
         assert_eq!(state.last_action_by.as_deref(), Some("alice"));
-        assert_eq!(state.last_action_time, Some(ts(1_000)));
+        assert_eq!(state.last_action_time, Some(ts(1_000).timestamp()));
 
         apply_phase(&store, "evt", "active", "bob", ts(2_000))
             .await
@@ -2063,7 +2054,7 @@ mod tests {
         let state = store.load("evt").await.unwrap().unwrap();
         assert_eq!(state.last_action.as_deref(), Some("set_phase"));
         assert_eq!(state.last_action_by.as_deref(), Some("bob"));
-        assert_eq!(state.last_action_time, Some(ts(2_000)));
+        assert_eq!(state.last_action_time, Some(ts(2_000).timestamp()));
 
         apply_phase(&store, "evt", "post_event", "carol", ts(3_000))
             .await
@@ -2071,7 +2062,7 @@ mod tests {
         let state = store.load("evt").await.unwrap().unwrap();
         assert_eq!(state.last_action.as_deref(), Some("set_phase"));
         assert_eq!(state.last_action_by.as_deref(), Some("carol"));
-        assert_eq!(state.last_action_time, Some(ts(3_000)));
+        assert_eq!(state.last_action_time, Some(ts(3_000).timestamp()));
     }
 
     #[tokio::test]
@@ -2093,7 +2084,7 @@ mod tests {
         let state = store.load("evt").await.unwrap().unwrap();
         assert_eq!(state.last_action.as_deref(), Some("set_phase"));
         assert_eq!(state.last_action_by.as_deref(), Some("phase-op"));
-        assert_eq!(state.last_action_time, Some(ts(2_000)));
+        assert_eq!(state.last_action_time, Some(ts(2_000).timestamp()));
     }
 
     #[tokio::test]
@@ -2131,15 +2122,9 @@ mod tests {
             Some("Doors open at noon")
         );
         // Second call is spaced beyond the debounce window.
-        apply_message(
-            &store,
-            "evt",
-            "",
-            "op@x",
-            ts(1000).checked_add(DEBOUNCE).unwrap(),
-        )
-        .await
-        .unwrap();
+        apply_message(&store, "evt", "", "op@x", ts(1000 + DEBOUNCE_MILLIS))
+            .await
+            .unwrap();
         assert_eq!(store.message.lock().unwrap().as_deref(), Some(""));
     }
 
@@ -2174,14 +2159,9 @@ mod tests {
             Some(AdminAction::Pause)
         );
         // Resume spaced beyond the debounce window.
-        apply_resume(
-            &store,
-            "evt",
-            "op@x",
-            ts(1000).checked_add(DEBOUNCE).unwrap(),
-        )
-        .await
-        .unwrap();
+        apply_resume(&store, "evt", "op@x", ts(1000 + DEBOUNCE_MILLIS))
+            .await
+            .unwrap();
         assert_eq!(*store.control.lock().unwrap(), StoredControl::Open);
         assert_eq!(
             *store.control_action.lock().unwrap(),
@@ -2254,15 +2234,9 @@ mod tests {
         assert_eq!(*store.rate.lock().unwrap(), Some(500));
         // After the window, it succeeds.
         assert!(
-            apply_rate(
-                &store,
-                "evt",
-                "600",
-                "op@x",
-                ts(1000).checked_add(DEBOUNCE).unwrap()
-            )
-            .await
-            .is_ok()
+            apply_rate(&store, "evt", "600", "op@x", ts(1000 + DEBOUNCE_MILLIS))
+                .await
+                .is_ok()
         );
     }
 
@@ -2278,7 +2252,7 @@ mod tests {
         apply_rate(&store, "evt", "500", "op@x", ahead)
             .await
             .unwrap();
-        assert_eq!(*store.last_time.lock().unwrap(), Some(ahead));
+        assert_eq!(*store.last_time.lock().unwrap(), Some(ahead.timestamp()));
 
         apply_rate(&store, "evt", "600", "op@x", ts(1_000))
             .await
