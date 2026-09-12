@@ -8,7 +8,7 @@
 # the admin Lambda, which lives here: putting the store in edge would need
 # edge to export its ARN back to core, a module cycle. core exports
 # gate_kvs_arn; edge consumes it. Same shape, same resolution, as the
-# CloudFront key pair ADR-0020 put in core for the same reason (now retired).
+# CloudFront key pair that lived in core for the same reason (now retired).
 
 resource "aws_cloudfront_key_value_store" "gate" {
   name    = "${var.name_prefix}-gate"

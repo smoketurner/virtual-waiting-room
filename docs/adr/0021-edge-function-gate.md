@@ -6,12 +6,12 @@ none of it did: the runtime verifies an unchanged `wr_common::crypto` credential
 reaches an edge in a median of 31 seconds. What remains in §5 are design decisions — what trips
 fail-open, and which revocation design — not open questions about feasibility.
 
-**Supersedes if accepted:** [ADR-0020](0020-cloudfront-signed-cookie-gate.md) entirely. It does
-**not** restore [ADR-0009](0009-fail-open.md) on its own — see §5.1.
+**Replaces** the trusted-key-group gate entirely. It does **not** restore
+[ADR-0009](0009-fail-open.md) on its own — see §5.1.
 
 ## 1. Context
 
-ADR-0020 made CloudFront's trusted key group the gate. That bought two things worth keeping: the
+CloudFront's trusted key group was the gate. That bought two things worth keeping: the
 gate costs nothing per request, and it works against an origin we cannot put code near. What it
 gave up is that CloudFront **verifies a signature; it does not decide**.
 
@@ -25,8 +25,9 @@ gave up is that CloudFront **verifies a signature; it does not decide**.
 | [#72](https://github.com/smoketurner/virtual-waiting-room/issues/72) | XHR refused with a machine-readable answer, not an HTML page |
 | [#73](https://github.com/smoketurner/virtual-waiting-room/issues/73) | A reason attached to every refusal |
 
-ADR-0020 rejected this option because a CloudFront Function "needs the symmetric signing key
-readable at the edge and cannot record arrivals." Both objections dissolve: arrivals are recorded
+This option was rejected when the trusted-key-group gate was chosen, because a CloudFront
+Function needs the symmetric signing key readable at the edge and cannot record arrivals. Both
+objections dissolve: arrivals are recorded
 one step earlier by `generate_token` (§3.1), and the key at the edge is unavoidable in any design
 that verifies at the edge, so the question is which edge store holds it (§4.1).
 
@@ -434,7 +435,7 @@ job. `structure.md` and `testing.md` are updated to match; in particular `testin
 #64 and this ADR remove — replaced by the gate's own `next=` query parameter, which preserves the
 visitor's destination through the redirect without needing a client-side loop guard at all.
 
-**ADR-0020 is retired in one change, with no dual-gate window.** A transition period would require
+**The trusted-key-group gate is retired in one change, with no dual-gate window.** A transition period would require
 knowing whether a viewer-request function runs before or after trusted-key-group validation, which
 AWS does not document; if validation runs first, the two gates cannot coexist at all. The `custom_
 error_response` block and `trusted_key_groups` are removed and the gate's `function_association`

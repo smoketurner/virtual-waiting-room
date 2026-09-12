@@ -19,13 +19,12 @@ One record per decision. Each states the context, the decision, and its conseque
 | [0012](0012-anti-ddos-count-mode.md) | Ship the anti-DDoS rule group in Count mode |
 | [0013](0013-cache-behaviour-separation.md) | Separate cache behaviours to preserve request collapsing |
 | [0014](0014-admin-ui-askama-cloudscape-tokens.md) | Render the admin UI with askama compile-time templates (styling superseded by 0018) |
-| [0015](0015-stripe-prequeue-counter.md) | Stripe the pre-queue registration counter across 10 shards |
+| [0015](0015-stripe-prequeue-counter.md) | Stripe the pre-queue registration counter across 10 partition keys |
 | [0016](0016-admin-oidc-dynamodb-sessions.md) | Authenticate the admin UI with OIDC and DynamoDB sessions |
 | [0017](0017-andon-cord-emergency-controls.md) | Give the operator an andon cord and guarded emergency controls |
 | [0018](0018-admin-vouch-design-language.md) | Style the admin UI with the Vouch design language (supersedes 0014's styling) |
 | [0019](0019-visitor-facing-serving-state.md) | Express the visitor-facing serving state as one enum |
-| [0020](0020-cloudfront-signed-cookie-gate.md) | Gate the protected origin with CloudFront signed cookies |
-| [0021](0021-edge-function-gate.md) | Move the gate to a CloudFront Function (supersedes 0020) |
+| [0021](0021-edge-function-gate.md) | Gate the protected origin with a CloudFront Function |
 | [0022](0022-durable-controller-cadence.md) | Build the controller's 10-second cadence from durable waits |
 | [0023](0023-adaptive-poll-interval.md) | Scale the client poll interval with distance to the front |
 | [0024](0024-jws-credentials.md) | Carry credentials as a JWS (amends 0011) |
@@ -39,7 +38,6 @@ Decisions deferred until measurement or a client engagement supplies the input.
 |---|---|
 | Bot Control Common versus Targeted | Run Targeted in Count mode during a real event and measure what it catches that Common does not. Ten times the per-request cost. |
 | Flat-rate versus pay-as-you-go CloudFront pricing | Flat-rate is usually the better fit for a large planned event (predictable, caps exposure), but the Terraform provider cannot create a flat-rate distribution yet ([#45450](https://github.com/hashicorp/terraform-provider-aws/issues/45450), PR #49235). PAYG is the default until it lands; flat-rate is selected manually per event. The crossover is otherwise non-monotonic in event size, poll interval and Bot Control tier. |
-| Session credential format | Whether to follow an HMAC-over-concatenation scheme or a JWT. The required property is only that it signs different inputs from the admission token. |
 | Signing key rotation | Compromise permits minting admission for every event in the deployment. |
 | Standby inflow measurement placement | Authorizer-local versus centrally aggregated. |
 | No-show controller tuning | Smoothing window and correction bounds need a real event's data. |

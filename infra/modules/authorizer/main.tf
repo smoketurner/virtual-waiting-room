@@ -9,7 +9,7 @@
 #
 # The function is built and deployed, but nothing in this account invokes it:
 # it attaches at the customer's own origin. CloudFront signed cookies are the
-# gate for origins we cannot run code in (ADR-0020); this remains for the ones
+# gate for origins we cannot run code in; this remains for the ones
 # we can, where per-request rules on header, cookie, or user agent are needed.
 #
 # Fail fast on a misconfigured VPC seam.
