@@ -8,10 +8,6 @@ output "table_arns" {
   value       = module.core.table_arns
 }
 
-output "signing_key_parameter_name" {
-  description = "Name of the SSM SecureString parameter holding the signing key."
-  value       = module.core.signing_key_parameter_name
-}
 
 output "join_queue_url" {
   description = "URL of the live-join SQS queue."
@@ -82,4 +78,9 @@ output "demo_origin_bucket" {
 output "cloudfront_distribution_id" {
   description = "CloudFront distribution ID. Needed to invalidate the waiting-room pages after changing them, since they are cached at the edge for five minutes."
   value       = module.edge.distribution_id
+}
+
+output "seal_schedule_name" {
+  description = "Name of the one-time seal schedule (issue #128), so scripts can disable it alongside a reset."
+  value       = module.core.seal_schedule_name
 }

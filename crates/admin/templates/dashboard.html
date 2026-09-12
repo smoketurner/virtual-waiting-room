@@ -160,6 +160,39 @@
       </div>
     </section>
 
+    <!-- Scheduled start (issue #128) -->
+    <section class="card">
+      <div class="card-header">
+        <h2>Start time</h2>
+        <p class="sub">When the pre-queue is sealed and the event opens.</p>
+      </div>
+      <div class="card-body">
+        <form method="post" action="/admin/start_time">
+          <div class="form-field">
+            <label for="starts_at">Event opens at</label>
+            <input id="starts_at" name="starts_at" type="datetime-local" value="{{ starts_at_raw }}" title="Local date and time the event opens, read in the timezone below.">
+          </div>
+          <div class="form-field">
+            <label for="timezone">Timezone</label>
+            <select id="timezone" name="timezone" title="The timezone the time above is read in.">
+              {% for tz in timezones %}
+              <option value="{{ tz }}"{% if starts_at_timezone == *tz %} selected{% endif %}>{{ tz }}</option>
+              {% endfor %}
+            </select>
+            <span class="help">Currently <strong>{{ starts_at }}</strong>. The time is read in the timezone you pick, not your browser's, and the event opens at that local time even if daylight saving changes between now and then. Waiting visitors see a countdown to it. Setting a time arms the seal; clearing it disables the seal without deleting the schedule.</span>
+          </div>
+          <button type="submit" title="Schedule when the event opens.">Set start time</button>
+        </form>
+        {% if !starts_at_raw.is_empty() %}
+        <form method="post" action="/admin/start_time" data-confirm="Clear the start time? The seal will no longer fire on its own and the countdown disappears." style="margin-top:12px;">
+          <input type="hidden" name="starts_at" value="">
+          <input type="hidden" name="timezone" value="{{ starts_at_timezone }}">
+          <button type="submit" class="normal" title="Unschedule the event.">Clear start time</button>
+        </form>
+        {% endif %}
+      </div>
+    </section>
+
     <!-- Broadcast message -->
     <section class="card">
       <div class="card-header">
@@ -240,7 +273,7 @@
         }
       });
     });
-    var nums = ["serving_counter", "queue_counter", "participant_count", "target_rate", "message", "serving_state"];
+    var nums = ["serving_counter", "queue_counter", "participant_count", "target_rate", "message", "serving_state", "starts_at"];
     function refresh() {
       fetch("/admin/state", { headers: { "Accept": "application/json" }, credentials: "same-origin" })
         .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })

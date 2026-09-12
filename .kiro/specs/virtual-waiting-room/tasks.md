@@ -36,6 +36,7 @@ Throwaway code. Measures what documentation cannot settle.
 ### 1c. Pre-queue
 
 - [ ] Static countdown page, CDN-cached, zero origin calls per *view* — registration (one `POST /join` per visitor) is separate from viewing and is not zero-call; see the amended F1.1/F1.2 acceptance [F1.1, F1.2]
+  - *Partial: the countdown itself is built (issue #128). The operator sets the start time and its timezone on the dashboard, `/status` publishes `starts_at`, and `waiting.js` counts down to it during `pre_queue`. What is outstanding is the framing: the countdown renders on the existing waiting page, which is polled, not on a separate CDN-cached static page with zero origin calls per view.*
 - [x] Pre-queue registration (identity only, spread across the window); striped counter for ~10,000/s registration ceiling [C1]
 - [x] `/status` carries phase, so the countdown page polls one endpoint (Min TTL 1 s, no cookies forwarded — DESIGN §8); after T−0 also carries `shuffle_seed`, `participant_count`, `prequeue_offsets`
 - [x] Registration writes `PreQueue {r, s, l, t}` with `attribute_not_exists(r)`; shard `s = hash(request_id) % 10`, local index `l` claimed per-shard with one `SET s = :shard ADD n :count` per batch shard group (DESIGN §4.1, ADR-0015) [F2.5]

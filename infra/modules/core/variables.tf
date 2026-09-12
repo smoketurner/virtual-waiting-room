@@ -116,12 +116,6 @@ variable "event_id" {
   }
 }
 
-variable "seal_start_time" {
-  description = "One-time UTC start time for the seal, as an EventBridge at() value without the 'at(' wrapper, e.g. \"2026-09-10T18:00:00\". Empty = no schedule created (seal invoked manually)."
-  type        = string
-  default     = ""
-}
-
 # --- Admin OIDC login (ADR-0016) ----------------------------------------------
 # The client secret is NOT a variable — it is an SSM SecureString written out of
 # band. These are the non-secret OIDC config the admin Lambda needs.

@@ -51,6 +51,22 @@ pub const SHARD_INDEX_ATTR: &str = "s";
 /// increment, forever, for no benefit — nothing queries by attribute name.
 pub const SHARD_COUNT_ATTR: &str = "n";
 
+/// The attribute the event's scheduled start is stored in, epoch seconds.
+///
+/// Named here because two crates must agree on it and neither can see the
+/// other's spelling: `admin` writes it, and `wr-common`'s own `Counters` parser
+/// reads it back for `read` to publish. Absence means unscheduled, so clearing
+/// a start time removes the attribute rather than zeroing it.
+pub const STARTS_AT_ATTR: &str = "starts_at";
+
+/// The attribute the scheduled start's IANA timezone is stored in.
+///
+/// Kept beside the epoch rather than derived from it: the epoch is the
+/// absolute instant every reader needs, while this is what the operator
+/// actually chose, and only the latter renders their form back the way they
+/// filled it in.
+pub const STARTS_AT_TZ_ATTR: &str = "starts_at_tz";
+
 /// Partition key of the event's own item, holding the sequences, phase, seal
 /// outputs, and operator state.
 ///

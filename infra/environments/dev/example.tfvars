@@ -8,7 +8,6 @@ region              = "us-east-1"
 aws_profile         = "dev-admin" # "" = default credential chain
 event_id            = "smoke"
 lambda_architecture = "arm64" # must match `make build ARCH=...`
-seal_start_time     = ""      # EventBridge at() value; "" = manual seal
 
 # Bare domain of the protected origin CloudFront fronts as its default
 # behaviour. Host only - no scheme, no path.

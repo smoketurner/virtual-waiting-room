@@ -68,8 +68,10 @@ one write, read back on the same polled document). The real reasons:
    resources): three variables and three environment entries cost nothing there, where an admin
    route and its supporting `Store` method would.
 3. **Criterion 4 of #69 (operator-configurable and published) is satisfied without it.** Deploy-time
-   Terraform published on `/status` is exactly that: the same place the operator already sets
-   `seal_start_time`, served on the same document as `target_rate`.
+   Terraform published on `/status` is exactly that, served on the same document as `target_rate`.
+   (The `seal_start_time` variable this originally cited as the precedent for deploy-time operator
+   configuration is gone: issue #128 moved the start time to the dashboard. The decision below
+   stands on its own — the poll policy is not a per-event dial the way the start time is.)
 
 Changing the policy mid-event, if ever needed, is safe but not useful enough to build a lever
 for: a change in interval *length* does not collapse phase offsets (see Consequences), so it

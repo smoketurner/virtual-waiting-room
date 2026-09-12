@@ -228,6 +228,31 @@ def fresh_counters(event_id: str, phase: str, target_rate: int, queue_ahead: int
     }
 
 
+def disable_schedule(scheduler, name: str) -> None:
+    """Disable the one-time seal schedule, preserving everything else on it.
+
+    UpdateSchedule replaces the schedule rather than patching it, so every
+    field has to be sent back — omitting the target would drop the event id the
+    seal reads and silently break the next run. Same read-then-resend the admin
+    Lambda does.
+    """
+    current = scheduler.get_schedule(Name=name)
+    if current.get("State") == "DISABLED":
+        print(f"{name}: already disabled")
+        return
+    scheduler.update_schedule(
+        Name=name,
+        GroupName=current.get("GroupName", "default"),
+        ScheduleExpression=current["ScheduleExpression"],
+        ScheduleExpressionTimezone=current.get("ScheduleExpressionTimezone", "UTC"),
+        FlexibleTimeWindow=current["FlexibleTimeWindow"],
+        Target=current["Target"],
+        State="DISABLED",
+        **{k: current[k] for k in ("Description", "KmsKeyArn") if k in current},
+    )
+    print(f"{name}: disabled (was {current.get('State')})")
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Reset a deployed Virtual Waiting Room environment for testing.",
@@ -280,6 +305,7 @@ def main() -> int:
     # CloudFront is a global service and its API lives in us-east-1 regardless
     # of where the rest of the stack is.
     cf = session.client("cloudfront", region_name="us-east-1")
+    scheduler = session.client("scheduler")
 
     say("Reading the deployed stack from terraform outputs")
     subprocess.run(
@@ -332,6 +358,22 @@ def main() -> int:
     ddb.put_item(TableName=tables["counters"], Item=item)
     for key in sorted(item):
         print(f"  {key:18} {next(iter(item[key].values()))}")
+
+    say("Disabling the seal schedule")
+    # The Counters item was just rewritten without a start time (issue #128).
+    # Leaving the schedule armed would seal a cohort whose PreQueue rows this
+    # script has already deleted, at a moment nothing is counting down to.
+    try:
+        schedule_name = tf_output("seal_schedule_name")
+    except subprocess.CalledProcessError:
+        schedule_name = ""
+    if schedule_name:
+        disable_schedule(scheduler, schedule_name)
+    else:
+        print(
+            "no seal_schedule_name output; skipping.\n"
+            "Apply the stack to pick it up, or a previously set start time stays armed."
+        )
 
     say("Invalidating the edge cache")
     if distribution_id:

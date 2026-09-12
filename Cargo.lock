@@ -12,11 +12,13 @@ dependencies = [
  "aws-lc-rs",
  "aws-sdk-cloudfrontkeyvaluestore",
  "aws-sdk-dynamodb",
+ "aws-sdk-scheduler",
  "aws-sdk-ssm",
  "aws-smithy-types",
  "axum",
  "base64 0.23.1",
  "cookie",
+ "jiff",
  "jsonwebtoken",
  "lambda_http",
  "mime_guess",
@@ -363,6 +365,32 @@ dependencies = [
  "aws-runtime",
  "aws-smithy-async",
  "aws-smithy-eventstream",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.5.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
+name = "aws-sdk-scheduler"
+version = "1.109.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ceeb0086b9e915dd01c5fd50a9a9c0236e4ad1a5fac0f8de20004abac0fbfece"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
  "aws-smithy-http",
  "aws-smithy-json",
  "aws-smithy-observability",
@@ -1912,6 +1940,7 @@ dependencies = [
  "defmt",
  "jiff-core",
  "jiff-static",
+ "jiff-tzdb",
  "jiff-tzdb-platform",
  "log",
  "portable-atomic",

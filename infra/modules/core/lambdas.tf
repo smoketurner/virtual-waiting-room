@@ -127,6 +127,9 @@ resource "aws_lambda_function" "admin" {
       EVENT_ID       = var.event_id
       # Issue #71: mirrors fail_open_until to the edge gate's KeyValueStore.
       EDGE_KVS_ARN = aws_cloudfront_key_value_store.gate.arn
+      # Issue #128: the operator's start time is written here, which arms the
+      # one-time seal schedule Terraform created disabled.
+      SEAL_SCHEDULE_NAME = aws_scheduler_schedule.seal.name
       # API Gateway prefixes the path with the stage (e.g. /dev/admin); this
       # makes the Rust runtime strip it so the Axum routes match unprefixed.
       AWS_LAMBDA_HTTP_IGNORE_STAGE_IN_PATH = "true"
@@ -156,40 +159,65 @@ resource "aws_lambda_permission" "admin_apigw" {
 }
 
 # --- seal schedule (EventBridge Scheduler) ------------------------------------
-# One-time trigger at the event start. Disabled by default (no start time set);
-# the operator sets seal_start_time and flips it on ahead of the event. The
-# target payload names the event to seal.
+# One-time trigger at the event start (issue #128). The schedule always exists
+# so that destroying the stack destroys it too; the operator sets the time from
+# the admin dashboard, which is the only thing that ever writes the expression.
+#
+# Ownership is split. Terraform owns the schedule's existence, its target, its
+# retry policy and its role; the admin owns the expression and the state. The
+# expression below is therefore a placeholder that is never the real value, in
+# the same shape as aws_ssm_parameter.oidc_client_secret: required by the API,
+# overwritten out of band, and excluded from drift by ignore_changes. It is set
+# far in the future rather than near, so that even an accidental enable of the
+# placeholder cannot fire a seal.
 
 resource "aws_scheduler_schedule" "seal" {
-  count = var.seal_start_time == "" ? 0 : 1
-
   name = "${var.name_prefix}-seal"
 
   flexible_time_window {
     mode = "OFF"
   }
 
-  schedule_expression          = "at(${var.seal_start_time})"
+  schedule_expression          = "at(2099-12-31T23:59:59)"
   schedule_expression_timezone = "UTC"
+  state                        = "DISABLED"
 
   target {
     arn      = aws_lambda_function.seal_event.arn
-    role_arn = aws_iam_role.seal_scheduler[0].arn
+    role_arn = aws_iam_role.seal_scheduler.arn
     input    = jsonencode({ event_id = var.event_id })
+
+    # Deliberately not the AWS defaults (86400 seconds / 185 attempts). Two
+    # reasons. A seal that could not be delivered for 24 hours would open the
+    # event a day late, which is worse than not opening it at all, so the
+    # attempt is bounded to minutes. And because the provider's defaults are
+    # also the service's, an UpdateSchedule that dropped this block would be
+    # indistinguishable from one that preserved it -- declaring a non-default
+    # value is what makes the admin writer's read-modify-write observable.
+    retry_policy {
+      maximum_event_age_in_seconds = 600
+      maximum_retry_attempts       = 10
+    }
+  }
+
+  # The operator's start time lives here, written by the admin Lambda. Without
+  # this, every apply after an operator set a time would revert it. The
+  # timezone is theirs too: the operator picks the zone their event opens in,
+  # and Scheduler evaluates the expression in it.
+  lifecycle {
+    ignore_changes = [schedule_expression, schedule_expression_timezone, state]
   }
 }
 
 resource "aws_iam_role" "seal_scheduler" {
-  count              = var.seal_start_time == "" ? 0 : 1
   name               = "${var.name_prefix}-seal-scheduler-role"
   assume_role_policy = data.aws_iam_policy_document.scheduler_assume_role.json
   tags               = var.tags
 }
 
 resource "aws_iam_role_policy" "seal_scheduler" {
-  count = var.seal_start_time == "" ? 0 : 1
-  name  = "${var.name_prefix}-seal-scheduler-policy"
-  role  = aws_iam_role.seal_scheduler[0].id
+  name = "${var.name_prefix}-seal-scheduler-policy"
+  role = aws_iam_role.seal_scheduler.id
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{

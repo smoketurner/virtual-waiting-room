@@ -12,8 +12,8 @@
 #   make apply                 # terraform apply (real deploy — needs AWS creds)
 #   make destroy               # tear the stack down (prompts to confirm)
 #
-# Deployment config (region, aws_profile, event_id, lambda_architecture,
-# seal_start_time) lives in infra/environments/dev/terraform.tfvars and is
+# Deployment config (region, aws_profile, event_id, lambda_architecture)
+# lives in infra/environments/dev/terraform.tfvars and is
 # authoritative — this Makefile passes no -var, which would override the file.
 
 SHELL       := /usr/bin/env bash

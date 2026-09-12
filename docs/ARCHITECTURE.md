@@ -614,7 +614,7 @@ protected: CloudFront [/*, CloudFront Function at viewer-request]
              ├─ valid session cookie → customer origin (or the demo fixture)
              └─ missing/expired       → 302/403 → /_wr/waiting.html
 
-seal:      EventBridge Scheduler at(seal_start_time)   [only if set]
+seal:      EventBridge Scheduler at(operator's time)   [always; disabled until set]
              → seal_event → BatchGetItem ×10 → one guarded UpdateItem
 
 meter:     EventBridge Scheduler rate(1 minute)        [always]

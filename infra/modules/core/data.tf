@@ -204,6 +204,42 @@ data "aws_iam_policy_document" "admin" {
     resources = [aws_cloudfront_key_value_store.gate.arn]
   }
 
+  # Issue #128: the operator sets the event's start time from the dashboard,
+  # which rewrites the one-time seal schedule. Read as well as write, because
+  # UpdateSchedule replaces the whole schedule rather than patching it, so the
+  # writer has to fetch the current definition to resend it intact.
+  #
+  # No CreateSchedule or DeleteSchedule: Terraform owns whether the schedule
+  # exists, the admin owns only when it fires. Clearing a start time therefore
+  # cannot delete it even if the code asked to.
+  statement {
+    sid    = "ReadAndWriteSealSchedule"
+    effect = "Allow"
+    actions = [
+      "scheduler:GetSchedule",
+      "scheduler:UpdateSchedule",
+    ]
+    resources = [aws_scheduler_schedule.seal.arn]
+  }
+
+  # UpdateSchedule resends the target's RoleArn, so the caller must be allowed
+  # to pass it. Scoped to that one role and to Scheduler as the only service it
+  # may be passed to, rather than the role/* the AWS example uses. What the
+  # grant is worth to an attacker is bounded by the role itself: its whole
+  # policy is a single lambda:InvokeFunction on seal_event.
+  statement {
+    sid       = "PassSealSchedulerRole"
+    effect    = "Allow"
+    actions   = ["iam:PassRole"]
+    resources = [aws_iam_role.seal_scheduler.arn]
+
+    condition {
+      test     = "StringEquals"
+      variable = "iam:PassedToService"
+      values   = ["scheduler.amazonaws.com"]
+    }
+  }
+
   statement {
     sid    = "Logs"
     effect = "Allow"

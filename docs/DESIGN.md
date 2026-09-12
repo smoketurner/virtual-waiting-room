@@ -150,7 +150,7 @@ Three of the four phases serve a static operator-authored page from content deli
 | Concern | Mechanism |
 |---|---|
 | Phase state | Attribute on the `Counters` item; one conditional `UpdateItem` transitions a phase |
-| Scheduled transitions | EventBridge Scheduler invoking `seal_event` at T−0 |
+| Scheduled transitions | EventBridge Scheduler invoking `seal_event` at T−0. Terraform creates the schedule disabled; the operator sets T−0 and its timezone on the dashboard, which arms it (ADR-0025) |
 | Manual transitions | `/admin/phase` on the admin Lambda, writing the same conditional `UpdateItem` |
 | Phase pages | Client HTML in S3, served through CloudFront with a long time to live (TTL) |
 | Current phase for clients | `/status`, cached 5 s globally |
