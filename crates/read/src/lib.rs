@@ -148,6 +148,21 @@ pub struct StatusResponse {
     /// reconstruct its global index without a round trip.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prequeue_offsets: Option<[u64; SHARDS]>,
+    /// Present once sealed: the 256-bit permutation key, lowercase hex.
+    ///
+    /// With the offsets and the cohort size published alongside it, anyone can
+    /// recompute the whole ordering from the registration indices and check it
+    /// against the positions the room serves. The key is what makes that
+    /// check possible, so withholding it would leave the ordering unverifiable
+    /// by anyone outside the deployment.
+    ///
+    /// Absent before the seal, and the absence is load-bearing: a registrant
+    /// holding the key early could compute which registration index lands at
+    /// the front of the queue and register until they got one, which is the
+    /// advantage the permutation exists to remove. It is generated at the seal
+    /// for that reason, so there is nothing to publish before then.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shuffle_seed: Option<String>,
     /// Operator broadcast text for the waiting page. Absent when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
@@ -219,6 +234,7 @@ pub fn status(counters: &Counters, poll_policy: Option<PollPolicy>, now: u64) ->
         serving_position: counters.serving_counter,
         participant_count: counters.participant_count,
         prequeue_offsets: counters.prequeue_offsets,
+        shuffle_seed: counters.shuffle_seed.map(hex::encode),
         message: counters.message.clone(),
         target_rate: counters.target_rate,
         poll_policy,
@@ -277,7 +293,7 @@ mod tests {
         reason = "test code panics on setup failure; shard/len casts are provably small"
     )]
 
-    use wr_common::SealedOffsets;
+    use wr_common::{SealedOffsets, Seed, prp};
 
     use super::*;
 
@@ -332,6 +348,70 @@ mod tests {
         assert_eq!(json["phase"], "pre_queue");
         assert!(json.get("participant_count").is_none());
         assert!(json.get("prequeue_offsets").is_none());
+        // The seed is the one seal output that must never appear early:
+        // holding it before registration closes turns "register and take your
+        // chances" into "register until you draw a front position".
+        assert!(counters.sealed().is_none());
+        assert!(json.get("shuffle_seed").is_none());
+    }
+
+    #[test]
+    fn status_publishes_the_seed_once_sealed() {
+        let counters = sealed_counters([1; SHARDS], [0xAB; 32]);
+        assert!(counters.sealed().is_some());
+        let json = serde_json::to_value(status(&counters, None, 0)).unwrap();
+        assert_eq!(json["shuffle_seed"], "ab".repeat(32));
+    }
+
+    #[test]
+    fn a_published_status_reproduces_every_position() {
+        // The audit an outside party performs: take the seed, cohort size and
+        // offsets off /status, recompute the permutation over the registration
+        // indices, and check the result against the positions the room serves.
+        let counts = [3, 0, 5, 1, 0, 0, 2, 0, 0, 4];
+        let counters = sealed_counters(counts, [42u8; 32]);
+        let json = serde_json::to_value(status(&counters, None, 0)).unwrap();
+
+        let seed = Seed(
+            hex::decode(json["shuffle_seed"].as_str().unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
+        let n = json["participant_count"].as_u64().unwrap();
+        let offsets: Vec<u64> = json["prequeue_offsets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap())
+            .collect();
+
+        let mut checked = 0;
+        for (shard, &count) in counts.iter().enumerate() {
+            for l in 0..count {
+                let recomputed = prp(&seed, offsets[shard] + l, n);
+                match queue_num(&counters, &row(shard as u8, l)).unwrap() {
+                    ResolvedQueueNum::PreQueue(resp) => assert_eq!(resp.position, recomputed),
+                    ResolvedQueueNum::Straggler => panic!("issued index resolved as a straggler"),
+                }
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, n);
+    }
+
+    #[test]
+    fn the_published_seed_is_lowercase_hex_of_all_32_bytes() {
+        let mut seed = [0u8; 32];
+        for (i, b) in seed.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let counters = sealed_counters([1; SHARDS], seed);
+        let json = serde_json::to_value(status(&counters, None, 0)).unwrap();
+        let published = json["shuffle_seed"].as_str().unwrap();
+        assert_eq!(published.len(), 64);
+        assert_eq!(published, published.to_lowercase());
+        assert_eq!(hex::decode(published).unwrap(), seed.to_vec());
     }
 
     #[test]
@@ -575,6 +655,16 @@ mod tests {
                 prop_assert_eq!(policy.ceiling_ms, ceiling);
                 prop_assert_eq!(policy.divisor, divisor);
             }
+        }
+
+        /// An auditor reads the seed back out of the published string, so the
+        /// encoding has to survive every byte pattern a seal can generate —
+        /// including the leading zeros a naive formatter drops.
+        #[test]
+        fn the_published_seed_decodes_back_to_the_bytes_it_encodes(bytes in any::<[u8; 32]>()) {
+            let counters = sealed_counters([1; SHARDS], bytes);
+            let published = status(&counters, None, 0).shuffle_seed;
+            prop_assert_eq!(hex::decode(published.unwrap_or_default()), Ok(bytes.to_vec()));
         }
     }
 

@@ -253,10 +253,14 @@ test seam.
 | Phase change | `phase = :from` | A transition another operator applied is a 409 |
 | Rate change | `target_rate = :exp`, or `attribute_not_exists(target_rate)` | Same, for the rate |
 | Admission control | `admission_control = :from`, widened to allow absence when `:from` is `open` | Same, and absence reads as `open` |
-| Every debounced admin write | `attribute_not_exists(last_action_epoch_ms) OR last_action_epoch_ms < :cutoff` | A double-submitted form is a no-op for 2,000 ms |
+| Every debounced admin write | `attribute_not_exists(last_action_epoch_ms) OR last_action_epoch_ms <= :cutoff` | A double-submitted form is a no-op for 2,000 ms |
 
 Forcing maintenance mode is guarded on the expected phase but **not** debounced. An emergency stop
 must always apply.
+
+`last_action_epoch_ms` is written from the instant the request was served at, and read back as an
+instant. A stored value no instant can hold reads as no stamp at all, so it cannot hold the
+debounce window open against every later action.
 
 Every guarded write handles `ConditionalCheckFailedException` by name, and none treats it as an
 error. `assign_position` reports a duplicate, `seal_event` returns `AlreadySealed`, the controller

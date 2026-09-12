@@ -12,6 +12,7 @@
 
 use std::sync::Arc;
 
+use admin::arrival::{ArrivalTime, arrival_layer};
 use admin::dynamo::DynamoStore;
 use admin::edge::KvsStore;
 use admin::oidc::{self, OidcClient, OidcConfig};
@@ -156,7 +157,10 @@ async fn main() -> Result<(), Error> {
         // every response. The dashboard handler sets its own nonce'd CSP first;
         // apply_hardening leaves an existing CSP intact, so this adds the policy
         // only where a handler did not (everything but the dashboard).
-        .layer(axum::middleware::map_response(harden_response));
+        .layer(axum::middleware::map_response(harden_response))
+        // Outermost: every handler below is served at one instant, stamped
+        // before any other layer can await.
+        .layer(axum::middleware::from_fn(arrival_layer));
 
     // Trim a trailing slash before routing so /admin/ resolves to the /admin
     // route (and /admin/phase/ to /admin/phase, etc.) — the same handler, not a
@@ -192,16 +196,16 @@ fn session_id_from(headers: &HeaderMap) -> Option<String> {
 }
 
 /// Returns the authenticated session, or `None` if the request is unauthenticated.
-async fn authed(state: &Shared, headers: &HeaderMap) -> Option<AdminSession> {
+async fn authed(state: &Shared, headers: &HeaderMap, now: ArrivalTime) -> Option<AdminSession> {
     let id = session_id_from(headers)?;
-    state.sessions.load_session(&id).await.ok().flatten()
+    state.sessions.load_session(&id, now).await.ok().flatten()
 }
 
 // --- OIDC flow ----------------------------------------------------------------
 
 /// Starts the login: build the authorize URL with PKCE, persist the transaction
 /// keyed by CSRF state, redirect the browser to the provider.
-async fn login(State(state): State<Shared>) -> Response {
+async fn login(State(state): State<Shared>, now: ArrivalTime) -> Response {
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
     let (auth_url, csrf, nonce) = state
         .oidc
@@ -220,7 +224,11 @@ async fn login(State(state): State<Shared>) -> Response {
         pkce_verifier: pkce_verifier.secret().clone(),
         nonce: nonce.secret().clone(),
     };
-    if let Err(e) = state.sessions.put_pending(csrf.secret(), &pending).await {
+    if let Err(e) = state
+        .sessions
+        .put_pending(csrf.secret(), &pending, now)
+        .await
+    {
         return server_error(&e.to_string());
     }
     // Bind this login to the browser that started it: a short-lived cookie
@@ -251,6 +259,7 @@ struct CallbackParams {
 async fn callback(
     State(state): State<Shared>,
     headers: HeaderMap,
+    now: ArrivalTime,
     Query(params): Query<CallbackParams>,
 ) -> Response {
     // Browser binding: the callback must carry the login-state cookie set at
@@ -263,7 +272,7 @@ async fn callback(
 
     let Some(pending) = state
         .sessions
-        .take_pending(&params.state)
+        .take_pending(&params.state, now)
         .await
         .ok()
         .flatten()
@@ -312,7 +321,7 @@ async fn callback(
 
     let session_id = match state
         .sessions
-        .create_session(&AdminSession { subject, email })
+        .create_session(&AdminSession { subject, email }, now)
         .await
     {
         Ok(id) => id,
@@ -360,11 +369,11 @@ async fn logout(State(state): State<Shared>, headers: HeaderMap) -> Response {
 // --- Admin routes (session-gated) ---------------------------------------------
 
 /// Renders the dashboard from current control state. Unauthenticated -> login.
-async fn dashboard(State(state): State<Shared>, headers: HeaderMap) -> Response {
-    let Some(session) = authed(&state, &headers).await else {
+async fn dashboard(State(state): State<Shared>, headers: HeaderMap, now: ArrivalTime) -> Response {
+    let Some(session) = authed(&state, &headers, now).await else {
         return Redirect::to("/admin/login").into_response();
     };
-    match state.store_load(now_ms() / 1000).await {
+    match state.store_load(now).await {
         Ok(Some(mut view)) => {
             view.csp_nonce = admin::security::nonce();
             view.operator_email = session.email;
@@ -398,11 +407,11 @@ async fn dashboard(State(state): State<Shared>, headers: HeaderMap) -> Response 
 
 /// Current control state as JSON for the dashboard's poller. Session-gated like
 /// the dashboard; returns the same view the HTML renders.
-async fn state_json(State(state): State<Shared>, headers: HeaderMap) -> Response {
-    if authed(&state, &headers).await.is_none() {
+async fn state_json(State(state): State<Shared>, headers: HeaderMap, now: ArrivalTime) -> Response {
+    if authed(&state, &headers, now).await.is_none() {
         return (StatusCode::UNAUTHORIZED, "not authenticated").into_response();
     }
-    match state.store_load(now_ms() / 1000).await {
+    match state.store_load(now).await {
         Ok(Some(view)) => axum::Json(view).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, "event not found").into_response(),
         Err(e) => server_error(&e),
@@ -417,9 +426,10 @@ struct PhaseForm {
 async fn set_phase(
     State(state): State<Shared>,
     headers: HeaderMap,
+    now: ArrivalTime,
     Form(form): Form<PhaseForm>,
 ) -> Response {
-    let Some(session) = authed(&state, &headers).await else {
+    let Some(session) = authed(&state, &headers, now).await else {
         return Redirect::to("/admin/login").into_response();
     };
     finish(
@@ -428,7 +438,7 @@ async fn set_phase(
             &state.event_id,
             &form.phase,
             &session.email,
-            now_ms(),
+            now,
         )
         .await
         .map(|_| ()),
@@ -443,9 +453,10 @@ struct RateForm {
 async fn set_rate(
     State(state): State<Shared>,
     headers: HeaderMap,
+    now: ArrivalTime,
     Form(form): Form<RateForm>,
 ) -> Response {
-    let Some(session) = authed(&state, &headers).await else {
+    let Some(session) = authed(&state, &headers, now).await else {
         return Redirect::to("/admin/login").into_response();
     };
     finish(
@@ -454,7 +465,7 @@ async fn set_rate(
             &state.event_id,
             &form.rate,
             &session.email,
-            now_ms(),
+            now,
         )
         .await
         .map(|_| ()),
@@ -469,9 +480,10 @@ struct MessageForm {
 async fn set_message(
     State(state): State<Shared>,
     headers: HeaderMap,
+    now: ArrivalTime,
     Form(form): Form<MessageForm>,
 ) -> Response {
-    let Some(session) = authed(&state, &headers).await else {
+    let Some(session) = authed(&state, &headers, now).await else {
         return Redirect::to("/admin/login").into_response();
     };
     finish(
@@ -480,7 +492,7 @@ async fn set_message(
             &state.event_id,
             &form.message,
             &session.email,
-            now_ms(),
+            now,
         )
         .await,
     )
@@ -500,9 +512,10 @@ struct StartTimeForm {
 async fn set_start_time(
     State(state): State<Shared>,
     headers: HeaderMap,
+    now: ArrivalTime,
     Form(form): Form<StartTimeForm>,
 ) -> Response {
-    let Some(session) = authed(&state, &headers).await else {
+    let Some(session) = authed(&state, &headers, now).await else {
         return Redirect::to("/admin/login").into_response();
     };
     finish(
@@ -513,33 +526,33 @@ async fn set_start_time(
             &form.starts_at,
             &form.timezone,
             &session.email,
-            now_ms(),
+            now,
         )
         .await,
     )
 }
 
-async fn reset(State(state): State<Shared>, headers: HeaderMap) -> Response {
-    let Some(session) = authed(&state, &headers).await else {
+async fn reset(State(state): State<Shared>, headers: HeaderMap, now: ArrivalTime) -> Response {
+    let Some(session) = authed(&state, &headers, now).await else {
         return Redirect::to("/admin/login").into_response();
     };
-    finish(apply_reset(&state.store, &state.event_id, &session.email, now_ms()).await)
+    finish(apply_reset(&state.store, &state.event_id, &session.email, now).await)
 }
 
 /// Holds admission while the queue keeps forming. Reversible, no confirmation.
-async fn pause(State(state): State<Shared>, headers: HeaderMap) -> Response {
-    let Some(session) = authed(&state, &headers).await else {
+async fn pause(State(state): State<Shared>, headers: HeaderMap, now: ArrivalTime) -> Response {
+    let Some(session) = authed(&state, &headers, now).await else {
         return Redirect::to("/admin/login").into_response();
     };
-    finish(apply_pause(&state.store, &state.event_id, &session.email, now_ms()).await)
+    finish(apply_pause(&state.store, &state.event_id, &session.email, now).await)
 }
 
 /// Resume admission after a pause.
-async fn resume(State(state): State<Shared>, headers: HeaderMap) -> Response {
-    let Some(session) = authed(&state, &headers).await else {
+async fn resume(State(state): State<Shared>, headers: HeaderMap, now: ArrivalTime) -> Response {
+    let Some(session) = authed(&state, &headers, now).await else {
         return Redirect::to("/admin/login").into_response();
     };
-    finish(apply_resume(&state.store, &state.event_id, &session.email, now_ms()).await)
+    finish(apply_resume(&state.store, &state.event_id, &session.email, now).await)
 }
 
 #[derive(Deserialize)]
@@ -552,9 +565,10 @@ struct FailOpenForm {
 async fn fail_open(
     State(state): State<Shared>,
     headers: HeaderMap,
+    now: ArrivalTime,
     Form(form): Form<FailOpenForm>,
 ) -> Response {
-    let Some(session) = authed(&state, &headers).await else {
+    let Some(session) = authed(&state, &headers, now).await else {
         return Redirect::to("/admin/login").into_response();
     };
     finish(
@@ -564,7 +578,7 @@ async fn fail_open(
             &state.event_id,
             &form.minutes,
             &session.email,
-            now_ms(),
+            now,
         )
         .await,
     )
@@ -572,8 +586,8 @@ async fn fail_open(
 
 /// Clears the fail-open epoch. Not "resume": under the split this only
 /// clears the epoch, so a pause queued during the window still applies.
-async fn recover(State(state): State<Shared>, headers: HeaderMap) -> Response {
-    let Some(session) = authed(&state, &headers).await else {
+async fn recover(State(state): State<Shared>, headers: HeaderMap, now: ArrivalTime) -> Response {
+    let Some(session) = authed(&state, &headers, now).await else {
         return Redirect::to("/admin/login").into_response();
     };
     finish(
@@ -582,7 +596,7 @@ async fn recover(State(state): State<Shared>, headers: HeaderMap) -> Response {
             &state.edge,
             &state.event_id,
             &session.email,
-            now_ms(),
+            now,
         )
         .await,
     )
@@ -604,9 +618,10 @@ struct RulesForm {
 async fn set_rules(
     State(state): State<Shared>,
     headers: HeaderMap,
+    now: ArrivalTime,
     Form(form): Form<RulesForm>,
 ) -> Response {
-    let Some(session) = authed(&state, &headers).await else {
+    let Some(session) = authed(&state, &headers, now).await else {
         return Redirect::to("/admin/login").into_response();
     };
     let rules = match parse_rules(&form.rules) {
@@ -620,18 +635,10 @@ async fn set_rules(
             &state.event_id,
             rules,
             &session.email,
-            now_ms(),
+            now,
         )
         .await,
     )
-}
-
-/// Current epoch-millis for the audit stamp + debounce guard.
-fn now_ms() -> u64 {
-    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        Ok(d) => u64::try_from(d.as_millis()).unwrap_or(u64::MAX),
-        Err(_) => 0,
-    }
 }
 
 /// A route whose backing plane (authorizer / sessions) is not in the MVP.
@@ -698,9 +705,10 @@ async fn static_asset(headers: HeaderMap, Path(path): Path<String>) -> Response 
 
 impl AppState {
     /// Loads control state and maps it to the dashboard view, resolved at
-    /// `now` (epoch seconds).
-    async fn store_load(&self, now: u64) -> Result<Option<Dashboard>, String> {
+    /// `now`.
+    async fn store_load(&self, now: ArrivalTime) -> Result<Option<Dashboard>, String> {
         use admin::Store;
+        let now = now.epoch_seconds();
         self.store
             .load(&self.event_id)
             .await

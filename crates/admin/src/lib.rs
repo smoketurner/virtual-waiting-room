@@ -5,8 +5,13 @@
 
 use std::future::Future;
 
+use jiff::{SignedDuration, Timestamp};
+
+use crate::arrival::ArrivalTime;
+
 use wr_common::{IllegalControl, Phase, ProtectionRule, RuleFieldError, StoredControl};
 
+pub mod arrival;
 pub mod dynamo;
 pub mod edge;
 pub mod oidc;
@@ -171,12 +176,12 @@ pub trait Store {
         to: Phase,
         action: AdminAction,
         actor: &str,
-        now_ms: u64,
+        now: ArrivalTime,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
     /// Sets the admission target rate, guarded (ADR-0017 defensive controls):
     /// the write applies only if the stored rate still equals `expected` and the
-    /// last mutation is older than the debounce window (`now_ms - DEBOUNCE_MS`).
+    /// last mutation is older than the debounce window (`now - DEBOUNCE`).
     /// It also stamps the audit fields and `last_action_epoch_ms` atomically.
     /// Returns `Conflict` if the guard fails (lost race or too-fast).
     fn set_rate(
@@ -185,7 +190,7 @@ pub trait Store {
         expected: Option<u32>,
         rate: u32,
         actor: &str,
-        now_ms: u64,
+        now: ArrivalTime,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
     /// Sets the operator broadcast message, guarded on the debounce window and
@@ -195,7 +200,7 @@ pub trait Store {
         event_id: &str,
         message: &str,
         actor: &str,
-        now_ms: u64,
+        now: ArrivalTime,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
     /// Writes or clears the scheduled event start (issue #128), guarded on the
@@ -211,7 +216,7 @@ pub trait Store {
         starts_at: Option<(u64, &str)>,
         action: AdminAction,
         actor: &str,
-        now_ms: u64,
+        now: ArrivalTime,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
     /// Moves the stored control from `from` to `to`, guarded on the stored
@@ -227,7 +232,7 @@ pub trait Store {
         to: StoredControl,
         action: AdminAction,
         actor: &str,
-        now_ms: u64,
+        now: ArrivalTime,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
     /// Sets the fail-open epoch unconditionally (break-glass: not guarded on
@@ -240,7 +245,7 @@ pub trait Store {
         until: u64,
         action: AdminAction,
         actor: &str,
-        now_ms: u64,
+        now: ArrivalTime,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
     /// Stamps the audit fields for a ruleset change (issue #71), plus
@@ -257,7 +262,7 @@ pub trait Store {
         rules_digest: &str,
         rules_count: usize,
         actor: &str,
-        now_ms: u64,
+        now: ArrivalTime,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
     /// Forces the maintenance phase, guarded on the expected current phase and
@@ -267,7 +272,7 @@ pub trait Store {
         event_id: &str,
         from: Phase,
         actor: &str,
-        now_ms: u64,
+        now: ArrivalTime,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 }
 
@@ -295,8 +300,11 @@ pub struct ControlState {
     pub last_action: Option<String>,
     pub last_action_by: Option<String>,
     pub last_action_at: Option<String>,
-    /// Epoch-millis of the last mutation, for the debounce guard.
-    pub last_action_epoch_ms: Option<u64>,
+    /// When the last mutation happened, for the debounce guard. `None` when
+    /// the event has never been mutated, and also when the stored epoch is
+    /// not a representable instant — an unusable stamp is the same as no
+    /// stamp, and treating it as one would reject every later action.
+    pub last_action_time: Option<Timestamp>,
     /// The scheduled event start, epoch seconds; `None` when unscheduled
     /// (issue #128).
     pub starts_at: Option<u64>,
@@ -315,7 +323,11 @@ pub const MAX_ADMISSION_RATE: u32 = 100_000;
 /// two mutations to the same event closer together than this are rejected as
 /// [`ActionError::TooFast`], defeating double-clicks and fast toggling. The
 /// emergency full-stop (force maintenance) is deliberately NOT debounced.
-pub const DEBOUNCE_MS: u64 = 2000;
+pub const DEBOUNCE: SignedDuration = SignedDuration::from_millis(DEBOUNCE_MILLIS);
+
+/// [`DEBOUNCE`] in the unit the stored stamp is written in, for the `DynamoDB`
+/// condition expression — which compares numbers, not instants.
+pub(crate) const DEBOUNCE_MILLIS: i64 = 2_000;
 
 /// The mutating operator actions, recorded verbatim in the `last_action` audit
 /// field (ADR-0017). An enum rather than scattered string literals so the audit
@@ -609,7 +621,7 @@ pub async fn apply_phase<S: Store>(
     event_id: &str,
     to: &str,
     actor: &str,
-    now_ms: u64,
+    now: ArrivalTime,
 ) -> Result<Phase, ApplyError> {
     let to = parse_phase(to)?;
     let Some(state) = store.load(event_id).await? else {
@@ -630,14 +642,7 @@ pub async fn apply_phase<S: Store>(
         .into());
     }
     store
-        .set_phase(
-            event_id,
-            state.phase,
-            to,
-            AdminAction::SetPhase,
-            actor,
-            now_ms,
-        )
+        .set_phase(event_id, state.phase, to, AdminAction::SetPhase, actor, now)
         .await?;
     Ok(to)
 }
@@ -652,21 +657,27 @@ pub async fn apply_reset<S: Store>(
     store: &S,
     event_id: &str,
     actor: &str,
-    now_ms: u64,
+    now: ArrivalTime,
 ) -> Result<(), ApplyError> {
     let Some(state) = store.load(event_id).await? else {
         return Err(ActionError::NotFound.into());
     };
     store
-        .force_maintenance(event_id, state.phase, actor, now_ms)
+        .force_maintenance(event_id, state.phase, actor, now)
         .await?;
     Ok(())
 }
 
 /// Returns `Err(TooFast)` if the last mutation is within the debounce window.
-fn debounce_check(state: &ControlState, now_ms: u64) -> Result<(), ActionError> {
-    if let Some(last) = state.last_action_epoch_ms
-        && now_ms.saturating_sub(last) < DEBOUNCE_MS
+///
+/// The elapsed time is signed, so a stamp later than `now` measures negative
+/// and falls outside the window rather than reading as "no time has passed".
+/// A stamp in the future describes no prior action, and nothing an operator
+/// does would move it back into the past, so treating it as recent would
+/// reject every later action for good.
+fn debounce_check(state: &ControlState, now: ArrivalTime) -> Result<(), ActionError> {
+    if let Some(last) = state.last_action_time
+        && (SignedDuration::ZERO..DEBOUNCE).contains(&now.timestamp().duration_since(last))
     {
         return Err(ActionError::TooFast);
     }
@@ -685,7 +696,7 @@ pub async fn apply_rate<S: Store>(
     event_id: &str,
     rate: &str,
     actor: &str,
-    now_ms: u64,
+    now: ArrivalTime,
 ) -> Result<u32, ApplyError> {
     let rate: u32 = rate.parse().map_err(|_| ActionError::InvalidRate)?;
     if rate == 0 {
@@ -700,9 +711,9 @@ pub async fn apply_rate<S: Store>(
     let Some(state) = store.load(event_id).await? else {
         return Err(ActionError::NotFound.into());
     };
-    debounce_check(&state, now_ms)?;
+    debounce_check(&state, now)?;
     store
-        .set_rate(event_id, state.target_rate, rate, actor, now_ms)
+        .set_rate(event_id, state.target_rate, rate, actor, now)
         .await?;
     Ok(rate)
 }
@@ -718,7 +729,7 @@ pub async fn apply_pause<S: Store>(
     store: &S,
     event_id: &str,
     actor: &str,
-    now_ms: u64,
+    now: ArrivalTime,
 ) -> Result<(), ApplyError> {
     apply_control(
         store,
@@ -726,7 +737,7 @@ pub async fn apply_pause<S: Store>(
         StoredControl::pause,
         AdminAction::Pause,
         actor,
-        now_ms,
+        now,
     )
     .await
 }
@@ -742,7 +753,7 @@ pub async fn apply_resume<S: Store>(
     store: &S,
     event_id: &str,
     actor: &str,
-    now_ms: u64,
+    now: ArrivalTime,
 ) -> Result<(), ApplyError> {
     apply_control(
         store,
@@ -750,7 +761,7 @@ pub async fn apply_resume<S: Store>(
         StoredControl::resume,
         AdminAction::Resume,
         actor,
-        now_ms,
+        now,
     )
     .await
 }
@@ -766,7 +777,7 @@ async fn apply_control<S, T>(
     transition: T,
     action: AdminAction,
     actor: &str,
-    now_ms: u64,
+    now: ArrivalTime,
 ) -> Result<(), ApplyError>
 where
     S: Store,
@@ -775,11 +786,11 @@ where
     let Some(state) = store.load(event_id).await? else {
         return Err(ActionError::NotFound.into());
     };
-    debounce_check(&state, now_ms)?;
+    debounce_check(&state, now)?;
     let from = state.stored_control;
     let to = transition(from).map_err(|_| ActionError::Conflict)?;
     store
-        .set_stored_control(event_id, from, to, action, actor, now_ms)
+        .set_stored_control(event_id, from, to, action, actor, now)
         .await?;
     Ok(())
 }
@@ -843,7 +854,7 @@ pub async fn apply_fail_open<S: Store, E: EdgeConfigStore>(
     event_id: &str,
     minutes: &str,
     actor: &str,
-    now_ms: u64,
+    now: ArrivalTime,
 ) -> Result<(), ApplyError> {
     let minutes: u32 = minutes.parse().map_err(|_| ActionError::InvalidDuration)?;
     if minutes == 0 || minutes > MAX_FAIL_OPEN_MINUTES {
@@ -852,7 +863,7 @@ pub async fn apply_fail_open<S: Store, E: EdgeConfigStore>(
     if store.load(event_id).await?.is_none() {
         return Err(ActionError::NotFound.into());
     }
-    let now_secs = now_ms / 1000;
+    let now_secs = now.epoch_seconds();
     let until = now_secs.saturating_add(u64::from(minutes).saturating_mul(60));
 
     edge_read_modify_write(edge, |cfg| cfg.fail_open_until = until)
@@ -860,7 +871,7 @@ pub async fn apply_fail_open<S: Store, E: EdgeConfigStore>(
         .map_err(|e| StoreError::Backend(e.to_string()))?;
 
     store
-        .set_fail_open_until(event_id, until, AdminAction::FailOpen, actor, now_ms)
+        .set_fail_open_until(event_id, until, AdminAction::FailOpen, actor, now)
         .await?;
     Ok(())
 }
@@ -881,13 +892,13 @@ pub async fn apply_recover<S: Store, E: EdgeConfigStore>(
     edge: &E,
     event_id: &str,
     actor: &str,
-    now_ms: u64,
+    now: ArrivalTime,
 ) -> Result<(), ApplyError> {
     if store.load(event_id).await?.is_none() {
         return Err(ActionError::NotFound.into());
     }
     store
-        .set_fail_open_until(event_id, 0, AdminAction::Recover, actor, now_ms)
+        .set_fail_open_until(event_id, 0, AdminAction::Recover, actor, now)
         .await?;
 
     edge_read_modify_write(edge, |cfg| cfg.fail_open_until = 0)
@@ -927,16 +938,16 @@ pub async fn apply_start_time<S: Store, K: SealSchedule>(
     at: &str,
     timezone: &str,
     actor: &str,
-    now_ms: u64,
+    now: ArrivalTime,
 ) -> Result<(), ApplyError> {
     let Some(state) = store.load(event_id).await? else {
         return Err(ActionError::NotFound.into());
     };
-    debounce_check(&state, now_ms)?;
+    debounce_check(&state, now)?;
 
     if at.trim().is_empty() {
         store
-            .set_starts_at(event_id, None, AdminAction::ClearStartTime, actor, now_ms)
+            .set_starts_at(event_id, None, AdminAction::ClearStartTime, actor, now)
             .await?;
         schedule
             .set_start_time(None)
@@ -945,7 +956,7 @@ pub async fn apply_start_time<S: Store, K: SealSchedule>(
         return Ok(());
     }
 
-    let start = parse_start_time(at, timezone, now_ms / 1000)?;
+    let start = parse_start_time(at, timezone, now.epoch_seconds())?;
     schedule
         .set_start_time(Some((&start.expression, &start.timezone)))
         .await
@@ -956,7 +967,7 @@ pub async fn apply_start_time<S: Store, K: SealSchedule>(
             Some((start.epoch_secs, &start.timezone)),
             AdminAction::SetStartTime,
             actor,
-            now_ms,
+            now,
         )
         .await?;
     Ok(())
@@ -985,7 +996,7 @@ pub async fn apply_set_rules<S: Store, E: EdgeConfigStore>(
     event_id: &str,
     rules: Vec<ProtectionRule>,
     actor: &str,
-    now_ms: u64,
+    now: ArrivalTime,
 ) -> Result<(), ApplyError> {
     if store.load(event_id).await?.is_none() {
         return Err(ActionError::NotFound.into());
@@ -1025,7 +1036,7 @@ pub async fn apply_set_rules<S: Store, E: EdgeConfigStore>(
         Err(_) => String::new(),
     };
     if let Err(e) = store
-        .set_rules_audit(event_id, &digest, cfg.rules.len(), actor, now_ms)
+        .set_rules_audit(event_id, &digest, cfg.rules.len(), actor, now)
         .await
     {
         // Non-fatal: the KeyValueStore write already landed and is what the
@@ -1138,13 +1149,13 @@ pub async fn apply_message<S: Store>(
     event_id: &str,
     message: &str,
     actor: &str,
-    now_ms: u64,
+    now: ArrivalTime,
 ) -> Result<(), ApplyError> {
     let Some(state) = store.load(event_id).await? else {
         return Err(ActionError::NotFound.into());
     };
-    debounce_check(&state, now_ms)?;
-    store.set_message(event_id, message, actor, now_ms).await?;
+    debounce_check(&state, now)?;
+    store.set_message(event_id, message, actor, now).await?;
     Ok(())
 }
 
@@ -1180,6 +1191,12 @@ mod tests {
 
     use super::*;
 
+    /// An arrival `ms` milliseconds after the epoch. The tests below talk in
+    /// small round numbers because only the intervals between them matter.
+    fn ts(ms: i64) -> ArrivalTime {
+        ArrivalTime::for_test_millis(ms)
+    }
+
     struct FakeStore {
         phase: Mutex<Phase>,
         rate: Mutex<Option<u32>>,
@@ -1194,7 +1211,7 @@ mod tests {
         last_action: Mutex<Option<String>>,
         last_action_by: Mutex<Option<String>>,
         last_action_at: Mutex<Option<String>>,
-        last_epoch: Mutex<Option<u64>>,
+        last_time: Mutex<Option<Timestamp>>,
         /// The most recent `set_rules_audit` call's digest + count, if any.
         rules_audit: Mutex<Option<(String, usize)>>,
         /// The scheduled start (issue #128), `None` when unscheduled.
@@ -1228,7 +1245,7 @@ mod tests {
                 last_action: Mutex::new(None),
                 last_action_by: Mutex::new(None),
                 last_action_at: Mutex::new(None),
-                last_epoch: Mutex::new(None),
+                last_time: Mutex::new(None),
                 rules_audit: Mutex::new(None),
                 missing: false,
                 conflict: false,
@@ -1341,11 +1358,11 @@ mod tests {
 
         /// Stamps all four audit fields, mirroring `apply_audit_values` in the
         /// real store; every mutating method calls this.
-        fn stamp_audit(&self, action: AdminAction, actor: &str, now_ms: u64) {
+        fn stamp_audit(&self, action: AdminAction, actor: &str, now: ArrivalTime) {
             *self.last_action.lock().unwrap() = Some(action.as_str().to_owned());
             *self.last_action_by.lock().unwrap() = Some(actor.to_owned());
-            *self.last_action_at.lock().unwrap() = Some(now_ms.to_string());
-            *self.last_epoch.lock().unwrap() = Some(now_ms);
+            *self.last_action_at.lock().unwrap() = Some(now.timestamp().to_string());
+            *self.last_time.lock().unwrap() = Some(now.timestamp());
         }
     }
 
@@ -1370,7 +1387,7 @@ mod tests {
                     last_action: self.last_action.lock().unwrap().clone(),
                     last_action_by: self.last_action_by.lock().unwrap().clone(),
                     last_action_at: self.last_action_at.lock().unwrap().clone(),
-                    last_action_epoch_ms: *self.last_epoch.lock().unwrap(),
+                    last_action_time: *self.last_time.lock().unwrap(),
                     starts_at: *self.starts_at.lock().unwrap(),
                     starts_at_timezone: self.starts_at_timezone.lock().unwrap().clone(),
                 }))
@@ -1385,13 +1402,13 @@ mod tests {
             to: Phase,
             action: AdminAction,
             actor: &str,
-            now_ms: u64,
+            now: ArrivalTime,
         ) -> impl Future<Output = Result<(), StoreError>> + Send {
             let result = if self.conflict {
                 Err(StoreError::Conflict)
             } else {
                 *self.phase.lock().unwrap() = to;
-                self.stamp_audit(action, actor, now_ms);
+                self.stamp_audit(action, actor, now);
                 Ok(())
             };
             std::future::ready(result)
@@ -1403,13 +1420,13 @@ mod tests {
             _expected: Option<u32>,
             rate: u32,
             actor: &str,
-            now_ms: u64,
+            now: ArrivalTime,
         ) -> impl Future<Output = Result<(), StoreError>> + Send {
             let result = if self.conflict {
                 Err(StoreError::Conflict)
             } else {
                 *self.rate.lock().unwrap() = Some(rate);
-                self.stamp_audit(AdminAction::SetRate, actor, now_ms);
+                self.stamp_audit(AdminAction::SetRate, actor, now);
                 Ok(())
             };
             std::future::ready(result)
@@ -1420,10 +1437,10 @@ mod tests {
             _event_id: &str,
             message: &str,
             actor: &str,
-            now_ms: u64,
+            now: ArrivalTime,
         ) -> impl Future<Output = Result<(), StoreError>> + Send {
             *self.message.lock().unwrap() = Some(message.to_owned());
-            self.stamp_audit(AdminAction::SetMessage, actor, now_ms);
+            self.stamp_audit(AdminAction::SetMessage, actor, now);
             std::future::ready(Ok(()))
         }
 
@@ -1433,7 +1450,7 @@ mod tests {
             starts_at: Option<(u64, &str)>,
             action: AdminAction,
             actor: &str,
-            now_ms: u64,
+            now: ArrivalTime,
         ) -> impl Future<Output = Result<(), StoreError>> + Send {
             self.writes.lock().unwrap().push("dynamo");
             let result = if self.starts_at_write_fails {
@@ -1441,7 +1458,7 @@ mod tests {
             } else {
                 *self.starts_at.lock().unwrap() = starts_at.map(|(secs, _)| secs);
                 *self.starts_at_timezone.lock().unwrap() = starts_at.map(|(_, tz)| tz.to_owned());
-                self.stamp_audit(action, actor, now_ms);
+                self.stamp_audit(action, actor, now);
                 Ok(())
             };
             std::future::ready(result)
@@ -1454,7 +1471,7 @@ mod tests {
             to: StoredControl,
             action: AdminAction,
             actor: &str,
-            now_ms: u64,
+            now: ArrivalTime,
         ) -> impl Future<Output = Result<(), StoreError>> + Send {
             // Mirrors the conditional write: the move applies only if the stored
             // value is still the one the caller read.
@@ -1464,7 +1481,7 @@ mod tests {
             } else {
                 *guard = to;
                 *self.control_action.lock().unwrap() = Some(action);
-                self.stamp_audit(action, actor, now_ms);
+                self.stamp_audit(action, actor, now);
                 Ok(())
             };
             std::future::ready(result)
@@ -1476,13 +1493,13 @@ mod tests {
             until: u64,
             action: AdminAction,
             actor: &str,
-            now_ms: u64,
+            now: ArrivalTime,
         ) -> impl Future<Output = Result<(), StoreError>> + Send {
             let result = if self.conflict {
                 Err(StoreError::Conflict)
             } else {
                 *self.fail_open_until.lock().unwrap() = until;
-                self.stamp_audit(action, actor, now_ms);
+                self.stamp_audit(action, actor, now);
                 Ok(())
             };
             std::future::ready(result)
@@ -1494,13 +1511,13 @@ mod tests {
             rules_digest: &str,
             rules_count: usize,
             actor: &str,
-            now_ms: u64,
+            now: ArrivalTime,
         ) -> impl Future<Output = Result<(), StoreError>> + Send {
             let result = if self.conflict {
                 Err(StoreError::Conflict)
             } else {
                 *self.rules_audit.lock().unwrap() = Some((rules_digest.to_owned(), rules_count));
-                self.stamp_audit(AdminAction::SetRules, actor, now_ms);
+                self.stamp_audit(AdminAction::SetRules, actor, now);
                 Ok(())
             };
             std::future::ready(result)
@@ -1511,13 +1528,13 @@ mod tests {
             _event_id: &str,
             _from: Phase,
             actor: &str,
-            now_ms: u64,
+            now: ArrivalTime,
         ) -> impl Future<Output = Result<(), StoreError>> + Send {
             let result = if self.conflict {
                 Err(StoreError::Conflict)
             } else {
                 *self.phase.lock().unwrap() = Phase::Maintenance;
-                self.stamp_audit(AdminAction::ForceMaintenance, actor, now_ms);
+                self.stamp_audit(AdminAction::ForceMaintenance, actor, now);
                 Ok(())
             };
             std::future::ready(result)
@@ -1670,7 +1687,7 @@ mod tests {
             FUTURE,
             "UTC",
             "op@example.com",
-            1000,
+            ts(1000),
         )
         .await
         .unwrap();
@@ -1697,15 +1714,23 @@ mod tests {
             FUTURE,
             "UTC",
             "op@example.com",
-            1000,
+            ts(1000),
         )
         .await
         .unwrap();
         store.writes.lock().unwrap().clear();
 
-        apply_start_time(&store, &schedule, "evt", "", "UTC", "op@example.com", 9999)
-            .await
-            .unwrap();
+        apply_start_time(
+            &store,
+            &schedule,
+            "evt",
+            "",
+            "UTC",
+            "op@example.com",
+            ts(9999),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(*store.writes.lock().unwrap(), vec!["dynamo", "schedule"]);
         // Disabled, not deleted — and the port has no delete to call.
@@ -1723,7 +1748,7 @@ mod tests {
         for (at, tz) in [("nonsense", "UTC"), (FUTURE, "Nowhere/Anywhere")] {
             let (store, schedule) = start_time_fixture();
             assert!(
-                apply_start_time(&store, &schedule, "evt", at, tz, "op@example.com", 1000)
+                apply_start_time(&store, &schedule, "evt", at, tz, "op@example.com", ts(1000))
                     .await
                     .is_err()
             );
@@ -1751,7 +1776,7 @@ mod tests {
                 FUTURE,
                 "UTC",
                 "op@example.com",
-                1000
+                ts(1000)
             )
             .await
             .is_err()
@@ -1773,7 +1798,7 @@ mod tests {
                 FUTURE,
                 "UTC",
                 "op@example.com",
-                1000
+                ts(1000)
             )
             .await
             .is_err()
@@ -1794,7 +1819,7 @@ mod tests {
             FUTURE,
             "UTC",
             "op@example.com",
-            1000,
+            ts(1000),
         )
         .await
         .unwrap();
@@ -1808,7 +1833,7 @@ mod tests {
             "2030-07-20T09:00",
             "UTC",
             "op@example.com",
-            1500,
+            ts(1500),
         )
         .await;
         assert!(matches!(err, Err(ApplyError::Action(ActionError::TooFast))));
@@ -1831,7 +1856,7 @@ mod tests {
                 FUTURE,
                 "UTC",
                 "op@example.com",
-                1000
+                ts(1000)
             )
             .await,
             Err(ApplyError::Action(ActionError::NotFound))
@@ -1842,7 +1867,7 @@ mod tests {
     #[tokio::test]
     async fn apply_phase_advances_and_persists() {
         let store = FakeStore::with_phase(Phase::Idle);
-        let to = apply_phase(&store, "evt", "pre_queue", "op@x", 1_000)
+        let to = apply_phase(&store, "evt", "pre_queue", "op@x", ts(1_000))
             .await
             .unwrap();
         assert_eq!(to, Phase::PreQueue);
@@ -1851,13 +1876,13 @@ mod tests {
         let state = store.load("evt").await.unwrap().unwrap();
         assert_eq!(state.last_action.as_deref(), Some("set_phase"));
         assert_eq!(state.last_action_by.as_deref(), Some("op@x"));
-        assert_eq!(state.last_action_epoch_ms, Some(1_000));
+        assert_eq!(state.last_action_time, Some(ts(1_000).timestamp()));
     }
 
     #[tokio::test]
     async fn apply_phase_rejects_illegal_transition() {
         let store = FakeStore::with_phase(Phase::Idle);
-        let err = apply_phase(&store, "evt", "active", "op@x", 1_000)
+        let err = apply_phase(&store, "evt", "active", "op@x", ts(1_000))
             .await
             .unwrap_err();
         assert!(matches!(
@@ -1874,7 +1899,7 @@ mod tests {
     #[tokio::test]
     async fn apply_phase_rejects_unknown_phase() {
         let store = FakeStore::with_phase(Phase::Idle);
-        let err = apply_phase(&store, "evt", "bogus", "op@x", 1_000)
+        let err = apply_phase(&store, "evt", "bogus", "op@x", ts(1_000))
             .await
             .unwrap_err();
         assert!(matches!(err, ApplyError::Action(ActionError::UnknownPhase)));
@@ -1886,7 +1911,7 @@ mod tests {
             missing: true,
             ..FakeStore::default()
         };
-        let err = apply_phase(&store, "evt", "pre_queue", "op@x", 1_000)
+        let err = apply_phase(&store, "evt", "pre_queue", "op@x", ts(1_000))
             .await
             .unwrap_err();
         assert!(matches!(err, ApplyError::Action(ActionError::NotFound)));
@@ -1899,7 +1924,7 @@ mod tests {
             conflict: true,
             ..FakeStore::default()
         };
-        let err = apply_phase(&store, "evt", "pre_queue", "op@x", 1_000)
+        let err = apply_phase(&store, "evt", "pre_queue", "op@x", ts(1_000))
             .await
             .unwrap_err();
         assert!(matches!(err, ApplyError::Store(StoreError::Conflict)));
@@ -1917,7 +1942,7 @@ mod tests {
             Phase::PostEvent,
         ] {
             let store = FakeStore::with_phase(from);
-            let err = apply_phase(&store, "evt", "maintenance", "op@x", 1_000)
+            let err = apply_phase(&store, "evt", "maintenance", "op@x", ts(1_000))
                 .await
                 .unwrap_err();
             assert!(
@@ -1936,7 +1961,7 @@ mod tests {
         // Maintenance -> Maintenance is also rejected (no same-phase no-op for
         // maintenance through this route).
         let store = FakeStore::with_phase(Phase::Maintenance);
-        let err = apply_phase(&store, "evt", "maintenance", "op@x", 1_000)
+        let err = apply_phase(&store, "evt", "maintenance", "op@x", ts(1_000))
             .await
             .unwrap_err();
         assert!(matches!(
@@ -1951,13 +1976,13 @@ mod tests {
     #[tokio::test]
     async fn reset_forces_maintenance_from_any_phase() {
         let store = FakeStore::with_phase(Phase::Active);
-        apply_reset(&store, "evt", "op@x", 1000).await.unwrap();
+        apply_reset(&store, "evt", "op@x", ts(1000)).await.unwrap();
         assert_eq!(*store.phase.lock().unwrap(), Phase::Maintenance);
         // The emergency stop stamps audit (ADR-0017 §6).
         let state = store.load("evt").await.unwrap().unwrap();
         assert_eq!(state.last_action.as_deref(), Some("force_maintenance"));
         assert_eq!(state.last_action_by.as_deref(), Some("op@x"));
-        assert_eq!(state.last_action_epoch_ms, Some(1000));
+        assert_eq!(state.last_action_time, Some(ts(1000).timestamp()));
     }
 
     #[tokio::test]
@@ -1969,19 +1994,19 @@ mod tests {
         let store = FakeStore::with_phase(Phase::Active);
 
         // Audited emergency stop.
-        apply_reset(&store, "evt", "op@x", 5_000).await.unwrap();
+        apply_reset(&store, "evt", "op@x", ts(5_000)).await.unwrap();
         assert_eq!(*store.phase.lock().unwrap(), Phase::Maintenance);
         let state = store.load("evt").await.unwrap().unwrap();
         assert_eq!(state.last_action.as_deref(), Some("force_maintenance"));
         assert_eq!(state.last_action_by.as_deref(), Some("op@x"));
-        assert_eq!(state.last_action_epoch_ms, Some(5_000));
+        assert_eq!(state.last_action_time, Some(ts(5_000).timestamp()));
 
         // The dropdown's offered recovery path (next_phases(Maintenance)[0]).
         assert_eq!(
             next_phases(Phase::Maintenance),
             vec![Phase::Active, Phase::Idle]
         );
-        apply_phase(&store, "evt", "active", "op@y", 6_000)
+        apply_phase(&store, "evt", "active", "op@y", ts(6_000))
             .await
             .unwrap();
         assert_eq!(*store.phase.lock().unwrap(), Phase::Active);
@@ -1992,21 +2017,21 @@ mod tests {
         let state = store.load("evt").await.unwrap().unwrap();
         assert_eq!(state.last_action.as_deref(), Some("set_phase"));
         assert_eq!(state.last_action_by.as_deref(), Some("op@y"));
-        assert_eq!(state.last_action_epoch_ms, Some(6_000));
+        assert_eq!(state.last_action_time, Some(ts(6_000).timestamp()));
     }
 
     #[tokio::test]
     async fn recovery_from_maintenance_to_idle_stamps_audit() {
         // The other dropdown recovery option: Maintenance -> Idle (reset).
         let store = FakeStore::with_phase(Phase::Maintenance);
-        apply_phase(&store, "evt", "idle", "op@z", 7_000)
+        apply_phase(&store, "evt", "idle", "op@z", ts(7_000))
             .await
             .unwrap();
         assert_eq!(*store.phase.lock().unwrap(), Phase::Idle);
         let state = store.load("evt").await.unwrap().unwrap();
         assert_eq!(state.last_action.as_deref(), Some("set_phase"));
         assert_eq!(state.last_action_by.as_deref(), Some("op@z"));
-        assert_eq!(state.last_action_epoch_ms, Some(7_000));
+        assert_eq!(state.last_action_time, Some(ts(7_000).timestamp()));
     }
 
     #[tokio::test]
@@ -2014,30 +2039,30 @@ mod tests {
         // Every lifecycle transition records the actor and time, not just the
         // recovery-from-maintenance path.
         let store = FakeStore::with_phase(Phase::Idle);
-        apply_phase(&store, "evt", "pre_queue", "alice", 1_000)
+        apply_phase(&store, "evt", "pre_queue", "alice", ts(1_000))
             .await
             .unwrap();
         assert_eq!(*store.phase.lock().unwrap(), Phase::PreQueue);
         let state = store.load("evt").await.unwrap().unwrap();
         assert_eq!(state.last_action.as_deref(), Some("set_phase"));
         assert_eq!(state.last_action_by.as_deref(), Some("alice"));
-        assert_eq!(state.last_action_epoch_ms, Some(1_000));
+        assert_eq!(state.last_action_time, Some(ts(1_000).timestamp()));
 
-        apply_phase(&store, "evt", "active", "bob", 2_000)
+        apply_phase(&store, "evt", "active", "bob", ts(2_000))
             .await
             .unwrap();
         let state = store.load("evt").await.unwrap().unwrap();
         assert_eq!(state.last_action.as_deref(), Some("set_phase"));
         assert_eq!(state.last_action_by.as_deref(), Some("bob"));
-        assert_eq!(state.last_action_epoch_ms, Some(2_000));
+        assert_eq!(state.last_action_time, Some(ts(2_000).timestamp()));
 
-        apply_phase(&store, "evt", "post_event", "carol", 3_000)
+        apply_phase(&store, "evt", "post_event", "carol", ts(3_000))
             .await
             .unwrap();
         let state = store.load("evt").await.unwrap().unwrap();
         assert_eq!(state.last_action.as_deref(), Some("set_phase"));
         assert_eq!(state.last_action_by.as_deref(), Some("carol"));
-        assert_eq!(state.last_action_epoch_ms, Some(3_000));
+        assert_eq!(state.last_action_time, Some(ts(3_000).timestamp()));
     }
 
     #[tokio::test]
@@ -2046,39 +2071,39 @@ mod tests {
         // set_phase, proving set_phase does not leave the prior action's
         // stamp in place (the bug).
         let store = FakeStore::with_phase(Phase::Active);
-        apply_rate(&store, "evt", "500", "rate-op", 1_000)
+        apply_rate(&store, "evt", "500", "rate-op", ts(1_000))
             .await
             .unwrap();
         let state = store.load("evt").await.unwrap().unwrap();
         assert_eq!(state.last_action.as_deref(), Some("set_rate"));
         assert_eq!(state.last_action_by.as_deref(), Some("rate-op"));
 
-        apply_phase(&store, "evt", "post_event", "phase-op", 2_000)
+        apply_phase(&store, "evt", "post_event", "phase-op", ts(2_000))
             .await
             .unwrap();
         let state = store.load("evt").await.unwrap().unwrap();
         assert_eq!(state.last_action.as_deref(), Some("set_phase"));
         assert_eq!(state.last_action_by.as_deref(), Some("phase-op"));
-        assert_eq!(state.last_action_epoch_ms, Some(2_000));
+        assert_eq!(state.last_action_time, Some(ts(2_000).timestamp()));
     }
 
     #[tokio::test]
     async fn rate_rejects_zero_and_nonnumeric() {
         let store = FakeStore::with_phase(Phase::Active);
         assert!(matches!(
-            apply_rate(&store, "evt", "0", "op@x", 1000)
+            apply_rate(&store, "evt", "0", "op@x", ts(1000))
                 .await
                 .unwrap_err(),
             ApplyError::Action(ActionError::InvalidRate)
         ));
         assert!(matches!(
-            apply_rate(&store, "evt", "fast", "op@x", 1000)
+            apply_rate(&store, "evt", "fast", "op@x", ts(1000))
                 .await
                 .unwrap_err(),
             ApplyError::Action(ActionError::InvalidRate)
         ));
         assert_eq!(
-            apply_rate(&store, "evt", "500", "op@x", 1000)
+            apply_rate(&store, "evt", "500", "op@x", ts(1000))
                 .await
                 .unwrap(),
             500
@@ -2089,7 +2114,7 @@ mod tests {
     #[tokio::test]
     async fn message_sets_and_allows_empty() {
         let store = FakeStore::with_phase(Phase::Active);
-        apply_message(&store, "evt", "Doors open at noon", "op@x", 1000)
+        apply_message(&store, "evt", "Doors open at noon", "op@x", ts(1000))
             .await
             .unwrap();
         assert_eq!(
@@ -2097,7 +2122,7 @@ mod tests {
             Some("Doors open at noon")
         );
         // Second call is spaced beyond the debounce window.
-        apply_message(&store, "evt", "", "op@x", 1000 + DEBOUNCE_MS)
+        apply_message(&store, "evt", "", "op@x", ts(1000 + DEBOUNCE_MILLIS))
             .await
             .unwrap();
         assert_eq!(store.message.lock().unwrap().as_deref(), Some(""));
@@ -2108,27 +2133,33 @@ mod tests {
         let store = FakeStore::with_phase(Phase::Active);
         let over = (u64::from(MAX_ADMISSION_RATE) + 1).to_string();
         assert!(matches!(
-            apply_rate(&store, "evt", &over, "op@x", 1000).await,
+            apply_rate(&store, "evt", &over, "op@x", ts(1000)).await,
             Err(ApplyError::Action(ActionError::RateTooHigh { .. }))
         ));
         assert!(
-            apply_rate(&store, "evt", &MAX_ADMISSION_RATE.to_string(), "op@x", 1000)
-                .await
-                .is_ok()
+            apply_rate(
+                &store,
+                "evt",
+                &MAX_ADMISSION_RATE.to_string(),
+                "op@x",
+                ts(1000)
+            )
+            .await
+            .is_ok()
         );
     }
 
     #[tokio::test]
     async fn pause_and_resume_move_the_control_between_open_and_paused() {
         let store = FakeStore::with_phase(Phase::Active);
-        apply_pause(&store, "evt", "op@x", 1000).await.unwrap();
+        apply_pause(&store, "evt", "op@x", ts(1000)).await.unwrap();
         assert_eq!(*store.control.lock().unwrap(), StoredControl::Paused);
         assert_eq!(
             *store.control_action.lock().unwrap(),
             Some(AdminAction::Pause)
         );
         // Resume spaced beyond the debounce window.
-        apply_resume(&store, "evt", "op@x", 1000 + DEBOUNCE_MS)
+        apply_resume(&store, "evt", "op@x", ts(1000 + DEBOUNCE_MILLIS))
             .await
             .unwrap();
         assert_eq!(*store.control.lock().unwrap(), StoredControl::Open);
@@ -2170,7 +2201,7 @@ mod tests {
             phase: Mutex::new(Phase::Active),
             ..Default::default()
         };
-        apply_pause(&store, "evt", "op@x", 1000).await.unwrap();
+        apply_pause(&store, "evt", "op@x", ts(1000)).await.unwrap();
         assert_eq!(*store.control.lock().unwrap(), StoredControl::Paused);
         // The epoch is untouched by a pause.
         assert_eq!(*store.fail_open_until.lock().unwrap(), 1_000_000);
@@ -2183,7 +2214,7 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(
-            apply_pause(&store, "evt", "op@x", 1000).await,
+            apply_pause(&store, "evt", "op@x", ts(1000)).await,
             Err(ApplyError::Action(ActionError::NotFound))
         ));
     }
@@ -2191,22 +2222,47 @@ mod tests {
     #[tokio::test]
     async fn second_mutation_within_debounce_window_is_rejected() {
         let store = FakeStore::with_phase(Phase::Active);
-        apply_rate(&store, "evt", "500", "op@x", 1000)
+        apply_rate(&store, "evt", "500", "op@x", ts(1000))
             .await
             .unwrap();
-        // A second mutation 100ms later (< DEBOUNCE_MS) is rejected.
+        // A second mutation 100ms later (< DEBOUNCE) is rejected.
         assert!(matches!(
-            apply_rate(&store, "evt", "600", "op@x", 1100).await,
+            apply_rate(&store, "evt", "600", "op@x", ts(1100)).await,
             Err(ApplyError::Action(ActionError::TooFast))
         ));
         // The rate did not change.
         assert_eq!(*store.rate.lock().unwrap(), Some(500));
         // After the window, it succeeds.
         assert!(
-            apply_rate(&store, "evt", "600", "op@x", 1000 + DEBOUNCE_MS)
+            apply_rate(&store, "evt", "600", "op@x", ts(1000 + DEBOUNCE_MILLIS))
                 .await
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn a_stamp_from_the_future_does_not_lock_the_control_plane() {
+        // A stamp later than now cannot describe a prior action, so it does
+        // not hold the debounce window open. Measuring it as unsigned would
+        // read it as "no time has passed" and refuse every rate, message,
+        // pause, resume, rules and start-time change for good, because nothing
+        // an operator can do moves the stamp back into the past.
+        let store = FakeStore::with_phase(Phase::Active);
+        let ahead = ts(60_000);
+        apply_rate(&store, "evt", "500", "op@x", ahead)
+            .await
+            .unwrap();
+        assert_eq!(*store.last_time.lock().unwrap(), Some(ahead.timestamp()));
+
+        apply_rate(&store, "evt", "600", "op@x", ts(1_000))
+            .await
+            .unwrap();
+        assert_eq!(*store.rate.lock().unwrap(), Some(600));
+        // And the debounce itself still works from the recovered stamp.
+        assert!(matches!(
+            apply_rate(&store, "evt", "700", "op@x", ts(1_100)).await,
+            Err(ApplyError::Action(ActionError::TooFast))
+        ));
     }
 
     #[tokio::test]
@@ -2219,7 +2275,7 @@ mod tests {
         // The transition is illegal from Paused, so it is refused before any
         // write is attempted.
         assert!(matches!(
-            apply_pause(&store, "evt", "op@x", 1000).await,
+            apply_pause(&store, "evt", "op@x", ts(1000)).await,
             Err(ApplyError::Action(ActionError::Conflict))
         ));
         assert_eq!(*store.control.lock().unwrap(), StoredControl::Paused);
@@ -2229,11 +2285,11 @@ mod tests {
     async fn force_maintenance_is_not_debounced() {
         let store = FakeStore::with_phase(Phase::Active);
         // A recent mutation sets the debounce clock.
-        apply_rate(&store, "evt", "500", "op@x", 1000)
+        apply_rate(&store, "evt", "500", "op@x", ts(1000))
             .await
             .unwrap();
         // Force maintenance immediately after still applies (emergency stop).
-        apply_reset(&store, "evt", "op@x", 1100).await.unwrap();
+        apply_reset(&store, "evt", "op@x", ts(1100)).await.unwrap();
         assert_eq!(*store.phase.lock().unwrap(), Phase::Maintenance);
     }
 
@@ -2243,10 +2299,10 @@ mod tests {
     async fn fail_open_writes_the_edge_before_dynamodb() {
         let store = FakeStore::with_phase(Phase::Active);
         let edge = FakeEdgeStore::default();
-        apply_fail_open(&store, &edge, "evt", "30", "op@x", 1_000_000)
+        apply_fail_open(&store, &edge, "evt", "30", "op@x", ts(1_000_000))
             .await
             .unwrap();
-        let until = 1_000 + 30 * 60; // now_ms/1000 + minutes*60
+        let until = 1_000 + 30 * 60; // now/1000 + minutes*60
         assert_eq!(*store.fail_open_until.lock().unwrap(), until);
         assert_eq!(edge.cfg.lock().unwrap().fail_open_until, until);
         // Order: the edge write happened, and it is the only write recorded
@@ -2265,7 +2321,7 @@ mod tests {
         let edge = FakeEdgeStore::default();
         edge.cfg.lock().unwrap().enforce_from = 42;
         edge.cfg.lock().unwrap().rules = vec![ProtectionRule::PathPrefix("/checkout".to_owned())];
-        apply_fail_open(&store, &edge, "evt", "5", "op@x", 0)
+        apply_fail_open(&store, &edge, "evt", "5", "op@x", ts(0))
             .await
             .unwrap();
         let cfg = edge.cfg.lock().unwrap();
@@ -2292,7 +2348,7 @@ mod tests {
         };
         *edge.fail_next_write_then_inject.lock().unwrap() = Some(concurrent.clone());
 
-        apply_fail_open(&store, &edge, "evt", "10", "op@x", 0)
+        apply_fail_open(&store, &edge, "evt", "10", "op@x", ts(0))
             .await
             .unwrap();
 
@@ -2315,7 +2371,7 @@ mod tests {
             ..Default::default()
         };
         let edge = FakeEdgeStore::default();
-        apply_fail_open(&store, &edge, "evt", "10", "op@x", 0)
+        apply_fail_open(&store, &edge, "evt", "10", "op@x", ts(0))
             .await
             .unwrap();
         assert!(*store.fail_open_until.lock().unwrap() > 0);
@@ -2328,16 +2384,16 @@ mod tests {
         let store = FakeStore::with_phase(Phase::Active);
         let edge = FakeEdgeStore::default();
         assert!(matches!(
-            apply_fail_open(&store, &edge, "evt", "0", "op@x", 0).await,
+            apply_fail_open(&store, &edge, "evt", "0", "op@x", ts(0)).await,
             Err(ApplyError::Action(ActionError::InvalidDuration))
         ));
         assert!(matches!(
-            apply_fail_open(&store, &edge, "evt", "not-a-number", "op@x", 0).await,
+            apply_fail_open(&store, &edge, "evt", "not-a-number", "op@x", ts(0)).await,
             Err(ApplyError::Action(ActionError::InvalidDuration))
         ));
         let over = (MAX_FAIL_OPEN_MINUTES + 1).to_string();
         assert!(matches!(
-            apply_fail_open(&store, &edge, "evt", &over, "op@x", 0).await,
+            apply_fail_open(&store, &edge, "evt", &over, "op@x", ts(0)).await,
             Err(ApplyError::Action(ActionError::InvalidDuration))
         ));
     }
@@ -2377,7 +2433,7 @@ mod tests {
 
         let store = FakeStore::with_phase(Phase::Active);
         let edge = FakeEdgeStore::default();
-        let err = apply_set_rules(&store, &edge, "evt", rules, "op@x", 0)
+        let err = apply_set_rules(&store, &edge, "evt", rules, "op@x", ts(0))
             .await
             .unwrap_err();
         assert!(matches!(
@@ -2402,11 +2458,11 @@ mod tests {
         let rules: Vec<ProtectionRule> = (0..6)
             .map(|_| ProtectionRule::PathPrefix(format!("/{}", "a".repeat(121))))
             .collect();
-        apply_set_rules(&store, &edge, "evt", rules, "op@x", 0)
+        apply_set_rules(&store, &edge, "evt", rules, "op@x", ts(0))
             .await
             .unwrap();
 
-        // now_ms picked so now_secs is a realistic 10-digit epoch and the
+        // now picked so now_secs is a realistic 10-digit epoch and the
         // engaged window is the maximum the form allows.
         apply_fail_open(
             &store,
@@ -2414,7 +2470,7 @@ mod tests {
             "evt",
             &MAX_FAIL_OPEN_MINUTES.to_string(),
             "op@x",
-            9_999_999_999_000,
+            ts(9_999_999_999_000),
         )
         .await
         .unwrap();
@@ -2425,12 +2481,12 @@ mod tests {
     async fn recover_clears_the_epoch_on_both_stores_dynamodb_first() {
         let store = FakeStore::with_phase(Phase::Active);
         let edge = FakeEdgeStore::default();
-        apply_fail_open(&store, &edge, "evt", "10", "op@x", 0)
+        apply_fail_open(&store, &edge, "evt", "10", "op@x", ts(0))
             .await
             .unwrap();
         assert!(*store.fail_open_until.lock().unwrap() > 0);
 
-        apply_recover(&store, &edge, "evt", "op@y", 5_000)
+        apply_recover(&store, &edge, "evt", "op@y", ts(5_000))
             .await
             .unwrap();
         assert_eq!(*store.fail_open_until.lock().unwrap(), 0);
@@ -2451,7 +2507,7 @@ mod tests {
             ..Default::default()
         };
         let edge = FakeEdgeStore::default();
-        apply_recover(&store, &edge, "evt", "op@x", 0)
+        apply_recover(&store, &edge, "evt", "op@x", ts(0))
             .await
             .unwrap();
         assert_eq!(*store.fail_open_until.lock().unwrap(), 0);
@@ -2466,7 +2522,7 @@ mod tests {
         };
         let edge = FakeEdgeStore::default();
         assert!(matches!(
-            apply_recover(&store, &edge, "evt", "op@x", 0).await,
+            apply_recover(&store, &edge, "evt", "op@x", ts(0)).await,
             Err(ApplyError::Action(ActionError::NotFound))
         ));
     }
@@ -2481,7 +2537,7 @@ mod tests {
             ProtectionRule::PathPrefix("/checkout".to_owned()),
             ProtectionRule::Cookie("loyalty_member".to_owned()),
         ];
-        apply_set_rules(&store, &edge, "evt", rules.clone(), "op@x", 1000)
+        apply_set_rules(&store, &edge, "evt", rules.clone(), "op@x", ts(1000))
             .await
             .unwrap();
         assert_eq!(edge.cfg.lock().unwrap().rules, rules);
@@ -2505,7 +2561,7 @@ mod tests {
             "evt",
             vec![ProtectionRule::PathPrefix("/x".to_owned())],
             "op@x",
-            0,
+            ts(0),
         )
         .await
         .unwrap();
@@ -2519,7 +2575,7 @@ mod tests {
         let store = FakeStore::with_phase(Phase::Active);
         let edge = FakeEdgeStore::default();
         let bad = vec![ProtectionRule::Cookie("bad\nname".to_owned())];
-        let err = apply_set_rules(&store, &edge, "evt", bad, "op@x", 0)
+        let err = apply_set_rules(&store, &edge, "evt", bad, "op@x", ts(0))
             .await
             .unwrap_err();
         assert!(matches!(
@@ -2538,7 +2594,7 @@ mod tests {
         let too_many: Vec<ProtectionRule> = (0..=MAX_RULES)
             .map(|i| ProtectionRule::PathPrefix(format!("/p{i}")))
             .collect();
-        let err = apply_set_rules(&store, &edge, "evt", too_many, "op@x", 0)
+        let err = apply_set_rules(&store, &edge, "evt", too_many, "op@x", ts(0))
             .await
             .unwrap_err();
         assert!(matches!(
@@ -2555,7 +2611,7 @@ mod tests {
         };
         let edge = FakeEdgeStore::default();
         assert!(matches!(
-            apply_set_rules(&store, &edge, "evt", vec![], "op@x", 0).await,
+            apply_set_rules(&store, &edge, "evt", vec![], "op@x", ts(0)).await,
             Err(ApplyError::Action(ActionError::NotFound))
         ));
     }
@@ -2567,7 +2623,7 @@ mod tests {
         let store = FakeStore::with_phase(Phase::Active);
         let edge = FakeEdgeStore::default();
         edge.cfg.lock().unwrap().rules = vec![ProtectionRule::PathPrefix("/x".to_owned())];
-        apply_set_rules(&store, &edge, "evt", vec![], "op@x", 0)
+        apply_set_rules(&store, &edge, "evt", vec![], "op@x", ts(0))
             .await
             .unwrap();
         assert!(edge.cfg.lock().unwrap().rules.is_empty());
