@@ -455,6 +455,22 @@
     return "over " + hours + (hours === 1 ? " hour" : " hours");
   }
 
+  // Seconds from now until an absolute epoch published on /status, or null
+  // when there is no usable one. Validated like adoptPolicy does: a malformed
+  // field must leave the page on its unscheduled text rather than rendering
+  // NaN at every waiting visitor.
+  //
+  // The comparison is against the visitor's own clock, which may be wrong. It
+  // is only ever used to choose wording, never to decide that the event has
+  // opened -- that is the next poll's job -- so a skewed clock costs a
+  // slightly early or late label and nothing else.
+  function secondsUntil(epochSecs) {
+    if (typeof epochSecs !== "number" || !isFinite(epochSecs)) {
+      return null;
+    }
+    return epochSecs - Math.floor(Date.now() / 1000);
+  }
+
   function renderEta(ahead, targetRate) {
     // Falls back to the operator's target so the first poll says something,
     // rather than leaving a dash for the half minute it takes to watch the
@@ -667,10 +683,25 @@
           // one with a different permutation.
           forgetPosition();
           nextIntervalMs = policy.ceilingMs;
-          say(
-            "The event isn't open yet",
-            "This page updates on its own when it opens."
-          );
+          // A scheduled event counts down to its start; an unscheduled one has
+          // no moment to name, so it keeps the original text. Branch rather
+          // than render then overwrite -- both write the same two elements.
+          var startsIn = secondsUntil(s.starts_at);
+          if (startsIn === null) {
+            say(
+              "The event isn't open yet",
+              "This page updates on its own when it opens."
+            );
+          } else if (startsIn > 0) {
+            say(
+              "Opens in " + humanWait(startsIn),
+              "This page updates on its own when it opens."
+            );
+          } else {
+            // The start has passed but the seal has not landed yet. Saying
+            // "opens in under a minute" forever would read as stuck.
+            say("Opening now", "This page updates on its own when it opens.");
+          }
           if (s.phase === "pre_queue") {
             // Registration during the countdown is a single direct write
             // (join() no-ops on reload via JOINED_KEY), not a poll: the

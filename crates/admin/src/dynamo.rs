@@ -72,6 +72,8 @@ impl Store for DynamoStore {
                 .get("last_action_epoch_ms")
                 .and_then(|v| v.as_n().ok())
                 .and_then(|n| n.parse().ok()),
+            starts_at: num(wr_common::STARTS_AT_ATTR),
+            starts_at_timezone: str_attr(wr_common::STARTS_AT_TZ_ATTR),
         }))
     }
 
@@ -211,6 +213,43 @@ impl Store for DynamoStore {
             .expression_attribute_values(":u", AttributeValue::N(until.to_string()));
         req = apply_audit_values(req, action, actor, now_ms);
         send_guarded(req, "fail_open_until").await
+    }
+
+    async fn set_starts_at(
+        &self,
+        event_id: &str,
+        starts_at: Option<(u64, &str)>,
+        action: crate::AdminAction,
+        actor: &str,
+        now_ms: u64,
+    ) -> Result<(), StoreError> {
+        const AUDIT: &str = "last_action = :a, last_action_by = :by, \
+                             last_action_at = :at, last_action_epoch_ms = :ms";
+        let (at_attr, tz_attr) = (wr_common::STARTS_AT_ATTR, wr_common::STARTS_AT_TZ_ATTR);
+
+        let mut req = self
+            .client
+            .update_item()
+            .table_name(&self.counters_table)
+            .set_key(Some(event_key(event_id)));
+
+        // Clearing REMOVEs both attributes instead of writing a zero, so the
+        // read path can still tell an unscheduled event from one whose start
+        // has already passed. Note both branches keep a SET clause: the audit
+        // stamp is written either way, and a bare REMOVE would drop it.
+        req = match starts_at {
+            Some((secs, tz)) => req
+                .update_expression(format!("SET {at_attr} = :s, {tz_attr} = :tz, {AUDIT}"))
+                .expression_attribute_values(":s", AttributeValue::N(secs.to_string()))
+                .expression_attribute_values(":tz", AttributeValue::S(tz.to_owned())),
+            None => req.update_expression(format!("SET {AUDIT} REMOVE {at_attr}, {tz_attr}")),
+        };
+
+        req = apply_audit_values(req, action, actor, now_ms);
+        // Debounced like set_rate and set_message: scheduling is a routine
+        // control, not the break-glass that set_fail_open_until is.
+        req = guard_debounce(req, now_ms);
+        send_guarded(req, wr_common::STARTS_AT_ATTR).await
     }
 
     async fn set_rules_audit(

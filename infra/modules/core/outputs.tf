@@ -93,3 +93,8 @@ output "generate_token_function_name" {
   description = "Name of the Lambda that mints admission cookies and records arrivals."
   value       = aws_lambda_function.generate_token.function_name
 }
+
+output "seal_schedule_name" {
+  description = "Name of the one-time seal schedule (issue #128). Terraform creates it disabled; the admin Lambda sets its expression and state, and scripts/reset-env.py disables it so a reset cannot leave a seal armed for a cohort it just deleted."
+  value       = aws_scheduler_schedule.seal.name
+}

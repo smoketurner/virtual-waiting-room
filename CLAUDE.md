@@ -37,7 +37,7 @@ prek run             # pre-commit hooks (fmt, actionlint, zizmor, shellcheck)
 never run apply or destroy unless explicitly asked.
 
 Deployment configuration (region, `aws_profile`, `event_id`, `lambda_architecture`,
-`seal_start_time`, artifact paths) lives in `infra/environments/dev/terraform.tfvars` and is
+artifact paths) lives in `infra/environments/dev/terraform.tfvars` and is
 authoritative — the Makefile deliberately passes no `-var`, since a command-line `-var` would
 override the file. `make build` reads `lambda_architecture` out of that file to pick its cross-compile
 target, so the binaries cannot be built for a different architecture than the functions are

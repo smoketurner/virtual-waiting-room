@@ -95,7 +95,44 @@ pub struct Dashboard {
     /// the JSON state view.
     #[serde(skip)]
     pub rules_load_failed: bool,
+    /// The scheduled start for display (issue #128), rendered in the
+    /// operator's own zone, or "not set".
+    pub starts_at: String,
+    /// The same instant as the `datetime-local` field wants it
+    /// (`YYYY-MM-DDTHH:MM` in the chosen zone), empty when unscheduled.
+    /// Render-only, like `message_raw`.
+    #[serde(skip)]
+    pub starts_at_raw: String,
+    /// The chosen IANA zone, defaulting to UTC when unscheduled, so the
+    /// dropdown re-renders on the operator's selection.
+    #[serde(skip)]
+    pub starts_at_timezone: String,
+    /// The zones offered in the dropdown. A short curated list rather than the
+    /// whole IANA database: 600 options is not a usable control, and any zone
+    /// outside it can still be posted and is still validated.
+    #[serde(skip)]
+    pub timezones: Vec<&'static str>,
 }
+
+/// The zones the dashboard offers. UTC first because it is the unambiguous
+/// choice and the one a reader of the stored value expects; the rest are the
+/// zones a public onsale is realistically scheduled in.
+pub const OFFERED_TIMEZONES: [&str; 14] = [
+    "UTC",
+    "America/New_York",
+    "America/Chicago",
+    "America/Denver",
+    "America/Los_Angeles",
+    "America/Sao_Paulo",
+    "Europe/London",
+    "Europe/Dublin",
+    "Europe/Paris",
+    "Europe/Berlin",
+    "Europe/Madrid",
+    "Asia/Tokyo",
+    "Asia/Singapore",
+    "Australia/Sydney",
+];
 
 /// One phase in the lifecycle strip.
 pub struct Step {
@@ -176,6 +213,29 @@ impl Dashboard {
             operator_email: String::new(),
             rules_text: String::new(),
             rules_load_failed: false,
+            starts_at: {
+                let tz = state.starts_at_timezone.as_deref().unwrap_or("UTC");
+                dash(
+                    state
+                        .starts_at
+                        .and_then(|secs| crate::format_start_time(secs, tz))
+                        .map(|at| format!("{at} {tz}")),
+                )
+            },
+            starts_at_raw: state
+                .starts_at
+                .and_then(|secs| {
+                    crate::format_start_time(
+                        secs,
+                        state.starts_at_timezone.as_deref().unwrap_or("UTC"),
+                    )
+                })
+                .unwrap_or_default(),
+            starts_at_timezone: state
+                .starts_at_timezone
+                .clone()
+                .unwrap_or_else(|| crate::DEFAULT_TIMEZONE.to_owned()),
+            timezones: OFFERED_TIMEZONES.to_vec(),
         }
     }
 }
@@ -217,6 +277,8 @@ mod tests {
             last_action_by: Some("op@example.com".to_owned()),
             last_action_at: Some("2026-09-09T22:00:00Z".to_owned()),
             last_action_epoch_ms: Some(1_788_000_000_000),
+            starts_at: None,
+            starts_at_timezone: None,
         }
     }
 
@@ -227,6 +289,30 @@ mod tests {
         assert!(html.contains(">active<"));
         assert!(html.contains("Doors open at noon"));
         assert!(html.contains("500"));
+    }
+
+    #[test]
+    fn an_unscheduled_event_offers_no_clear_and_defaults_to_utc() {
+        let html = Dashboard::from_state(&state(), 0).render().unwrap();
+        assert!(html.contains("not set"));
+        // Nothing to clear, so no clear button to mis-click.
+        assert!(!html.contains("Clear start time"));
+        assert!(html.contains(r#"<option value="UTC" selected>"#));
+    }
+
+    #[test]
+    fn a_scheduled_event_prefills_the_form_in_the_operators_own_zone() {
+        // 2030-06-15T14:00Z is 10:00 in New York. The operator picked New
+        // York, so that is what the form must show them -- re-rendering in UTC
+        // would invite them to "correct" a time that is already right.
+        let mut s = state();
+        s.starts_at = Some(1_907_762_400);
+        s.starts_at_timezone = Some("America/New_York".to_owned());
+        let html = Dashboard::from_state(&s, 0).render().unwrap();
+
+        assert!(html.contains(r#"value="2030-06-15T10:00""#));
+        assert!(html.contains(r#"<option value="America/New_York" selected>"#));
+        assert!(html.contains("Clear start time"));
     }
 
     #[test]

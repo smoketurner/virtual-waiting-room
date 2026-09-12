@@ -7,17 +7,23 @@
 
 Drives the scheduled-pre-queue and live-join happy paths against a deployed dev
 stack and asserts the core invariant: no two visitors get the same queue
-position. Registers fresh UUIDv7 request ids each run, but is not re-runnable
-against a stack whose event is already sealed: step 3 sets phase = pre_queue,
-which is a no-op once shuffle_seed exists, so the batch takes the live path
-instead, no PreQueue rows appear, and step 3's poll fails after 90s with no
-indication why. Run `scripts/reset-env.py` first if the event was sealed by a
-previous run.
+position. Registers fresh UUIDv7 request ids each run.
+
+Re-runnable: it resets the environment first, via `scripts/reset-env.py`, which
+clears the seal outputs from any previous run. Without that a second run finds
+`shuffle_seed` already set, so the joins take the live path, no PreQueue rows
+appear, and step 2 fails after 90s with nothing to say why. Pass `--no-reset`
+if you have just reset by hand.
 
 The script reads the API URL, table names, seal function, and event id from
 `terraform output` and never touches Terraform state — deploy with `make apply`
 first. It exercises the app only (writes PreQueue rows, invokes seal, polls the
 API).
+
+It does NOT touch the signing key. Terraform generates that during apply and
+writes the same value to both readers — the SSM SecureString the Lambdas read
+and the edge gate's KeyValueStore — so overwriting one desynchronizes them and
+every cookie minted afterwards is refused at the gate until the next apply.
 
 Self-contained via uv: the PEP 723 block above declares boto3, so `uv run`
 creates an ephemeral virtualenv and installs it — no manual venv or pip step.
@@ -30,11 +36,12 @@ Prerequisites:
 Usage:
   AWS_PROFILE=dev-admin uv run scripts/smoke_test.py
   # or, since the shebang runs uv, just: AWS_PROFILE=dev-admin ./scripts/smoke_test.py
+  AWS_PROFILE=dev-admin ./scripts/smoke_test.py --no-reset
 """
 
 from __future__ import annotations
 
-import base64
+import argparse
 import json
 import os
 import secrets
@@ -113,11 +120,19 @@ def api_post(api_url: str, path: str, body: dict) -> None:
 
 
 def main() -> int:
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument(
+        "--no-reset",
+        action="store_true",
+        help="Skip the reset-env.py call. Only correct if you just reset by hand: "
+        "a stack whose event is already sealed will hang in step 2.",
+    )
+    args = p.parse_args()
+
     region = os.environ.get("AWS_REGION", "us-east-1")
     session = boto3.Session(region_name=region)
     ddb = session.client("dynamodb")
     lam = session.client("lambda")
-    ssm = session.client("ssm")
 
     say("1. Read the deployed stack from terraform outputs")
     subprocess.run(
@@ -134,28 +149,27 @@ def main() -> int:
         tables["positions"],
     )
     seal_fn = tf_output("seal_event_function_name")
-    key_param = tf_output("signing_key_parameter_name")
     print(f"API: {api_url}  event_id: {event_id}")
 
-    say("2. Seed the signing key out-of-band (SSM SecureString placeholder -> real)")
-    ssm.put_parameter(
-        Name=key_param,
-        Type="SecureString",
-        Overwrite=True,
-        Value=base64.b64encode(secrets.token_bytes(32)).decode(),
-    )
-    print("signing key written")
+    if args.no_reset:
+        say("2. Skipping the reset (--no-reset)")
+    else:
+        # reset-env.py owns the Counters item's shape: it deletes and rewrites
+        # the whole item, which is what clears a previous run's shuffle_seed.
+        # Patching phase here instead would leave that seed in place and send
+        # the joins below down the live path.
+        say("2. Reset the environment to a fresh pre_queue event")
+        subprocess.run(
+            [
+                str(Path(__file__).resolve().parent / "reset-env.py"),
+                "--phase",
+                "pre_queue",
+                "--yes",
+            ],
+            check=True,
+        )
 
     say("3. Pre-queue registration: POST /v1/join for a small cohort during pre_queue")
-    # Open the pre-queue phase. Nothing seeds a Counters item at apply time, so
-    # this is the first write to it.
-    ddb.update_item(
-        TableName=counters,
-        Key={"event_id": {"S": f"EVT#{event_id}"}},
-        UpdateExpression="SET phase = :p",
-        ExpressionAttributeValues={":p": {"S": "pre_queue"}},
-    )
-
     ids: list[str] = [uuid_v7() for _ in range(COHORT)]
     for rid in ids:
         api_post(api_url, "/v1/join", {"request_id": rid, "event_id": event_id})

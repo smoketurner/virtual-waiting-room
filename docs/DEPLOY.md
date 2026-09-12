@@ -97,7 +97,6 @@ override the file, so the file stays the single source of truth. Copy
 | `aws_profile`               | *(empty)*   | Named AWS profile to authenticate with. Empty uses the default credential chain — environment, active SSO session, or instance role. |
 | `event_id`                  | `default`   | The single event id this deployment serves.                             |
 | `lambda_architecture`       | `arm64`     | Lambda CPU architecture (`arm64` or `x86_64`). **Must match the built binaries.** |
-| `seal_start_time`           | *(empty)*   | One-time UTC seal time as an EventBridge `at()` value, e.g. `2026-09-10T18:00:00`. Empty = seal invoked manually. |
 | `client_origin_domain_name` | *(none)*    | **Required.** Bare domain of the protected origin CloudFront fronts. Host only — no scheme, no path. |
 | `*_artifact_path`           | *(empty)*   | The four built zips. Empty = that function stays on the placeholder.     |
 | `oidc_*`                    | *(varies)*  | Admin login (ADR-0016). The client secret is not here — it goes in an SSM SecureString out of band. |

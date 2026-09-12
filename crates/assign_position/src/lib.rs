@@ -642,6 +642,7 @@ mod tests {
             target_rate: None,
             stored_control: StoredControl::Open,
             fail_open_until: 0,
+            starts_at: None,
         }
     }
 
@@ -666,6 +667,7 @@ mod tests {
             target_rate: None,
             stored_control: StoredControl::Open,
             fail_open_until: 0,
+            starts_at: None,
         }
     }
 

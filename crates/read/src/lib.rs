@@ -165,6 +165,17 @@ pub struct StatusResponse {
     /// not set one — the client then keeps its own fixed-interval default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub poll_policy: Option<PollPolicy>,
+    /// The scheduled start, epoch seconds, so the waiting page can count down
+    /// during `pre_queue` (issue #128). Absent when no start time is set, which
+    /// is what the page distinguishes to decide between a countdown and "the
+    /// event isn't open yet".
+    ///
+    /// Absolute rather than a remaining-seconds figure: `/status` is cached at
+    /// the edge with request collapsing, so one origin fetch answers every
+    /// simultaneous poll and a relative value would be served stale to all but
+    /// the request that produced it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub starts_at: Option<u64>,
 }
 
 /// A resolved `/queue_num` response.
@@ -211,6 +222,7 @@ pub fn status(counters: &Counters, poll_policy: Option<PollPolicy>, now: u64) ->
         message: counters.message.clone(),
         target_rate: counters.target_rate,
         poll_policy,
+        starts_at: counters.starts_at,
     }
 }
 
@@ -287,6 +299,7 @@ mod tests {
             target_rate: None,
             stored_control: StoredControl::Open,
             fail_open_until: 0,
+            starts_at: None,
         }
     }
 
@@ -313,11 +326,31 @@ mod tests {
             target_rate: None,
             stored_control: StoredControl::Open,
             fail_open_until: 0,
+            starts_at: None,
         };
         let json = serde_json::to_value(status(&counters, None, 0)).unwrap();
         assert_eq!(json["phase"], "pre_queue");
         assert!(json.get("participant_count").is_none());
         assert!(json.get("prequeue_offsets").is_none());
+    }
+
+    #[test]
+    fn status_omits_the_start_time_when_none_is_scheduled() {
+        // The waiting page branches on the key being absent, not on its value,
+        // so serializing a null here would put it into the countdown path for
+        // an event that has no start time.
+        let mut counters = sealed_counters([1; SHARDS], [7u8; 32]);
+        counters.starts_at = None;
+        let json = serde_json::to_value(status(&counters, None, 0)).unwrap();
+        assert!(json.get("starts_at").is_none());
+    }
+
+    #[test]
+    fn status_publishes_the_scheduled_start() {
+        let mut counters = sealed_counters([1; SHARDS], [7u8; 32]);
+        counters.starts_at = Some(1_800_000_000);
+        let json = serde_json::to_value(status(&counters, None, 0)).unwrap();
+        assert_eq!(json["starts_at"], 1_800_000_000_u64);
     }
 
     #[test]
@@ -590,6 +623,7 @@ mod tests {
             target_rate: None,
             stored_control: StoredControl::Open,
             fail_open_until: 0,
+            starts_at: None,
         };
         assert_eq!(
             queue_num(&counters, &row(0, 0)),

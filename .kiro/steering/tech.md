@@ -18,7 +18,7 @@ costs the most, because it is loaded into every session.
 | Function | Trigger | Job |
 |---|---|---|
 | `assign_position` | SQS event source mapping | Claims a contiguous position range per batch, writes `Positions` rows |
-| `seal_event` | EventBridge Scheduler, `at(seal_start_time)` | One conditional `UpdateItem` at T−0: seed, offsets, count, phase |
+| `seal_event` | EventBridge Scheduler, one-time `at()` set by the operator on the dashboard (issue #128) | One conditional `UpdateItem` at T−0: seed, offsets, count, phase |
 | `read` | API Gateway | `GET /v1/status`, `GET /v1/queue_num` |
 | `generate_token` | API Gateway | Checks the position against `serving_counter`, records the arrival, mints a signed session cookie the edge gate's CloudFront Function verifies (issue #71) |
 | `controller` | EventBridge Scheduler, `rate(1 minute)` | Durable function: six 10-second passes per execution — no-show correction, `serving_counter`, position expiry. Waits between passes suspend the execution rather than being billed |
@@ -38,7 +38,7 @@ only in the member crate that uses them):
 | Lambda runtime | `lambda_runtime`, `lambda_http`, `aws_lambda_events` |
 | Web framework (admin UI) | `axum`, `tower`, `tower-http` |
 | Async runtime | `tokio` |
-| AWS SDK | `aws-config`, `aws-sdk-dynamodb`, `aws-sdk-ssm`, `aws-smithy-types`, `aws-sdk-cloudfrontkeyvaluestore` (admin only — writes the edge gate's config, issue #71) |
+| AWS SDK | `aws-config`, `aws-sdk-dynamodb`, `aws-sdk-ssm`, `aws-smithy-types`, `aws-sdk-cloudfrontkeyvaluestore` (admin only — writes the edge gate's config, issue #71), `aws-sdk-scheduler` (admin only — sets the seal schedule's time, issue #128) |
 | Templating + static assets (admin UI) | `askama`, `rust-embed`, `mime_guess` |
 | Admin OIDC login (ADR-0016) | `openidconnect`, `jsonwebtoken`, `reqwest`, `rustls`, `cookie` |
 | Serialization | `serde`, `serde_json`, `serde_dynamo`, `base64` |
@@ -47,8 +47,19 @@ only in the member crate that uses them):
 | Dev | `proptest` |
 
 There is no SQS SDK dependency: API Gateway writes to the queue and `assign_position` receives
-the batch as a Lambda event. There is no EventBridge or Secrets Manager SDK dependency either —
-schedules are Terraform-managed and secrets are read from SSM.
+the batch as a Lambda event. There is no Secrets Manager SDK dependency either — secrets are read
+from SSM.
+
+Terraform creates every schedule and owns its target, retry policy and role. The one schedule
+whose *time* is not Terraform's is the seal (issue #128): the operator sets it on the dashboard,
+so `admin` carries `aws-sdk-scheduler` to rewrite the expression and state, and those two fields
+alone sit under `ignore_changes`. `UpdateSchedule` replaces rather than patches, so that writer
+reads the schedule and resends the whole definition.
+
+Timezone conversion uses `jiff` with the tz database compiled in (`tzdb-bundle-always`), not read
+from the runtime image — `provided.al2023` does not guarantee one. It is a control-plane
+dependency in `admin` only: the operator picks the zone their event opens in, and a stored offset
+would be wrong on the far side of a daylight-saving change.
 
 - **The admission path is `aws-lc-rs` only.** Credentials are minted and verified with `aws-lc-rs`
   throughout. Select the AWS SDK's `aws-lc-rs`-backed TLS/crypto path and disable defaults so no

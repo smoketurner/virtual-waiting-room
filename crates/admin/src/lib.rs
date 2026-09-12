@@ -10,6 +10,7 @@ use wr_common::{IllegalControl, Phase, ProtectionRule, RuleFieldError, StoredCon
 pub mod dynamo;
 pub mod edge;
 pub mod oidc;
+pub mod scheduler;
 pub mod security;
 pub mod sessions;
 pub mod templates;
@@ -117,6 +118,36 @@ pub trait EdgeConfigStore {
 #[error("edge config store error: {0}")]
 pub struct EdgeStoreError(pub String);
 
+/// The port to the one-time seal schedule (issue #128). A trait seam so the
+/// start-time actions run without AWS; the SDK-backed implementation lives in
+/// `scheduler`.
+///
+/// There is deliberately no delete operation. Terraform owns whether the
+/// schedule exists and the admin's IAM policy grants no
+/// `scheduler:DeleteSchedule`, so clearing a start time can only ever disable
+/// it — an invariant held by the shape of this trait rather than by a
+/// convention a later edit could quietly drop.
+pub trait SealSchedule {
+    /// Arms the schedule at a bare `YYYY-MM-DDTHH:MM:SS` read in the given
+    /// IANA zone, or disables it when `None`.
+    ///
+    /// The zone goes to the scheduler rather than being folded into a UTC
+    /// timestamp, so that a schedule set months ahead still fires at the local
+    /// hour the operator chose after a daylight-saving change.
+    ///
+    /// Implementations MUST read the current schedule first and resend the
+    /// whole definition: `UpdateSchedule` replaces rather than patches.
+    fn set_start_time(
+        &self,
+        at: Option<(&str, &str)>,
+    ) -> impl Future<Output = Result<(), ScheduleError>> + Send;
+}
+
+/// A seal-schedule failure.
+#[derive(Debug, thiserror::Error)]
+#[error("seal schedule error: {0}")]
+pub struct ScheduleError(pub String);
+
 /// The persistence port the admin actions drive. Reading the current `Counters`
 /// state and applying one guarded mutation to it.
 pub trait Store {
@@ -163,6 +194,22 @@ pub trait Store {
         &self,
         event_id: &str,
         message: &str,
+        actor: &str,
+        now_ms: u64,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// Writes or clears the scheduled event start (issue #128), guarded on the
+    /// debounce window and stamping the audit fields atomically. `None`
+    /// removes the attribute rather than zeroing it, because the read path
+    /// distinguishes "never scheduled" from a start that has passed.
+    ///
+    /// One method for both directions on purpose: a separate clear could drift
+    /// from the write in which audit fields it stamps or which guard it holds.
+    fn set_starts_at(
+        &self,
+        event_id: &str,
+        starts_at: Option<(u64, &str)>,
+        action: AdminAction,
         actor: &str,
         now_ms: u64,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
@@ -250,6 +297,13 @@ pub struct ControlState {
     pub last_action_at: Option<String>,
     /// Epoch-millis of the last mutation, for the debounce guard.
     pub last_action_epoch_ms: Option<u64>,
+    /// The scheduled event start, epoch seconds; `None` when unscheduled
+    /// (issue #128).
+    pub starts_at: Option<u64>,
+    /// The IANA zone the operator chose the start time in, so the form
+    /// re-renders in the zone they typed rather than snapping to UTC.
+    /// `None` when unscheduled.
+    pub starts_at_timezone: Option<String>,
 }
 
 /// The upper sanity bound on the admission target rate (ADR-0017 §4): a
@@ -286,6 +340,10 @@ pub enum AdminAction {
     /// only in the `KeyValueStore` — this label and the audit fields it stamps
     /// on `Counters` are what makes the change visible on the dashboard.
     SetRules,
+    /// Schedules the event start (issue #128), arming the seal schedule.
+    SetStartTime,
+    /// Clears the scheduled start, disabling the seal schedule.
+    ClearStartTime,
 }
 
 impl AdminAction {
@@ -302,6 +360,8 @@ impl AdminAction {
             Self::FailOpen => "fail_open",
             Self::Recover => "recover",
             Self::SetRules => "set_rules",
+            Self::SetStartTime => "set_start_time",
+            Self::ClearStartTime => "clear_start_time",
         }
     }
 }
@@ -352,6 +412,129 @@ pub enum ActionError {
     /// The event does not exist.
     #[error("event not found")]
     NotFound,
+    /// The start time is not a `YYYY-MM-DDTHH:MM[:SS]` UTC timestamp.
+    #[error("invalid start time")]
+    InvalidStartTime,
+    /// The start time is in the past. Rejected rather than clamped: an
+    /// operator who mistypes a date wants to be told, not to have the event
+    /// seal immediately.
+    #[error("start time must be in the future")]
+    StartTimeInPast,
+    /// The timezone is not an IANA name in the bundled database. Validated
+    /// server-side because the form is a plain POST and its value is whatever
+    /// the client sent, not necessarily one of the offered options.
+    #[error("unknown timezone")]
+    UnknownTimezone,
+}
+
+/// A validated operator-supplied start time (issue #128), carrying every form
+/// the writers need: the UTC epoch for `Counters.starts_at`, and the bare
+/// wall-clock timestamp plus IANA zone for the schedule's `at()` expression.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartTime {
+    /// The absolute instant, so the waiting page counts down to the same
+    /// moment regardless of where the visitor is.
+    pub epoch_secs: u64,
+    /// `YYYY-MM-DDTHH:MM:SS`, no zone suffix. `EventBridge` Scheduler takes the
+    /// zone separately and rejects an expression that carries one itself.
+    pub expression: String,
+    /// The IANA zone the expression is read in, e.g. `America/New_York`.
+    pub timezone: String,
+}
+
+/// The zone an unspecified start time is read in.
+pub const DEFAULT_TIMEZONE: &str = "UTC";
+
+/// Parses the dashboard's wall-clock field plus its IANA timezone into a
+/// [`StartTime`].
+///
+/// Accepts `YYYY-MM-DDTHH:MM` (what a `datetime-local` field submits) and
+/// `YYYY-MM-DDTHH:MM:SS`, read in `timezone` rather than assumed to be UTC —
+/// an operator scheduling a 10am onsale should enter 10am, not convert it,
+/// and should not have to know whether their event falls on the far side of a
+/// daylight-saving change. The zone is what makes that safe: an offset would
+/// be correct on the day it was chosen and wrong after the transition.
+///
+/// The `Z` juggling below is not incidental. Smithy's RFC-3339 codec requires
+/// a zone suffix on input and always writes one on output, while `at()`
+/// forbids one either way, so the suffix is appended before parsing and
+/// stripped after formatting.
+///
+/// # Errors
+///
+/// [`ActionError::UnknownTimezone`] if the zone is not in the bundled IANA
+/// database; [`ActionError::InvalidStartTime`] if the timestamp is not one of
+/// the two accepted shapes, carries an offset or fractional seconds, or names
+/// a wall-clock time that does not exist in that zone (the hour skipped by a
+/// daylight-saving change); [`ActionError::StartTimeInPast`] if it is not
+/// strictly in the future.
+pub fn parse_start_time(
+    input: &str,
+    timezone: &str,
+    now_secs: u64,
+) -> Result<StartTime, ActionError> {
+    let tz = jiff::tz::TimeZone::get(timezone).map_err(|_| ActionError::UnknownTimezone)?;
+
+    let trimmed = input.trim();
+    // Exactly the two accepted lengths, so an offset ("...+01:00"), a trailing
+    // 'Z', or fractional seconds are rejected by shape before the parser sees
+    // them and silently reinterprets the instant.
+    let normalized = match trimmed.len() {
+        16 => format!("{trimmed}:00"),
+        19 => trimmed.to_owned(),
+        _ => return Err(ActionError::InvalidStartTime),
+    };
+
+    let civil: jiff::civil::DateTime = normalized
+        .parse()
+        .map_err(|_| ActionError::InvalidStartTime)?;
+
+    // A wall-clock time inside a spring-forward gap never happens, so it is
+    // rejected rather than silently nudged: an operator told "18:30" is
+    // scheduled deserves to know their zone has no 18:30 that day. An
+    // ambiguous time in a fall-back overlap does happen, twice, and takes the
+    // earlier of the two -- the event opens at the first 18:30, not the
+    // second.
+    let zoned = tz
+        .to_ambiguous_zoned(civil)
+        .compatible()
+        .map_err(|_| ActionError::InvalidStartTime)?;
+
+    // `compatible` resolves a spring-forward gap by shifting forward rather
+    // than failing, so the only way to tell a nonexistent wall-clock time from
+    // a real one is that the resolved civil time is not the one asked for. An
+    // ambiguous fall-back time survives this check, because both of its two
+    // instants carry the civil time that was requested.
+    if zoned.datetime() != civil {
+        return Err(ActionError::InvalidStartTime);
+    }
+
+    let epoch_secs =
+        u64::try_from(zoned.timestamp().as_second()).map_err(|_| ActionError::InvalidStartTime)?;
+    if epoch_secs <= now_secs {
+        return Err(ActionError::StartTimeInPast);
+    }
+
+    Ok(StartTime {
+        epoch_secs,
+        expression: normalized,
+        timezone: timezone.to_owned(),
+    })
+}
+
+/// Renders a stored UTC epoch back into the `YYYY-MM-DDTHH:MM` wall-clock form
+/// in `timezone`, for pre-filling the dashboard field with what the operator
+/// originally typed.
+///
+/// Returns `None` for an unknown zone or an epoch outside the representable
+/// range, neither of which any value this crate writes can be.
+#[must_use]
+pub fn format_start_time(epoch_secs: u64, timezone: &str) -> Option<String> {
+    let tz = jiff::tz::TimeZone::get(timezone).ok()?;
+    let secs = i64::try_from(epoch_secs).ok()?;
+    let zoned = jiff::Timestamp::from_second(secs).ok()?.to_zoned(tz);
+    // datetime-local round-trips minutes, not seconds.
+    Some(format!("{}", zoned.datetime().strftime("%Y-%m-%dT%H:%M")))
 }
 
 /// Parses an operator-supplied phase string to a [`Phase`].
@@ -713,6 +896,72 @@ pub async fn apply_recover<S: Store, E: EdgeConfigStore>(
     Ok(())
 }
 
+/// Sets or clears the event's scheduled start (issue #128): writes
+/// `Counters.starts_at`, which the waiting page counts down to, and arms or
+/// disables the one-time seal schedule, which is what actually fires the seal.
+/// An empty `at` clears, so one action covers both directions.
+///
+/// Two stores describe one fact, so the order is fixed to make the residue of
+/// a half-completed change the harmless one. **The schedule may be armed
+/// without an announcement; an announcement must never outlive its schedule.**
+/// Arming first when setting leaves, at worst, a schedule that fires with no
+/// countdown shown — which is exactly how the system behaved before this
+/// existed. Clearing `starts_at` first leaves, at worst, a countdown already
+/// removed from a page whose schedule is still armed, and the operator sees
+/// the error and retries.
+///
+/// The debounce is evaluated here, before either write. Leaving it to the
+/// store's own guard would let a double-submit move the schedule and then be
+/// rejected by `DynamoDB`, diverging the two for the rest of the window.
+///
+/// # Errors
+///
+/// [`ActionError::InvalidStartTime`] or [`ActionError::StartTimeInPast`] for a
+/// rejected value, in which case neither store is touched;
+/// [`ActionError::NotFound`] if the event is missing; [`ActionError::TooFast`]
+/// inside the debounce window; store and schedule errors otherwise.
+pub async fn apply_start_time<S: Store, K: SealSchedule>(
+    store: &S,
+    schedule: &K,
+    event_id: &str,
+    at: &str,
+    timezone: &str,
+    actor: &str,
+    now_ms: u64,
+) -> Result<(), ApplyError> {
+    let Some(state) = store.load(event_id).await? else {
+        return Err(ActionError::NotFound.into());
+    };
+    debounce_check(&state, now_ms)?;
+
+    if at.trim().is_empty() {
+        store
+            .set_starts_at(event_id, None, AdminAction::ClearStartTime, actor, now_ms)
+            .await?;
+        schedule
+            .set_start_time(None)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        return Ok(());
+    }
+
+    let start = parse_start_time(at, timezone, now_ms / 1000)?;
+    schedule
+        .set_start_time(Some((&start.expression, &start.timezone)))
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+    store
+        .set_starts_at(
+            event_id,
+            Some((start.epoch_secs, &start.timezone)),
+            AdminAction::SetStartTime,
+            actor,
+            now_ms,
+        )
+        .await?;
+    Ok(())
+}
+
 /// Replaces the edge gate's ruleset (issue #71). The `KeyValueStore` is the
 /// sole store for `rules` — this reads the current config, keeps
 /// `enforce_from` and `fail_open_until` exactly as they were, replaces only
@@ -927,7 +1176,7 @@ pub fn if_none_match(header_value: &str, etag: &str) -> bool {
 mod tests {
     #![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
 
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use super::*;
 
@@ -948,6 +1197,16 @@ mod tests {
         last_epoch: Mutex<Option<u64>>,
         /// The most recent `set_rules_audit` call's digest + count, if any.
         rules_audit: Mutex<Option<(String, usize)>>,
+        /// The scheduled start (issue #128), `None` when unscheduled.
+        starts_at: Mutex<Option<u64>>,
+        starts_at_timezone: Mutex<Option<String>>,
+        /// Ordered log of every write to either store, so a test can assert
+        /// which one moved first rather than only that both did. Shared with
+        /// [`FakeSealSchedule`], which appends to the same log.
+        writes: Arc<Mutex<Vec<&'static str>>>,
+        /// When set, the `DynamoDB` write of the start time fails, standing in
+        /// for a crash between the two stores.
+        starts_at_write_fails: bool,
         missing: bool,
         /// When set, the next guarded write reports a lost race.
         conflict: bool,
@@ -961,6 +1220,10 @@ mod tests {
                 message: Mutex::new(None),
                 control: Mutex::new(StoredControl::Open),
                 fail_open_until: Mutex::new(0),
+                starts_at: Mutex::new(None),
+                starts_at_timezone: Mutex::new(None),
+                writes: Arc::new(Mutex::new(Vec::new())),
+                starts_at_write_fails: false,
                 control_action: Mutex::new(None),
                 last_action: Mutex::new(None),
                 last_action_by: Mutex::new(None),
@@ -976,6 +1239,48 @@ mod tests {
     /// An in-memory [`EdgeConfigStore`], mirroring the `KeyValueStore`'s
     /// read-modify-write shape closely enough to exercise the write ordering
     /// `apply_fail_open`/`apply_recover` depend on.
+    /// A [`SealSchedule`] that records what it was told, sharing the store's
+    /// write log so a test can assert which of the two moved first.
+    struct FakeSealSchedule {
+        armed: Mutex<Option<(String, String)>>,
+        writes: Arc<Mutex<Vec<&'static str>>>,
+        fails: bool,
+    }
+
+    impl FakeSealSchedule {
+        fn new(writes: Arc<Mutex<Vec<&'static str>>>) -> Self {
+            Self {
+                armed: Mutex::new(None),
+                writes,
+                fails: false,
+            }
+        }
+
+        fn failing(writes: Arc<Mutex<Vec<&'static str>>>) -> Self {
+            Self {
+                armed: Mutex::new(None),
+                writes,
+                fails: true,
+            }
+        }
+    }
+
+    impl SealSchedule for FakeSealSchedule {
+        fn set_start_time(
+            &self,
+            at: Option<(&str, &str)>,
+        ) -> impl Future<Output = Result<(), ScheduleError>> + Send {
+            self.writes.lock().unwrap().push("schedule");
+            let result = if self.fails {
+                Err(ScheduleError("update_schedule failed".to_owned()))
+            } else {
+                *self.armed.lock().unwrap() = at.map(|(a, tz)| (a.to_owned(), tz.to_owned()));
+                Ok(())
+            };
+            std::future::ready(result)
+        }
+    }
+
     struct FakeEdgeStore {
         cfg: Mutex<GateConfig>,
         writes: Mutex<Vec<u64>>,
@@ -1066,6 +1371,8 @@ mod tests {
                     last_action_by: self.last_action_by.lock().unwrap().clone(),
                     last_action_at: self.last_action_at.lock().unwrap().clone(),
                     last_action_epoch_ms: *self.last_epoch.lock().unwrap(),
+                    starts_at: *self.starts_at.lock().unwrap(),
+                    starts_at_timezone: self.starts_at_timezone.lock().unwrap().clone(),
                 }))
             };
             std::future::ready(result)
@@ -1118,6 +1425,26 @@ mod tests {
             *self.message.lock().unwrap() = Some(message.to_owned());
             self.stamp_audit(AdminAction::SetMessage, actor, now_ms);
             std::future::ready(Ok(()))
+        }
+
+        fn set_starts_at(
+            &self,
+            _event_id: &str,
+            starts_at: Option<(u64, &str)>,
+            action: AdminAction,
+            actor: &str,
+            now_ms: u64,
+        ) -> impl Future<Output = Result<(), StoreError>> + Send {
+            self.writes.lock().unwrap().push("dynamo");
+            let result = if self.starts_at_write_fails {
+                Err(StoreError::Backend("starts_at write failed".to_owned()))
+            } else {
+                *self.starts_at.lock().unwrap() = starts_at.map(|(secs, _)| secs);
+                *self.starts_at_timezone.lock().unwrap() = starts_at.map(|(_, tz)| tz.to_owned());
+                self.stamp_audit(action, actor, now_ms);
+                Ok(())
+            };
+            std::future::ready(result)
         }
 
         fn set_stored_control(
@@ -1239,6 +1566,277 @@ mod tests {
         assert_eq!(next_phases(Maintenance), vec![Active, Idle]);
         assert!(transition_allowed(Maintenance, Active));
         assert!(transition_allowed(Maintenance, Idle));
+    }
+
+    // --- start time (issue #128) ---------------------------------------------
+
+    /// Well past any `now` the tests use, so a valid time is never rejected
+    /// for being in the past.
+    const FUTURE: &str = "2030-06-15T10:00";
+
+    fn start_time_fixture() -> (FakeStore, FakeSealSchedule) {
+        let store = FakeStore::default();
+        let schedule = FakeSealSchedule::new(Arc::clone(&store.writes));
+        (store, schedule)
+    }
+
+    #[test]
+    fn a_start_time_is_read_in_the_operators_zone_not_utc() {
+        // 10:00 in New York on a summer date is 14:00 UTC. Reading the field as
+        // UTC would open the event four hours early.
+        let start = parse_start_time("2030-06-15T10:00", "America/New_York", 0).unwrap();
+        let utc = parse_start_time("2030-06-15T14:00", "UTC", 0).unwrap();
+        assert_eq!(start.epoch_secs, utc.epoch_secs);
+        // The expression keeps the operator's wall clock; the zone travels
+        // beside it, so the schedule fires at 10:00 local whatever the offset
+        // is by then.
+        assert_eq!(start.expression, "2030-06-15T10:00:00");
+        assert_eq!(start.timezone, "America/New_York");
+    }
+
+    #[test]
+    fn the_same_wall_clock_is_a_different_instant_across_a_dst_boundary() {
+        // The point of storing a zone rather than an offset: 10:00 New York is
+        // UTC-4 in June and UTC-5 in January, so a fixed offset chosen at
+        // scheduling time would be an hour wrong on one side of the change.
+        let summer = parse_start_time("2030-06-15T10:00", "America/New_York", 0).unwrap();
+        let winter = parse_start_time("2030-01-15T10:00", "America/New_York", 0).unwrap();
+        let summer_utc = parse_start_time("2030-06-15T14:00", "UTC", 0).unwrap();
+        let winter_utc = parse_start_time("2030-01-15T15:00", "UTC", 0).unwrap();
+        assert_eq!(summer.epoch_secs, summer_utc.epoch_secs);
+        assert_eq!(winter.epoch_secs, winter_utc.epoch_secs);
+    }
+
+    #[test]
+    fn a_wall_clock_time_that_does_not_exist_is_rejected() {
+        // 02:30 never happens in New York on the spring-forward date; an
+        // operator told it is scheduled should be told otherwise instead.
+        assert_eq!(
+            parse_start_time("2030-03-10T02:30", "America/New_York", 0),
+            Err(ActionError::InvalidStartTime)
+        );
+    }
+
+    #[test]
+    fn start_time_rejects_bad_shapes_and_zones() {
+        for bad in [
+            "2030-06-15",
+            "2030-06-15T10:00:00Z",
+            "2030-06-15T10:00:00+01:00",
+            "2030-06-15T10:00:00.5",
+            "not-a-time",
+            "",
+        ] {
+            assert!(parse_start_time(bad, "UTC", 0).is_err(), "accepted {bad:?}");
+        }
+        assert_eq!(
+            parse_start_time(FUTURE, "Mars/Olympus_Mons", 0),
+            Err(ActionError::UnknownTimezone)
+        );
+    }
+
+    #[test]
+    fn a_start_time_in_the_past_is_rejected_rather_than_clamped() {
+        let start = parse_start_time(FUTURE, "UTC", 0).unwrap();
+        assert_eq!(
+            parse_start_time(FUTURE, "UTC", start.epoch_secs),
+            Err(ActionError::StartTimeInPast)
+        );
+    }
+
+    #[test]
+    fn start_time_round_trips_through_the_form_value() {
+        for tz in ["UTC", "America/New_York", "Australia/Sydney"] {
+            let start = parse_start_time(FUTURE, tz, 0).unwrap();
+            assert_eq!(
+                format_start_time(start.epoch_secs, tz).as_deref(),
+                Some(FUTURE),
+                "{tz} did not round trip"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn setting_a_start_time_arms_the_schedule_before_announcing_it() {
+        // The schedule may be armed without an announcement; an announcement
+        // must never outlive its schedule. A crash between the two writes
+        // therefore leaves a seal that still fires with no countdown shown,
+        // which is how the system behaved before start times existed.
+        let (store, schedule) = start_time_fixture();
+        apply_start_time(
+            &store,
+            &schedule,
+            "evt",
+            FUTURE,
+            "UTC",
+            "op@example.com",
+            1000,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(*store.writes.lock().unwrap(), vec!["schedule", "dynamo"]);
+        assert_eq!(
+            *schedule.armed.lock().unwrap(),
+            Some(("2030-06-15T10:00:00".to_owned(), "UTC".to_owned()))
+        );
+        assert!(store.starts_at.lock().unwrap().is_some());
+        assert_eq!(
+            store.last_action.lock().unwrap().as_deref(),
+            Some("set_start_time")
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_a_start_time_withdraws_the_announcement_first() {
+        let (store, schedule) = start_time_fixture();
+        apply_start_time(
+            &store,
+            &schedule,
+            "evt",
+            FUTURE,
+            "UTC",
+            "op@example.com",
+            1000,
+        )
+        .await
+        .unwrap();
+        store.writes.lock().unwrap().clear();
+
+        apply_start_time(&store, &schedule, "evt", "", "UTC", "op@example.com", 9999)
+            .await
+            .unwrap();
+
+        assert_eq!(*store.writes.lock().unwrap(), vec!["dynamo", "schedule"]);
+        // Disabled, not deleted — and the port has no delete to call.
+        assert!(schedule.armed.lock().unwrap().is_none());
+        assert!(store.starts_at.lock().unwrap().is_none());
+        assert!(store.starts_at_timezone.lock().unwrap().is_none());
+        assert_eq!(
+            store.last_action.lock().unwrap().as_deref(),
+            Some("clear_start_time")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_start_time_touches_neither_store() {
+        for (at, tz) in [("nonsense", "UTC"), (FUTURE, "Nowhere/Anywhere")] {
+            let (store, schedule) = start_time_fixture();
+            assert!(
+                apply_start_time(&store, &schedule, "evt", at, tz, "op@example.com", 1000)
+                    .await
+                    .is_err()
+            );
+            assert!(store.writes.lock().unwrap().is_empty());
+            assert!(schedule.armed.lock().unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_announcement_leaves_the_schedule_armed_and_reports_it() {
+        // The residue of a half-applied set: armed but unannounced. The
+        // operator sees the error and retries; nobody is counting down to a
+        // moment that will not arrive.
+        let store = FakeStore {
+            starts_at_write_fails: true,
+            ..FakeStore::default()
+        };
+        let schedule = FakeSealSchedule::new(Arc::clone(&store.writes));
+
+        assert!(
+            apply_start_time(
+                &store,
+                &schedule,
+                "evt",
+                FUTURE,
+                "UTC",
+                "op@example.com",
+                1000
+            )
+            .await
+            .is_err()
+        );
+        assert!(schedule.armed.lock().unwrap().is_some());
+        assert!(store.starts_at.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_failed_schedule_write_does_not_announce_a_start() {
+        let store = FakeStore::default();
+        let schedule = FakeSealSchedule::failing(Arc::clone(&store.writes));
+
+        assert!(
+            apply_start_time(
+                &store,
+                &schedule,
+                "evt",
+                FUTURE,
+                "UTC",
+                "op@example.com",
+                1000
+            )
+            .await
+            .is_err()
+        );
+        assert!(store.starts_at.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_double_submitted_start_time_is_rejected_before_the_schedule_moves() {
+        // The debounce is evaluated here rather than left to the store's own
+        // guard: a rejection after the schedule had already moved would leave
+        // the two describing different times for the rest of the window.
+        let (store, schedule) = start_time_fixture();
+        apply_start_time(
+            &store,
+            &schedule,
+            "evt",
+            FUTURE,
+            "UTC",
+            "op@example.com",
+            1000,
+        )
+        .await
+        .unwrap();
+        let armed = schedule.armed.lock().unwrap().clone();
+        store.writes.lock().unwrap().clear();
+
+        let err = apply_start_time(
+            &store,
+            &schedule,
+            "evt",
+            "2030-07-20T09:00",
+            "UTC",
+            "op@example.com",
+            1500,
+        )
+        .await;
+        assert!(matches!(err, Err(ApplyError::Action(ActionError::TooFast))));
+        assert!(store.writes.lock().unwrap().is_empty());
+        assert_eq!(*schedule.armed.lock().unwrap(), armed);
+    }
+
+    #[tokio::test]
+    async fn a_start_time_for_a_missing_event_is_not_found() {
+        let store = FakeStore {
+            missing: true,
+            ..FakeStore::default()
+        };
+        let schedule = FakeSealSchedule::new(Arc::clone(&store.writes));
+        assert!(matches!(
+            apply_start_time(
+                &store,
+                &schedule,
+                "evt",
+                FUTURE,
+                "UTC",
+                "op@example.com",
+                1000
+            )
+            .await,
+            Err(ApplyError::Action(ActionError::NotFound))
+        ));
+        assert!(store.writes.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

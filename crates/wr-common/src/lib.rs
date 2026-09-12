@@ -20,6 +20,7 @@ pub mod permutation;
 pub mod rules;
 
 pub use crypto::{AdmissionToken, Session, SigningKey, VerifyError};
+pub use expr::{STARTS_AT_ATTR, STARTS_AT_TZ_ATTR};
 pub use ids::{
     AdmissionControl, EventId, IllegalControl, Phase, RequestId, ServingState, StoredControl,
     UnknownControl, UnknownPhase, resolve, serving_state,

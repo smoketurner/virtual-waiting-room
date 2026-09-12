@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use aws_sdk_dynamodb::types::AttributeValue;
 use serde::{Deserialize, Serialize};
 
+use crate::expr::STARTS_AT_ATTR;
 use crate::ids::{Phase, StoredControl};
 use crate::permutation::{Assignment, SHARDS, SealedOffsets, Seed};
 
@@ -97,6 +98,18 @@ pub struct Counters {
     /// Self-expiring by construction, so a control plane that engages it and
     /// then dies cannot leave the deployment open indefinitely.
     pub fail_open_until: u64,
+    /// The scheduled event start, epoch seconds; absent when no start time is
+    /// set. Written by the admin, which arms the `EventBridge` schedule in the
+    /// same action: the schedule is what fires the seal, this is what the
+    /// waiting page counts down to.
+    ///
+    /// Absent rather than `0`, unlike `fail_open_until`: there, a zero and a
+    /// past deadline both mean "not in force" and callers treat them
+    /// identically. Here they do not — a visitor arriving before an unscheduled
+    /// event must be told the event is not open, while one arriving after a
+    /// scheduled start has passed must be told it is opening, so collapsing the
+    /// two would erase a distinction the read path needs.
+    pub starts_at: Option<u64>,
 }
 
 /// The sealed pre-queue index space and permutation seed, once the seal has
@@ -221,6 +234,7 @@ impl Counters {
                 // "fail_open" string): normal admission (safe default).
                 .unwrap_or_default(),
             fail_open_until: num("fail_open_until").unwrap_or(0),
+            starts_at: num(STARTS_AT_ATTR),
         }
     }
 }
@@ -325,6 +339,7 @@ mod tests {
             target_rate: None,
             stored_control: StoredControl::Open,
             fail_open_until: 0,
+            starts_at: None,
         }
     }
 
@@ -371,6 +386,38 @@ mod tests {
         assert!(counters.target_rate.is_none());
         assert_eq!(counters.stored_control, StoredControl::Open);
         assert_eq!(counters.fail_open_until, 0);
+        // Absent, not zero: the waiting page tells "no start time set" from "a
+        // start time that has passed", and a defaulted 0 would read as the
+        // latter for every event that was never scheduled.
+        assert!(counters.starts_at.is_none());
+    }
+
+    #[test]
+    fn from_item_reads_the_scheduled_start() {
+        let mut item = HashMap::new();
+        item.insert(
+            STARTS_AT_ATTR.to_owned(),
+            AttributeValue::N("1800000000".to_owned()),
+        );
+        assert_eq!(
+            Counters::from_item("evt-1", &item).starts_at,
+            Some(1_800_000_000)
+        );
+    }
+
+    #[test]
+    fn from_item_treats_an_unparsable_start_as_unscheduled() {
+        // A clear removes the attribute, but a hand-edited or half-migrated row
+        // must not resolve to an epoch nobody wrote.
+        for bad in [
+            AttributeValue::N("not-a-number".to_owned()),
+            AttributeValue::S("1800000000".to_owned()),
+            AttributeValue::N("-1".to_owned()),
+        ] {
+            let mut item = HashMap::new();
+            item.insert(STARTS_AT_ATTR.to_owned(), bad);
+            assert!(Counters::from_item("evt-1", &item).starts_at.is_none());
+        }
     }
 
     #[test]

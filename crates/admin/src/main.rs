@@ -15,12 +15,13 @@ use std::sync::Arc;
 use admin::dynamo::DynamoStore;
 use admin::edge::KvsStore;
 use admin::oidc::{self, OidcClient, OidcConfig};
+use admin::scheduler::SchedulerStore;
 use admin::sessions::{AdminSession, PendingLogin, SessionStore};
 use admin::templates::Dashboard;
 use admin::{
     ApplyError, EdgeConfigStore, apply_fail_open, apply_message, apply_pause, apply_phase,
-    apply_rate, apply_recover, apply_reset, apply_resume, apply_set_rules, format_rules,
-    parse_rules,
+    apply_rate, apply_recover, apply_reset, apply_resume, apply_set_rules, apply_start_time,
+    format_rules, parse_rules,
 };
 use askama::Template;
 use axum::Form;
@@ -55,6 +56,9 @@ struct StaticAssets;
 struct AppState {
     store: DynamoStore,
     edge: KvsStore,
+    /// The one-time seal schedule the operator's start time writes (issue
+    /// #128).
+    schedule: SchedulerStore,
     sessions: SessionStore,
     oidc: OidcClient,
     http: reqwest::Client,
@@ -109,10 +113,12 @@ async fn main() -> Result<(), Error> {
     .map_err(|e| Error::from(e.to_string()))?;
 
     let kvs = aws_sdk_cloudfrontkeyvaluestore::Client::new(&config);
+    let scheduler = aws_sdk_scheduler::Client::new(&config);
 
     let state = Arc::new(AppState {
         store: DynamoStore::new(dynamo.clone(), std::env::var("COUNTERS_TABLE")?),
         edge: KvsStore::new(kvs, std::env::var("EDGE_KVS_ARN")?),
+        schedule: SchedulerStore::new(scheduler, std::env::var("SEAL_SCHEDULE_NAME")?),
         sessions: SessionStore::new(dynamo, std::env::var("TOKENS_TABLE")?),
         oidc,
         http,
@@ -136,6 +142,7 @@ async fn main() -> Result<(), Error> {
         .route("/admin/phase", post(set_phase))
         .route("/admin/rate", post(set_rate))
         .route("/admin/message", post(set_message))
+        .route("/admin/start_time", post(set_start_time))
         .route("/admin/reset", post(reset))
         .route("/admin/pause", post(pause))
         .route("/admin/resume", post(resume))
@@ -472,6 +479,39 @@ async fn set_message(
             &state.store,
             &state.event_id,
             &form.message,
+            &session.email,
+            now_ms(),
+        )
+        .await,
+    )
+}
+
+/// The start-time form (issue #128). Both fields are plain form values, so the
+/// control works with JavaScript disabled; `starts_at` empty clears the
+/// schedule. The timezone is submitted rather than inferred because a plain
+/// POST carries no browser zone, and validated server-side because its value
+/// is whatever the client sent, not necessarily one the dropdown offered.
+#[derive(Deserialize)]
+struct StartTimeForm {
+    starts_at: String,
+    timezone: String,
+}
+
+async fn set_start_time(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Form(form): Form<StartTimeForm>,
+) -> Response {
+    let Some(session) = authed(&state, &headers).await else {
+        return Redirect::to("/admin/login").into_response();
+    };
+    finish(
+        apply_start_time(
+            &state.store,
+            &state.schedule,
+            &state.event_id,
+            &form.starts_at,
+            &form.timezone,
             &session.email,
             now_ms(),
         )

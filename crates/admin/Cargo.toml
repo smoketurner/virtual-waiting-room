@@ -21,11 +21,13 @@ aws-config = { workspace = true, features = ["behavior-version-latest", "default
 aws-lc-rs = { workspace = true, features = ["aws-lc-sys"] }
 aws-sdk-cloudfrontkeyvaluestore = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio", "sigv4a"] }
 aws-sdk-dynamodb = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+aws-sdk-scheduler = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 aws-sdk-ssm = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 aws-smithy-types = { workspace = true }
 axum = { workspace = true, features = ["http1", "query", "form", "json", "tokio"] }
 base64 = { workspace = true, features = ["alloc"] }
 cookie = { workspace = true }
+jiff = { workspace = true, features = ["std", "tzdb-bundle-always"] }
 jsonwebtoken = { workspace = true, features = ["aws_lc_rs"] }
 lambda_http = { workspace = true, features = ["apigw_rest"] }
 mime_guess = { workspace = true }
