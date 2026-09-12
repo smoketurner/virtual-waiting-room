@@ -111,9 +111,9 @@ impl Store for DynamoStore {
         }
         .build();
         request = request
-            .condition_expression(guard.expression)
-            .set_expression_attribute_names(Some(guard.names))
-            .set_expression_attribute_values(Some(guard.values));
+            .condition_expression(guard.expression.clone())
+            .set_expression_attribute_names(guard.names_or_none())
+            .set_expression_attribute_values(guard.values_or_none());
 
         match request.send().await {
             Ok(_) => Ok(WriteOutcome::Written),
@@ -207,8 +207,8 @@ impl Store for DynamoStore {
             .put_item()
             .table_name(&self.prequeue_table)
             .set_item(Some(attrs))
-            .condition_expression(guard.expression)
-            .set_expression_attribute_names(Some(guard.names))
+            .condition_expression(guard.expression.clone())
+            .set_expression_attribute_names(guard.names_or_none())
             .send()
             .await;
 
