@@ -92,7 +92,7 @@ distribution-wide association would bill every `/status` poll from every waiter.
 locally, reading its whole configuration and the HMAC signing secret from one CloudFront
 KeyValueStore (`infra/modules/edge/functions/gate.js.tftpl`): no rule matches → pass through
 (dormancy, #60); a valid session cookie → pass through; otherwise refuse with a reason (#73), a
-302 to the waiting page for navigation and 403 JSON for XHR (#72). This replaces ADR-0020's
+302 to the waiting page for navigation and 403 JSON for XHR (#72). This replaces the earlier
 trusted-key-group gate, which could verify a signature but not decide, closing #58's mechanism,
 #60, #64, #66, #72 and #73. `event_id` and the session cookie name are templated into the
 function's own source rather than carried in the KeyValueStore value, so Terraform stays their
@@ -170,7 +170,7 @@ The event's own item is `EVT#{event_id}`. Every key is built by `wr_common::expr
 the call site, and `event_id` may not contain `#` — the separator would let one event's shard
 key collide with another event's item. The write
 ceiling is 1,000/s per partition key, so striping across attribute names on one item would
-share a single budget and distribute nothing (ADR-0015 amendment). Attribute names are billed
+share a single budget and distribute nothing (ADR-0015). Attribute names are billed
 on every write too, which is why the shard attribute is one letter.
 
 ### Infrastructure

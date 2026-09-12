@@ -102,13 +102,12 @@ authorizer without a call to the waiting-room backend.
                                             see below)
 ```
 
-A CloudFront Function (ADR-0021, issue #71) replaced the earlier trusted-key-group gate
-(ADR-0020, superseded): it reads its whole configuration and the signing secret from one
+A CloudFront Function (ADR-0021, issue #71) replaced the earlier trusted-key-group gate: it reads its whole configuration and the signing secret from one
 CloudFront KeyValueStore, so it decides locally instead of only verifying a signature. Still no
 compute in the *origin* request path — the function runs at the edge in sub-millisecond time,
 never calling the origin or any backend.
 
-**The alternative gate** (ADR-0011, ADR-0020 §5.1's authorizer half). For an origin the operator
+**The alternative gate** (ADR-0011, ADR-0021 §5.1). For an origin the operator
 controls and wants per-request rules on — header, cookie, user agent — `modules/authorizer` runs
 a Rust Lambda at that origin instead: session cookie → admission token → protection-rule match →
 302, deciding locally with no backend call. It shares `wr_common::rules::ProtectionRule` with the
@@ -448,7 +447,7 @@ skipped number.
 The two striped counters — the pre-queue registration index and the arrivals count — are
 **not** attributes on this item. Each shard is its own item in the same table, keyed
 `EVT#{event_id}#PQ#{shard}` and `EVT#{event_id}#AR#{shard}` respectively, holding one attribute
-`n` (ADR-0015 Amendment). Striping across attribute names on one item would put all ten shards
+`n` (ADR-0015). Striping across attribute names on one item would put all ten shards
 back under that item's single 1,000-write/s ceiling and distribute nothing.
 
 **`PreQueue`** — partition key `r`. Attributes `s` (shard), `l` (local index), `t`. Short

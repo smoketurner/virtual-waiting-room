@@ -90,7 +90,7 @@ resource "aws_cloudfront_origin_request_policy" "protected" {
 # KeyValueStore (gate_kvs_arn) — no compute in the request path beyond the
 # function's own sub-millisecond budget, and it works against an origin we
 # cannot run code in. Replaces the CloudFront trusted-key-group gate
-# (ADR-0020, retired) with a decision point that can express #58's mechanism,
+# (retired) with a decision point that can express #58's mechanism,
 # #60's dormancy, #66's rules, and #72/#73's refusal shaping.
 resource "aws_cloudfront_function" "gate" {
   name    = "${var.name_prefix}-gate"
