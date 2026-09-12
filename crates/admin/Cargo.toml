@@ -23,7 +23,6 @@ aws-sdk-cloudfrontkeyvaluestore = { workspace = true, features = ["behavior-vers
 aws-sdk-dynamodb = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 aws-sdk-scheduler = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 aws-sdk-ssm = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
-aws-smithy-types = { workspace = true }
 axum = { workspace = true, features = ["http1", "query", "form", "json", "tokio"] }
 base64 = { workspace = true, features = ["alloc"] }
 cookie = { workspace = true }

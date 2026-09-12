@@ -664,9 +664,17 @@ pub async fn apply_reset<S: Store>(
 }
 
 /// Returns `Err(TooFast)` if the last mutation is within the debounce window.
+///
+/// A stamp later than `now_ms` describes no prior action, so it is not treated
+/// as one: the window is measured only when the subtraction is real. Saturating
+/// it instead would read every such stamp as "0 ms ago" and reject every
+/// operator action from then on, and there is no action that clears it — a
+/// stamp in the future stays in the future.
 fn debounce_check(state: &ControlState, now_ms: u64) -> Result<(), ActionError> {
-    if let Some(last) = state.last_action_epoch_ms
-        && now_ms.saturating_sub(last) < DEBOUNCE_MS
+    if let Some(elapsed) = state
+        .last_action_epoch_ms
+        .and_then(|last| now_ms.checked_sub(last))
+        && elapsed < DEBOUNCE_MS
     {
         return Err(ActionError::TooFast);
     }
@@ -2207,6 +2215,30 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn a_stamp_from_the_future_does_not_lock_the_control_plane() {
+        // A stamp later than now cannot describe a prior action, so it does
+        // not hold the debounce window open. Reading it as "0 ms ago" would
+        // refuse every rate, message, pause, resume, rules and start-time
+        // change for good, because nothing an operator can do moves the stamp
+        // back into the past.
+        let store = FakeStore::with_phase(Phase::Active);
+        apply_rate(&store, "evt", "500", "op@x", u64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(*store.last_epoch.lock().unwrap(), Some(u64::MAX));
+
+        apply_rate(&store, "evt", "600", "op@x", 1000)
+            .await
+            .unwrap();
+        assert_eq!(*store.rate.lock().unwrap(), Some(600));
+        // And the debounce itself still works from the recovered stamp.
+        assert!(matches!(
+            apply_rate(&store, "evt", "700", "op@x", 1100).await,
+            Err(ApplyError::Action(ActionError::TooFast))
+        ));
     }
 
     #[tokio::test]

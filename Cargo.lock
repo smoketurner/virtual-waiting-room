@@ -14,7 +14,6 @@ dependencies = [
  "aws-sdk-dynamodb",
  "aws-sdk-scheduler",
  "aws-sdk-ssm",
- "aws-smithy-types",
  "axum",
  "base64 0.23.1",
  "cookie",

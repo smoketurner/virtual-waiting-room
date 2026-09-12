@@ -364,7 +364,10 @@ async fn dashboard(State(state): State<Shared>, headers: HeaderMap) -> Response 
     let Some(session) = authed(&state, &headers).await else {
         return Redirect::to("/admin/login").into_response();
     };
-    match state.store_load(now_ms() / 1000).await {
+    let Some(now) = now_ms() else {
+        return server_error(CLOCK_UNREADABLE);
+    };
+    match state.store_load(now / 1000).await {
         Ok(Some(mut view)) => {
             view.csp_nonce = admin::security::nonce();
             view.operator_email = session.email;
@@ -402,7 +405,10 @@ async fn state_json(State(state): State<Shared>, headers: HeaderMap) -> Response
     if authed(&state, &headers).await.is_none() {
         return (StatusCode::UNAUTHORIZED, "not authenticated").into_response();
     }
-    match state.store_load(now_ms() / 1000).await {
+    let Some(now) = now_ms() else {
+        return server_error(CLOCK_UNREADABLE);
+    };
+    match state.store_load(now / 1000).await {
         Ok(Some(view)) => axum::Json(view).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, "event not found").into_response(),
         Err(e) => server_error(&e),
@@ -422,13 +428,16 @@ async fn set_phase(
     let Some(session) = authed(&state, &headers).await else {
         return Redirect::to("/admin/login").into_response();
     };
+    let Some(now) = now_ms() else {
+        return server_error(CLOCK_UNREADABLE);
+    };
     finish(
         apply_phase(
             &state.store,
             &state.event_id,
             &form.phase,
             &session.email,
-            now_ms(),
+            now,
         )
         .await
         .map(|_| ()),
@@ -448,13 +457,16 @@ async fn set_rate(
     let Some(session) = authed(&state, &headers).await else {
         return Redirect::to("/admin/login").into_response();
     };
+    let Some(now) = now_ms() else {
+        return server_error(CLOCK_UNREADABLE);
+    };
     finish(
         apply_rate(
             &state.store,
             &state.event_id,
             &form.rate,
             &session.email,
-            now_ms(),
+            now,
         )
         .await
         .map(|_| ()),
@@ -474,13 +486,16 @@ async fn set_message(
     let Some(session) = authed(&state, &headers).await else {
         return Redirect::to("/admin/login").into_response();
     };
+    let Some(now) = now_ms() else {
+        return server_error(CLOCK_UNREADABLE);
+    };
     finish(
         apply_message(
             &state.store,
             &state.event_id,
             &form.message,
             &session.email,
-            now_ms(),
+            now,
         )
         .await,
     )
@@ -505,6 +520,9 @@ async fn set_start_time(
     let Some(session) = authed(&state, &headers).await else {
         return Redirect::to("/admin/login").into_response();
     };
+    let Some(now) = now_ms() else {
+        return server_error(CLOCK_UNREADABLE);
+    };
     finish(
         apply_start_time(
             &state.store,
@@ -513,7 +531,7 @@ async fn set_start_time(
             &form.starts_at,
             &form.timezone,
             &session.email,
-            now_ms(),
+            now,
         )
         .await,
     )
@@ -523,7 +541,10 @@ async fn reset(State(state): State<Shared>, headers: HeaderMap) -> Response {
     let Some(session) = authed(&state, &headers).await else {
         return Redirect::to("/admin/login").into_response();
     };
-    finish(apply_reset(&state.store, &state.event_id, &session.email, now_ms()).await)
+    let Some(now) = now_ms() else {
+        return server_error(CLOCK_UNREADABLE);
+    };
+    finish(apply_reset(&state.store, &state.event_id, &session.email, now).await)
 }
 
 /// Holds admission while the queue keeps forming. Reversible, no confirmation.
@@ -531,7 +552,10 @@ async fn pause(State(state): State<Shared>, headers: HeaderMap) -> Response {
     let Some(session) = authed(&state, &headers).await else {
         return Redirect::to("/admin/login").into_response();
     };
-    finish(apply_pause(&state.store, &state.event_id, &session.email, now_ms()).await)
+    let Some(now) = now_ms() else {
+        return server_error(CLOCK_UNREADABLE);
+    };
+    finish(apply_pause(&state.store, &state.event_id, &session.email, now).await)
 }
 
 /// Resume admission after a pause.
@@ -539,7 +563,10 @@ async fn resume(State(state): State<Shared>, headers: HeaderMap) -> Response {
     let Some(session) = authed(&state, &headers).await else {
         return Redirect::to("/admin/login").into_response();
     };
-    finish(apply_resume(&state.store, &state.event_id, &session.email, now_ms()).await)
+    let Some(now) = now_ms() else {
+        return server_error(CLOCK_UNREADABLE);
+    };
+    finish(apply_resume(&state.store, &state.event_id, &session.email, now).await)
 }
 
 #[derive(Deserialize)]
@@ -557,6 +584,9 @@ async fn fail_open(
     let Some(session) = authed(&state, &headers).await else {
         return Redirect::to("/admin/login").into_response();
     };
+    let Some(now) = now_ms() else {
+        return server_error(CLOCK_UNREADABLE);
+    };
     finish(
         apply_fail_open(
             &state.store,
@@ -564,7 +594,7 @@ async fn fail_open(
             &state.event_id,
             &form.minutes,
             &session.email,
-            now_ms(),
+            now,
         )
         .await,
     )
@@ -576,13 +606,16 @@ async fn recover(State(state): State<Shared>, headers: HeaderMap) -> Response {
     let Some(session) = authed(&state, &headers).await else {
         return Redirect::to("/admin/login").into_response();
     };
+    let Some(now) = now_ms() else {
+        return server_error(CLOCK_UNREADABLE);
+    };
     finish(
         apply_recover(
             &state.store,
             &state.edge,
             &state.event_id,
             &session.email,
-            now_ms(),
+            now,
         )
         .await,
     )
@@ -613,6 +646,9 @@ async fn set_rules(
         Ok(rules) => rules,
         Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
     };
+    let Some(now) = now_ms() else {
+        return server_error(CLOCK_UNREADABLE);
+    };
     finish(
         apply_set_rules(
             &state.store,
@@ -620,18 +656,25 @@ async fn set_rules(
             &state.event_id,
             rules,
             &session.email,
-            now_ms(),
+            now,
         )
         .await,
     )
 }
 
-/// Current epoch-millis for the audit stamp + debounce guard.
-fn now_ms() -> u64 {
-    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        Ok(d) => u64::try_from(d.as_millis()).unwrap_or(u64::MAX),
-        Err(_) => 0,
-    }
+/// Current epoch-millis for the audit stamp + debounce guard, or `None` if the
+/// clock cannot be read forward from the epoch.
+///
+/// `None` rather than a sentinel: this value is stamped onto the event as
+/// `last_action_epoch_ms` and every later debounced action is compared against
+/// it, so a made-up number is not a degraded reading — it is a wrong one that
+/// the control plane then believes. A saturated stamp sits in the future
+/// forever and rejects every subsequent change as too soon.
+fn now_ms() -> Option<u64> {
+    let since_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    u64::try_from(since_epoch.as_millis()).ok()
 }
 
 /// A route whose backing plane (authorizer / sessions) is not in the MVP.
@@ -731,6 +774,11 @@ fn finish(result: Result<(), ApplyError>) -> Response {
         Err(ApplyError::Store(e)) => server_error(&e.to_string()),
     }
 }
+
+/// Logged when [`now_ms`] cannot produce a timestamp. Every operator action
+/// stamps one and is guarded against the last one, so there is no action to
+/// take without a clock.
+const CLOCK_UNREADABLE: &str = "system clock is not readable";
 
 fn server_error(msg: &str) -> Response {
     tracing::error!(error = %msg, "admin handler error");
