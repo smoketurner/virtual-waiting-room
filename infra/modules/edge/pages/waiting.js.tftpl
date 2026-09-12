@@ -167,7 +167,7 @@
 
   function cookieGet(name) {
     try {
-      var parts = String(window.document.cookie || "").split(";");
+      var parts = String(document.cookie || "").split(";");
       for (var i = 0; i < parts.length; i++) {
         var part = parts[i].trim();
         if (part.slice(0, name.length + 1) === name + "=") {
@@ -182,7 +182,7 @@
 
   function cookieSet(name, value) {
     try {
-      window.document.cookie =
+      document.cookie =
         name +
         "=" +
         encodeURIComponent(value) +
@@ -237,7 +237,7 @@
       /* tier unavailable */
     }
     try {
-      window.document.cookie = key + "=;path=/;max-age=0;SameSite=Lax;Secure";
+      document.cookie = key + "=;path=/;max-age=0;SameSite=Lax;Secure";
     } catch (e) {
       /* tier unavailable */
     }

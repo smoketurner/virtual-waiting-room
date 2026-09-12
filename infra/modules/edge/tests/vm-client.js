@@ -44,28 +44,88 @@ function jsonResponse(status, body) {
  * advance it with `client.clock.now = ...` between calls — the script only
  * ever reads time through `Date.now()`, which this harness redirects to it.
  */
-function loadClient({ route, now, locationSearch }) {
+function loadClient({
+  route,
+  now,
+  locationSearch,
+  locationHash,
+  cookie,
+  // Which storage tiers throw. "local" and "session" mimic private browsing
+  // and blocked site data; "cookie" mimics a document.cookie that silently
+  // refuses to persist, which is what a Secure cookie on a non-HTTPS origin
+  // does. Passing all three leaves only the in-memory tier, which is the case
+  // the conditional fragment strip exists for.
+  storageFails,
+}) {
   const clock = { now: now || 1_700_000_000_000 };
   const calls = [];
   const timers = [];
   let nextTimerId = 1;
   const elements = {};
   const listeners = {};
+  const fails = new Set(storageFails || []);
 
-  const storageOf = () => {
+  const storageOf = (name) => {
     const store = new Map();
+    const guard = () => {
+      if (fails.has(name)) {
+        throw new Error(`${name}Storage unavailable`);
+      }
+    };
     return {
-      getItem: (k) => (store.has(k) ? store.get(k) : null),
-      setItem: (k, v) => store.set(k, String(v)),
-      removeItem: (k) => store.delete(k),
+      getItem: (k) => {
+        guard();
+        return store.has(k) ? store.get(k) : null;
+      },
+      setItem: (k, v) => {
+        guard();
+        store.set(k, String(v));
+      },
+      removeItem: (k) => {
+        guard();
+        store.delete(k);
+      },
     };
   };
 
+  // A document.cookie that behaves like the real one: assignment appends or
+  // replaces a single pair, reading returns the whole jar. When the cookie
+  // tier is failing, writes are silently dropped — which is exactly why
+  // storeDurable reads back rather than trusting that no exception was thrown.
+  const jar = new Map();
+  if (cookie) {
+    for (const pair of String(cookie).split(";")) {
+      const [k, ...rest] = pair.trim().split("=");
+      if (k) {
+        jar.set(k, rest.join("="));
+      }
+    }
+  }
+
   const win = {
-    localStorage: storageOf(),
-    sessionStorage: storageOf(),
+    localStorage: storageOf("local"),
+    sessionStorage: storageOf("session"),
+    atob: (b64) => Buffer.from(b64, "base64").toString("binary"),
+    crypto: {
+      getRandomValues: (a) => a.fill(7),
+      subtle: {
+        digest: async (algorithm, data) =>
+          require("node:crypto")
+            .createHash(String(algorithm).toLowerCase().replace("-", ""))
+            .update(Buffer.from(data))
+            .digest().buffer,
+      },
+    },
+    history: {
+      replaceState: (_state, _title, url) => {
+        win.history.replacedWith = url;
+        win.location.hash = "";
+      },
+    },
     location: {
       search: locationSearch || "",
+      hash: locationHash || "",
+      pathname: "/_wr/waiting.html",
       replace: (url) => { win.location.replacedTo = url; },
     },
     setTimeout: (fn, ms) => {
@@ -83,6 +143,24 @@ function loadClient({ route, now, locationSearch }) {
 
   const doc = {
     hidden: false,
+    get cookie() {
+      return [...jar.entries()].map(([k, v]) => `${k}=${v}`).join("; ");
+    },
+    set cookie(value) {
+      const [pair] = String(value).split(";");
+      const [k, ...rest] = pair.trim().split("=");
+      if (!k) {
+        return;
+      }
+      if (/max-age=0/i.test(value)) {
+        jar.delete(k);
+        return;
+      }
+      if (fails.has("cookie")) {
+        return;
+      }
+      jar.set(k, rest.join("="));
+    },
     getElementById: (id) => {
       const el = { id, textContent: "", hidden: false, className: "", style: {} };
       elements[id] = el;
@@ -92,6 +170,10 @@ function loadClient({ route, now, locationSearch }) {
       (listeners[type] = listeners[type] || []).push(fn);
     },
   };
+
+  // waiting.js reaches the DOM as a bare global, as a browser does; exposing it
+  // on window too means a `window.document.x` slip cannot silently no-op here.
+  win.document = doc;
 
   const fetchImpl = (url, opts) => {
     calls.push({ url: String(url), opts });
@@ -105,7 +187,9 @@ function loadClient({ route, now, locationSearch }) {
   const ctx = vm.createContext({
     window: win,
     document: doc,
-    crypto: { getRandomValues: (a) => a.fill(7) },
+    crypto: win.crypto,
+    TextEncoder,
+    TextDecoder,
     fetch: fetchImpl,
     // A real Date, but anchored to the test's clock: `Date.now()` and a bare
     // `new Date()` both read `clock.now`, so a timestamp the page renders is
@@ -155,4 +239,35 @@ function loadClient({ route, now, locationSearch }) {
   };
 }
 
-module.exports = { loadClient, jsonResponse };
+/** The request_id waiting.js derives for a ticket subject, computed independently. */
+function deriveRequestId(aud, sub) {
+  const message = Buffer.concat([
+    Buffer.from("vwr/rid/v1", "utf8"),
+    Buffer.from([0]),
+    Buffer.from(aud, "utf8"),
+    Buffer.from([0]),
+    Buffer.from(sub, "utf8"),
+  ]);
+  const bytes = require("node:crypto")
+    .createHash("sha256")
+    .update(message)
+    .digest()
+    .subarray(0, 16);
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = [...bytes].map((b) => b.toString(16).padStart(2, "0"));
+  return (
+    hex.slice(0, 4).join("") + "-" + hex.slice(4, 6).join("") + "-" +
+    hex.slice(6, 8).join("") + "-" + hex.slice(8, 10).join("") + "-" +
+    hex.slice(10, 16).join("")
+  );
+}
+
+/** An unsigned JWS-shaped ticket. waiting.js only decodes; it never verifies. */
+function ticket({ aud = "evt-1", sub = "c3ViamVjdC1vbmUtMjItY2hhcnMtbG9uZw", exp }) {
+  const b64 = (o) =>
+    Buffer.from(JSON.stringify(o)).toString("base64url");
+  return `${b64({ alg: "ES256" })}.${b64({ aud, sub, exp })}.c2ln`;
+}
+
+module.exports = { loadClient, jsonResponse, deriveRequestId, ticket };
