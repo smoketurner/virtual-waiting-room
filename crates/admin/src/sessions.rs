@@ -166,7 +166,7 @@ impl SessionStore {
         session: &AdminSession,
         now: ArrivalTime,
     ) -> Result<String, SessionError> {
-        let id = opaque_id()?;
+        let id = session_id(now)?;
         let expires = now.epoch_seconds().saturating_add(SESSION_TTL_SECS);
         self.client
             .put_item()
@@ -236,36 +236,35 @@ impl SessionStore {
     }
 }
 
-/// A random UUIDv4-shaped opaque id from the aws-lc-rs RNG (already in the tree
-/// via rustls). Avoids adding the `uuid` crate for one identifier.
+/// A `UUIDv7` session id: the arrival instant in the leading 48 bits and 74
+/// random bits below it — the same shape a visitor's `request_id` carries.
+///
+/// The timestamp is the request's own, not a fresh reading, so the id records
+/// when the login it belongs to arrived.
+///
+/// `uuid` lays out the fields; the randomness is drawn here from the aws-lc-rs
+/// RNG this deployment already uses everywhere else. `Uuid::new_v7` would draw
+/// its own from `getrandom` and panic if that failed, where the RNG failing is
+/// something this returns and the login reports.
 ///
 /// # Errors
 ///
-/// [`SessionError::Rng`] if the operating system RNG is unavailable. The id is
-/// the whole of the session credential, so there is no substitute to fall back
-/// to — anything derived from a clock or a counter would be guessable by
-/// whoever knows which substitute was used.
-fn opaque_id() -> Result<String, SessionError> {
+/// [`SessionError::Rng`] if the operating system RNG is unavailable. The
+/// random bits are the unguessable part of the credential and the timestamp is
+/// public knowledge, so there is nothing to fall back to: an id without
+/// randomness is one an attacker can produce for themselves.
+fn session_id(now: ArrivalTime) -> Result<String, SessionError> {
     use aws_lc_rs::rand::{SecureRandom, SystemRandom};
-    let mut bytes = [0u8; 16];
+
+    let mut random_bytes = [0u8; 10];
     SystemRandom::new()
-        .fill(&mut bytes)
+        .fill(&mut random_bytes)
         .map_err(|_| SessionError::Rng)?;
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    let mut h = String::with_capacity(32);
-    for b in bytes {
-        use std::fmt::Write;
-        let _ = write!(h, "{b:02x}");
-    }
-    Ok(format!(
-        "{}-{}-{}-{}-{}",
-        &h[0..8],
-        &h[8..12],
-        &h[12..16],
-        &h[16..20],
-        &h[20..32]
-    ))
+    Ok(
+        uuid::Builder::from_unix_timestamp_millis(now.epoch_millis(), &random_bytes)
+            .into_uuid()
+            .to_string(),
+    )
 }
 
 #[cfg(test)]
@@ -492,21 +491,49 @@ mod tests {
     // ---- Session ids ----
 
     #[test]
-    fn opaque_ids_are_uuid_shaped_and_never_repeat() {
-        let first = opaque_id().unwrap();
-        let second = opaque_id().unwrap();
-        assert_eq!(first.len(), 36);
+    fn a_session_id_is_a_uuidv7() {
+        let id = session_id(ArrivalTime::for_test_millis(1_700_000_000_000)).unwrap();
+        assert_eq!(id.len(), 36);
         assert_eq!(
-            first.split('-').map(str::len).collect::<Vec<_>>(),
+            id.split('-').map(str::len).collect::<Vec<_>>(),
             vec![8, 4, 4, 4, 12]
         );
-        assert!(first.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
-        // The two nibbles the shape fixes: version 4, RFC 4122 variant.
-        assert_eq!(&first[14..15], "4");
-        assert!(matches!(&first[19..20], "8" | "9" | "a" | "b"));
-        assert_ne!(
-            first, second,
-            "a session id is the whole credential; two draws must differ"
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
+        // The two nibbles the shape fixes: version 7, RFC 9562 variant. A
+        // visitor's request_id is validated against exactly these.
+        assert_eq!(&id[14..15], "7");
+        assert!(matches!(&id[19..20], "8" | "9" | "a" | "b"));
+    }
+
+    #[test]
+    fn a_session_id_carries_the_arrival_instant() {
+        // The leading 48 bits are the request's own millisecond, not a fresh
+        // reading, so the id records when the login that minted it arrived.
+        let at = ArrivalTime::for_test_millis(1_700_000_000_000);
+        let id = session_id(at).unwrap();
+        let leading: String = id.chars().filter(|c| *c != '-').take(12).collect();
+        assert_eq!(
+            u64::from_str_radix(&leading, 16).unwrap(),
+            at.epoch_millis()
+        );
+    }
+
+    #[test]
+    fn session_ids_from_one_instant_still_differ() {
+        // Two logins inside the same millisecond share every timestamp bit, so
+        // the 74 random bits are the whole of what makes the credential
+        // unguessable.
+        let at = ArrivalTime::for_test_millis(1_700_000_000_000);
+        assert_ne!(session_id(at).unwrap(), session_id(at).unwrap());
+    }
+
+    #[test]
+    fn session_ids_sort_by_the_instant_they_were_minted() {
+        let earlier = session_id(ArrivalTime::for_test_millis(1_700_000_000_000)).unwrap();
+        let later = session_id(ArrivalTime::for_test_millis(1_700_000_000_001)).unwrap();
+        assert!(
+            earlier < later,
+            "a UUIDv7 orders lexicographically by time: {earlier} then {later}"
         );
     }
 }

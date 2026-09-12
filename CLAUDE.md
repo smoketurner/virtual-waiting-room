@@ -210,9 +210,9 @@ most often:
 - **The admission path is `aws-lc-rs` only.** `ring` and `openssl` are banned outright
   (`deny.toml`); RustCrypto is a scoped, deliberate exception on two control-plane paths only
   (admin's OIDC login, admin's edge-gate KeyValueStore writer — `.kiro/steering/tech.md`), never
-  the paths that mint or verify a credential. This constrains dependency selection (see the
-  `openidconnect`/`reqwest`/`rustls` comments in `Cargo.toml`): a crate whose defaults pull in a
-  ring-backed provider must have defaults disabled.
+  the paths that mint or verify a credential. This constrains dependency selection — `openidconnect`,
+  `reqwest` and `rustls` are the ones it bites: a crate whose defaults pull in a ring-backed provider
+  must have defaults disabled. `Cargo.toml` carries no comments; the constraint lives here.
 - `allow_attributes = "deny"` means you cannot silently `#[allow]` a lint. Fix the cause.
   `unwrap_used`, `panic`, `todo`, `print_stdout` are denied workspace-wide.
 - Controller and permutation arithmetic must be checked or saturating — the release profile

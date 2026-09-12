@@ -42,6 +42,7 @@ tower = { workspace = true }
 tower-http = { workspace = true, features = ["normalize-path"] }
 tracing = { workspace = true, default-features = true }
 tracing-subscriber = { workspace = true, features = ["fmt", "env-filter", "json"] }
+uuid = { workspace = true }
 wr-common = { workspace = true }
 
 [lints]

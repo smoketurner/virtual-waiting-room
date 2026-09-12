@@ -26,9 +26,10 @@ use jiff::Timestamp;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArrivalTime {
     at: Timestamp,
-    /// The same instant in epoch seconds, converted once here where the
-    /// constructor has already established that it is not negative.
+    /// The same instant in epoch seconds and milliseconds, converted once in
+    /// the constructor where both are checked against the epoch.
     epoch_seconds: u64,
+    epoch_millis: u64,
 }
 
 impl ArrivalTime {
@@ -41,7 +42,12 @@ impl ArrivalTime {
     /// The request is refused instead.
     fn new(at: Timestamp) -> Option<Self> {
         let epoch_seconds = u64::try_from(at.as_second()).ok()?;
-        Some(Self { at, epoch_seconds })
+        let epoch_millis = u64::try_from(at.as_millisecond()).ok()?;
+        Some(Self {
+            at,
+            epoch_seconds,
+            epoch_millis,
+        })
     }
 
     /// The arrival instant, at full precision.
@@ -57,6 +63,13 @@ impl ArrivalTime {
     #[must_use]
     pub fn epoch_seconds(self) -> u64 {
         self.epoch_seconds
+    }
+
+    /// The arrival instant in epoch milliseconds, the unit a `UUIDv7` carries in
+    /// its leading 48 bits.
+    #[must_use]
+    pub fn epoch_millis(self) -> u64 {
+        self.epoch_millis
     }
 
     /// An arrival at a fixed instant, for tests that call an action directly
