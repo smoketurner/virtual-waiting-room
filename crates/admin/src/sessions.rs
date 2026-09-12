@@ -13,11 +13,12 @@
 //!   ~8 h. The cookie carries only the opaque `<id>`.
 
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::types::AttributeValue;
 use wr_common::expr::{TOKENS_TTL_ATTR, oidc_session_key, pkce_transaction_key};
+
+use crate::arrival::ArrivalTime;
 
 /// TTL for a pending login transaction (PKCE verifier + nonce).
 const PKCE_TTL_SECS: u64 = 600;
@@ -28,8 +29,12 @@ const SESSION_TTL_SECS: u64 = 8 * 60 * 60;
 pub enum SessionError {
     #[error("dynamodb: {0}")]
     Backend(String),
-    #[error("system clock before epoch")]
-    Clock,
+    /// The operating system RNG could not produce a session id. Refusing the
+    /// login is the only safe answer: a session id is a bearer credential, and
+    /// one drawn from anything predictable can be guessed by whoever knows the
+    /// fallback.
+    #[error("no randomness available for a session id")]
+    Rng,
 }
 
 /// A pending OIDC login transaction, keyed by the CSRF state token.
@@ -51,21 +56,12 @@ pub struct SessionStore {
     tokens_table: String,
 }
 
-fn now_secs() -> Result<u64, SessionError> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .map_err(|_| SessionError::Clock)
-}
-
 /// Decodes a consumed pending-login row from its `DynamoDB` attributes.
 ///
 /// Returns `None` when the row is absent, already past its
 /// [`TOKENS_TTL_ATTR`] deadline (`DynamoDB` TTL deletion is not instant, so the
 /// expiry is enforced on read), or missing the PKCE verifier / nonce. `now` is
-/// the current epoch
-/// second; a broken clock collapses it to the epoch so a clock failure never
-/// rejects a fresh login (mirroring `load_session`).
+/// the epoch second the request arrived at.
 ///
 /// This is the AWS-free pure half of `take_pending`: it takes exactly the
 /// shape `DeleteItem(AllOld)` returns so the expiry/parsing logic can be
@@ -106,16 +102,18 @@ impl SessionStore {
         }
     }
 
-    /// Persists a pending login keyed by the CSRF state, with a short TTL.
+    /// Persists a pending login keyed by the CSRF state, with a short TTL
+    /// measured from `now`.
     ///
     /// # Errors
-    /// Returns [`SessionError`] if the clock is invalid or the write fails.
+    /// Returns [`SessionError::Backend`] if the write fails.
     pub async fn put_pending(
         &self,
         state: &str,
         pending: &PendingLogin,
+        now: ArrivalTime,
     ) -> Result<(), SessionError> {
-        let expires = now_secs()? + PKCE_TTL_SECS;
+        let expires = now.epoch_seconds().saturating_add(PKCE_TTL_SECS);
         self.client
             .put_item()
             .table_name(&self.tokens_table)
@@ -139,8 +137,11 @@ impl SessionStore {
     ///
     /// # Errors
     /// Returns [`SessionError::Backend`] if the delete fails.
-    pub async fn take_pending(&self, state: &str) -> Result<Option<PendingLogin>, SessionError> {
-        let now = now_secs().unwrap_or_default();
+    pub async fn take_pending(
+        &self,
+        state: &str,
+        now: ArrivalTime,
+    ) -> Result<Option<PendingLogin>, SessionError> {
         let out = self
             .client
             .delete_item()
@@ -151,16 +152,22 @@ impl SessionStore {
             .await
             .map_err(|e| SessionError::Backend(format!("take_pending: {e}")))?;
 
-        Ok(pending_login_from(out.attributes(), now))
+        Ok(pending_login_from(out.attributes(), now.epoch_seconds()))
     }
 
-    /// Creates a session and returns its opaque id (for the cookie).
+    /// Creates a session expiring `SESSION_TTL_SECS` after `now`, and returns
+    /// its opaque id (for the cookie).
     ///
     /// # Errors
-    /// Returns [`SessionError`] if the clock is invalid or the write fails.
-    pub async fn create_session(&self, session: &AdminSession) -> Result<String, SessionError> {
-        let id = uuid_v4();
-        let expires = now_secs()? + SESSION_TTL_SECS;
+    /// Returns [`SessionError::Rng`] if no session id can be drawn, or
+    /// [`SessionError::Backend`] if the write fails.
+    pub async fn create_session(
+        &self,
+        session: &AdminSession,
+        now: ArrivalTime,
+    ) -> Result<String, SessionError> {
+        let id = opaque_id()?;
+        let expires = now.epoch_seconds().saturating_add(SESSION_TTL_SECS);
         self.client
             .put_item()
             .table_name(&self.tokens_table)
@@ -180,7 +187,11 @@ impl SessionStore {
     ///
     /// # Errors
     /// Returns [`SessionError::Backend`] if the read fails.
-    pub async fn load_session(&self, id: &str) -> Result<Option<AdminSession>, SessionError> {
+    pub async fn load_session(
+        &self,
+        id: &str,
+        now: ArrivalTime,
+    ) -> Result<Option<AdminSession>, SessionError> {
         let out = self
             .client
             .get_item()
@@ -197,7 +208,7 @@ impl SessionStore {
             .get(TOKENS_TTL_ATTR)
             .and_then(|v| v.as_n().ok())
             .and_then(|n| n.parse::<u64>().ok())
-            .is_some_and(|exp| now_secs().is_ok_and(|now| now >= exp));
+            .is_some_and(|exp| now.epoch_seconds() >= exp);
         if expired {
             return Ok(None);
         }
@@ -227,15 +238,19 @@ impl SessionStore {
 
 /// A random UUIDv4-shaped opaque id from the aws-lc-rs RNG (already in the tree
 /// via rustls). Avoids adding the `uuid` crate for one identifier.
-fn uuid_v4() -> String {
+///
+/// # Errors
+///
+/// [`SessionError::Rng`] if the operating system RNG is unavailable. The id is
+/// the whole of the session credential, so there is no substitute to fall back
+/// to — anything derived from a clock or a counter would be guessable by
+/// whoever knows which substitute was used.
+fn opaque_id() -> Result<String, SessionError> {
     use aws_lc_rs::rand::{SecureRandom, SystemRandom};
     let mut bytes = [0u8; 16];
-    // `SystemRandom.fill` only errors if the OS RNG is unavailable, which on
-    // Lambda does not happen; fall back to a time-seeded value rather than panic.
-    if SystemRandom::new().fill(&mut bytes).is_err() {
-        let seed = now_secs().unwrap_or(0).to_be_bytes();
-        bytes[..8].copy_from_slice(&seed);
-    }
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| SessionError::Rng)?;
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     let mut h = String::with_capacity(32);
@@ -243,18 +258,20 @@ fn uuid_v4() -> String {
         use std::fmt::Write;
         let _ = write!(h, "{b:02x}");
     }
-    format!(
+    Ok(format!(
         "{}-{}-{}-{}-{}",
         &h[0..8],
         &h[8..12],
         &h[12..16],
         &h[16..20],
         &h[20..32]
-    )
+    ))
 }
 
 #[cfg(test)]
 mod tests {
+    #![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
+
     use super::*;
 
     // Fixed "current time" (2023-11-14 22:13:20 UTC) so the expiry tests are
@@ -452,32 +469,44 @@ mod tests {
         );
     }
 
-    // ---- Clock-fail defense (mirrors `load_session`) ----
+    // ---- The instant the expiry is measured against ----
 
     #[test]
-    fn clock_failure_never_rejects_a_fresh_login() {
-        // A broken clock collapses `now` to 0 (the epoch); a fresh login whose
-        // `expires_at` is far in the future stays valid. `take_pending`
-        // computes `now = now_secs().unwrap_or_default()` for exactly this.
-        let item = row("v", "n", Some(NOW + PKCE_TTL_SECS));
+    fn expiry_is_measured_against_the_arrival_stamp() {
+        // The store reads no clock of its own: the second a row is compared
+        // against is the one the request arrived at, so a login cannot expire
+        // between the session check and the action it authorises.
+        let arrival = ArrivalTime::for_test_millis(1_700_000_000_000);
+        assert_eq!(arrival.epoch_seconds(), NOW);
+
+        let expired = row("v", "n", Some(NOW));
         assert_eq!(
-            pending_login_from(Some(&item), 0),
-            Some(PendingLogin {
-                pkce_verifier: "v".to_string(),
-                nonce: "n".to_string(),
-            })
+            pending_login_from(Some(&expired), arrival.epoch_seconds()),
+            None
         );
+
+        let fresh = row("v", "n", Some(NOW + 1));
+        assert!(pending_login_from(Some(&fresh), arrival.epoch_seconds()).is_some());
     }
 
+    // ---- Session ids ----
+
     #[test]
-    fn expiry_is_enforced_against_a_real_clock_now_too() {
-        // Smoke check the helper against the real wall clock: a row written
-        // "now" via the same formula `put_pending` uses must be valid, and one
-        // written long ago must be rejected.
-        let real_now = now_secs().unwrap_or_default();
-        let fresh = row("v", "n", Some(real_now + PKCE_TTL_SECS));
-        assert!(pending_login_from(Some(&fresh), real_now).is_some());
-        let stale = row("v", "n", Some(real_now.saturating_sub(PKCE_TTL_SECS + 1)));
-        assert_eq!(pending_login_from(Some(&stale), real_now), None);
+    fn opaque_ids_are_uuid_shaped_and_never_repeat() {
+        let first = opaque_id().unwrap();
+        let second = opaque_id().unwrap();
+        assert_eq!(first.len(), 36);
+        assert_eq!(
+            first.split('-').map(str::len).collect::<Vec<_>>(),
+            vec![8, 4, 4, 4, 12]
+        );
+        assert!(first.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
+        // The two nibbles the shape fixes: version 4, RFC 4122 variant.
+        assert_eq!(&first[14..15], "4");
+        assert!(matches!(&first[19..20], "8" | "9" | "a" | "b"));
+        assert_ne!(
+            first, second,
+            "a session id is the whole credential; two draws must differ"
+        );
     }
 }

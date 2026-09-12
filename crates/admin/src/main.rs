@@ -196,16 +196,16 @@ fn session_id_from(headers: &HeaderMap) -> Option<String> {
 }
 
 /// Returns the authenticated session, or `None` if the request is unauthenticated.
-async fn authed(state: &Shared, headers: &HeaderMap) -> Option<AdminSession> {
+async fn authed(state: &Shared, headers: &HeaderMap, now: ArrivalTime) -> Option<AdminSession> {
     let id = session_id_from(headers)?;
-    state.sessions.load_session(&id).await.ok().flatten()
+    state.sessions.load_session(&id, now).await.ok().flatten()
 }
 
 // --- OIDC flow ----------------------------------------------------------------
 
 /// Starts the login: build the authorize URL with PKCE, persist the transaction
 /// keyed by CSRF state, redirect the browser to the provider.
-async fn login(State(state): State<Shared>) -> Response {
+async fn login(State(state): State<Shared>, now: ArrivalTime) -> Response {
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
     let (auth_url, csrf, nonce) = state
         .oidc
@@ -224,7 +224,11 @@ async fn login(State(state): State<Shared>) -> Response {
         pkce_verifier: pkce_verifier.secret().clone(),
         nonce: nonce.secret().clone(),
     };
-    if let Err(e) = state.sessions.put_pending(csrf.secret(), &pending).await {
+    if let Err(e) = state
+        .sessions
+        .put_pending(csrf.secret(), &pending, now)
+        .await
+    {
         return server_error(&e.to_string());
     }
     // Bind this login to the browser that started it: a short-lived cookie
@@ -255,6 +259,7 @@ struct CallbackParams {
 async fn callback(
     State(state): State<Shared>,
     headers: HeaderMap,
+    now: ArrivalTime,
     Query(params): Query<CallbackParams>,
 ) -> Response {
     // Browser binding: the callback must carry the login-state cookie set at
@@ -267,7 +272,7 @@ async fn callback(
 
     let Some(pending) = state
         .sessions
-        .take_pending(&params.state)
+        .take_pending(&params.state, now)
         .await
         .ok()
         .flatten()
@@ -316,7 +321,7 @@ async fn callback(
 
     let session_id = match state
         .sessions
-        .create_session(&AdminSession { subject, email })
+        .create_session(&AdminSession { subject, email }, now)
         .await
     {
         Ok(id) => id,
@@ -365,7 +370,7 @@ async fn logout(State(state): State<Shared>, headers: HeaderMap) -> Response {
 
 /// Renders the dashboard from current control state. Unauthenticated -> login.
 async fn dashboard(State(state): State<Shared>, headers: HeaderMap, now: ArrivalTime) -> Response {
-    let Some(session) = authed(&state, &headers).await else {
+    let Some(session) = authed(&state, &headers, now).await else {
         return Redirect::to("/admin/login").into_response();
     };
     match state.store_load(now).await {
@@ -403,7 +408,7 @@ async fn dashboard(State(state): State<Shared>, headers: HeaderMap, now: Arrival
 /// Current control state as JSON for the dashboard's poller. Session-gated like
 /// the dashboard; returns the same view the HTML renders.
 async fn state_json(State(state): State<Shared>, headers: HeaderMap, now: ArrivalTime) -> Response {
-    if authed(&state, &headers).await.is_none() {
+    if authed(&state, &headers, now).await.is_none() {
         return (StatusCode::UNAUTHORIZED, "not authenticated").into_response();
     }
     match state.store_load(now).await {
@@ -424,7 +429,7 @@ async fn set_phase(
     now: ArrivalTime,
     Form(form): Form<PhaseForm>,
 ) -> Response {
-    let Some(session) = authed(&state, &headers).await else {
+    let Some(session) = authed(&state, &headers, now).await else {
         return Redirect::to("/admin/login").into_response();
     };
     finish(
@@ -451,7 +456,7 @@ async fn set_rate(
     now: ArrivalTime,
     Form(form): Form<RateForm>,
 ) -> Response {
-    let Some(session) = authed(&state, &headers).await else {
+    let Some(session) = authed(&state, &headers, now).await else {
         return Redirect::to("/admin/login").into_response();
     };
     finish(
@@ -478,7 +483,7 @@ async fn set_message(
     now: ArrivalTime,
     Form(form): Form<MessageForm>,
 ) -> Response {
-    let Some(session) = authed(&state, &headers).await else {
+    let Some(session) = authed(&state, &headers, now).await else {
         return Redirect::to("/admin/login").into_response();
     };
     finish(
@@ -510,7 +515,7 @@ async fn set_start_time(
     now: ArrivalTime,
     Form(form): Form<StartTimeForm>,
 ) -> Response {
-    let Some(session) = authed(&state, &headers).await else {
+    let Some(session) = authed(&state, &headers, now).await else {
         return Redirect::to("/admin/login").into_response();
     };
     finish(
@@ -528,7 +533,7 @@ async fn set_start_time(
 }
 
 async fn reset(State(state): State<Shared>, headers: HeaderMap, now: ArrivalTime) -> Response {
-    let Some(session) = authed(&state, &headers).await else {
+    let Some(session) = authed(&state, &headers, now).await else {
         return Redirect::to("/admin/login").into_response();
     };
     finish(apply_reset(&state.store, &state.event_id, &session.email, now).await)
@@ -536,7 +541,7 @@ async fn reset(State(state): State<Shared>, headers: HeaderMap, now: ArrivalTime
 
 /// Holds admission while the queue keeps forming. Reversible, no confirmation.
 async fn pause(State(state): State<Shared>, headers: HeaderMap, now: ArrivalTime) -> Response {
-    let Some(session) = authed(&state, &headers).await else {
+    let Some(session) = authed(&state, &headers, now).await else {
         return Redirect::to("/admin/login").into_response();
     };
     finish(apply_pause(&state.store, &state.event_id, &session.email, now).await)
@@ -544,7 +549,7 @@ async fn pause(State(state): State<Shared>, headers: HeaderMap, now: ArrivalTime
 
 /// Resume admission after a pause.
 async fn resume(State(state): State<Shared>, headers: HeaderMap, now: ArrivalTime) -> Response {
-    let Some(session) = authed(&state, &headers).await else {
+    let Some(session) = authed(&state, &headers, now).await else {
         return Redirect::to("/admin/login").into_response();
     };
     finish(apply_resume(&state.store, &state.event_id, &session.email, now).await)
@@ -563,7 +568,7 @@ async fn fail_open(
     now: ArrivalTime,
     Form(form): Form<FailOpenForm>,
 ) -> Response {
-    let Some(session) = authed(&state, &headers).await else {
+    let Some(session) = authed(&state, &headers, now).await else {
         return Redirect::to("/admin/login").into_response();
     };
     finish(
@@ -582,7 +587,7 @@ async fn fail_open(
 /// Clears the fail-open epoch. Not "resume": under the split this only
 /// clears the epoch, so a pause queued during the window still applies.
 async fn recover(State(state): State<Shared>, headers: HeaderMap, now: ArrivalTime) -> Response {
-    let Some(session) = authed(&state, &headers).await else {
+    let Some(session) = authed(&state, &headers, now).await else {
         return Redirect::to("/admin/login").into_response();
     };
     finish(
@@ -616,7 +621,7 @@ async fn set_rules(
     now: ArrivalTime,
     Form(form): Form<RulesForm>,
 ) -> Response {
-    let Some(session) = authed(&state, &headers).await else {
+    let Some(session) = authed(&state, &headers, now).await else {
         return Redirect::to("/admin/login").into_response();
     };
     let rules = match parse_rules(&form.rules) {

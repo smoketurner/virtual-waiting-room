@@ -24,25 +24,39 @@ use jiff::Timestamp;
 
 /// The instant a request arrived at the control plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ArrivalTime(Timestamp);
+pub struct ArrivalTime {
+    at: Timestamp,
+    /// The same instant in epoch seconds, converted once here where the
+    /// constructor has already established that it is not negative.
+    epoch_seconds: u64,
+}
 
 impl ArrivalTime {
+    /// An arrival at `at`, or `None` if that instant is before the epoch.
+    ///
+    /// A request cannot arrive before 1970, and the two things this feeds read
+    /// a pre-epoch value in opposite directions — a fail-open deadline becomes
+    /// one that has already lapsed, a session expiry becomes one nothing has
+    /// reached yet — so there is no substitute value that is safe for both.
+    /// The request is refused instead.
+    fn new(at: Timestamp) -> Option<Self> {
+        let epoch_seconds = u64::try_from(at.as_second()).ok()?;
+        Some(Self { at, epoch_seconds })
+    }
+
     /// The arrival instant, at full precision.
     #[must_use]
     pub fn timestamp(self) -> Timestamp {
-        self.0
+        self.at
     }
 
-    /// The arrival instant in epoch seconds, for the two places that work in
-    /// them rather than in instants: the fail-open deadline the edge gate
-    /// compares against its own clock, and the start-time validation.
-    ///
-    /// A pre-epoch instant clamps to 0, which both read as already past — the
-    /// safe direction for a deadline, since it withholds a fail-open window
-    /// rather than granting an unbounded one.
+    /// The arrival instant in epoch seconds, for the places that work in them
+    /// rather than in instants: the fail-open deadline the edge gate compares
+    /// against its own clock, the start-time validation, and the session and
+    /// login-transaction expiries.
     #[must_use]
     pub fn epoch_seconds(self) -> u64 {
-        u64::try_from(self.0.as_second()).unwrap_or(0)
+        self.epoch_seconds
     }
 
     /// An arrival at a fixed instant, for tests that call an action directly
@@ -53,22 +67,28 @@ impl ArrivalTime {
             clippy::expect_used,
             reason = "test-only constructor; an out-of-range literal is a test bug"
         )]
-        Self(Timestamp::from_millisecond(millis).expect("test timestamp in range"))
+        Timestamp::from_millisecond(millis)
+            .ok()
+            .and_then(Self::new)
+            .expect("test timestamp in range and at or after the epoch")
     }
 }
 
 /// Stamps the arrival instant into request extensions.
 ///
 /// Mounted as the outermost layer of the router, so the stamp is taken before
-/// any other layer can await. A clock outside the range of an instant answers
+/// any other layer can await. A clock a request cannot have arrived at answers
 /// the request here rather than handing a handler something to stamp: reading
 /// it with `Timestamp::now()` would panic on such a clock instead.
 pub async fn arrival_layer(mut request: Request, next: Next) -> Response {
-    let Ok(at) = Timestamp::try_from(std::time::SystemTime::now()) else {
-        tracing::error!("system clock is not readable as an instant");
+    let arrival = Timestamp::try_from(std::time::SystemTime::now())
+        .ok()
+        .and_then(ArrivalTime::new);
+    let Some(arrival) = arrival else {
+        tracing::error!("system clock is not readable as an instant at or after the epoch");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
-    request.extensions_mut().insert(ArrivalTime(at));
+    request.extensions_mut().insert(arrival);
     next.run(request).await
 }
 
@@ -157,6 +177,19 @@ mod tests {
         let app = Router::new().route("/t", get(echo_arrival));
         let (status, _) = get_t(app).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn an_instant_before_the_epoch_is_not_an_arrival() {
+        // Nothing can have arrived before 1970, and the seconds form would
+        // read in opposite directions for the two things it feeds: a deadline
+        // already lapsed, an expiry nothing has reached. The layer answers the
+        // request instead of picking one.
+        assert!(ArrivalTime::new(Timestamp::from_second(-1).unwrap()).is_none());
+        assert_eq!(
+            ArrivalTime::new(Timestamp::UNIX_EPOCH).map(ArrivalTime::epoch_seconds),
+            Some(0)
+        );
     }
 
     #[tokio::test]
