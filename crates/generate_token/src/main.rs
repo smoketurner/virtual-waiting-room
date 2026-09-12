@@ -118,11 +118,7 @@ async fn handle(state: &AppState, req: Request) -> Result<Response<Body>, Error>
     // being refused at their turn.
     match wr_common::Shard::random() {
         Ok(shard) => {
-            if let Err(e) = state
-                .store
-                .record_arrival(&state.event_id, shard.index())
-                .await
-            {
+            if let Err(e) = state.store.record_arrival(&state.event_id, shard).await {
                 // Non-fatal for this visitor: the controller tolerates a
                 // missed arrival better than the visitor tolerates being
                 // refused at their turn. Logged at error with a stable event

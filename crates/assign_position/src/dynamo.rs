@@ -7,9 +7,8 @@ use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::put_item::PutItemError;
 use aws_sdk_dynamodb::types::{AttributeValue, KeysAndAttributes, ReturnValue};
 use wr_common::expr::{
-    SHARD_COUNT_ATTR, claim_live_block_update, claim_prequeue_block_update,
-    claim_prequeue_block_values, event_key, expired_status_value, not_exists_condition,
-    not_exists_or_expired_condition, prequeue_key, prequeue_shard_key, status_attr_name,
+    Condition, Key, POSITIONS_KEY_ATTR, SHARD_COUNT_ATTR, SHARD_INDEX_ATTR, STATUS_ATTR,
+    STATUS_EXPIRED, Update,
 };
 use wr_common::{Counters, PositionItem, PositionStatus, PreQueueItem, Shard, Telemetry};
 
@@ -57,13 +56,19 @@ fn telemetry_or_none(telemetry: Telemetry) -> Option<Telemetry> {
 
 impl Store for DynamoStore {
     async fn claim_block(&self, event_id: &str, n: u64) -> Result<u64, StoreError> {
+        // `ALL_NEW` returns the value after the add, so the claimed block is
+        // `[end - n + 1, end]`.
+        let claim = Update::new()
+            .add("queue_counter", AttributeValue::N(n.to_string()))
+            .build();
         let out = self
             .client
             .update_item()
             .table_name(&self.counters_table)
-            .set_key(Some(event_key(event_id)))
-            .update_expression(claim_live_block_update())
-            .expression_attribute_values(":n", AttributeValue::N(n.to_string()))
+            .set_key(Some(Key::Event { event_id }.build()))
+            .update_expression(claim.expression)
+            .set_expression_attribute_names(Some(claim.names))
+            .set_expression_attribute_values(Some(claim.values))
             .return_values(ReturnValue::AllNew)
             .send()
             .await
@@ -96,14 +101,19 @@ impl Store for DynamoStore {
             .put_item()
             .table_name(&self.positions_table)
             .set_item(Some(attrs));
-        request = if write.allow_expired_overwrite {
-            request
-                .condition_expression(not_exists_or_expired_condition("request_id"))
-                .set_expression_attribute_names(Some(status_attr_name()))
-                .set_expression_attribute_values(Some(expired_status_value()))
+        // Widened for a derived request_id so a re-join can reclaim a row the
+        // controller expired; `completed` and `abandoned` stay terminal.
+        let guard = Condition::attribute_not_exists(POSITIONS_KEY_ATTR);
+        let guard = if write.allow_expired_overwrite {
+            guard.or_equals(STATUS_ATTR, AttributeValue::S(STATUS_EXPIRED.to_owned()))
         } else {
-            request.condition_expression(not_exists_condition("request_id"))
-        };
+            guard
+        }
+        .build();
+        request = request
+            .condition_expression(guard.expression)
+            .set_expression_attribute_names(Some(guard.names))
+            .set_expression_attribute_values(Some(guard.values));
 
         match request.send().await {
             Ok(_) => Ok(WriteOutcome::Written),
@@ -124,7 +134,7 @@ impl Store for DynamoStore {
             // Consistent: the batch's routing decision (live vs. pre-queue)
             // and the fix-up's straggler check both need the freshest write.
             .consistent_read(true)
-            .set_key(Some(event_key(event_id)))
+            .set_key(Some(Key::Event { event_id }.build()))
             .send()
             .await
             .map_err(|e| StoreError(format!("get_item counters: {e}")))?;
@@ -138,16 +148,25 @@ impl Store for DynamoStore {
         shard: Shard,
         count: u64,
     ) -> Result<u64, StoreError> {
+        // Stamps which shard this is alongside the add, so a reader that
+        // fetched a batch of shards does not have to take the key apart.
+        // `ALL_NEW` returns the count after the add; the block is
+        // `[n - count, n - 1]`.
+        let claim = Update::new()
+            .set(
+                SHARD_INDEX_ATTR,
+                AttributeValue::N(shard.index().to_string()),
+            )
+            .add(SHARD_COUNT_ATTR, AttributeValue::N(count.to_string()))
+            .build();
         let out = self
             .client
             .update_item()
             .table_name(&self.counters_table)
-            .set_key(Some(prequeue_shard_key(event_id, shard.index())))
-            .update_expression(claim_prequeue_block_update())
-            .set_expression_attribute_values(Some(claim_prequeue_block_values(
-                shard.index(),
-                count,
-            )))
+            .set_key(Some(Key::PrequeueShard { event_id, shard }.build()))
+            .update_expression(claim.expression)
+            .set_expression_attribute_names(Some(claim.names))
+            .set_expression_attribute_values(Some(claim.values))
             .return_values(ReturnValue::AllNew)
             .send()
             .await
@@ -176,12 +195,20 @@ impl Store for DynamoStore {
         let attrs: HashMap<String, AttributeValue> =
             serde_dynamo::to_item(&item).map_err(|e| StoreError(format!("serialize: {e}")))?;
 
+        let guard = Condition::attribute_not_exists(
+            Key::Prequeue {
+                request_id: &write.request_id,
+            }
+            .attr(),
+        )
+        .build();
         let result = self
             .client
             .put_item()
             .table_name(&self.prequeue_table)
             .set_item(Some(attrs))
-            .condition_expression(not_exists_condition("r"))
+            .condition_expression(guard.expression)
+            .set_expression_attribute_names(Some(guard.names))
             .send()
             .await;
 
@@ -203,7 +230,12 @@ impl Store for DynamoStore {
                 continue;
             }
             let keys_and_attrs = KeysAndAttributes::builder()
-                .set_keys(Some(chunk.iter().map(|id| prequeue_key(id)).collect()))
+                .set_keys(Some(
+                    chunk
+                        .iter()
+                        .map(|id| Key::Prequeue { request_id: id }.build())
+                        .collect(),
+                ))
                 .consistent_read(true)
                 .projection_expression("r")
                 .build()

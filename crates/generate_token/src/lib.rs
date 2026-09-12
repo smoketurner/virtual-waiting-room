@@ -13,7 +13,9 @@
 
 use std::future::Future;
 
-use wr_common::{Counters, Phase, PositionStatus, PreQueueItem, ResolveError, ResolvedPosition};
+use wr_common::{
+    Counters, Phase, PositionStatus, PreQueueItem, ResolveError, ResolvedPosition, Shard,
+};
 
 pub mod dynamo;
 
@@ -53,7 +55,7 @@ pub trait Store {
     fn record_arrival(
         &self,
         event_id: &str,
-        shard: usize,
+        shard: Shard,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 }
 

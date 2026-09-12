@@ -32,7 +32,7 @@ pub use ids::{
 };
 pub use items::{
     Counters, PositionItem, PositionStatus, PreQueueItem, ResolveError, ResolvedPosition, Sealed,
-    Telemetry,
+    Telemetry, shard_count_of, shard_index_of,
 };
 pub use permutation::{Assignment, RandError, SHARDS, SealError, SealedOffsets, Seed, Shard, prp};
 pub use rules::{

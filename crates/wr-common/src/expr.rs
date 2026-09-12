@@ -2,16 +2,24 @@
 //! place so the key shape and the attribute names live beside the item shapes
 //! rather than scattered across handlers.
 //!
-//! The key builders return the complete primary key rather than a string or a
-//! bare value, so the key attribute's own name is written once too. Call sites
-//! pass the result straight to `set_key`, or to `BatchGetItem`, which takes
-//! exactly this type.
+//! [`Key`] returns the complete primary key rather than a string or a bare
+//! value, so the key attribute's own name is written once too. Call sites pass
+//! the result straight to `set_key`, or to `BatchGetItem`, which takes exactly
+//! this type.
+//!
+//! [`Update`] and [`Condition`] build an expression and its placeholder
+//! bindings together. The call that names an attribute is the call that binds
+//! its value, so an expression cannot reference a placeholder nothing supplies
+//! — a mistake that compiles perfectly and fails only once the request reaches
+//! `DynamoDB`. The two allocate from disjoint placeholder namespaces (`#u`/`:u`
+//! and `#c`/`:c`), so an update and a condition on the same request can never
+//! collide.
 
 use std::collections::HashMap;
 
 use aws_sdk_dynamodb::types::AttributeValue;
 
-use crate::permutation::SHARDS;
+use crate::permutation::Shard;
 
 /// The partition key attribute of the `Counters` table.
 const KEY_ATTR: &str = "event_id";
@@ -23,6 +31,12 @@ const KEY_ATTR: &str = "event_id";
 /// request id, and neither is a PKCE state. Renaming it changes the table's hash
 /// key, which replaces the table.
 const TOKENS_KEY_ATTR: &str = "request_id";
+
+/// The partition key attribute of the `PreQueue` table.
+const PREQUEUE_KEY_ATTR: &str = "r";
+
+/// The partition key attribute of the `Positions` table.
+pub const POSITIONS_KEY_ATTR: &str = "request_id";
 
 /// The expiry attribute of every `Tokens` row — admission-token reservations,
 /// operator OIDC sessions, and pending PKCE logins alike.
@@ -67,296 +81,288 @@ pub const STARTS_AT_ATTR: &str = "starts_at";
 /// filled it in.
 pub const STARTS_AT_TZ_ATTR: &str = "starts_at_tz";
 
-/// Partition key of the event's own item, holding the sequences, phase, seal
-/// outputs, and operator state.
-///
-/// Every key in this table is built here rather than at each call site. The
-/// uppercase `EVT#` tag marks the structural part of the key so it cannot be
-/// confused with the event id itself, and it keeps the key space
-/// self-describing if events ever share a table.
-#[must_use]
-pub fn event_key(event_id: &str) -> HashMap<String, AttributeValue> {
-    key(format!("EVT#{event_id}"))
-}
+/// The `status` attribute of a `Positions` row. A `DynamoDB` reserved word, so
+/// it can only be referenced through a name placeholder — which [`Condition`]
+/// allocates for every attribute, reserved or not, so a caller never has to
+/// know which words are reserved.
+pub const STATUS_ATTR: &str = "status";
 
-/// Wraps a key value as the complete primary key. Returning the whole key,
-/// rather than the string or a bare `AttributeValue`, means the attribute name
-/// is written once as well as the key shape — call sites pass this straight to
-/// `set_key` or to `BatchGetItem`.
-fn key(value: String) -> HashMap<String, AttributeValue> {
-    HashMap::from([(KEY_ATTR.to_owned(), AttributeValue::S(value))])
-}
+/// The `status` value of a row the controller has expired.
+pub const STATUS_EXPIRED: &str = "expired";
 
-/// Partition key of a single-use admission token reservation.
+/// Which item a key addresses.
 ///
-/// The `Tokens` table is the one table here holding more than one kind of item
-/// — token reservations, OIDC sessions, and PKCE transactions all share its key
-/// space — so the tag is what keeps a session id from colliding with a token.
+/// One type rather than a constructor per item kind, so the tag prefixes and
+/// the per-table key attribute stay together and a call site cannot pair the
+/// wrong two. The uppercase tags mark the structural part of a key so it cannot
+/// be confused with the id itself.
+///
+/// Tags appear only where a table holds more than one kind of item. `Counters`
+/// holds the event plus its shard counters, and `Tokens` holds admission-token
+/// reservations, operator OIDC sessions and pending PKCE logins — without the
+/// tag a session id and a token for the same string would be one row.
 /// `Positions` and `PreQueue` hold one kind each and take bare ids: a tag there
-/// would disambiguate nothing while costing bytes in the partition key of every
-/// row, of which there is one per visitor.
-#[must_use]
-pub fn admission_token_key(request_id: &str) -> HashMap<String, AttributeValue> {
-    tokens_key(format!("TKN#{request_id}"))
-}
-
-/// Partition key of an operator's OIDC session.
-#[must_use]
-pub fn oidc_session_key(session_id: &str) -> HashMap<String, AttributeValue> {
-    tokens_key(format!("SESS#{session_id}"))
-}
-
-/// Partition key of a pending OIDC login, keyed by its CSRF state.
-#[must_use]
-pub fn pkce_transaction_key(state: &str) -> HashMap<String, AttributeValue> {
-    tokens_key(format!("PKCE#{state}"))
-}
-
-fn tokens_key(value: String) -> HashMap<String, AttributeValue> {
-    HashMap::from([(TOKENS_KEY_ATTR.to_owned(), AttributeValue::S(value))])
-}
-
-/// Partition key of one pre-queue registration shard.
+/// disambiguates nothing and costs bytes in the partition key of every row, of
+/// which there is one per visitor.
 ///
-/// A shard is its own ITEM, not an attribute on a shared one. `DynamoDB` caps
-/// throughput at 1,000 writes per second per partition key, so ten attributes
-/// on one item share one budget and distribute nothing; ten items are ten
-/// partition keys and ten budgets. The item is tiny, so every increment costs
-/// exactly one write unit rather than the size of a growing shared item.
+/// `event_id` may not contain `#`, or one event's shard key could collide with
+/// another event's item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Key<'a> {
+    /// The event's own item, holding the sequences, phase, seal outputs, and
+    /// operator state.
+    Event { event_id: &'a str },
+    /// One pre-queue registration shard.
+    ///
+    /// A shard is its own ITEM, not an attribute on a shared one. `DynamoDB`
+    /// caps throughput at 1,000 writes per second per partition key, so ten
+    /// attributes on one item share one budget and distribute nothing; ten
+    /// items are ten partition keys and ten budgets. The item is tiny, so every
+    /// increment costs exactly one write unit rather than the size of a growing
+    /// shared item.
+    PrequeueShard { event_id: &'a str, shard: Shard },
+    /// One arrivals shard, incremented when a visitor claims their admission
+    /// and summed by the controller to measure the no-show rate.
+    ArrivalsShard { event_id: &'a str, shard: Shard },
+    /// A single-use admission token reservation.
+    AdmissionToken { request_id: &'a str },
+    /// An operator's OIDC session.
+    OidcSession { session_id: &'a str },
+    /// A pending OIDC login, keyed by its CSRF state.
+    PkceTransaction { state: &'a str },
+    /// A visitor's own `PreQueue` row.
+    Prequeue { request_id: &'a str },
+    /// A visitor's own `Positions` row.
+    Position { request_id: &'a str },
+}
+
+impl Key<'_> {
+    /// The partition key attribute this key is written under.
+    #[must_use]
+    pub fn attr(self) -> &'static str {
+        match self {
+            Key::Event { .. } | Key::PrequeueShard { .. } | Key::ArrivalsShard { .. } => KEY_ATTR,
+            Key::AdmissionToken { .. } | Key::OidcSession { .. } | Key::PkceTransaction { .. } => {
+                TOKENS_KEY_ATTR
+            }
+            Key::Prequeue { .. } => PREQUEUE_KEY_ATTR,
+            Key::Position { .. } => POSITIONS_KEY_ATTR,
+        }
+    }
+
+    /// The key's value, without the attribute wrapper.
+    #[must_use]
+    pub fn value(self) -> String {
+        match self {
+            Key::Event { event_id } => format!("EVT#{event_id}"),
+            Key::PrequeueShard { event_id, shard } => {
+                format!("EVT#{event_id}#PQ#{}", shard.index())
+            }
+            Key::ArrivalsShard { event_id, shard } => {
+                format!("EVT#{event_id}#AR#{}", shard.index())
+            }
+            Key::AdmissionToken { request_id } => format!("TKN#{request_id}"),
+            Key::OidcSession { session_id } => format!("SESS#{session_id}"),
+            Key::PkceTransaction { state } => format!("PKCE#{state}"),
+            // Untagged: one kind of item per table, so a tag would
+            // disambiguate nothing and cost bytes in every visitor's key.
+            Key::Prequeue { request_id } | Key::Position { request_id } => request_id.to_owned(),
+        }
+    }
+
+    /// The complete primary key, ready for `set_key` or `BatchGetItem`.
+    #[must_use]
+    pub fn build(self) -> HashMap<String, AttributeValue> {
+        HashMap::from([(self.attr().to_owned(), AttributeValue::S(self.value()))])
+    }
+}
+
+/// A built expression and everything it refers to.
 ///
-/// # Panics
+/// Returned as one value so the three parts cannot be separated on the way to
+/// the request builder, which is how a binding goes missing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Expression {
+    /// The expression text, referring only to placeholders bound below.
+    pub expression: String,
+    /// `ExpressionAttributeNames`.
+    pub names: HashMap<String, String>,
+    /// `ExpressionAttributeValues`.
+    pub values: HashMap<String, AttributeValue>,
+}
+
+/// Builds an `UpdateExpression` together with its bindings.
 ///
-/// Panics if `shard >= SHARDS`; callers pick the shard with
-/// [`crate::permutation::Shard`], which is always in range.
-#[must_use]
-pub fn prequeue_shard_key(event_id: &str, shard: usize) -> HashMap<String, AttributeValue> {
-    assert!(shard < SHARDS, "shard {shard} out of range 0..{SHARDS}");
-    key(format!("EVT#{event_id}#PQ#{shard}"))
+/// Every attribute is referenced through an allocated `#u<n>` name placeholder,
+/// so a reserved word cannot silently break an expression, and every value
+/// through the matching `:u<n>`. Two calls naming the same attribute get two
+/// placeholders; that costs a few bytes and removes any question of one clause
+/// overwriting another's binding.
+#[derive(Debug, Clone, Default)]
+pub struct Update {
+    set: Vec<String>,
+    add: Vec<String>,
+    names: HashMap<String, String>,
+    values: HashMap<String, AttributeValue>,
+    next: usize,
 }
 
-/// Partition key of a visitor's own `PreQueue` row: `r`, the bare
-/// `request_id`. Unlike the shard items above, `PreQueue` holds one kind of
-/// item and takes no tag — a tag here would disambiguate nothing while
-/// costing bytes in the partition key of every row, of which there is one per
-/// visitor.
-#[must_use]
-pub fn prequeue_key(request_id: &str) -> HashMap<String, AttributeValue> {
-    HashMap::from([("r".to_owned(), AttributeValue::S(request_id.to_owned()))])
+impl Update {
+    /// An empty update.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn bind(&mut self, attr: &str, value: AttributeValue) -> (String, String) {
+        let slot = self.next;
+        self.next = self.next.saturating_add(1);
+        let name = format!("#u{slot}");
+        let placeholder = format!(":u{slot}");
+        self.names.insert(name.clone(), attr.to_owned());
+        self.values.insert(placeholder.clone(), value);
+        (name, placeholder)
+    }
+
+    /// `SET <attr> = <value>`.
+    #[must_use]
+    pub fn set(mut self, attr: &str, value: AttributeValue) -> Self {
+        let (name, placeholder) = self.bind(attr, value);
+        self.set.push(format!("{name} = {placeholder}"));
+        self
+    }
+
+    /// `ADD <attr> <value>` — the atomic counter increment.
+    #[must_use]
+    pub fn add(mut self, attr: &str, value: AttributeValue) -> Self {
+        let (name, placeholder) = self.bind(attr, value);
+        self.add.push(format!("{name} {placeholder}"));
+        self
+    }
+
+    /// The expression and its bindings.
+    #[must_use]
+    pub fn build(self) -> Expression {
+        let mut expression = String::new();
+        if !self.set.is_empty() {
+            expression.push_str("SET ");
+            expression.push_str(&self.set.join(", "));
+        }
+        if !self.add.is_empty() {
+            if !expression.is_empty() {
+                expression.push(' ');
+            }
+            expression.push_str("ADD ");
+            expression.push_str(&self.add.join(", "));
+        }
+        Expression {
+            expression,
+            names: self.names,
+            values: self.values,
+        }
+    }
 }
 
-/// Partition key of one arrivals shard, incremented when a visitor claims
-/// their admission and summed by the controller to measure the no-show rate.
-///
-/// # Panics
-///
-/// Panics if `shard >= SHARDS`.
-#[must_use]
-pub fn arrivals_shard_key(event_id: &str, shard: usize) -> HashMap<String, AttributeValue> {
-    assert!(shard < SHARDS, "shard {shard} out of range 0..{SHARDS}");
-    key(format!("EVT#{event_id}#AR#{shard}"))
+/// Builds a `ConditionExpression` together with its bindings.
+#[derive(Debug, Clone)]
+pub struct Condition {
+    expression: String,
+    names: HashMap<String, String>,
+    values: HashMap<String, AttributeValue>,
+    next: usize,
 }
 
-/// `SET s = :shard ADD n :one` — adds one to a shard's count and stamps which
-/// shard it is. With `ReturnValue::AllNew` the returned count is the value
-/// after the add, so a pre-queue registration's local index is `new - 1`.
-#[must_use]
-pub fn increment_shard_update() -> &'static str {
-    "SET s = :shard ADD n :one"
-}
+impl Condition {
+    fn bind_name(&mut self, attr: &str) -> String {
+        let slot = self.next;
+        self.next = self.next.saturating_add(1);
+        let name = format!("#c{slot}");
+        self.names.insert(name.clone(), attr.to_owned());
+        name
+    }
 
-/// The values [`increment_shard_update`] refers to.
-///
-/// Returned with the expression's placeholders already filled rather than left
-/// to the call site, because an expression naming a placeholder nothing binds
-/// compiles perfectly and fails only when it reaches `DynamoDB`.
-///
-/// # Panics
-///
-/// Panics if `shard >= SHARDS`.
-#[must_use]
-pub fn increment_shard_values(shard: usize) -> HashMap<String, AttributeValue> {
-    assert!(shard < SHARDS, "shard {shard} out of range 0..{SHARDS}");
-    HashMap::from([
-        (":one".to_owned(), AttributeValue::N("1".to_owned())),
-        (":shard".to_owned(), AttributeValue::N(shard.to_string())),
-    ])
-}
+    fn bind_value(&mut self, value: AttributeValue) -> String {
+        let slot = self.next;
+        self.next = self.next.saturating_add(1);
+        let placeholder = format!(":c{slot}");
+        self.values.insert(placeholder.clone(), value);
+        placeholder
+    }
 
-/// Reads a shard item's own index, or `None` if it is missing or out of range.
-#[must_use]
-pub fn shard_index_of<S: std::hash::BuildHasher>(
-    item: &HashMap<String, AttributeValue, S>,
-) -> Option<usize> {
-    let shard = item
-        .get(SHARD_INDEX_ATTR)
-        .and_then(|v| v.as_n().ok())
-        .and_then(|n| n.parse::<usize>().ok())?;
-    (shard < SHARDS).then_some(shard)
-}
+    /// `attribute_not_exists(<attr>)` — the idempotency guard on every position
+    /// and pre-queue write, so a retried request id is rejected rather than
+    /// duplicated.
+    #[must_use]
+    pub fn attribute_not_exists(attr: &str) -> Self {
+        let mut condition = Self {
+            expression: String::new(),
+            names: HashMap::new(),
+            values: HashMap::new(),
+            next: 0,
+        };
+        let name = condition.bind_name(attr);
+        condition.expression = format!("attribute_not_exists({name})");
+        condition
+    }
 
-/// Reads a shard item's count, or `None` if the count attribute is absent,
-/// not a `Number`, or not a parseable `u64`.
-///
-/// `None` distinguishes "this item has no readable count" from "this shard
-/// has no item": a shard that nothing has written yields no item at all from a
-/// `BatchGetItem` response, so it never reaches a fold that could call this.
-/// A present item whose count cannot be read is therefore corruption, not an
-/// empty shard — callers that fold batch-get items must turn `None` into an
-/// error rather than silently zero the shard, reserving zero for a shard that
-/// never reached them because it had no item.
-#[must_use]
-pub fn shard_count_of<S: std::hash::BuildHasher>(
-    item: &HashMap<String, AttributeValue, S>,
-) -> Option<u64> {
-    item.get(SHARD_COUNT_ATTR)
-        .and_then(|v| v.as_n().ok())
-        .and_then(|n| n.parse::<u64>().ok())
-}
+    /// Widens the condition with `OR <attr> = <value>`.
+    #[must_use]
+    pub fn or_equals(mut self, attr: &str, value: AttributeValue) -> Self {
+        let name = self.bind_name(attr);
+        let placeholder = self.bind_value(value);
+        self.expression = format!("{} OR {name} = {placeholder}", self.expression);
+        self
+    }
 
-/// `ADD queue_counter :n` — claims a contiguous block of `n` live-join
-/// positions. With `ReturnValue::AllNew` the returned value is the block end;
-/// the block is `[end - n + 1, end]`. `n` must be the count of *valid* records.
-#[must_use]
-pub fn claim_live_block_update() -> &'static str {
-    "ADD queue_counter :n"
-}
-
-/// `SET s = :shard ADD n :count` — claims a contiguous block of `count` local
-/// indices within one pre-queue shard, stamping which shard it is. With
-/// `ReturnValue::AllNew` the returned `n` is the shard's count after the add;
-/// the block is `[n - count, n - 1]`.
-///
-/// Distinct from [`increment_shard_update`] (the arrivals `+1`, used by
-/// `generate_token` and `authorizer`) rather than a shared generalisation of
-/// it: this claims a caller-supplied count in one round trip per batch shard
-/// group, not one per record, and a saturated block here is a duplicate
-/// global index, not a harmless gap — callers must `checked_sub`, never
-/// saturate, when turning the returned `n` into the block's first index.
-#[must_use]
-pub fn claim_prequeue_block_update() -> &'static str {
-    "SET s = :shard ADD n :count"
-}
-
-/// The values [`claim_prequeue_block_update`] refers to.
-///
-/// # Panics
-///
-/// Panics if `shard >= SHARDS`.
-#[must_use]
-pub fn claim_prequeue_block_values(shard: usize, count: u64) -> HashMap<String, AttributeValue> {
-    assert!(shard < SHARDS, "shard {shard} out of range 0..{SHARDS}");
-    HashMap::from([
-        (":count".to_owned(), AttributeValue::N(count.to_string())),
-        (":shard".to_owned(), AttributeValue::N(shard.to_string())),
-    ])
-}
-
-/// `attribute_not_exists(<key>)` — the idempotency guard on every position and
-/// pre-queue write, so a retried request id is rejected rather than duplicated.
-#[must_use]
-pub fn not_exists_condition(key_attr: &str) -> String {
-    format!("attribute_not_exists({key_attr})")
-}
-
-/// `attribute_not_exists(<key>) OR #s = :expired` — the live-join write's
-/// idempotency guard, widened (issue #59) so a re-join with a *derived*
-/// `request_id` can reclaim a row the controller expired. Before a derived id,
-/// a re-join always minted a fresh `UUIDv7` and the plain
-/// [`not_exists_condition`] never needed to consider what an existing row's
-/// status was; now the same identity always re-derives the same id, so
-/// without this the "reload to take a new place in line" advice on a 410
-/// would be a lie for anyone whose row the controller had already expired.
-/// `Completed` and `Abandoned` rows stay terminal: only `#s = :expired`
-/// widens the guard, via [`status_attr_name`] and [`expired_status_value`].
-#[must_use]
-pub fn not_exists_or_expired_condition(key_attr: &str) -> String {
-    format!("attribute_not_exists({key_attr}) OR #s = :expired")
-}
-
-/// The `ExpressionAttributeNames` [`not_exists_or_expired_condition`] needs:
-/// `status` is a `DynamoDB` reserved word, so it must be referenced through a
-/// placeholder rather than written into the expression literally.
-#[must_use]
-pub fn status_attr_name() -> HashMap<String, String> {
-    HashMap::from([("#s".to_owned(), "status".to_owned())])
-}
-
-/// The `ExpressionAttributeValues` [`not_exists_or_expired_condition`] needs.
-#[must_use]
-pub fn expired_status_value() -> HashMap<String, AttributeValue> {
-    HashMap::from([(
-        ":expired".to_owned(),
-        AttributeValue::S("expired".to_owned()),
-    )])
-}
-
-/// The seal's single `SET` clause, writing every value the seal produces in one
-/// update.
-///
-/// `queue_counter` is set to the same `:n` as `participant_count`: the live-join
-/// sequence starts at the cohort size, so the first post-seal live joiner is
-/// numbered behind the whole pre-queue cohort rather than colliding with it.
-/// Without that clause `ADD queue_counter :n` would hand a live joiner position
-/// 1, already owned by a pre-queue member of `[0, N)`.
-#[must_use]
-pub fn seal_update() -> &'static str {
-    "SET shuffle_seed = :seed, participant_count = :n, queue_counter = :n, \
-     prequeue_offsets = :offsets, phase = :active"
-}
-
-/// `attribute_not_exists(shuffle_seed)` — the seal's once-only guard. The seed
-/// is written by the seal and nothing else, so its absence means "not yet
-/// sealed" and a double-fire or retry is rejected rather than reseeding.
-#[must_use]
-pub fn seal_guard() -> &'static str {
-    "attribute_not_exists(shuffle_seed)"
+    /// The expression and its bindings.
+    #[must_use]
+    pub fn build(self) -> Expression {
+        Expression {
+            expression: self.expression,
+            names: self.names,
+            values: self.values,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    #![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
+
+    use std::collections::BTreeSet;
+
     use super::*;
+    use crate::permutation::SHARDS;
 
-    /// The single key value, for assertions.
-    fn key_string(k: &HashMap<String, AttributeValue>) -> String {
-        key_string_of(k, KEY_ATTR)
-    }
-
-    fn key_string_of(k: &HashMap<String, AttributeValue>, attr: &str) -> String {
-        k.get(attr)
-            .and_then(|v| v.as_s().ok())
-            .cloned()
-            .unwrap_or_default()
+    fn shard(index: usize) -> Shard {
+        Shard::new(index).unwrap()
     }
 
     #[test]
-    fn a_shard_item_reports_its_own_index() {
-        // Readers fetch shards in a batch and get them back in arbitrary order,
-        // so each item says which shard it is rather than having its key taken
-        // apart to find out.
-        let item = HashMap::from([
-            (
-                SHARD_INDEX_ATTR.to_owned(),
-                AttributeValue::N("7".to_owned()),
-            ),
-            (
-                SHARD_COUNT_ATTR.to_owned(),
-                AttributeValue::N("42".to_owned()),
-            ),
-        ]);
-        assert_eq!(shard_index_of(&item), Some(7));
-        assert_eq!(shard_count_of(&item), Some(42));
-
-        // Out of range or absent is None, never a wrong shard.
-        let bad = HashMap::from([(
-            SHARD_INDEX_ATTR.to_owned(),
-            AttributeValue::N(SHARDS.to_string()),
-        )]);
-        assert_eq!(shard_index_of(&bad), None);
-        assert_eq!(shard_index_of(&HashMap::new()), None);
-        // An unreadable or absent count is None; callers reserve zero for an
-        // absent *item*, since a present item reaching a fold is never empty —
-        // a missing count on one is corruption, not a still-unwritten shard.
-        assert_eq!(shard_count_of(&HashMap::new()), None);
+    fn key_values_are_frozen_wire_shapes() {
+        assert_eq!(Key::Event { event_id: "evt" }.value(), "EVT#evt");
+        assert_eq!(
+            Key::PrequeueShard {
+                event_id: "evt",
+                shard: shard(3)
+            }
+            .value(),
+            "EVT#evt#PQ#3"
+        );
+        assert_eq!(
+            Key::ArrivalsShard {
+                event_id: "evt",
+                shard: shard(3)
+            }
+            .value(),
+            "EVT#evt#AR#3"
+        );
+        assert_eq!(Key::AdmissionToken { request_id: "abc" }.value(), "TKN#abc");
+        assert_eq!(Key::OidcSession { session_id: "abc" }.value(), "SESS#abc");
+        assert_eq!(Key::PkceTransaction { state: "abc" }.value(), "PKCE#abc");
+        // One kind per table, so no tag: the bytes would be paid per visitor.
+        assert_eq!(Key::Prequeue { request_id: "abc" }.value(), "abc");
+        assert_eq!(Key::Position { request_id: "abc" }.value(), "abc");
     }
 
     #[test]
@@ -364,21 +370,33 @@ mod tests {
         // The whole point: distinct KEYS, not distinct attributes on one item.
         // Ten attributes on a shared item share that item's 1,000 writes per
         // second; ten keys do not.
-        let keys: std::collections::BTreeSet<String> = (0..SHARDS)
-            .map(|s| key_string(&prequeue_shard_key("evt", s)))
+        let prequeue: BTreeSet<String> = (0..SHARDS)
+            .map(|s| {
+                Key::PrequeueShard {
+                    event_id: "evt",
+                    shard: shard(s),
+                }
+                .value()
+            })
             .collect();
-        assert_eq!(keys.len(), SHARDS);
+        assert_eq!(prequeue.len(), SHARDS);
         assert!(
-            !keys.contains("evt"),
+            !prequeue.contains("EVT#evt"),
             "a shard must not collide with the Counters item"
         );
 
-        let arrivals: std::collections::BTreeSet<String> = (0..SHARDS)
-            .map(|s| key_string(&arrivals_shard_key("evt", s)))
+        let arrivals: BTreeSet<String> = (0..SHARDS)
+            .map(|s| {
+                Key::ArrivalsShard {
+                    event_id: "evt",
+                    shard: shard(s),
+                }
+                .value()
+            })
             .collect();
         assert_eq!(arrivals.len(), SHARDS);
         // The two counter families must not collide with each other either.
-        assert!(keys.is_disjoint(&arrivals));
+        assert!(prequeue.is_disjoint(&arrivals));
     }
 
     #[test]
@@ -386,192 +404,192 @@ mod tests {
         // Three kinds of item share this table's key. Without the tags an
         // operator session id and an admission token reservation for the same
         // string would be the same row.
-        let id = "abc";
         let keys = [
-            key_string_of(&admission_token_key(id), TOKENS_KEY_ATTR),
-            key_string_of(&oidc_session_key(id), TOKENS_KEY_ATTR),
-            key_string_of(&pkce_transaction_key(id), TOKENS_KEY_ATTR),
+            Key::AdmissionToken { request_id: "abc" }.value(),
+            Key::OidcSession { session_id: "abc" }.value(),
+            Key::PkceTransaction { state: "abc" }.value(),
         ];
-        let distinct: std::collections::BTreeSet<&String> = keys.iter().collect();
+        let distinct: BTreeSet<&String> = keys.iter().collect();
         assert_eq!(distinct.len(), 3, "two kinds share a key: {keys:?}");
-        assert_eq!(keys[0], "TKN#abc");
-        assert_eq!(keys[1], "SESS#abc");
-        assert_eq!(keys[2], "PKCE#abc");
     }
 
     #[test]
     fn shard_keys_are_scoped_to_their_event() {
         // Two events in one table must not share a counter.
         assert_ne!(
-            prequeue_shard_key("evt-a", 3),
-            prequeue_shard_key("evt-b", 3)
+            Key::PrequeueShard {
+                event_id: "evt-a",
+                shard: shard(3)
+            }
+            .value(),
+            Key::PrequeueShard {
+                event_id: "evt-b",
+                shard: shard(3)
+            }
+            .value()
         );
-        assert_eq!(key_string(&event_key("evt")), "EVT#evt");
-        assert_eq!(key_string(&prequeue_shard_key("evt", 3)), "EVT#evt#PQ#3");
-        assert_eq!(key_string(&arrivals_shard_key("evt", 3)), "EVT#evt#AR#3");
     }
 
     #[test]
-    #[should_panic(expected = "out of range")]
-    fn prequeue_shard_key_out_of_range_panics() {
-        let _ = prequeue_shard_key("evt", SHARDS);
+    fn a_key_carries_its_own_table_attribute() {
+        assert_eq!(Key::Event { event_id: "e" }.attr(), KEY_ATTR);
+        assert_eq!(Key::OidcSession { session_id: "s" }.attr(), TOKENS_KEY_ATTR);
+        assert_eq!(Key::Prequeue { request_id: "r" }.attr(), PREQUEUE_KEY_ATTR);
+        assert_eq!(Key::Position { request_id: "r" }.attr(), POSITIONS_KEY_ATTR);
+
+        let built = Key::Event { event_id: "evt" }.build();
+        assert_eq!(built.len(), 1);
+        assert_eq!(
+            built.get(KEY_ATTR).and_then(|v| v.as_s().ok()),
+            Some(&"EVT#evt".to_owned())
+        );
     }
 
-    #[test]
-    #[should_panic(expected = "out of range")]
-    fn arrivals_shard_key_out_of_range_panics() {
-        let _ = arrivals_shard_key("evt", SHARDS);
-    }
-
-    #[test]
-    fn a_hash_in_an_event_id_would_collide_two_keys() {
-        // EVT#a#PQ#1 is both event "a"'s first pre-queue shard and event
-        // "a#PQ#1"'s own item. One event per deployment makes this
-        // unreachable today, and the Terraform variable rejects a '#' so it
-        // stays that way — this records why that validation exists.
-        assert_eq!(prequeue_shard_key("a", 1), event_key("a#PQ#1"));
-    }
-
-    #[test]
-    fn a_shard_increment_names_only_short_attributes() {
-        // Attribute names are billed on every write, so the increment must not
-        // carry long ones.
-        assert_eq!(increment_shard_update(), "SET s = :shard ADD n :one");
-        assert_eq!(SHARD_COUNT_ATTR, "n");
-        assert_eq!(SHARD_INDEX_ATTR, "s");
-    }
-
-    #[test]
-    fn the_tokens_ttl_attribute_is_the_name_terraform_enables_ttl_on() {
-        // The value itself is the contract: it is repeated in the Tokens
-        // table's `ttl { attribute_name }` in infra/modules/core/main.tf, which
-        // no compiler checks against this constant. DynamoDB accepts a TTL
-        // configured on an attribute nothing writes without complaint and then
-        // reclaims nothing, so the mismatch is invisible until a table has
-        // grown for months. Changing this value means changing that block in
-        // the same commit.
-        assert_eq!(TOKENS_TTL_ATTR, "expires_at");
-    }
-
-    #[test]
-    fn no_expression_inlines_an_attribute_name_containing_a_hash() {
-        // '#' opens an expression-attribute-name placeholder, so an attribute
-        // whose name contains one cannot be written into an expression
-        // literally: `ADD arrivals#4 :one` parses as the attribute `arrivals`
-        // plus an undefined placeholder `#4`, and DynamoDB rejects it. That is
-        // exactly how the arrivals counter failed on every admitted visitor
-        // while the handler logged a warning and admitted them anyway.
-        //
-        // Keys are values, not expression text, so EVT#... and TKN#... are
-        // unaffected — this is only about the expression strings.
-        for expression in [
-            increment_shard_update(),
-            claim_live_block_update(),
-            claim_prequeue_block_update(),
-            seal_update(),
-            seal_guard(),
-        ] {
+    /// Every placeholder an expression names must be bound, and nothing else.
+    /// This is the property the builder exists to guarantee: the previous
+    /// split between an expression function and a separate values function
+    /// could not hold it, because nothing tied the two together.
+    fn assert_self_consistent(built: &Expression) {
+        for name in extract(&built.expression, '#') {
             assert!(
-                !expression.contains('#'),
-                "{expression:?} inlines an attribute name containing '#'; \
-                 it must use ExpressionAttributeNames or a name without one"
+                built.names.contains_key(&name),
+                "{name} referenced but not bound in {:?}",
+                built.names
             );
         }
-        assert!(!not_exists_condition("request_id").contains('#'));
-    }
-
-    #[test]
-    fn every_placeholder_in_the_increment_is_bound() {
-        // An expression referring to a placeholder nothing supplies is accepted
-        // by the compiler and rejected by DynamoDB at runtime, so the pairing
-        // is asserted here rather than discovered in a deploy.
-        let expression = increment_shard_update();
-        let values = increment_shard_values(3);
-        for placeholder in expression.split_whitespace().filter(|t| t.starts_with(':')) {
+        for placeholder in extract(&built.expression, ':') {
             assert!(
-                values.contains_key(placeholder),
-                "{placeholder} is used but never bound"
+                built.values.contains_key(&placeholder),
+                "{placeholder} referenced but not bound in {:?}",
+                built.values
             );
         }
-        assert_eq!(values[":shard"], AttributeValue::N("3".to_owned()));
-    }
-
-    #[test]
-    fn every_placeholder_in_the_prequeue_block_claim_is_bound() {
-        let expression = claim_prequeue_block_update();
-        let values = claim_prequeue_block_values(3, 42);
-        for placeholder in expression.split_whitespace().filter(|t| t.starts_with(':')) {
+        for name in built.names.keys() {
             assert!(
-                values.contains_key(placeholder),
-                "{placeholder} is used but never bound"
+                built.expression.contains(name.as_str()),
+                "{name} bound but never referenced"
             );
         }
-        assert_eq!(values[":shard"], AttributeValue::N("3".to_owned()));
-        assert_eq!(values[":count"], AttributeValue::N("42".to_owned()));
+        for placeholder in built.values.keys() {
+            assert!(
+                built.expression.contains(placeholder.as_str()),
+                "{placeholder} bound but never referenced"
+            );
+        }
+    }
+
+    /// Pulls every `#name` or `:value` token out of an expression.
+    fn extract(expression: &str, sigil: char) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut rest = expression;
+        while let Some(at) = rest.find(sigil) {
+            let tail = &rest[at..];
+            let end = tail
+                .char_indices()
+                .position(|(i, c)| i > 0 && !c.is_ascii_alphanumeric())
+                .unwrap_or(tail.len());
+            found.push(tail[..end].to_owned());
+            rest = &tail[end..];
+        }
+        found
     }
 
     #[test]
-    #[should_panic(expected = "out of range")]
-    fn claim_prequeue_block_values_out_of_range_panics() {
-        let _ = claim_prequeue_block_values(SHARDS, 1);
+    fn an_update_binds_every_placeholder_it_names() {
+        let built = Update::new()
+            .set(SHARD_INDEX_ATTR, AttributeValue::N("7".to_owned()))
+            .add(SHARD_COUNT_ATTR, AttributeValue::N("1".to_owned()))
+            .build();
+        assert!(built.expression.starts_with("SET "));
+        assert!(built.expression.contains(" ADD "));
+        assert_eq!(built.names.len(), 2);
+        assert_eq!(built.values.len(), 2);
+        assert_self_consistent(&built);
     }
 
     #[test]
-    fn live_block_and_condition_fragments() {
-        assert_eq!(claim_live_block_update(), "ADD queue_counter :n");
-        assert_eq!(
-            not_exists_condition("request_id"),
-            "attribute_not_exists(request_id)"
-        );
+    fn an_update_with_only_one_clause_emits_only_that_clause() {
+        let add_only = Update::new()
+            .add("queue_counter", AttributeValue::N("5".to_owned()))
+            .build();
+        assert!(add_only.expression.starts_with("ADD "));
+        assert!(!add_only.expression.contains("SET"));
+        assert_self_consistent(&add_only);
+
+        let set_only = Update::new()
+            .set("phase", AttributeValue::S("active".to_owned()))
+            .build();
+        assert!(set_only.expression.starts_with("SET "));
+        assert!(!set_only.expression.contains("ADD"));
+        assert_self_consistent(&set_only);
     }
 
     #[test]
-    fn the_widened_live_join_condition_binds_its_own_placeholders() {
-        let condition = not_exists_or_expired_condition("request_id");
-        assert_eq!(
-            condition,
-            "attribute_not_exists(request_id) OR #s = :expired"
-        );
-        assert_eq!(status_attr_name()["#s"], "status");
-        assert_eq!(
-            expired_status_value()[":expired"],
-            AttributeValue::S("expired".to_owned())
-        );
+    fn repeating_an_attribute_binds_each_clause_separately() {
+        // The seal writes the cohort size to two attributes at once. Two
+        // clauses, two placeholders, no shared binding to get out of step.
+        let built = Update::new()
+            .set("participant_count", AttributeValue::N("9".to_owned()))
+            .set("queue_counter", AttributeValue::N("9".to_owned()))
+            .build();
+        assert_eq!(built.values.len(), 2);
+        assert_self_consistent(&built);
     }
 
     #[test]
-    fn prequeue_key_uses_the_bare_request_id() {
-        assert_eq!(key_string_of(&prequeue_key("req-1"), "r"), "req-1");
+    fn an_empty_update_is_empty_rather_than_malformed() {
+        let built = Update::new().build();
+        assert_eq!(built.expression, "");
+        assert!(built.names.is_empty());
+        assert!(built.values.is_empty());
     }
 
     #[test]
-    fn seal_starts_the_live_join_sequence_at_the_cohort_size() {
-        // The one clause that keeps a post-seal live joiner off the pre-queue
-        // cohort's [0, N): queue_counter takes the same :n as participant_count,
-        // so `ADD queue_counter :1` next returns N + 1, not 1.
-        let update = seal_update();
+    fn a_condition_binds_every_placeholder_it_names() {
+        let plain = Condition::attribute_not_exists(POSITIONS_KEY_ATTR).build();
+        assert!(plain.expression.starts_with("attribute_not_exists("));
+        assert!(plain.values.is_empty());
+        assert_self_consistent(&plain);
+
+        let widened = Condition::attribute_not_exists(POSITIONS_KEY_ATTR)
+            .or_equals(STATUS_ATTR, AttributeValue::S(STATUS_EXPIRED.to_owned()))
+            .build();
+        assert!(widened.expression.contains(" OR "));
+        assert_eq!(widened.values.len(), 1);
+        assert_self_consistent(&widened);
+    }
+
+    #[test]
+    fn a_reserved_word_is_referenced_through_a_name_placeholder() {
+        // `status` is reserved, so it must never appear literally.
+        let built = Condition::attribute_not_exists(POSITIONS_KEY_ATTR)
+            .or_equals(STATUS_ATTR, AttributeValue::S(STATUS_EXPIRED.to_owned()))
+            .build();
         assert!(
-            update.contains("queue_counter = :n"),
-            "seal must seed queue_counter; without it live joins collide with [0, N)"
+            !built.expression.contains(STATUS_ATTR),
+            "reserved word written literally: {}",
+            built.expression
         );
-        assert!(update.contains("participant_count = :n"));
-        assert!(update.starts_with("SET "));
+        assert!(built.names.values().any(|v| v == STATUS_ATTR));
     }
 
     #[test]
-    fn seal_writes_every_value_in_one_guarded_update() {
-        // All four seal outputs plus the phase flip in a single SET, guarded on
-        // the seed's absence, so the seal is atomic and happens exactly once.
-        let update = seal_update();
-        for attr in [
-            "shuffle_seed = :seed",
-            "participant_count = :n",
-            "queue_counter = :n",
-            "prequeue_offsets = :offsets",
-            "phase = :active",
-        ] {
-            assert!(update.contains(attr), "seal update missing {attr}");
+    fn an_update_and_a_condition_never_share_a_placeholder() {
+        // Both land on one request, so their namespaces must be disjoint.
+        let update = Update::new()
+            .add(SHARD_COUNT_ATTR, AttributeValue::N("1".to_owned()))
+            .build();
+        let condition = Condition::attribute_not_exists(POSITIONS_KEY_ATTR)
+            .or_equals(STATUS_ATTR, AttributeValue::S(STATUS_EXPIRED.to_owned()))
+            .build();
+        for name in condition.names.keys() {
+            assert!(!update.names.contains_key(name), "name collision: {name}");
         }
-        assert_eq!(seal_guard(), "attribute_not_exists(shuffle_seed)");
+        for placeholder in condition.values.keys() {
+            assert!(
+                !update.values.contains_key(placeholder),
+                "value collision: {placeholder}"
+            );
+        }
     }
 }

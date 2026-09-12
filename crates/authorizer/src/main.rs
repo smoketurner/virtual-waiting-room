@@ -206,7 +206,7 @@ async fn carry_out<S: Store>(
             // so it is drawn here rather than in the pure `decide`.
             match wr_common::Shard::random() {
                 Ok(shard) => {
-                    if let Err(e) = store.record_arrival(&cfg.event_id, shard.index()).await {
+                    if let Err(e) = store.record_arrival(&cfg.event_id, shard).await {
                         // Non-fatal: admit the visitor; the controller
                         // tolerates a missed arrival count better than we
                         // tolerate blocking them.
@@ -322,6 +322,7 @@ mod tests {
     use authorizer::dynamo::{Store, StoreError};
     use authorizer::{Config, Decision, ProtectionRule, SessionMode, UnreachablePolicy};
     use lambda_http::{Body, Response};
+    use wr_common::Shard;
 
     /// What [`FakeStore::reserve_token`] returns, to drive each replay branch.
     #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
@@ -355,12 +356,12 @@ mod tests {
         fn record_arrival(
             &self,
             event_id: &str,
-            shard: usize,
+            shard: Shard,
         ) -> impl Future<Output = Result<(), StoreError>> + Send {
             self.arrivals
                 .lock()
                 .unwrap()
-                .push((event_id.to_owned(), shard));
+                .push((event_id.to_owned(), shard.index()));
             let err = *self.arrival_err.lock().unwrap();
             std::future::ready(if err {
                 Err(StoreError::Backend("injected arrival failure".to_owned()))

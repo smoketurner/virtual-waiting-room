@@ -302,11 +302,82 @@ pub enum ResolveError {
     BadShard,
 }
 
+/// Reads a shard item's own index, or `None` if it is missing or out of range.
+///
+/// Readers fetch shards in a batch and get them back in arbitrary order, so
+/// each item says which shard it is rather than having its key taken apart.
+#[must_use]
+pub fn shard_index_of<S: std::hash::BuildHasher>(
+    item: &HashMap<String, AttributeValue, S>,
+) -> Option<usize> {
+    let shard = item
+        .get(crate::expr::SHARD_INDEX_ATTR)
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<usize>().ok())?;
+    (shard < SHARDS).then_some(shard)
+}
+
+/// Reads a shard item's count, or `None` if the count attribute is absent,
+/// not a `Number`, or not a parseable `u64`.
+///
+/// `None` distinguishes "this item has no readable count" from "this shard has
+/// no item": a shard that nothing has written yields no item at all from a
+/// `BatchGetItem` response, so it never reaches a fold that could call this. A
+/// present item whose count cannot be read is therefore corruption, not an
+/// empty shard — callers that fold batch-get items must turn `None` into an
+/// error rather than silently zero the shard, reserving zero for a shard that
+/// never reached them because it had no item.
+#[must_use]
+pub fn shard_count_of<S: std::hash::BuildHasher>(
+    item: &HashMap<String, AttributeValue, S>,
+) -> Option<u64> {
+    item.get(crate::expr::SHARD_COUNT_ATTR)
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<u64>().ok())
+}
+
 #[cfg(test)]
 mod tests {
     #![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
 
     use super::*;
+
+    #[test]
+    fn a_shard_item_reports_its_own_index() {
+        // Readers fetch shards in a batch and get them back in arbitrary order,
+        // so each item says which shard it is rather than having its key taken
+        // apart to find out.
+        let item = HashMap::from([
+            (
+                crate::expr::SHARD_INDEX_ATTR.to_owned(),
+                AttributeValue::N("7".to_owned()),
+            ),
+            (
+                crate::expr::SHARD_COUNT_ATTR.to_owned(),
+                AttributeValue::N("42".to_owned()),
+            ),
+        ]);
+        assert_eq!(shard_index_of(&item), Some(7));
+        assert_eq!(shard_count_of(&item), Some(42));
+
+        // Out of range or absent is None, never a wrong shard.
+        let bad = HashMap::from([(
+            crate::expr::SHARD_INDEX_ATTR.to_owned(),
+            AttributeValue::N(SHARDS.to_string()),
+        )]);
+        assert_eq!(shard_index_of(&bad), None);
+        assert_eq!(shard_index_of(&HashMap::new()), None);
+        // An unreadable or absent count is None; callers reserve zero for an
+        // absent *item*, since a present item reaching a fold is never empty —
+        // a missing count on one is corruption, not a still-unwritten shard.
+        assert_eq!(shard_count_of(&HashMap::new()), None);
+        // A non-numeric count is corruption, not zero.
+        let corrupt = HashMap::from([(
+            crate::expr::SHARD_COUNT_ATTR.to_owned(),
+            AttributeValue::S("not a number".to_owned()),
+        )]);
+        assert_eq!(shard_count_of(&corrupt), None);
+    }
 
     #[test]
     fn prequeue_item_round_trips_through_attribute_values() {

@@ -14,8 +14,9 @@ use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
 use aws_sdk_dynamodb::types::AttributeValue;
-use wr_common::expr::{arrivals_shard_key, event_key, shard_count_of, shard_index_of};
+use wr_common::expr::Key;
 use wr_common::{Phase, PositionStatus, SHARDS, StoredControl};
+use wr_common::{Shard, shard_count_of, shard_index_of};
 
 use crate::{
     ControllerState, ExpiredPosition, NoShowState, ReleaseDecision, ReleaseInputs, ReleaseOutcome,
@@ -62,7 +63,7 @@ impl Store for DynamoStore {
             .client
             .get_item()
             .table_name(&self.counters_table)
-            .set_key(Some(event_key(event_id)))
+            .set_key(Some(Key::Event { event_id }.build()))
             .consistent_read(true)
             .send()
             .await
@@ -132,7 +133,7 @@ impl Store for DynamoStore {
             .client
             .update_item()
             .table_name(&self.counters_table)
-            .set_key(Some(event_key(event_id)))
+            .set_key(Some(Key::Event { event_id }.build()))
             .update_expression(
                 "SET serving_counter = :next, last_serving_counter = :last_serving, \
                  last_arrivals_total = :arrivals_total, no_show_rate = :no_show",
@@ -273,7 +274,7 @@ impl Store for DynamoStore {
             .client
             .update_item()
             .table_name(&self.counters_table)
-            .set_key(Some(event_key(event_id)))
+            .set_key(Some(Key::Event { event_id }.build()))
             .update_expression("SET max_expired_position = :m")
             // Only ever move the cursor forward.
             .condition_expression(
@@ -305,7 +306,8 @@ impl DynamoStore {
     /// `BatchGetItem` rather than attributes already in hand.
     async fn read_arrivals(&self, event_id: &str) -> Result<[u64; SHARDS], StoreError> {
         let keys: Vec<_> = (0..SHARDS)
-            .map(|shard| arrivals_shard_key(event_id, shard))
+            .filter_map(Shard::new)
+            .map(|shard| Key::ArrivalsShard { event_id, shard }.build())
             .collect();
 
         let request = aws_sdk_dynamodb::types::KeysAndAttributes::builder()

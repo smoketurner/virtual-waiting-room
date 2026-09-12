@@ -8,7 +8,7 @@ use read::{
     CountersCache, PollPolicy, QueueNumError, ResolvedQueueNum, parse_poll_policy, queue_num,
     status,
 };
-use wr_common::expr::event_key;
+use wr_common::expr::Key;
 use wr_common::{Counters, PreQueueItem};
 
 /// How long one execution environment holds the `Counters` item. Matched to the
@@ -169,7 +169,12 @@ async fn load_counters(ctx: &Ctx) -> Result<Option<Counters>, Error> {
         .client
         .get_item()
         .table_name(&ctx.counters_table)
-        .set_key(Some(event_key(&ctx.event_id)))
+        .set_key(Some(
+            Key::Event {
+                event_id: &ctx.event_id,
+            }
+            .build(),
+        ))
         .send()
         .await?;
     let counters = out

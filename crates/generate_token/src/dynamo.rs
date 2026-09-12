@@ -4,10 +4,8 @@ use std::collections::HashMap;
 
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::types::AttributeValue;
-use wr_common::expr::{
-    arrivals_shard_key, event_key, increment_shard_update, increment_shard_values,
-};
-use wr_common::{Counters, PositionStatus, PreQueueItem};
+use wr_common::expr::{Key, SHARD_COUNT_ATTR, SHARD_INDEX_ATTR, Update};
+use wr_common::{Counters, PositionStatus, PreQueueItem, Shard};
 
 use crate::{Store, StoreError};
 
@@ -45,7 +43,7 @@ impl Store for DynamoStore {
             // Consistent: a visitor polling for admission must not be told to
             // keep waiting because a replica lagged behind the controller.
             .consistent_read(true)
-            .set_key(Some(event_key(event_id)))
+            .set_key(Some(Key::Event { event_id }.build()))
             .send()
             .await
             .map_err(|e| StoreError(format!("get_item counters: {e}")))?;
@@ -88,15 +86,25 @@ impl Store for DynamoStore {
         Ok(out.item().and_then(position_from_item))
     }
 
-    async fn record_arrival(&self, event_id: &str, shard: usize) -> Result<(), StoreError> {
+    async fn record_arrival(&self, event_id: &str, shard: Shard) -> Result<(), StoreError> {
+        // Stamps the shard's own index alongside the +1 so a reader that
+        // fetched a batch of shards knows which is which.
+        let bump = Update::new()
+            .set(
+                SHARD_INDEX_ATTR,
+                AttributeValue::N(shard.index().to_string()),
+            )
+            .add(SHARD_COUNT_ATTR, AttributeValue::N("1".to_owned()))
+            .build();
         // The shard is its own item, so arrivals at the admission rate do not
         // contend with the queue_counter claims on the Counters item.
         self.client
             .update_item()
             .table_name(&self.counters_table)
-            .set_key(Some(arrivals_shard_key(event_id, shard)))
-            .update_expression(increment_shard_update())
-            .set_expression_attribute_values(Some(increment_shard_values(shard)))
+            .set_key(Some(Key::ArrivalsShard { event_id, shard }.build()))
+            .update_expression(bump.expression)
+            .set_expression_attribute_names(Some(bump.names))
+            .set_expression_attribute_values(Some(bump.values))
             .send()
             .await
             .map_err(|e| StoreError(format!("update_item arrivals: {e}")))?;
