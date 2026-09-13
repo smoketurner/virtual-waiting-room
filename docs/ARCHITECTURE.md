@@ -69,6 +69,7 @@ POST /v1/join
         required: request_id, event_id
         additionalProperties: false
         request_id maxLength 36
+        event_id maxLength = length of this deployment's event id
       integration type AWS, credentials: an IAM role
         Action=SendMessage&MessageBody=$util.urlEncode($input.body)
       integration responses

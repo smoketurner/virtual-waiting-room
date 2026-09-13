@@ -314,7 +314,9 @@ resource "aws_api_gateway_model" "join" {
     additionalProperties = false
     properties = {
       request_id = { type = "string", minLength = 1, maxLength = 36 } # canonical UUID length
-      event_id   = { type = "string", minLength = 1 }
+      # The only value a legitimate join carries: the client reads it from
+      # /status and assign_position discards anything else.
+      event_id = { type = "string", minLength = 1, maxLength = length(var.event_id) }
       # Never add to `required`: rejecting an absent ticket here would tell an
       # attacker whether the deployment is ticketed. assign_position enforces
       # presence instead (issue #59).
