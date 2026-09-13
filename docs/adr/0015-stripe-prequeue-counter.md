@@ -34,7 +34,7 @@ each call site, and `event_id` may not contain `#`, or one event's shard key cou
 another event's item.
 
 - **Registration.** Each `assign_position` invocation draws one shard `s` uniformly at random
-  (amended by [ADR-0026](0026-entry-tickets.md); it was `hash(request_id) % 10`). The invocation
+  (it was `hash(request_id) % 10`). The invocation
   issues a single `ADD n :count` / `ALL_NEW` against that shard — one round trip claims the whole
   batch's **local indices** within it, not one per registrant — then writes `PreQueue {r, s, l, t}`
   per request: the shard `s` and the local index `l`, never a global index.
@@ -85,9 +85,8 @@ shard attribute is the single letter `n`.
   Determinism was never load-bearing. Every caller uses the shard once at write time and the row
   stores it, so a retry never needs to reproduce it. Idempotency (F2.5) comes from
   `attribute_not_exists(r)` on the row, which holds whatever shard the retry lands on; what the
-  retry can now waste is a burned index, which the dedupe read
-  ([ADR-0026](0026-entry-tickets.md)) avoids in the common case and which the design already
-  tolerates. One draw per invocation rather than per record also collapses a batch from up to ten
+  retry can now waste is a burned index, which the dedupe read avoids in the common case and
+  which the design already tolerates. One draw per invocation rather than per record also collapses a batch from up to ten
   shard claims to one.
 - `PreQueue` stores `{r, s, l, t}`. The global index is derived, never stored, so it cannot disagree
   with the offsets.

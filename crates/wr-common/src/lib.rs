@@ -13,7 +13,6 @@
 //! which layer a type happens to live in.
 
 pub mod crypto;
-pub mod entry;
 pub mod expr;
 pub mod ids;
 pub mod items;
@@ -21,14 +20,10 @@ pub mod permutation;
 pub mod rules;
 
 pub use crypto::{AdmissionToken, Session, SigningKey, VerifyError};
-pub use entry::{
-    EntryPolicy, KeyError, TicketError, TicketKey, TicketSubject, derive_request_id, is_uuid_shape,
-    verify_ticket,
-};
 pub use expr::{STARTS_AT_ATTR, STARTS_AT_TZ_ATTR};
 pub use ids::{
     AdmissionControl, EventId, IllegalControl, Phase, RequestId, ServingState, StoredControl,
-    UnknownControl, UnknownPhase, resolve, serving_state,
+    UnknownControl, UnknownPhase, is_uuid_shape, resolve, serving_state,
 };
 pub use items::{
     Counters, PositionItem, PositionStatus, PreQueueItem, ResolveError, ResolvedPosition, Sealed,

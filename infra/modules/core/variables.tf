@@ -222,23 +222,6 @@ variable "poll_ceiling_ms" {
   }
 }
 
-variable "entry_ticket_public_key" {
-  description = "ES256 public key as a JSON JWK ({\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"...\",\"y\":\"...\"}) that verifies client-signed entry tickets. Empty disables entry gating: the deployment is a bare raffle where registration volume converts linearly into expected share of the queue."
-  type        = string
-  default     = ""
-
-  validation {
-    condition     = var.entry_ticket_public_key == "" || can(jsondecode(var.entry_ticket_public_key))
-    error_message = "entry_ticket_public_key must be empty or a JSON JWK object."
-  }
-}
-
-variable "entry_ticket_cookie_name" {
-  description = "Cookie the customer's issuer sets to carry the signed entry ticket on a custom domain deployment. Unused when entry_ticket_public_key is empty."
-  type        = string
-  default     = "vwr_ticket"
-}
-
 variable "poll_divisor" {
   description = "Divides a visitor's estimated wait, in seconds, into their poll interval in milliseconds per second of wait: a visitor who can see N seconds left polls roughly every N/divisor seconds, clamped to [poll_floor_ms, poll_ceiling_ms]."
   type        = number

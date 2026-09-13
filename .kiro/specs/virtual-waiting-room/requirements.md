@@ -191,27 +191,16 @@ activation queues first-in, first-out (FIFO).
 
 ### 1.7 Abuse mitigation
 
-**F6.1** — As an operator, I want to gate entry on a signed entry ticket so that one identity holds one position.
-- THE SYSTEM SHALL support gating **queue entry** on a client-issued signed entry ticket carrying an opaque per-identity subject.
-- WHERE a ticket is configured, THE SYSTEM SHALL derive the visitor's `request_id` from that subject and SHALL discard any registration whose supplied `request_id` differs from the derived value.
-- WHERE a ticket is missing, invalid, expired, or issued for another event, THE SYSTEM SHALL discard the registration without signalling the reason at join time.
-- Acceptance: N registrations under one identity yield exactly one position; a discarded registration is indistinguishable from an accepted one at the join call.
-
-**F6.2** — As a client, I want to sign tickets myself so that the waiting room never receives the identifier.
-- THE SYSTEM SHALL require the ticket to be signed by the client, not by the waiting room, and SHALL hold only a public key.
-- THE SYSTEM SHALL require the subject to be opaque, and SHALL reject a subject outside 22–256 base64url characters.
-- Acceptance: The waiting room verifies a signature over a subject it cannot reverse. The shape check fails closed on an email, a raw member number or a UUID; opaqueness beyond that is a customer obligation the wire format cannot enforce.
-
 **F6.3** — As an operator, I want bot-blocking deferrable to start so that suspected bots can be dropped at randomization.
 - WHERE the operator elects to defer bot-blocking, THE SYSTEM SHOULD enforce bot-blocking decisions at event start rather than during the pre-queue.
 - Acceptance: **Not built.** THE SYSTEM SHALL capture join-time telemetry (viewer address, ASN, country, JA4 fingerprint, user agent) on every registration row — this is done, and is the input such a decision would need — but no classification, no consumer and no seal-time mitigation exists. Deferred on cost: the mechanism depends on WAF Bot Control, which the deployment does not enable.
 
-**Scope of F6.1.** It bounds identifier minting, not volume: a farm holding N legitimate
-identities still receives N positions, so the guarantee is inherited from the customer's
-identity system. It is inapplicable where no prior relationship exists — a public onsale has no
-party who can vouch that a visitor is distinct — and such a deployment runs without a ticket as
-a bare raffle. Bounding volume without an identity needs proof of work or behavioural
-classification; neither is built.
+**No one-position-per-visitor control exists.** `request_id` is client-supplied, so nothing
+stops one visitor taking N places, and randomization converts volume into expected share
+linearly. Every deployment is a bare raffle. Bounding volume needs either an identity to bind a
+position to — which a public onsale open to anyone does not have — or a mechanism that costs the
+client something: proof of work, or behavioural classification over the telemetry F6.3
+describes. Neither is built.
 
 ### 1.8 Operator web interface
 
@@ -349,7 +338,7 @@ Contractual deliverables. Without these the capacity requirements are not met.
 
 Not required for the current release. Rationale in `adr/README.md`.
 
-- Invite-only waiting rooms with multi-factor authentication (MFA) gating. F6.1 is the primitive it would build on.
+- Invite-only waiting rooms with multi-factor authentication (MFA) gating.
 - Proof-of-Work challenges and CAPTCHA softblock before queue entry.
 - Native application software development kits (SDKs) for iOS, Android and React Native.
 - Platform connector breadth beyond the CloudFront/origin authorizer.

@@ -29,8 +29,9 @@ One record per decision. Each states the context, the decision, and its conseque
 | [0023](0023-adaptive-poll-interval.md) | Scale the client poll interval with distance to the front |
 | [0024](0024-jws-credentials.md) | Carry credentials as a JWS (amends 0011) |
 | [0025](0025-operator-owned-seal-schedule.md) | The operator owns the seal schedule's time; Terraform owns the schedule |
-| [0026](0026-entry-tickets.md) | One position per identity, from a customer-signed entry ticket (amends 0010, 0015) |
-| [0027](0027-ticket-delivery-fragment-not-query.md) | Deliver the entry ticket by cookie, or by URL fragment — never a query string |
+| [0026](0026-entry-tickets.md) | One position per identity, from a customer-signed entry ticket (superseded by 0028) |
+| [0027](0027-ticket-delivery-fragment-not-query.md) | Deliver the entry ticket by cookie, or by URL fragment — never a query string (superseded by 0028) |
+| [0028](0028-remove-entry-tickets.md) | Remove entry tickets: nothing could use them without customer-side work we do not supply |
 
 ## Open
 

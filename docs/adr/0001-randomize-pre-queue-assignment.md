@@ -27,8 +27,9 @@ first-served.
   holding ten times the registrations of the genuine population takes roughly 91% of the
   front of the queue — and the permutation is perfectly uniform over that poisoned
   population. Uniformity is a property of the draw, not of who holds the tickets.
-  Constraining volume is a separate mechanism ([0026](0026-entry-tickets.md)); with none
-  configured the raffle is a bare raffle, and this ADR's guarantee is only about speed.
+  Constraining volume is a separate mechanism and none is built
+  ([0028](0028-remove-entry-tickets.md)), so the raffle is a bare raffle and this ADR's
+  guarantee is only about speed.
 - Two fairness models must be documented to visitors: randomized for scheduled events,
   first-in first-out for standby activation.
 - Queue-it applies the same split, describing pre-queue randomization "like a raffle" and

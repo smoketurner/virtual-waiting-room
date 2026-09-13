@@ -76,19 +76,19 @@ Throwaway code. Measures what documentation cannot settle.
 
 ### 1g. Entry gating and abuse mitigation
 
-- [x] Client-signed entry ticket verified at join, `request_id` derived from its opaque subject so one identity holds one position [F6.1, F6.2]
 - [ ] Deferred bot enforcement: admit to pre-queue, block at randomization [F6.3]
       `Partial:` join-time telemetry (viewer address, ASN, country, JA4 fingerprint, user
       agent) is captured on every registration row, which is the input a deferred decision
       needs. No classifier, no operator action and no seal-time mitigation exist, and nothing
       reads the telemetry. Deferred on cost — the specified mechanism depends on WAF Bot
       Control, which the deployment does not enable.
-- [ ] Bound registration volume where no identity exists [F6.1 scope gap]
-      `Partial:` entry tickets bound identifier *minting*, not volume — a farm with N
-      legitimate identities gets N positions, and a public onsale has no party who can vouch
-      that a visitor is distinct, so it runs unticketed as a bare raffle. Proof of work at
-      registration, or behavioural classification over the telemetry above, is what would bound
-      it. Neither is built.
+- [ ] Bound how many positions one visitor can hold
+      `Partial:` nothing does. `request_id` is client-supplied, so volume converts into share
+      of the front of the queue linearly and every deployment is a bare raffle. The entry
+      tickets that bounded identifier *minting* were removed (ADR-0028) — they needed the
+      customer to build a signing endpoint, and they never bounded volume. Proof of work at
+      registration, or behavioural classification over the telemetry above, is what would
+      bound it.
 
 ### 1h. Operator surface
 
@@ -195,12 +195,12 @@ Reliability — the waiting room must not be the reason the site is down:
 - [ ] [#68](https://github.com/smoketurner/virtual-waiting-room/issues/68) Single-region failure domain undocumented and untested
 - [ ] [#70](https://github.com/smoketurner/virtual-waiting-room/issues/70) Pre-event readiness as a command, not a runbook [O1, O2, N7]
 
-Fairness and abuse — the raffle is only as fair as the identities behind the tickets:
+Fairness and abuse — nothing bounds how many places one visitor takes:
 
-- [ ] [#59](https://github.com/smoketurner/virtual-waiting-room/issues/59) No one-position-per-visitor control [F6.1, F6.2, F6.3]
-      `Partial:` entry tickets, the derived `request_id`, server-drawn shards, the reload
-      dedupe and join telemetry are built. F6.3 is not, and tickets do not help a deployment
-      with no identity process — see the two unchecked items in §1g.
+- [ ] [#59](https://github.com/smoketurner/virtual-waiting-room/issues/59) No one-position-per-visitor control [F6.3]
+      `Partial:` server-drawn shards, the reload dedupe and join telemetry are built. The entry
+      tickets are not — they were removed (ADR-0028). Nothing bounds volume; see the unchecked
+      items in §1g.
 - [ ] [#61](https://github.com/smoketurner/virtual-waiting-room/issues/61) Admission cookies wildcard-scoped and transferable
 - [ ] [#62](https://github.com/smoketurner/virtual-waiting-room/issues/62) `request_id` is both a public cache key and the bearer credential
 - [ ] [#63](https://github.com/smoketurner/virtual-waiting-room/issues/63) No way to revoke an admission

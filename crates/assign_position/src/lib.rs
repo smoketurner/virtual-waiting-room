@@ -2,12 +2,10 @@
 //! pre-queue registration.
 //!
 //! Consumes a batch of enqueued join messages. Each record is classified
-//! first (issue #59): its body must parse, its `event_id` must match, and
-//! under [`EntryPolicy::Ticketed`] it must carry a ticket that verifies and a
-//! `request_id` that equals the value derived from the ticket's subject. A
-//! record that fails any of these is a permanent [`DropReason`] — counted and
-//! logged, never retried, never dead-lettered, since no redelivery makes
-//! attacker-chosen or malformed input valid.
+//! first: its body must parse, its `request_id` must be UUID-shaped, and its
+//! `event_id` must match. A record that fails any of these is a permanent
+//! [`DropReason`] — counted and logged, never retried, never dead-lettered,
+//! since no redelivery makes attacker-chosen or malformed input valid.
 //!
 //! Each batch then reads the event's `Counters` item once (a strongly
 //! consistent `GetItem`) to decide which of two paths every accepted record in
@@ -53,7 +51,7 @@ use std::collections::HashSet;
 use std::future::Future;
 
 use serde::Deserialize;
-use wr_common::{Assignment, Counters, EntryPolicy, Phase, Shard, Telemetry, TicketError};
+use wr_common::{Assignment, Counters, Phase, Shard, Telemetry};
 
 pub mod dynamo;
 
@@ -62,10 +60,6 @@ pub mod dynamo;
 pub struct JoinMessage {
     pub request_id: String,
     pub event_id: String,
-    /// The client-carried entry ticket, present only under
-    /// [`EntryPolicy::Ticketed`]. Absent on an open deployment.
-    #[serde(default)]
-    pub ticket: Option<String>,
 }
 
 /// One record from the SQS batch: the message id (for failure reporting), the
@@ -86,10 +80,10 @@ pub struct PositionWrite {
     pub position: u64,
     pub telemetry: Telemetry,
     /// Whether the write may overwrite an existing row whose `status` is
-    /// `expired` (issue #59). A re-join with a derived `request_id` would
-    /// otherwise never be able to reclaim the id a controller-expired live
-    /// join left behind, permanently stranding a visitor whose reload advice
-    /// says "take a new place in line". Excluded for a request id that also
+    /// `expired`. A re-join keeps its `request_id`, so without this it could
+    /// never reclaim the id a controller-expired live join left behind,
+    /// permanently stranding a visitor whose reload advice says "take a new
+    /// place in line". Excluded for a request id that also
     /// holds a `PreQueue` row, so a fixed-up straggler's expired live
     /// position cannot be resurrected out from under the read path, which
     /// prefers that `PreQueue` row and would keep serving the stale value.
@@ -204,26 +198,10 @@ pub struct BatchOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DropReason {
     /// The body did not parse as JSON, or a required field was missing or the
-    /// wrong shape (including a malformed ticket under a ticketed policy, and
-    /// a malformed `request_id` under an open one).
+    /// wrong shape (including a malformed `request_id`).
     BadShape,
     /// The message's `event_id` does not match this deployment's.
     WrongEvent,
-    /// A ticketed deployment received a join with no ticket.
-    NoTicket,
-    /// The ticket's signature does not verify under the configured key.
-    BadSignature,
-    /// The ticket has expired.
-    Expired,
-    /// The ticket is not yet valid (`nbf` in the future).
-    NotYetValid,
-    /// The ticket's `aud` does not name this event.
-    WrongAudience,
-    /// The ticket's `sub` fails the opaque-subject shape check.
-    BadSubject,
-    /// The supplied `request_id` does not equal the value derived from the
-    /// ticket's verified subject.
-    IdMismatch,
 }
 
 /// Per-reason drop counts for one batch, logged under fixed field names so a
@@ -232,13 +210,6 @@ pub enum DropReason {
 struct DropCounts {
     bad_shape: u64,
     wrong_event: u64,
-    no_ticket: u64,
-    bad_signature: u64,
-    expired: u64,
-    not_yet_valid: u64,
-    wrong_audience: u64,
-    bad_subject: u64,
-    id_mismatch: u64,
 }
 
 impl DropCounts {
@@ -246,26 +217,11 @@ impl DropCounts {
         match reason {
             DropReason::BadShape => self.bad_shape += 1,
             DropReason::WrongEvent => self.wrong_event += 1,
-            DropReason::NoTicket => self.no_ticket += 1,
-            DropReason::BadSignature => self.bad_signature += 1,
-            DropReason::Expired => self.expired += 1,
-            DropReason::NotYetValid => self.not_yet_valid += 1,
-            DropReason::WrongAudience => self.wrong_audience += 1,
-            DropReason::BadSubject => self.bad_subject += 1,
-            DropReason::IdMismatch => self.id_mismatch += 1,
         }
     }
 
     fn total(&self) -> u64 {
-        self.bad_shape
-            + self.wrong_event
-            + self.no_ticket
-            + self.bad_signature
-            + self.expired
-            + self.not_yet_valid
-            + self.wrong_audience
-            + self.bad_subject
-            + self.id_mismatch
+        self.bad_shape + self.wrong_event
     }
 }
 
@@ -278,14 +234,9 @@ enum RecordVerdict {
     Reject(DropReason),
 }
 
-/// Parses and validates one record's body against `policy`.
-///
-/// Order: shape, then envelope `event_id`, then (under a ticketed policy)
-/// the ticket itself, then the derived id. An open policy only shape-checks
-/// `request_id`, exactly as the pre-issue-#59 `UUIDv7` check did, except the
-/// shape it accepts is no longer pinned to version 7 (nothing in this
-/// deployment depends on that ordering).
-fn classify_record(body: &str, policy: &EntryPolicy, event_id: &str, now: u64) -> RecordVerdict {
+/// Parses and validates one record's body: shape, then envelope `event_id`,
+/// then the `request_id`'s own shape.
+fn classify_record(body: &str, event_id: &str) -> RecordVerdict {
     let msg: JoinMessage = match serde_json::from_str(body) {
         Ok(msg) => msg,
         Err(_err) => return RecordVerdict::Reject(DropReason::BadShape),
@@ -293,42 +244,10 @@ fn classify_record(body: &str, policy: &EntryPolicy, event_id: &str, now: u64) -
     if msg.event_id != event_id {
         return RecordVerdict::Reject(DropReason::WrongEvent);
     }
-
-    match policy {
-        EntryPolicy::Open => {
-            if wr_common::is_uuid_shape(&msg.request_id) {
-                RecordVerdict::Accept(msg)
-            } else {
-                RecordVerdict::Reject(DropReason::BadShape)
-            }
-        }
-        EntryPolicy::Ticketed(key) => {
-            let Some(ticket) = msg.ticket.as_deref() else {
-                return RecordVerdict::Reject(DropReason::NoTicket);
-            };
-            let subject = match wr_common::verify_ticket(key, ticket, event_id, now) {
-                Ok(subject) => subject,
-                Err(TicketError::Malformed) => return RecordVerdict::Reject(DropReason::BadShape),
-                Err(TicketError::BadSignature) => {
-                    return RecordVerdict::Reject(DropReason::BadSignature);
-                }
-                Err(TicketError::Expired) => return RecordVerdict::Reject(DropReason::Expired),
-                Err(TicketError::NotYetValid) => {
-                    return RecordVerdict::Reject(DropReason::NotYetValid);
-                }
-                Err(TicketError::WrongAudience) => {
-                    return RecordVerdict::Reject(DropReason::WrongAudience);
-                }
-                Err(TicketError::BadSubject) => {
-                    return RecordVerdict::Reject(DropReason::BadSubject);
-                }
-            };
-            let derived = wr_common::derive_request_id(event_id, &subject);
-            if msg.request_id != derived {
-                return RecordVerdict::Reject(DropReason::IdMismatch);
-            }
-            RecordVerdict::Accept(msg)
-        }
+    if wr_common::is_uuid_shape(&msg.request_id) {
+        RecordVerdict::Accept(msg)
+    } else {
+        RecordVerdict::Reject(DropReason::BadShape)
     }
 }
 
@@ -350,16 +269,14 @@ fn classify_record(body: &str, policy: &EntryPolicy, event_id: &str, now: u64) -
 pub async fn process_batch<S: Store>(
     store: &S,
     event_id: &str,
-    policy: &EntryPolicy,
     shard: Shard,
-    now: u64,
     records: &[BatchRecord],
 ) -> BatchOutcome {
     let mut outcome = BatchOutcome::default();
     let mut drops = DropCounts::default();
     let mut valid = Vec::new();
     for record in records {
-        match classify_record(&record.body, policy, event_id, now) {
+        match classify_record(&record.body, event_id) {
             RecordVerdict::Accept(msg) => {
                 valid.push((record.message_id.clone(), msg, record.telemetry.clone()));
             }
@@ -372,13 +289,6 @@ pub async fn process_batch<S: Store>(
             event = "join_dropped",
             bad_shape = drops.bad_shape,
             wrong_event = drops.wrong_event,
-            no_ticket = drops.no_ticket,
-            bad_signature = drops.bad_signature,
-            expired = drops.expired,
-            not_yet_valid = drops.not_yet_valid,
-            wrong_audience = drops.wrong_audience,
-            bad_subject = drops.bad_subject,
-            id_mismatch = drops.id_mismatch,
             total = drops.total(),
             "dropped invalid join records"
         );
@@ -917,7 +827,7 @@ mod tests {
     }
 
     async fn run_open(store: &FakeStore, records: &[BatchRecord]) -> BatchOutcome {
-        process_batch(store, "evt-1", &EntryPolicy::Open, shard(0), 0, records).await
+        process_batch(store, "evt-1", shard(0), records).await
     }
 
     // --- live path (unchanged behaviour) ------------------------------------
@@ -1157,15 +1067,7 @@ mod tests {
     async fn mismatched_event_id_is_dropped_not_failed() {
         let store = FakeStore::default();
         let records = vec![rec("m1", VALID_ID)]; // rec() hardcodes event_id "evt-1"
-        let outcome = process_batch(
-            &store,
-            "evt-other",
-            &EntryPolicy::Open,
-            shard(0),
-            0,
-            &records,
-        )
-        .await;
+        let outcome = process_batch(&store, "evt-other", shard(0), &records).await;
         assert!(outcome.failures.is_empty());
         assert_eq!(*store.counter.lock().unwrap(), 0);
     }
@@ -1242,8 +1144,7 @@ mod tests {
             rec("m2", "018f3a2b-7c9d-7e1f-8002-0123456789ab"),
             rec("m3", "018f3a2b-7c9d-7e1f-8003-0123456789ab"),
         ];
-        let outcome =
-            process_batch(&store, "evt-1", &EntryPolicy::Open, shard(4), 0, &records).await;
+        let outcome = process_batch(&store, "evt-1", shard(4), &records).await;
         assert!(outcome.failures.is_empty());
 
         let writes = store.prequeue_writes.lock().unwrap();
@@ -1424,180 +1325,5 @@ mod tests {
             live_writes[0].position >= 1,
             "straggler position must be >= the cohort size"
         );
-    }
-
-    // --- entry ticket policy (issue #59) ------------------------------------
-
-    mod ticketed {
-        use wr_common::{EntryPolicy, TicketKey};
-
-        use super::*;
-
-        /// A real P-256 test key pair, generated once for these tests.
-        const X_B64: &str = "q_1C5Qxlm0UznPTg8b4ztGRqGDTPcXTowgzHboJ9WBc";
-        const Y_B64: &str = "50IwinLZ2kFdic8gGwFfQ2d6X6UI6s6V3ek9fcjPB-I";
-        const PRIVATE_KEY_PKCS8_B64: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgCM8Gu+5Pe7vq5HGC\
-             lTlTi057LV3NH5ii+Dukp6okfsyhRANCAASr/ULlDGWbRTOc9ODxvjO0ZGoYNM9xdOjCDMdugn1YF+dCMIpy\
-             2dpBXYnPIBsBX0Nnel+lCOrOld3pPX3Izwfi";
-
-        const SUBJECT: &str = "0123456789abcdefghijklmnopqrstuvwxyz-_ABCD";
-
-        fn ticket_key() -> TicketKey {
-            let json = format!(r#"{{"kty":"EC","crv":"P-256","x":"{X_B64}","y":"{Y_B64}"}}"#);
-            TicketKey::from_jwk_json(&json).unwrap()
-        }
-
-        fn policy() -> EntryPolicy {
-            EntryPolicy::Ticketed(ticket_key())
-        }
-
-        fn sign(event_id: &str, sub: &str, exp: u64) -> String {
-            use base64::Engine as _;
-            use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
-            use serde::Serialize;
-
-            #[derive(Serialize)]
-            struct Claims<'a> {
-                aud: &'a str,
-                sub: &'a str,
-                exp: u64,
-            }
-            let der = base64::engine::general_purpose::STANDARD
-                .decode(PRIVATE_KEY_PKCS8_B64)
-                .unwrap();
-            let key = EncodingKey::from_ec_der(&der);
-            encode(
-                &Header::new(Algorithm::ES256),
-                &Claims {
-                    aud: event_id,
-                    sub,
-                    exp,
-                },
-                &key,
-            )
-            .unwrap()
-        }
-
-        fn rec_with_ticket(message_id: &str, request_id: &str, ticket: &str) -> BatchRecord {
-            BatchRecord {
-                message_id: message_id.to_owned(),
-                body: format!(
-                    r#"{{"request_id":"{request_id}","event_id":"evt-1","ticket":"{ticket}"}}"#
-                ),
-                telemetry: Telemetry::default(),
-            }
-        }
-
-        /// The `request_id` a valid, unexpired ticket for `sub` would derive
-        /// to, computed the same way `classify_record` does: verify, then
-        /// derive from the resulting subject.
-        fn expected_id(sub: &str) -> String {
-            let ticket = sign("evt-1", sub, 2_000_000_000);
-            let subject = wr_common::verify_ticket(&ticket_key(), &ticket, "evt-1", 0).unwrap();
-            wr_common::derive_request_id("evt-1", &subject)
-        }
-
-        #[tokio::test]
-        async fn n_registrations_under_one_identity_yield_one_position() {
-            let store = FakeStore::default();
-            let policy = policy();
-            let subject_id = expected_id(SUBJECT);
-
-            // Five fresh tickets, same subject: each derives the identical
-            // request_id, so the fifth "registration" is really four retries.
-            let records: Vec<BatchRecord> = (0..5)
-                .map(|i| {
-                    let ticket = sign("evt-1", SUBJECT, 2_000_000_000);
-                    rec_with_ticket(&format!("m{i}"), &subject_id, &ticket)
-                })
-                .collect();
-            let outcome =
-                process_batch(&store, "evt-1", &policy, shard(0), 1_000_000_000, &records).await;
-            assert!(outcome.failures.is_empty());
-            assert_eq!(
-                store.writes.lock().unwrap().len(),
-                1,
-                "five registrations under one identity yield exactly one position"
-            );
-        }
-
-        #[tokio::test]
-        async fn a_tampered_request_id_is_dropped() {
-            let store = FakeStore::default();
-            let ticket = sign("evt-1", SUBJECT, 2_000_000_000);
-            // A client-chosen id that does not match the ticket's derivation.
-            let records = vec![rec_with_ticket("m1", VALID_ID, &ticket)];
-            let outcome = process_batch(
-                &store,
-                "evt-1",
-                &policy(),
-                shard(0),
-                1_000_000_000,
-                &records,
-            )
-            .await;
-            assert!(outcome.failures.is_empty());
-            assert!(store.writes.lock().unwrap().is_empty());
-        }
-
-        #[tokio::test]
-        async fn a_missing_ticket_is_dropped_without_client_visible_failure() {
-            let store = FakeStore::default();
-            let records = vec![rec("m1", VALID_ID)]; // no ticket field
-            let outcome = process_batch(
-                &store,
-                "evt-1",
-                &policy(),
-                shard(0),
-                1_000_000_000,
-                &records,
-            )
-            .await;
-            // 200 at join either way: never a batch failure.
-            assert!(outcome.failures.is_empty());
-            assert!(store.writes.lock().unwrap().is_empty());
-        }
-
-        #[tokio::test]
-        async fn an_expired_ticket_is_dropped() {
-            let store = FakeStore::default();
-            let policy = policy();
-            let ticket = sign("evt-1", SUBJECT, 1000);
-            let subject = wr_common::verify_ticket(&ticket_key(), &ticket, "evt-1", 500).unwrap();
-            let request_id = wr_common::derive_request_id("evt-1", &subject);
-            let records = vec![rec_with_ticket("m1", &request_id, &ticket)];
-            let outcome =
-                process_batch(&store, "evt-1", &policy, shard(0), 2_000_000_000, &records).await;
-            assert!(outcome.failures.is_empty());
-            assert!(store.writes.lock().unwrap().is_empty());
-        }
-
-        #[tokio::test]
-        async fn wrong_event_ticket_is_dropped() {
-            let store = FakeStore::default();
-            let ticket = sign("other-event", SUBJECT, 2_000_000_000);
-            let records = vec![rec_with_ticket("m1", VALID_ID, &ticket)];
-            let outcome = process_batch(
-                &store,
-                "evt-1",
-                &policy(),
-                shard(0),
-                1_000_000_000,
-                &records,
-            )
-            .await;
-            assert!(outcome.failures.is_empty());
-            assert!(store.writes.lock().unwrap().is_empty());
-        }
-
-        #[tokio::test]
-        async fn open_policy_still_behaves_exactly_as_before() {
-            let store = FakeStore::default();
-            let records = vec![rec("m1", VALID_ID)];
-            let outcome =
-                process_batch(&store, "evt-1", &EntryPolicy::Open, shard(0), 0, &records).await;
-            assert!(outcome.failures.is_empty());
-            assert_eq!(store.writes.lock().unwrap().len(), 1);
-        }
     }
 }

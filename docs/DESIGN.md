@@ -631,39 +631,16 @@ admission for every event in that deployment.
 
 ### Entry gating
 
-Optional, and off unless `entry_ticket_public_key` is configured
-([ADR-0026](adr/0026-entry-tickets.md)).
+None. `request_id` is client-supplied, so nothing binds a position to a person: a client that
+mints N identifiers takes N places, and randomization converts that volume into expected share
+of the front of the queue linearly. Every deployment is a bare raffle.
 
-The customer's own system mints an **entry ticket**: a compact ES256 JWS carrying `aud` (the
-event id), `exp`, and `sub` — an opaque per-identity value it derives itself, e.g.
-`base64url(HMAC-SHA256(pepper, identity ‖ event_id))`. The waiting room holds only the public
-key. `assign_position` verifies the ticket and derives
-
-```
-request_id = uuid_shape(SHA-256("vwr/rid/v1" ‖ 0x00 ‖ aud ‖ 0x00 ‖ sub)[0..16])
-```
-
-rejecting any record whose supplied `request_id` differs. The existing
-`attribute_not_exists(request_id)` guard then yields one position per identity with no new
-table and no new write.
-
-Three properties matter. **The identifier never reaches us** — the customer derives the subject
-themselves, so integrating needs no agreement about handling member data. **Verification is in
-the consumer, not the edge** — the join stays a direct API Gateway → SQS write with no compute,
-the ticket rides in the body, and a bad ticket still gets 200 so nothing is learned at join
-time. **An invalid ticket is a drop, not an error** — never retried, never dead-lettered, since
-no redelivery makes attacker-chosen input valid and five retries would deepen the cost
-asymmetry this exists to fix.
-
-Delivery is by cookie on a custom domain, or by URL fragment otherwise
-([ADR-0027](adr/0027-ticket-delivery-fragment-not-query.md)).
-
-**What this bounds, and what it does not.** It moves the constraint from minting identifiers to
-obtaining identities; a farm with N legitimate accounts still gets N positions. It is therefore
-worth whatever the customer's identity system is worth, and it is inapplicable to a public
-onsale where no prior relationship exists — that deployment runs unticketed, as a bare raffle
-in which volume converts linearly into share of the front of the queue. Bounding volume with no
-identity requires proof of work or behavioural classification, neither of which is built.
+An earlier design verified a customer-signed entry ticket and derived `request_id` from its
+subject. It was removed: it required the customer to build and host a signing endpoint against a
+login they already ran, so no deployment could use it without that upstream work, and it bounded
+identifier minting rather than volume — a farm with N legitimate accounts still took N
+positions. Bounding volume needs a mechanism that costs the client something: proof of work, or
+behavioural classification over the join telemetry described below. Neither is built.
 
 ### Deferred bot enforcement
 

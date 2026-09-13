@@ -176,58 +176,6 @@ could observe. Set `session_ttl_seconds` comfortably longer than the worst reali
 protected origin — cart to confirmation, not the median — or a visitor can lose their admission to
 nothing more than a slow checkout.
 
-## Entry tickets (issue #59)
-
-Optional. Leave `entry_ticket_public_key` empty and the deployment behaves as it always has: any
-client that can mint a `request_id` can take a place in line, and registration volume converts
-linearly into share of the front of the queue. **That is the correct setting for a public onsale**,
-where there is no prior relationship to sign about — but know that it is what you are choosing.
-See [ADR-0026](adr/0026-entry-tickets.md).
-
-### What you build
-
-One authenticated redirect handler on your own domain. Authenticate the visitor however you
-already do, then:
-
-1. Derive an opaque subject — `base64url(HMAC-SHA256(pepper, identity ‖ event_id))` is the
-   recommended recipe. **Never put the member id, email or order reference in `sub` directly.**
-   It must be 22–256 base64url characters; a raw email or member number is rejected, but the
-   check is on shape, not entropy, so a weak subject passes.
-2. Mint a compact ES256 JWS with `aud` = the event id, a short `exp`, and that `sub`.
-3. Redirect the visitor to the waiting page carrying the ticket.
-
-Set `entry_ticket_public_key` to the matching P-256 public key as a JSON JWK
-(`{"kty":"EC","crv":"P-256","x":"…","y":"…"}`). We never hold your private key, so we cannot mint
-tickets.
-
-### Delivering the ticket
-
-**With a custom domain** (`aliases` + `acm_certificate_arn`, the expected setup) set a cookie
-named by `entry_ticket_cookie_name` with `Domain=` your registrable domain. It re-presents itself
-on every load and never appears in a URL.
-
-**Without one**, redirect to
-`https://<distribution>/_wr/waiting.html#wrt=<jws>`. The fragment is never sent to a server. Two
-things to get right: the `Location` must be `https://`, and **tickets sent by email should use the
-cookie path instead** — link rewriters such as Outlook SafeLinks re-encode the whole URL, fragment
-included, into a query parameter on their own host, which hands the ticket to a third party.
-
-### Two things that will bite you
-
-**A ticket is a bearer credential.** Whoever reads one takes that identity's position; nothing
-binds it to a browser. Keep `exp` short.
-
-**Never add a third-party tag to the waiting page.** Not analytics, not a tag manager, not a
-session recorder. The ticket is same-origin readable for the whole visit, so any script on that
-page can harvest every visitor's credential. This applies to both delivery paths and is invisible
-until it is violated.
-
-### What it does not do
-
-A farm holding N legitimate identities still gets N positions. Entry tickets move the constraint
-from minting identifiers to obtaining identities, so they are worth exactly what your identity
-system is worth. If your accounts are free, instant and unverified, this buys you very little.
-
 ## Tear down
 
 ```bash

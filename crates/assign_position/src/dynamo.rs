@@ -101,8 +101,8 @@ impl Store for DynamoStore {
             .put_item()
             .table_name(&self.positions_table)
             .set_item(Some(attrs));
-        // Widened for a derived request_id so a re-join can reclaim a row the
-        // controller expired; `completed` and `abandoned` stay terminal.
+        // Widened so a re-join can reclaim a row the controller expired;
+        // `completed` and `abandoned` stay terminal.
         let guard = Condition::attribute_not_exists(POSITIONS_KEY_ATTR);
         let guard = if write.allow_expired_overwrite {
             guard.or_equals(STATUS_ATTR, AttributeValue::S(STATUS_EXPIRED.to_owned()))
