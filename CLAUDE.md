@@ -196,7 +196,7 @@ needs SigV4A, which the Rust SDK signs with RustCrypto (`p256`/`hmac`/`sha2`, th
 admission path mints and verifies with `aws-lc-rs`.
 
 Keep the `core` module at or under 80 Terraform resources (requirement N6); justify additions.
-Currently 65.
+Currently 70.
 
 ## Conventions specific to this repo
 

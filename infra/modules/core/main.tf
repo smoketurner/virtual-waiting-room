@@ -383,11 +383,21 @@ resource "aws_api_gateway_integration" "join_sqs" {
   }
 }
 
+# Only a status code SQS returns on success reaches the client as one. For an
+# AWS-service integration the selection pattern is matched against the backend's
+# HTTP status code, so this claims 2xx and nothing else; a rejected SendMessage
+# falls through to the default response below.
+#
+# Without the pattern this response is itself the default, and a SendMessage
+# that never enqueued anything is reported to the visitor as a successful join
+# — no error, no log line, no row, and the first symptom is the event starting
+# with an empty queue (issue #144).
 resource "aws_api_gateway_integration_response" "join_200" {
-  rest_api_id = aws_api_gateway_rest_api.this.id
-  resource_id = aws_api_gateway_resource.join.id
-  http_method = aws_api_gateway_method.join_post.http_method
-  status_code = aws_api_gateway_method_response.join_200.status_code
+  rest_api_id       = aws_api_gateway_rest_api.this.id
+  resource_id       = aws_api_gateway_resource.join.id
+  http_method       = aws_api_gateway_method.join_post.http_method
+  status_code       = aws_api_gateway_method_response.join_200.status_code
+  selection_pattern = "2\\d{2}"
 
   depends_on = [aws_api_gateway_integration.join_sqs]
 }
@@ -397,4 +407,37 @@ resource "aws_api_gateway_method_response" "join_200" {
   resource_id = aws_api_gateway_resource.join.id
   http_method = aws_api_gateway_method.join_post.http_method
   status_code = "200"
+}
+
+# The catch-all, deliberately: an empty selection pattern makes this the default
+# response, so every outcome that is not provably a success is a failure the
+# client can see. Matching 4xx and 5xx explicitly instead would leave anything
+# unanticipated with no response at all.
+#
+# 502 rather than a 4xx because the visitor did nothing wrong — SQS rejecting
+# the send is this deployment's fault, including the AccessDenied a misconfigured
+# integration role produces. waiting.js already treats any non-2xx join as a
+# failed attempt, so this feeds its existing backoff and give-up path.
+#
+# The body is fixed rather than passed through: the SQS error carries the queue
+# name, the AWS error code and a request id, none of which belong in a response
+# to an anonymous visitor (issue #144).
+resource "aws_api_gateway_integration_response" "join_502" {
+  rest_api_id = aws_api_gateway_rest_api.this.id
+  resource_id = aws_api_gateway_resource.join.id
+  http_method = aws_api_gateway_method.join_post.http_method
+  status_code = aws_api_gateway_method_response.join_502.status_code
+
+  response_templates = {
+    "application/json" = jsonencode({ message = "join could not be enqueued" })
+  }
+
+  depends_on = [aws_api_gateway_integration.join_sqs]
+}
+
+resource "aws_api_gateway_method_response" "join_502" {
+  rest_api_id = aws_api_gateway_rest_api.this.id
+  resource_id = aws_api_gateway_resource.join.id
+  http_method = aws_api_gateway_method.join_post.http_method
+  status_code = "502"
 }

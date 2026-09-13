@@ -34,3 +34,8 @@ jobs:
       # it needs no AWS credentials and no backend.
       - run: terraform -chdir=infra/modules/edge init -backend=false -input=false
       - run: terraform -chdir=infra/modules/edge test
+      # The join failure-mapping test (issue #144), same deal: the aws provider
+      # is mocked and the Lambda artifacts it hashes are a committed fixture, so
+      # it runs without credentials and without a build.
+      - run: terraform -chdir=infra/modules/core init -backend=false -input=false
+      - run: terraform -chdir=infra/modules/core test

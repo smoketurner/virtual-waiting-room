@@ -199,6 +199,13 @@ resource "aws_api_gateway_deployment" "this" {
       jsonencode(aws_api_gateway_integration.join_sqs.request_parameters),
       aws_api_gateway_model.join.schema,
       aws_api_gateway_method.join_post.request_validator_id,
+      # Which SQS outcomes map to a 200 and which to a 502 (issue #144). Same
+      # stable-id hazard: editing the selection pattern is an in-place update,
+      # so without hashing it the stage keeps mapping every failed SendMessage
+      # to a 200 long after the configuration says otherwise.
+      aws_api_gateway_integration_response.join_200.selection_pattern,
+      aws_api_gateway_integration_response.join_502.id,
+      jsonencode(aws_api_gateway_integration_response.join_502.response_templates),
       [for k in sort(keys(local.api_endpoints)) : local.endpoint_resource_id[k]],
       [for k in sort(keys(local.api_endpoints)) : aws_api_gateway_method.endpoint[k].id],
       [for k in sort(keys(local.api_endpoints)) : aws_api_gateway_integration.endpoint[k].id],
@@ -227,6 +234,8 @@ resource "aws_api_gateway_deployment" "this" {
 
   depends_on = [
     aws_api_gateway_integration.join_sqs,
+    aws_api_gateway_integration_response.join_200,
+    aws_api_gateway_integration_response.join_502,
     aws_api_gateway_integration.endpoint,
     aws_api_gateway_integration.static,
     aws_api_gateway_integration.admin_proxy,

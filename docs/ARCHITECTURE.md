@@ -71,6 +71,9 @@ POST /v1/join
         request_id maxLength 36
       integration type AWS, credentials: an IAM role
         Action=SendMessage&MessageBody=$util.urlEncode($input.body)
+      integration responses
+        selection pattern 2\d{2} → 200, the SQS response passed through
+        default                  → 502, fixed JSON body
   → SQS standard queue
       visibility timeout 181 s, maxReceiveCount 5
       DLQ retention 14 days
