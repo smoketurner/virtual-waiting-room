@@ -507,7 +507,15 @@ the client treats as "re-join with the same request id" — deliberately the sam
 one: the retried join's `attribute_not_exists` guard passes precisely because no row exists yet
 for it, and a fresh id would abandon whatever the first attempt eventually resolves to. API
 Gateway returning 200 means *accepted into the queue*, not *position assigned*; the 404-and-rejoin
-loop makes that asymmetry safe and is part of the client contract. The straggler self-heal
+loop makes that asymmetry safe and is part of the client contract.
+
+What 200 does mean is that `SendMessage` succeeded. The success integration response claims only
+the status codes SQS returns on success, and a second, default integration response maps every
+other outcome to a 502 with a fixed body. Without that split the success response is itself the
+default and a rejected `SendMessage` is reported as a successful join, leaving the visitor polling
+for a position no one will ever write — an absence with no error, no log line and no row, whose
+first symptom is the event starting with an empty queue. The client treats the 502 as a failed
+attempt and backs off, the same path a validation rejection already takes. The straggler self-heal
 (§4.1, §8) rides on the same recovery loop and the same "same id" re-join.
 
 ---
