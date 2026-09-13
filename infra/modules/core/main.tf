@@ -314,7 +314,15 @@ resource "aws_api_gateway_model" "join" {
     additionalProperties = false
     properties = {
       request_id = { type = "string", minLength = 1, maxLength = 36 } # canonical UUID length
-      event_id   = { type = "string", minLength = 1 }
+      # Bounded by this deployment's own event id, which is the only value a
+      # legitimate join can carry: the client reads it from /status, which
+      # publishes EVENT_ID verbatim, and assign_position discards anything
+      # else. Unbounded, the field was the one unmetered thing on a path that
+      # runs no compute and therefore throttles on nothing — a 300 KB event_id
+      # passes validation, costs the operator CloudFront and API Gateway
+      # transfer, and below the 256 KB SQS limit also buys a queue message and
+      # a dead-letter record.
+      event_id = { type = "string", minLength = 1, maxLength = length(var.event_id) }
       # Never add to `required`: rejecting an absent ticket here would tell an
       # attacker whether the deployment is ticketed. assign_position enforces
       # presence instead (issue #59).
