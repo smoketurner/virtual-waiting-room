@@ -1,6 +1,6 @@
 # ADR-0026: One position per identity, from a customer-signed entry ticket
 
-**Status:** Accepted
+**Status:** Superseded by [0028](0028-remove-entry-tickets.md) — entry tickets were removed.
 
 ## 1. Context
 

@@ -8,15 +8,12 @@ use aws_lambda_events::sqs::{
     BatchItemFailure, SqsBatchResponse, SqsEvent, SqsMessage, SqsMessageAttribute,
 };
 use lambda_runtime::{Error, LambdaEvent, service_fn};
-use wr_common::{EntryPolicy, Shard, Telemetry};
+use wr_common::{Shard, Telemetry};
 
 /// Resolved once at cold start and shared across invocations.
 struct AppState {
     store: DynamoStore,
     event_id: String,
-    /// A parse failure on `ENTRY_TICKET_PUBLIC_KEY` is a hard init failure
-    /// (see `init`), never a silent downgrade to [`EntryPolicy::Open`].
-    policy: EntryPolicy,
 }
 
 #[tokio::main]
@@ -45,19 +42,7 @@ async fn init() -> Result<AppState, Error> {
     let event_id = std::env::var("EVENT_ID")?;
     let store = DynamoStore::new(client, counters_table, prequeue_table, positions_table);
 
-    // Empty (unset or blank) means EntryPolicy::Open, today's bare raffle. A
-    // non-empty value that fails to parse as a P-256 JWK is a hard init
-    // failure: an operator who configured a key must find out the deployment
-    // never came up, not discover months later that it silently ran open.
-    let configured_key = std::env::var("ENTRY_TICKET_PUBLIC_KEY").unwrap_or_default();
-    let policy =
-        EntryPolicy::parse(&configured_key).map_err(|e| format!("ENTRY_TICKET_PUBLIC_KEY: {e}"))?;
-
-    Ok(AppState {
-        store,
-        event_id,
-        policy,
-    })
+    Ok(AppState { store, event_id })
 }
 
 // The SqsBatchResponse / BatchItemFailure event structs are #[non_exhaustive],
@@ -93,15 +78,7 @@ async fn handle(state: &AppState, event: LambdaEvent<SqsEvent>) -> Result<SqsBat
         }
     };
 
-    let outcome = process_batch(
-        &state.store,
-        &state.event_id,
-        &state.policy,
-        shard,
-        now_epoch_secs(),
-        &records,
-    )
-    .await;
+    let outcome = process_batch(&state.store, &state.event_id, shard, &records).await;
 
     let batch_item_failures = outcome
         .failures
@@ -160,12 +137,6 @@ fn truncate_bytes(s: &str, max_bytes: usize) -> String {
     }
     let boundary = s.floor_char_boundary(max_bytes);
     s[..boundary].to_owned()
-}
-
-fn now_epoch_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
 }
 
 #[cfg(test)]

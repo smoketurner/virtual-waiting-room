@@ -1,6 +1,6 @@
 # ADR-0027: Deliver the entry ticket by cookie, or by URL fragment — never a query string
 
-**Status:** Accepted
+**Status:** Superseded by [0028](0028-remove-entry-tickets.md) — entry tickets were removed.
 
 ## 1. Context
 

@@ -73,12 +73,7 @@ locals {
     waiting_path        = local.waiting_page_path
   })
 
-  # The waiting page's client (issue #59): only entry_ticket_cookie_name is
-  # templated in, so the custom-domain ticket-delivery path reads the cookie
-  # name Terraform knows without hardcoding it twice.
-  waiting_js_source = templatefile("${path.module}/pages/waiting.js.tftpl", {
-    entry_ticket_cookie_name = var.entry_ticket_cookie_name
-  })
+  waiting_js_source = file("${path.module}/pages/waiting.js")
 
   # A custom domain is served only when both an alias and a certificate are
   # configured; see the paired variable validations in variables.tf.

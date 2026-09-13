@@ -16,20 +16,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 
-const SRC = path.join(__dirname, "..", "pages", "waiting.js.tftpl");
-
-/** The cookie name Terraform templates in; matches the module's variable default. */
-const ENTRY_TICKET_COOKIE_NAME = "vwr_ticket";
-
-/** Mirrors Terraform's `${var}` interpolation for the plain scalars this template uses. */
-function renderTemplate(source, values) {
-  return source.replace(/\$\{(\w+)\}/g, (_, name) => {
-    if (!(name in values)) {
-      throw new Error(`missing template value for \${${name}}`);
-    }
-    return values[name];
-  });
-}
+const SRC = path.join(__dirname, "..", "pages", "waiting.js");
 
 /** A `Response`-shaped value `getJSON`/`postJSON` can call `.json()` on. */
 function jsonResponse(status, body) {
@@ -48,7 +35,6 @@ function loadClient({
   route,
   now,
   locationSearch,
-  locationHash,
   cookie,
   // Which storage tiers throw. "local" and "session" mimic private browsing
   // and blocked site data; "cookie" mimics a document.cookie that silently
@@ -105,26 +91,11 @@ function loadClient({
   const win = {
     localStorage: storageOf("local"),
     sessionStorage: storageOf("session"),
-    atob: (b64) => Buffer.from(b64, "base64").toString("binary"),
     crypto: {
       getRandomValues: (a) => a.fill(7),
-      subtle: {
-        digest: async (algorithm, data) =>
-          require("node:crypto")
-            .createHash(String(algorithm).toLowerCase().replace("-", ""))
-            .update(Buffer.from(data))
-            .digest().buffer,
-      },
-    },
-    history: {
-      replaceState: (_state, _title, url) => {
-        win.history.replacedWith = url;
-        win.location.hash = "";
-      },
     },
     location: {
       search: locationSearch || "",
-      hash: locationHash || "",
       pathname: "/_wr/waiting.html",
       replace: (url) => { win.location.replacedTo = url; },
     },
@@ -205,10 +176,7 @@ function loadClient({
     Math,
     console,
   });
-  const source = renderTemplate(fs.readFileSync(SRC, "utf8"), {
-    entry_ticket_cookie_name: ENTRY_TICKET_COOKIE_NAME,
-  });
-  vm.runInContext(source, ctx, { filename: "waiting.js" });
+  vm.runInContext(fs.readFileSync(SRC, "utf8"), ctx, { filename: "waiting.js" });
 
   return {
     win,
@@ -239,35 +207,4 @@ function loadClient({
   };
 }
 
-/** The request_id waiting.js derives for a ticket subject, computed independently. */
-function deriveRequestId(aud, sub) {
-  const message = Buffer.concat([
-    Buffer.from("vwr/rid/v1", "utf8"),
-    Buffer.from([0]),
-    Buffer.from(aud, "utf8"),
-    Buffer.from([0]),
-    Buffer.from(sub, "utf8"),
-  ]);
-  const bytes = require("node:crypto")
-    .createHash("sha256")
-    .update(message)
-    .digest()
-    .subarray(0, 16);
-  bytes[6] = (bytes[6] & 0x0f) | 0x40;
-  bytes[8] = (bytes[8] & 0x3f) | 0x80;
-  const hex = [...bytes].map((b) => b.toString(16).padStart(2, "0"));
-  return (
-    hex.slice(0, 4).join("") + "-" + hex.slice(4, 6).join("") + "-" +
-    hex.slice(6, 8).join("") + "-" + hex.slice(8, 10).join("") + "-" +
-    hex.slice(10, 16).join("")
-  );
-}
-
-/** An unsigned JWS-shaped ticket. waiting.js only decodes; it never verifies. */
-function ticket({ aud = "evt-1", sub = "c3ViamVjdC1vbmUtMjItY2hhcnMtbG9uZw", exp }) {
-  const b64 = (o) =>
-    Buffer.from(JSON.stringify(o)).toString("base64url");
-  return `${b64({ alg: "ES256" })}.${b64({ aud, sub, exp })}.c2ln`;
-}
-
-module.exports = { loadClient, jsonResponse, deriveRequestId, ticket };
+module.exports = { loadClient, jsonResponse };

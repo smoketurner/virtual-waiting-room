@@ -26,6 +26,30 @@ impl RequestId {
     }
 }
 
+/// Checks the canonical `8-4-4-4-12` hex shape, rejecting a malformed or
+/// truncated id before it reaches a claim.
+///
+/// No version or variant nibble check: nothing here depends on a `request_id`
+/// being time-ordered, since no consumer sorts by it and no index exists over
+/// it.
+#[must_use]
+pub fn is_uuid_shape(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    for (i, &b) in bytes.iter().enumerate() {
+        let ok = match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        };
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
 /// The event lifecycle phase, stored on the `Counters` item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -260,6 +284,19 @@ mod tests {
     #![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
 
     use super::*;
+
+    #[test]
+    fn uuid_shape_validation() {
+        assert!(is_uuid_shape("018f3a2b-7c9d-7e1f-abcd-0123456789ab"));
+        // A v4-shaped id passes too: the check pins the hyphen/hex layout, not
+        // a version.
+        assert!(is_uuid_shape("018f3a2b-7c9d-4e1f-abcd-0123456789ab"));
+        assert!(!is_uuid_shape("not-a-uuid"));
+        assert!(!is_uuid_shape("018f3a2b7c9d7e1fabcd0123456789ab"));
+        assert!(!is_uuid_shape(""));
+        assert!(!is_uuid_shape("018f3a2b-7c9d-7e1f-abcd-0123456789abcd"));
+        assert!(!is_uuid_shape("018f3a2b-7c9d-7e1f-abcd-0123456789ag"));
+    }
 
     #[test]
     fn serving_state_projects_the_visitor_experience() {

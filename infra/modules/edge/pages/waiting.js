@@ -127,8 +127,8 @@
   // pre-queue index, inflating the cohort with indices nobody holds.
   //
   // The memory tier always succeeds and never survives a reload. That makes
-  // "no exception was thrown" useless as a durability test, so storeDurable
-  // reads the value back and only the tiers that return it count.
+  // "no exception was thrown" useless as a durability test, so each tier reads
+  // the value back and only the ones that return it count.
   var memoryStore = {};
 
   function localGet(key) {
@@ -211,18 +211,9 @@
       : null;
   }
 
-  // True only when a tier that survives a reload accepted the value. Callers
-  // that strip something irrecoverable from the URL depend on this answer, so
-  // it is a read-back and not a guess.
-  function storeDurable(key, value) {
-    var durable =
-      localSet(key, value) || cookieSet(key, value) || sessionSet(key, value);
-    memoryStore[key] = value;
-    return durable;
-  }
-
   function writeStored(key, value) {
-    storeDurable(key, value);
+    localSet(key, value) || cookieSet(key, value) || sessionSet(key, value);
+    memoryStore[key] = value;
   }
 
   function removeStored(key) {
@@ -244,208 +235,18 @@
     delete memoryStore[key];
   }
 
-  // --- Entry tickets (issue #59) ---------------------------------------------
-  //
-  // A ticket is a customer-signed ES256 JWS whose `sub` is an opaque per-identity
-  // value. request_id is derived from it, so every reload and every device
-  // belonging to one identity resolves to one position, and assign_position drops
-  // any record whose request_id does not match what it re-derives.
-  //
-  // Two ingress paths. On a custom domain the issuer sets a cookie, which
-  // re-presents itself on every load. Otherwise the issuer redirects with the
-  // ticket in the URL fragment, which is never sent to any server and is stripped
-  // from Referer — unlike a query string, which would reach the access log of
-  // every subresource the page loads.
-  var TICKET_KEY = "vwr_ticket";
-  var TICKET_COOKIE = "${entry_ticket_cookie_name}";
-
-  function fragmentTicket() {
-    var hash = String(window.location.hash || "");
-    if (hash.charAt(0) === "#") {
-      hash = hash.slice(1);
-    }
-    var parts = hash.split("&");
-    for (var i = 0; i < parts.length; i++) {
-      if (parts[i].slice(0, 4) === "wrt=") {
-        try {
-          return decodeURIComponent(parts[i].slice(4));
-        } catch (e) {
-          return null;
-        }
-      }
-    }
-    return null;
-  }
-
-  function decodeSegment(segment) {
-    try {
-      var b64 = segment.replace(/-/g, "+").replace(/_/g, "/");
-      while (b64.length % 4 !== 0) {
-        b64 += "=";
-      }
-      var raw = window.atob(b64);
-      var bytes = new Uint8Array(raw.length);
-      for (var i = 0; i < raw.length; i++) {
-        bytes[i] = raw.charCodeAt(i);
-      }
-      return JSON.parse(new TextDecoder().decode(bytes));
-    } catch (e) {
-      return null;
-    }
-  }
-
-  // Reads a ticket's claims WITHOUT verifying its signature. This is only ever
-  // used to choose between candidates; assign_position is what verifies, and a
-  // ticket that decodes here can still be rejected there.
-  function claimsOf(jws) {
-    var parts = String(jws || "").split(".");
-    return parts.length === 3 ? decodeSegment(parts[1]) : null;
-  }
-
-  function audienceOf(claims) {
-    if (typeof claims.aud === "string") {
-      return claims.aud;
-    }
-    if (Object.prototype.toString.call(claims.aud) === "[object Array]") {
-      for (var i = 0; i < claims.aud.length; i++) {
-        if (typeof claims.aud[i] === "string") {
-          return claims.aud[i];
-        }
-      }
-    }
-    return null;
-  }
-
-  // Ordered by expiry, not by where the ticket came from. Source order cannot
-  // express this: the fragment is deliberately left in place for a visitor whose
-  // storage all failed, so they can bookmark it, collect a newer ticket into the
-  // cookie, and return through the stale link. The older ticket would otherwise
-  // win and be rejected as expired while a valid one sat one tier down.
-  function pickTicket(candidates) {
-    var nowSecs = Math.floor(Date.now() / 1000);
-    var best = null;
-    var bestExp = -1;
-    for (var i = 0; i < candidates.length; i++) {
-      if (!candidates[i]) {
-        continue;
-      }
-      var claims = claimsOf(candidates[i]);
-      if (!claims || typeof claims.exp !== "number" || claims.exp <= nowSecs) {
-        continue;
-      }
-      if (claims.exp > bestExp) {
-        bestExp = claims.exp;
-        best = candidates[i];
-      }
-    }
-    return best;
-  }
-
-  // SHA-256("vwr/rid/v1" || 0x00 || aud || 0x00 || sub), first 16 bytes, UUID
-  // nibbles forced. Must stay byte-identical to wr_common::derive_request_id —
-  // a mismatch drops every registration.
-  function deriveRequestId(aud, sub) {
-    var encoder = new TextEncoder();
-    var label = encoder.encode("vwr/rid/v1");
-    var audBytes = encoder.encode(aud);
-    var subBytes = encoder.encode(sub);
-    var message = new Uint8Array(
-      label.length + 1 + audBytes.length + 1 + subBytes.length
-    );
-    var at = 0;
-    message.set(label, at);
-    at += label.length;
-    message[at] = 0;
-    at += 1;
-    message.set(audBytes, at);
-    at += audBytes.length;
-    message[at] = 0;
-    at += 1;
-    message.set(subBytes, at);
-
-    return window.crypto.subtle
-      .digest("SHA-256", message)
-      .then(function (digest) {
-        var bytes = new Uint8Array(digest).subarray(0, 16);
-        var out = [];
-        for (var i = 0; i < 16; i++) {
-          out.push(bytes[i]);
-        }
-        out[6] = (out[6] & 0x0f) | 0x40;
-        out[8] = (out[8] & 0x3f) | 0x80;
-        var hex = [];
-        for (var j = 0; j < 16; j++) {
-          hex.push(("0" + out[j].toString(16)).slice(-2));
-        }
-        return (
-          hex.slice(0, 4).join("") +
-          "-" +
-          hex.slice(4, 6).join("") +
-          "-" +
-          hex.slice(6, 8).join("") +
-          "-" +
-          hex.slice(8, 10).join("") +
-          "-" +
-          hex.slice(10, 16).join("")
-        );
-      });
-  }
-
   var requestId = null;
-  var ticket = null;
 
-  // Resolves the identity this page will queue under, before the first poll.
-  // Returns a promise ONLY when a ticket has to be hashed; without one the id is
-  // resolved synchronously and returns null, so a deployment with no tickets
-  // keeps polling on exactly the schedule it always did rather than starting a
-  // microtask late.
-  //
-  // With a ticket, request_id is a pure function of its subject, so storage is a
-  // convenience rather than a correctness requirement — re-entering through the
-  // customer's link re-derives the same id with no storage at all. That property
-  // holds ONLY because the fragment is stripped conditionally below: making the
-  // strip unconditional silently makes storage load-bearing again.
+  // Resolves the identity this page queues under, before the first poll. The id
+  // survives a reload through the storage chain above; a visitor whose every
+  // tier fails mints a fresh one and so takes a new place rather than
+  // recovering their old one.
   function resolveIdentity() {
-    var fromFragment = fragmentTicket();
-    ticket = pickTicket([
-      fromFragment,
-      cookieGet(TICKET_COOKIE),
-      readStored(TICKET_KEY),
-    ]);
-
-    if (ticket) {
-      var stored = storeDurable(TICKET_KEY, ticket);
-      // Strip only once the ticket is somewhere that survives a reload. With
-      // every tier failing, the fragment IS the storage: removing it would turn
-      // a refresh into a lost ticket for exactly the visitors this chain exists
-      // to protect.
-      if (fromFragment && stored) {
-        try {
-          window.history.replaceState(
-            null,
-            "",
-            window.location.pathname + window.location.search
-          );
-        } catch (e) {
-          /* no replaceState; the ticket stays in the address bar */
-        }
-      }
-      var claims = claimsOf(ticket);
-      var aud = claims ? audienceOf(claims) : null;
-      if (claims && aud && typeof claims.sub === "string") {
-        return deriveRequestId(aud, claims.sub).then(function (derived) {
-          requestId = derived;
-          writeStored(STORAGE_KEY, requestId);
-        });
-      }
-    }
-
     requestId = readStored(STORAGE_KEY);
     if (!requestId) {
       requestId = uuidv7();
       writeStored(STORAGE_KEY, requestId);
     }
-    return null;
   }
 
   // Learned from /status. The join request is validated at the edge against a
@@ -535,8 +336,8 @@
   // one join per poll interval, per waiter, for the whole event.
   var joinedId = null;
 
-  // A join can fail permanently for structural reasons: a missing or invalid
-  // ticket, a misconfigured key, an ingest that rejects every record. Backoff
+  // A join can fail permanently for structural reasons: an ingest that rejects
+  // every record, or an unconfigured event. Backoff
   // alone only slows that down — it never stops — so both counters below end in
   // a terminal state that calls stop().
   var MAX_JOIN_ATTEMPTS = 8;
@@ -567,9 +368,6 @@
     }
     joinAttempts += 1;
     var body = { request_id: requestId, event_id: eventId };
-    if (ticket) {
-      body.ticket = ticket;
-    }
     return postJSON("/v1/join", body).then(function (res) {
       // Only a request the ingest accepted claims a place. postJSON resolves
       // for any status, so recording unconditionally marks a rejected join as
@@ -1219,14 +1017,7 @@
   el.note.textContent =
     "Closing this page keeps your place — reopening it picks the same place back up.";
 
-  // Nothing may join before the identity it would join under is known, and
-  // deriving that from a ticket subject is a SHA-256. Only that path waits.
-  var identityPending = resolveIdentity();
-  if (identityPending) {
-    identityPending.then(tick, function () {
-      giveUp("We could not get you into the queue. Please reload the page.");
-    });
-  } else {
-    tick();
-  }
+  // Nothing may join before the identity it would join under is known.
+  resolveIdentity();
+  tick();
 })();
