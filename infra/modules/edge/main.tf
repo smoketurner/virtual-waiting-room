@@ -306,6 +306,25 @@ resource "aws_cloudfront_distribution" "this" {
     }
   }
 
+  # Join (issue #59). Its own behaviour rather than one of the write paths
+  # above, because it alone needs the CloudFront-generated viewer headers, which
+  # the managed AllViewerExceptHostHeader policy does not forward.
+  #
+  # Like the write behaviour it carries NO function association: the gate lives
+  # on the default behaviour only. Without a behaviour of its own /v1/join falls
+  # through to that default, where the gate refuses a visitor who has no session
+  # cookie yet — which is every visitor trying to join.
+  ordered_cache_behavior {
+    path_pattern             = local.join_path
+    target_origin_id         = local.api_origin_id
+    viewer_protocol_policy   = "redirect-to-https"
+    allowed_methods          = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
+    cached_methods           = ["GET", "HEAD"]
+    cache_policy_id          = local.caching_disabled_policy_id
+    origin_request_policy_id = aws_cloudfront_origin_request_policy.join.id
+    compress                 = true
+  }
+
   # Admin control plane: /admin, /admin/*, /static/* (ADR-0016). Uncached, all
   # methods, forward everything except Host so the OIDC session cookie + callback
   # query reach the admin Lambda. Access is gated by the admin Lambda's OIDC
