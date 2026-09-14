@@ -9,7 +9,9 @@ use jiff::{SignedDuration, Timestamp};
 
 use crate::arrival::ArrivalTime;
 
-use wr_common::{IllegalControl, Phase, ProtectionRule, RuleFieldError, StoredControl};
+use wr_common::{
+    DemotionReport, IllegalControl, Phase, ProtectionRule, RuleFieldError, StoredControl,
+};
 
 pub mod arrival;
 pub mod dynamo;
@@ -162,6 +164,14 @@ pub trait Store {
         event_id: &str,
     ) -> impl Future<Output = Result<Option<ControlState>, StoreError>> + Send;
 
+    /// Loads the seal's demotion report (issue #145), or `None` when no seal
+    /// with rules set has run. Its own item, so its own read: the dashboard
+    /// is the only reader, and the event item stays small for every poll.
+    fn load_demotion_report(
+        &self,
+        event_id: &str,
+    ) -> impl Future<Output = Result<Option<DemotionReport>, StoreError>> + Send;
+
     /// Transitions the phase with a guard on the expected current phase, so two
     /// operators cannot race a transition, and stamps the audit fields
     /// (`last_action` = `action`, `last_action_by`, `last_action_at`,
@@ -312,6 +322,13 @@ pub struct ControlState {
     /// re-renders in the zone they typed rather than snapping to UTC.
     /// `None` when unscheduled.
     pub starts_at_timezone: Option<String>,
+    /// `D`, the tail the seal demoted into (issue #145); `0` when nothing was
+    /// demoted or demotion was not enforced.
+    pub demoted_count: u64,
+    /// How many tail indices the seal actually wrote, once it finished; `None`
+    /// until then. Less than `demoted_count` means the seal died part way and
+    /// the remainder kept their primary slots.
+    pub demotion_applied: Option<u64>,
 }
 
 /// The upper sanity bound on the admission target rate (ADR-0017 §4): a
@@ -1390,9 +1407,18 @@ mod tests {
                     last_action_time: *self.last_time.lock().unwrap(),
                     starts_at: *self.starts_at.lock().unwrap(),
                     starts_at_timezone: self.starts_at_timezone.lock().unwrap().clone(),
+                    demoted_count: 0,
+                    demotion_applied: None,
                 }))
             };
             std::future::ready(result)
+        }
+
+        fn load_demotion_report(
+            &self,
+            _event_id: &str,
+        ) -> impl Future<Output = Result<Option<DemotionReport>, StoreError>> + Send {
+            std::future::ready(Ok(None))
         }
 
         fn set_phase(

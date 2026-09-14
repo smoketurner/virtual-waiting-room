@@ -112,6 +112,83 @@ pub struct Dashboard {
     /// outside it can still be posted and is still validated.
     #[serde(skip)]
     pub timezones: Vec<&'static str>,
+    /// Seal-time demotion (issue #145), for the operator's card. `D` and the
+    /// applied count come from `ControlState`; the rest is the report item,
+    /// read separately by the handler like the ruleset. Render-only.
+    #[serde(skip)]
+    pub demotion: DemotionView,
+}
+
+/// What the dashboard shows about the seal's demotion (issue #145): a
+/// fairness control that acts invisibly is hard to defend after the event, so
+/// what was demoted, and on what basis, is on the dashboard.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DemotionView {
+    /// A report exists: a seal ran with rules set.
+    pub reported: bool,
+    /// `observe` or `enforce`, from the report.
+    pub mode: String,
+    /// The rules the seal ran with, canonical form.
+    pub rules: String,
+    /// Cohort rows classified.
+    pub cohort: u64,
+    /// Rows in a demoted group (demoted, or would have been under observe).
+    pub demoted: u64,
+    /// Demoted groups in total.
+    pub groups_total: u64,
+    /// The largest demoted groups.
+    pub groups: Vec<DemotionGroupRow>,
+    /// `groups.len()`, as the same width as `groups_total` for the template's
+    /// "largest X of Y" line.
+    pub groups_shown: u64,
+    /// The rules did not parse, and this is why. The seal ran without them.
+    pub error: String,
+    /// Tail indices written, as "7 of 7" or "3 of 7", or empty when the seal
+    /// did not enforce anything.
+    pub applied: String,
+    /// The seal enforced a demotion and has not yet recorded finishing: the
+    /// phase is held at `pre_queue` while tail indices are written. If this
+    /// outlives the seal's own timeout, the seal died and the operator opens
+    /// the event by hand.
+    pub applying: bool,
+}
+
+/// One row of the demotion card's group table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DemotionGroupRow {
+    pub signal: String,
+    pub value: String,
+    pub count: u64,
+    pub max: u64,
+}
+
+impl Dashboard {
+    /// Attaches the seal's demotion report (issue #145) to the view, or marks
+    /// its absence. Called by the handler after [`Dashboard::from_state`], the
+    /// way the ruleset is, because the report is a separate item.
+    pub fn with_demotion_report(&mut self, report: Option<&wr_common::DemotionReport>) {
+        let Some(report) = report else {
+            return;
+        };
+        self.demotion.reported = true;
+        self.demotion.mode.clone_from(&report.mode);
+        self.demotion.rules.clone_from(&report.rules);
+        self.demotion.cohort = report.cohort;
+        self.demotion.demoted = report.demoted;
+        self.demotion.groups_total = report.groups_total;
+        self.demotion.error = report.error.clone().unwrap_or_default();
+        let mut groups = Vec::with_capacity(report.groups.len());
+        for group in &report.groups {
+            groups.push(DemotionGroupRow {
+                signal: group.signal.clone(),
+                value: group.value.clone(),
+                count: group.count,
+                max: group.max,
+            });
+        }
+        self.demotion.groups_shown = u64::try_from(groups.len()).unwrap_or(u64::MAX);
+        self.demotion.groups = groups;
+    }
 }
 
 /// The zones the dashboard offers. UTC first because it is the unambiguous
@@ -236,6 +313,25 @@ impl Dashboard {
                 .clone()
                 .unwrap_or_else(|| crate::DEFAULT_TIMEZONE.to_owned()),
             timezones: OFFERED_TIMEZONES.to_vec(),
+            demotion: DemotionView {
+                reported: false,
+                mode: String::new(),
+                rules: String::new(),
+                cohort: 0,
+                demoted: 0,
+                groups_total: 0,
+                groups: Vec::new(),
+                groups_shown: 0,
+                error: String::new(),
+                applied: match (state.demoted_count, state.demotion_applied) {
+                    (0, _) => String::new(),
+                    (demoted, Some(applied)) => format!("{applied} of {demoted}"),
+                    (demoted, None) => format!("0 of {demoted} recorded"),
+                },
+                applying: state.demoted_count > 0
+                    && state.demotion_applied.is_none()
+                    && state.phase == wr_common::Phase::PreQueue,
+            },
         }
     }
 }
@@ -279,6 +375,8 @@ mod tests {
             last_action_time: jiff::Timestamp::from_millisecond(1_788_000_000_000).ok(),
             starts_at: None,
             starts_at_timezone: None,
+            demoted_count: 0,
+            demotion_applied: None,
         }
     }
 
@@ -289,6 +387,89 @@ mod tests {
         assert!(html.contains(">active<"));
         assert!(html.contains("Doors open at noon"));
         assert!(html.contains("500"));
+    }
+
+    #[test]
+    fn without_a_report_the_demotion_card_says_so() {
+        let html = Dashboard::from_state(&state(), 0).render().unwrap();
+        assert!(html.contains("Seal-time demotion"));
+        assert!(html.contains("No report yet"));
+        assert!(!html.contains("Demotion is being applied"));
+    }
+
+    #[test]
+    fn the_demotion_card_shows_what_was_demoted_and_on_what_basis() {
+        // Issue #145's acceptance: the operator can see what was mitigated
+        // and why, group by group, with the threshold each one exceeded.
+        let mut s = state();
+        s.demoted_count = 7;
+        s.demotion_applied = Some(7);
+        let mut view = Dashboard::from_state(&s, 0);
+        let report = wr_common::DemotionReport {
+            mode: "enforce".to_owned(),
+            rules: "address:5".to_owned(),
+            cohort: 1000,
+            demoted: 7,
+            groups_total: 1,
+            groups: vec![wr_common::ReportGroup {
+                signal: "address".to_owned(),
+                value: "198.51.100.1".to_owned(),
+                count: 7,
+                max: 5,
+            }],
+            sealed_at: 1,
+            error: None,
+        };
+        view.with_demotion_report(Some(&report));
+        let html = view.render().unwrap();
+        assert!(html.contains("<strong>enforce</strong>"));
+        assert!(html.contains("address:5"));
+        assert!(html.contains("<strong>7</strong> of 1000 registrations in 1 group<"));
+        assert!(html.contains("7 of 7"));
+        assert!(html.contains("198.51.100.1"));
+        assert!(!html.contains("groups shown"));
+        assert!(!html.contains("Demotion is being applied"));
+    }
+
+    #[test]
+    fn an_observe_report_reads_as_would_demote_and_a_held_phase_as_applying() {
+        let mut s = state();
+        let mut view = Dashboard::from_state(&s, 0);
+        let mut report = wr_common::DemotionReport {
+            mode: "observe".to_owned(),
+            rules: "ja4:100".to_owned(),
+            cohort: 10,
+            demoted: 3,
+            groups_total: 250,
+            groups: vec![wr_common::ReportGroup {
+                signal: "ja4".to_owned(),
+                value: "t13d1516h2_8daaf6152771_02713d6af862".to_owned(),
+                count: 3,
+                max: 100,
+            }],
+            sealed_at: 1,
+            error: None,
+        };
+        view.with_demotion_report(Some(&report));
+        let html = view.render().unwrap();
+        assert!(html.contains("Would demote"));
+        assert!(html.contains("(reported, not applied)"));
+
+        // A seal that enforced and has not recorded finishing, with the phase
+        // still held, is applying; the operator is told what to do if it
+        // never finishes.
+        s.phase = Phase::PreQueue;
+        s.demoted_count = 3;
+        s.demotion_applied = None;
+        report.mode = "enforce".to_owned();
+        report.error = Some("rule \"ja4\" is not of the form signal:max".to_owned());
+        let mut view = Dashboard::from_state(&s, 0);
+        view.with_demotion_report(Some(&report));
+        let html = view.render().unwrap();
+        assert!(html.contains("Demotion is being applied"));
+        assert!(html.contains("0 of 3 recorded"));
+        assert!(html.contains("did not parse"));
+        assert!(html.contains("Largest 1 of 250 groups shown"));
     }
 
     #[test]

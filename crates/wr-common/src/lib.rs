@@ -13,6 +13,7 @@
 //! which layer a type happens to live in.
 
 pub mod crypto;
+pub mod demotion;
 pub mod expr;
 pub mod ids;
 pub mod items;
@@ -20,6 +21,10 @@ pub mod permutation;
 pub mod rules;
 
 pub use crypto::{AdmissionToken, Session, SigningKey, VerifyError};
+pub use demotion::{
+    Classification, Cohort, DemotedGroup, DemotionMode, DemotionReport, DemotionRule,
+    DemotionRules, MAX_REPORT_GROUPS, ReportGroup, RuleParseError, Signal, UnknownMode,
+};
 pub use expr::{STARTS_AT_ATTR, STARTS_AT_TZ_ATTR};
 pub use ids::{
     AdmissionControl, EventId, IllegalControl, Phase, RequestId, ServingState, StoredControl,

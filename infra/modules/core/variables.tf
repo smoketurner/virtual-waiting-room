@@ -237,3 +237,31 @@ variable "poll_divisor" {
     error_message = "poll_divisor must be a whole number — a fractional value fails read's u32 parse and silently disables the whole policy."
   }
 }
+
+# --- Seal-time demotion (issue #145) ------------------------------------------
+# Read by seal_event only. Both are deploy-time settings rather than admin
+# levers for the same reason the poll policy is: a fairness control that can be
+# flipped mid-event from a dashboard is one that can be flipped by mistake at
+# the moment it matters most, and the seal fires once.
+
+variable "demotion_rules" {
+  description = "Seal-time demotion rules (issue #145), comma-separated `signal:max` entries where signal is one of address, asn, ja4, ua. At the seal, every group of registrations sharing one value of that signal and numbering more than `max` is moved whole to a tail behind the rest of the cohort (or only reported, under demotion_mode = observe). Empty disables the scan entirely. Choose thresholds against a real event's report before enforcing: an office NAT or campus network shares one address, and every user of one browser release shares one JA4."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = can(regex("^\\s*$|^\\s*(address|asn|ja4|ua):[1-9][0-9]*\\s*(,\\s*(address|asn|ja4|ua):[1-9][0-9]*\\s*)*,?\\s*$", var.demotion_rules))
+    error_message = "demotion_rules must be empty or a comma-separated list of signal:max entries, where signal is address, asn, ja4 or ua and max is a whole number of at least 1 (e.g. \"address:25,asn:5000\")."
+  }
+}
+
+variable "demotion_mode" {
+  description = "What the seal does with a demotion classification (issue #145): `observe` writes the report and demotes nobody; `enforce` also moves every registration in a demoted group to the tail. Observe is the default, and the count-then-block discipline (O5) applies — run a real event in observe and read the report before enforcing."
+  type        = string
+  default     = "observe"
+
+  validation {
+    condition     = contains(["observe", "enforce"], var.demotion_mode)
+    error_message = "demotion_mode must be observe or enforce."
+  }
+}

@@ -36,6 +36,13 @@ visible fairness failure at 1,000,000 people. Tests are the primary evidence.
     `[0, N)`, because that index belongs to a later shard); `/queue_num` never calls `PRP` out
     of domain for it, falling through to the `Positions` row instead (a live-join position if
     one has landed, 404 — recoverable by re-join — if not).
+- **Seal-time demotion (ADR-0029, issue #145).** A group over its rule's threshold is demoted
+  whole and a group under it is not; a row in two demoted groups is listed once; a straggler is
+  never classified; every demoted row resolves into `[N, N + D)` and every other into `[0, N)`
+  with no position held twice; a tail index at or past `D` falls back to the row's own primary
+  slot; `observe` writes the report and no tail index; a lost election writes nothing after
+  classifying; a tail write that fails part way still opens the event with what landed; rules
+  that do not parse seal without demotion and say so in the report.
 - **Atomic counter (design §5).** Under concurrent load, the set of issued positions has
   **zero duplicates**; gaps are permitted and their rate is measured, not eliminated.
 - **Idempotent join** — repeating a join with the same `request_id` consumes no extra
@@ -79,7 +86,7 @@ Listed so they are not rediscovered late. Each is unbuilt today; do not write th
 the mechanism exists.
 
 - **One position per identity** (#59) — N registrations under one verified identifier yield one
-  position; a pre-queue registration classified as a bot at join is mitigated at seal.
+  position.
 - **Concurrency control** (#65) — with injected session durations an order of magnitude apart,
   measured active sessions converge on the ceiling in both cases.
 - **Revocation** (#63) — no design exists yet (ADR-0021 §5.2); do not write a test against a

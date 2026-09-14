@@ -44,3 +44,12 @@ oidc_allowed_emails = "" # comma-separated; "" = deny all (fail closed)
 poll_floor_ms   = 5000
 poll_ceiling_ms = 30000
 poll_divisor    = 10
+
+# --- Seal-time demotion (#145) ------------------------------------------------
+# At the seal, groups of registrations sharing one value of a signal (address,
+# asn, ja4, ua) and larger than the threshold are moved whole to a tail behind
+# the rest of the cohort. Empty rules = no scan. Leave demotion_mode at observe
+# for a first event and read the dashboard's report before enforcing: an office
+# NAT shares one address, and every user of one browser release shares one JA4.
+demotion_rules = "" # e.g. "address:25,asn:5000"
+demotion_mode  = "observe"

@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use aws_sdk_dynamodb::types::AttributeValue;
 use serde::{Deserialize, Serialize};
 
-use crate::expr::STARTS_AT_ATTR;
+use crate::expr::{DEMOTED_COUNT_ATTR, STARTS_AT_ATTR};
 use crate::ids::{Phase, StoredControl};
 use crate::permutation::{Assignment, SHARDS, SealedOffsets, Seed};
 
@@ -77,6 +77,13 @@ pub struct PreQueueItem {
     /// open (untelemetered) deployment.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub v: Option<Telemetry>,
+    /// Tail index (issue #145): written by the seal, after it has won, on every
+    /// row its demotion rules put in a demoted group, and never by
+    /// registration. A row carrying one resolves to `N + PRP(seed, d, D)`, the
+    /// compact tail behind the whole undemoted cohort, instead of its primary
+    /// slot. Absent on every other row.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub d: Option<u64>,
 }
 
 /// A `Positions` row, written lazily when a visitor is admitted.
@@ -122,6 +129,11 @@ pub struct Counters {
     pub participant_count: Option<u64>,
     /// Set at the seal: prefix offsets `offset[s] = Σ counts[0..s)`.
     pub prequeue_offsets: Option<[u64; SHARDS]>,
+    /// Set at the seal when demotion is enforced (issue #145): `D`, the size
+    /// of the compact tail `[N, N + D)` the demoted rows resolve into, and
+    /// the amount `queue_counter` was started past `N` to keep live joiners
+    /// behind it. `0` when nothing was demoted.
+    pub demoted_count: u64,
     /// Operator broadcast text shown to waiting visitors. Absent until an
     /// operator sets it; cleared by setting it empty.
     pub message: Option<String>,
@@ -164,6 +176,8 @@ pub struct Counters {
 pub struct Sealed {
     pub offsets: SealedOffsets,
     pub seed: Seed,
+    /// The tail's size `D` (issue #145); `0` when nothing was demoted.
+    pub demoted: u64,
 }
 
 impl Counters {
@@ -182,6 +196,7 @@ impl Counters {
         Some(Sealed {
             offsets: SealedOffsets::from_parts(offsets, participant_count),
             seed: Seed(seed_bytes),
+            demoted: self.demoted_count,
         })
     }
 
@@ -193,13 +208,26 @@ impl Counters {
     /// and belongs to the live-join sequence instead, so the permutation is
     /// never evaluated outside its domain.
     ///
+    /// A row the seal demoted (issue #145) carries a tail index `d < D` and
+    /// resolves to `N + PRP(seed, d, D)` instead: the tail is its own compact
+    /// permutation domain behind the whole undemoted cohort, so every position
+    /// stays unique — primary slots are `< N`, tail slots are `>= N` — and the
+    /// live-join sequence, started at `N + D`, stays behind both. A `d` at or
+    /// past `D` (a row demoted by a seal that then failed to record `D`, or a
+    /// hand-edited row) falls back to the row's own primary slot, which no one
+    /// else holds, rather than to a tail slot that might be taken.
+    ///
     /// # Errors
     ///
     /// [`ResolveError::NotSealed`] before the seal has written the seed, cohort
     /// size, and offsets; [`ResolveError::BadShard`] if the row's shard is
     /// outside `0..SHARDS`.
     pub fn resolve_prequeue(&self, row: &PreQueueItem) -> Result<ResolvedPosition, ResolveError> {
-        let Sealed { offsets, seed } = self.sealed().ok_or(ResolveError::NotSealed)?;
+        let Sealed {
+            offsets,
+            seed,
+            demoted,
+        } = self.sealed().ok_or(ResolveError::NotSealed)?;
 
         let shard = usize::from(row.s);
         if shard >= SHARDS {
@@ -209,7 +237,15 @@ impl Counters {
         let participant_count = offsets.participant_count();
         Ok(match offsets.assign(shard, row.l) {
             Assignment::PreQueue { index } => {
-                ResolvedPosition::PreQueue(crate::permutation::prp(&seed, index, participant_count))
+                let primary = crate::permutation::prp(&seed, index, participant_count);
+                let position = match row.d {
+                    Some(tail_index) if tail_index < demoted => {
+                        let tail = crate::permutation::prp(&seed, tail_index, demoted);
+                        participant_count.checked_add(tail).unwrap_or(primary)
+                    }
+                    Some(_) | None => primary,
+                };
+                ResolvedPosition::PreQueue(position)
             }
             // The exact live-join position is claimed by the live-join path,
             // not reconstructed here — every caller falls through to a
@@ -262,6 +298,7 @@ impl Counters {
             shuffle_seed,
             participant_count: num("participant_count"),
             prequeue_offsets,
+            demoted_count: num(DEMOTED_COUNT_ATTR).unwrap_or(0),
             target_rate: num("target_rate").and_then(|n| u32::try_from(n).ok()),
             message: item
                 .get("message")
@@ -387,6 +424,7 @@ mod tests {
             l: 42,
             t: 1_788_000_000,
             v: None,
+            d: None,
         };
         let av: std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue> =
             serde_dynamo::to_item(&item).unwrap();
@@ -409,6 +447,7 @@ mod tests {
                 u: Some("Mozilla/5.0".to_owned()),
                 q: Some("req-abc-123".to_owned()),
             }),
+            d: None,
         };
         let av: std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue> =
             serde_dynamo::to_item(&item).unwrap();
@@ -441,6 +480,7 @@ mod tests {
         ]);
         let item: PreQueueItem = serde_dynamo::from_item(av).unwrap();
         assert!(item.v.is_none());
+        assert!(item.d.is_none());
     }
 
     #[test]
@@ -500,6 +540,7 @@ mod tests {
             shuffle_seed: None,
             participant_count: None,
             prequeue_offsets: None,
+            demoted_count: 0,
             message: None,
             target_rate: None,
             stored_control: StoredControl::Open,
@@ -532,6 +573,124 @@ mod tests {
         counters.prequeue_offsets = Some([0, 0, 0, 1, 1, 1, 2, 2, 2, 2]);
         let sealed = counters.sealed().unwrap();
         assert_eq!(sealed.offsets.participant_count(), 3);
+    }
+
+    fn sealed_counters(counts: [u64; SHARDS], demoted: u64) -> Counters {
+        let sealed = SealedOffsets::seal(counts).unwrap();
+        let mut offsets = [0u64; SHARDS];
+        for (s, slot) in offsets.iter_mut().enumerate() {
+            *slot = sealed.offset(s);
+        }
+        let mut counters = unsealed_counters(Phase::Active);
+        counters.shuffle_seed = Some([3u8; 32]);
+        counters.participant_count = Some(sealed.participant_count());
+        counters.prequeue_offsets = Some(offsets);
+        counters.demoted_count = demoted;
+        counters.queue_counter = sealed.participant_count().saturating_add(demoted);
+        counters
+    }
+
+    fn prequeue_row(s: u8, l: u64, d: Option<u64>) -> PreQueueItem {
+        PreQueueItem {
+            r: format!("r-{s}-{l}"),
+            s,
+            l,
+            t: 0,
+            v: None,
+            d,
+        }
+    }
+
+    fn position_of(counters: &Counters, row: &PreQueueItem) -> u64 {
+        match counters.resolve_prequeue(row).unwrap() {
+            ResolvedPosition::PreQueue(p) => Some(p),
+            ResolvedPosition::LiveJoin => None,
+        }
+        .unwrap()
+    }
+
+    #[test]
+    fn a_demoted_row_resolves_into_a_compact_tail_behind_the_whole_cohort() {
+        // Cohort of 20 across two shards; 5 of them demoted with tail indices
+        // 0..5. Every undemoted row must land in [0, N), every demoted row in
+        // [N, N + D), and no two rows may share a position — a duplicate
+        // position is a visible fairness failure.
+        let counters = sealed_counters([10, 10, 0, 0, 0, 0, 0, 0, 0, 0], 5);
+        let n = 20;
+        let mut positions = std::collections::HashSet::new();
+        let mut tail_index = 0;
+        for s in 0..2u8 {
+            for l in 0..10u64 {
+                let d = (l % 4 == 0 && tail_index < 5).then(|| {
+                    let k = tail_index;
+                    tail_index += 1;
+                    k
+                });
+                let p = position_of(&counters, &prequeue_row(s, l, d));
+                if d.is_some() {
+                    assert!((n..n + 5).contains(&p), "tail row landed at {p}");
+                } else {
+                    assert!(p < n, "primary row landed at {p}");
+                }
+                assert!(positions.insert(p), "duplicate position {p}");
+            }
+        }
+        assert_eq!(tail_index, 5);
+        // The tail is a permutation: every tail slot is taken.
+        for k in 0..5 {
+            assert!(positions.contains(&(n + k)));
+        }
+    }
+
+    #[test]
+    fn a_tail_index_outside_the_recorded_tail_falls_back_to_the_primary_slot() {
+        // `d >= D` cannot come from a clean seal. Falling back to the row's own
+        // primary slot is always safe — nobody else holds it — where a tail
+        // slot computed over the wrong domain might be someone else's.
+        let counters = sealed_counters([10, 10, 0, 0, 0, 0, 0, 0, 0, 0], 5);
+        let primary = position_of(&counters, &prequeue_row(0, 3, None));
+        assert_eq!(
+            position_of(&counters, &prequeue_row(0, 3, Some(5))),
+            primary
+        );
+        assert_eq!(
+            position_of(&counters, &prequeue_row(0, 3, Some(u64::MAX))),
+            primary
+        );
+        // And with no tail recorded at all, a stray `d` changes nothing.
+        let untailed = sealed_counters([10, 10, 0, 0, 0, 0, 0, 0, 0, 0], 0);
+        let primary = position_of(&untailed, &prequeue_row(0, 3, None));
+        assert_eq!(
+            position_of(&untailed, &prequeue_row(0, 3, Some(0))),
+            primary
+        );
+    }
+
+    #[test]
+    fn a_straggler_is_a_live_join_even_with_a_tail_index() {
+        // The straggler rule runs first: a row past its shard's issued count
+        // was never in the cohort the seal classified, whatever it carries.
+        let counters = sealed_counters([10, 10, 0, 0, 0, 0, 0, 0, 0, 0], 5);
+        assert_eq!(
+            counters
+                .resolve_prequeue(&prequeue_row(0, 10, Some(0)))
+                .unwrap(),
+            ResolvedPosition::LiveJoin
+        );
+    }
+
+    #[test]
+    fn from_item_reads_the_demoted_count_and_defaults_it_to_zero() {
+        assert_eq!(
+            Counters::from_item("evt-1", &HashMap::new()).demoted_count,
+            0
+        );
+        let mut item = HashMap::new();
+        item.insert(
+            DEMOTED_COUNT_ATTR.to_owned(),
+            AttributeValue::N("42".to_owned()),
+        );
+        assert_eq!(Counters::from_item("evt-1", &item).demoted_count, 42);
     }
 
     #[test]

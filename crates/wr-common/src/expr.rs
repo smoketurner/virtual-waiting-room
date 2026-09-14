@@ -53,6 +53,16 @@ pub const POSITIONS_KEY_ATTR: &str = "request_id";
 /// row is still valid compares this attribute to the current time itself.
 pub const TOKENS_TTL_ATTR: &str = "expires_at";
 
+/// The event item's tail size `D` (issue #145), written by the seal when it
+/// enforces demotion and read by every resolver of a pre-queue row. Named here
+/// so the seal's writer and the item parser cannot drift apart.
+pub const DEMOTED_COUNT_ATTR: &str = "demoted_count";
+
+/// The event item's count of tail indices the seal actually wrote (issue
+/// #145), for the operator: equal to `D` after a clean seal, less when the
+/// seal died part way and some demoted rows kept their primary slots.
+pub const DEMOTION_APPLIED_ATTR: &str = "demotion_applied";
+
 /// The attribute a shard item records its own index in, so a reader that
 /// fetched a batch of shards knows which is which without taking the key apart
 /// again.
@@ -124,6 +134,10 @@ pub enum Key<'a> {
     /// One arrivals shard, incremented when a visitor claims their admission
     /// and summed by the controller to measure the no-show rate.
     ArrivalsShard { event_id: &'a str, shard: Shard },
+    /// The seal's demotion report (issue #145): what the rules demoted and on
+    /// what basis. Its own item so the event item, which every poll reads,
+    /// stays small; only the operator's dashboard reads this one.
+    DemotionReport { event_id: &'a str },
     /// A single-use admission token reservation.
     AdmissionToken { request_id: &'a str },
     /// An operator's OIDC session.
@@ -141,7 +155,10 @@ impl Key<'_> {
     #[must_use]
     pub fn attr(self) -> &'static str {
         match self {
-            Key::Event { .. } | Key::PrequeueShard { .. } | Key::ArrivalsShard { .. } => KEY_ATTR,
+            Key::Event { .. }
+            | Key::PrequeueShard { .. }
+            | Key::ArrivalsShard { .. }
+            | Key::DemotionReport { .. } => KEY_ATTR,
             Key::AdmissionToken { .. } | Key::OidcSession { .. } | Key::PkceTransaction { .. } => {
                 TOKENS_KEY_ATTR
             }
@@ -161,6 +178,7 @@ impl Key<'_> {
             Key::ArrivalsShard { event_id, shard } => {
                 format!("EVT#{event_id}#AR#{}", shard.index())
             }
+            Key::DemotionReport { event_id } => format!("EVT#{event_id}#DM"),
             Key::AdmissionToken { request_id } => format!("TKN#{request_id}"),
             Key::OidcSession { session_id } => format!("SESS#{session_id}"),
             Key::PkceTransaction { state } => format!("PKCE#{state}"),
@@ -373,6 +391,10 @@ mod tests {
             }
             .value(),
             "EVT#evt#AR#3"
+        );
+        assert_eq!(
+            Key::DemotionReport { event_id: "evt" }.value(),
+            "EVT#evt#DM"
         );
         assert_eq!(Key::AdmissionToken { request_id: "abc" }.value(), "TKN#abc");
         assert_eq!(Key::OidcSession { session_id: "abc" }.value(), "SESS#abc");

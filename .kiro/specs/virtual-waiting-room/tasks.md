@@ -77,18 +77,22 @@ Throwaway code. Measures what documentation cannot settle.
 ### 1g. Entry gating and abuse mitigation
 
 - [ ] Deferred bot enforcement: admit to pre-queue, block at randomization [F6.3]
-      `Partial:` join-time telemetry (viewer address, ASN, country, JA4 fingerprint, user
-      agent) is captured on every registration row, which is the input a deferred decision
-      needs. No classifier, no operator action and no seal-time mitigation exist, and nothing
-      reads the telemetry. Deferred on cost — the specified mechanism depends on WAF Bot
-      Control, which the deployment does not enable.
+      `Partial:` built as seal-time demotion (ADR-0029, issue #145): `seal_event` groups the
+      cohort by the join-time telemetry (address, ASN, JA4, user agent) under operator-set
+      `signal:max` rules, demotes every group over its threshold to a compact tail
+      (`N + PRP(seed, d, D)`, live joins from `N + D`), holds the phase while the tail indices
+      land, and writes a report the dashboard renders. Off by default (no rules) and `observe`
+      by default. Missing: the false-positive measurement against a real event that the
+      acceptance requires before the control is enforced by default, and the WAF-derived
+      signals (Bot Control labels, reputation lists) as further inputs.
 - [ ] Bound how many positions one visitor can hold
       `Partial:` nothing does. `request_id` is client-supplied, so volume converts into share
       of the front of the queue linearly and every deployment is a bare raffle. The entry
       tickets that bounded identifier *minting* were removed (ADR-0028) — they needed the
-      customer to build a signing endpoint, and they never bounded volume. Proof of work at
-      registration, or behavioural classification over the telemetry above, is what would
-      bound it.
+      customer to build a signing endpoint, and they never bounded volume. Seal-time demotion
+      (ADR-0029) now bounds the share a farm that shares an address, ASN, JA4 or user agent can
+      take of the *front*; it does not bound how many positions one visitor holds. Proof of
+      work at registration is what would.
 
 ### 1h. Operator surface
 

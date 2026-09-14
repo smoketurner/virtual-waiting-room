@@ -101,7 +101,8 @@ data "aws_iam_policy_document" "apigw_sqs" {
 }
 
 # Execution-role permissions for seal_event: read the shard counts and write the
-# seal (seed + offsets + count + phase) on the Counters item, plus logs.
+# seal (seed + offsets + count + phase) on the Counters item, write the demotion
+# report item beside it, scan and mark the pre-queue (issue #145), plus logs.
 data "aws_iam_policy_document" "seal_event" {
   statement {
     sid    = "ReadAndSealCounters"
@@ -112,8 +113,23 @@ data "aws_iam_policy_document" "seal_event" {
       # BatchGetItem. GetItem does not authorise it — it is its own action.
       "dynamodb:BatchGetItem",
       "dynamodb:UpdateItem",
+      # The demotion report is its own item (EVT#<id>#DM), written whole.
+      "dynamodb:PutItem",
     ]
     resources = [aws_dynamodb_table.counters.arn]
+  }
+
+  statement {
+    sid    = "ClassifyAndDemotePreQueue"
+    effect = "Allow"
+    actions = [
+      # The one sanctioned scan of the pre-queue: once, at the seal, and only
+      # when demotion rules are set. Never on the hot path.
+      "dynamodb:Scan",
+      # SET d = :k on each demoted row, guarded by attribute_not_exists(d).
+      "dynamodb:UpdateItem",
+    ]
+    resources = [aws_dynamodb_table.prequeue.arn]
   }
 
   statement {

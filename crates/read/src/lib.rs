@@ -311,6 +311,7 @@ mod tests {
             shuffle_seed: Some(seed),
             participant_count: Some(sealed.participant_count()),
             prequeue_offsets: Some(offsets),
+            demoted_count: 0,
             message: None,
             target_rate: None,
             stored_control: StoredControl::Open,
@@ -326,6 +327,7 @@ mod tests {
             l,
             t: 1_788_000_000,
             v: None,
+            d: None,
         }
     }
 
@@ -339,6 +341,7 @@ mod tests {
             shuffle_seed: None,
             participant_count: None,
             prequeue_offsets: None,
+            demoted_count: 0,
             message: None,
             target_rate: None,
             stored_control: StoredControl::Open,
@@ -399,6 +402,35 @@ mod tests {
             }
         }
         assert_eq!(checked, n);
+    }
+
+    #[test]
+    fn a_demoted_row_is_served_behind_the_whole_cohort() {
+        // Issue #145: a row carrying a tail index resolves past N, and the
+        // whole tail sits between the cohort and the live-join sequence.
+        let counts = [3, 0, 5, 1, 0, 0, 2, 0, 0, 4];
+        let mut counters = sealed_counters(counts, [42u8; 32]);
+        counters.demoted_count = 4;
+        counters.queue_counter = counters.participant_count.unwrap() + 4;
+        let n = counters.participant_count.unwrap();
+        let mut tail = std::collections::HashSet::new();
+        for k in 0..4 {
+            let mut demoted = row(2, k);
+            demoted.d = Some(k);
+            match queue_num(&counters, &demoted).unwrap() {
+                ResolvedQueueNum::PreQueue(resp) => {
+                    assert!(!resp.live_join);
+                    assert!((n..n + 4).contains(&resp.position));
+                    assert!(tail.insert(resp.position));
+                }
+                ResolvedQueueNum::Straggler => panic!("demoted row resolved as a straggler"),
+            }
+        }
+        // The published seal outputs are unchanged by demotion: N is still the
+        // cohort, and the tail is not announced to visitors.
+        let json = serde_json::to_value(status(&counters, None, 0)).unwrap();
+        assert_eq!(json["participant_count"], n);
+        assert!(json.get("demoted_count").is_none());
     }
 
     #[test]
@@ -710,6 +742,7 @@ mod tests {
             shuffle_seed: None,
             participant_count: None,
             prequeue_offsets: None,
+            demoted_count: 0,
             message: None,
             target_rate: None,
             stored_control: StoredControl::Open,
@@ -778,6 +811,7 @@ mod tests {
             l: 0,
             t: 1_788_000_000,
             v: None,
+            d: None,
         };
         assert_eq!(queue_num(&counters, &bad), Err(QueueNumError::BadShard));
     }

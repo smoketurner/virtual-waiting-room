@@ -193,14 +193,15 @@ activation queues first-in, first-out (FIFO).
 
 **F6.3** — As an operator, I want bot-blocking deferrable to start so that suspected bots can be dropped at randomization.
 - WHERE the operator elects to defer bot-blocking, THE SYSTEM SHOULD enforce bot-blocking decisions at event start rather than during the pre-queue.
-- Acceptance: **Not built.** THE SYSTEM SHALL capture join-time telemetry (viewer address, ASN, country, JA4 fingerprint, user agent) on every registration row — this is done, and is the input such a decision would need — but no classification, no consumer and no seal-time mitigation exists. Deferred on cost: the mechanism depends on WAF Bot Control, which the deployment does not enable.
+- Acceptance: THE SYSTEM SHALL capture join-time telemetry (viewer address, ASN, country, JA4 fingerprint, user agent) on every registration row. WHERE demotion rules are configured, THE SYSTEM SHALL, at the seal, demote every group of registrations sharing one value of a ruled signal and larger than its threshold to a compact tail behind the rest of the cohort, SHALL NOT make the demotion observable to the client before T−0, and SHALL record what was demoted and on what basis where the operator can see it. Under `observe` mode THE SYSTEM SHALL report and demote nobody. Built (ADR-0029); the false-positive measurement against a real event is outstanding, which is why nothing is enforced by default.
 
 **No one-position-per-visitor control exists.** `request_id` is client-supplied, so nothing
 stops one visitor taking N places, and randomization converts volume into expected share
 linearly. Every deployment is a bare raffle. Bounding volume needs either an identity to bind a
 position to — which a public onsale open to anyone does not have — or a mechanism that costs the
 client something: proof of work, or behavioural classification over the telemetry F6.3
-describes. Neither is built.
+describes. The second now exists as seal-time demotion (ADR-0029), disabled by default: it
+bounds a farm that shares an address, ASN, JA4 or user agent, and nothing else.
 
 ### 1.8 Operator web interface
 

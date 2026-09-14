@@ -188,6 +188,7 @@ mod tests {
             shuffle_seed: Some([9u8; 32]),
             participant_count: Some(sealed.participant_count()),
             prequeue_offsets: Some(offsets),
+            demoted_count: 0,
             message: None,
             target_rate: None,
             stored_control: StoredControl::Open,
@@ -299,10 +300,39 @@ mod tests {
             l: 1,
             t: 1_788_000_000,
             v: None,
+            d: None,
         };
         let grant = decide(&c, Some(&row), None, 0).unwrap();
         // Inside the sealed cohort.
         assert!(grant.position < c.participant_count.unwrap());
+    }
+
+    #[test]
+    fn a_demoted_registrant_is_admitted_only_once_the_cursor_reaches_the_tail() {
+        // Issue #145: the tail starts at N, so a cursor that has served the
+        // whole undemoted cohort has not yet reached a demoted row.
+        let mut c = counters(0);
+        let n = c.participant_count.unwrap();
+        c.demoted_count = 1;
+        c.queue_counter = n + 1;
+        let row = PreQueueItem {
+            r: REQ.to_owned(),
+            s: 3,
+            l: 1,
+            t: 1_788_000_000,
+            v: None,
+            d: Some(0),
+        };
+        c.serving_counter = n;
+        assert_eq!(
+            decide(&c, Some(&row), None, 0).unwrap_err(),
+            Denied::StillQueued {
+                position: n,
+                serving: n
+            }
+        );
+        c.serving_counter = n + 1;
+        assert_eq!(decide(&c, Some(&row), None, 0).unwrap().position, n);
     }
 
     #[test]
@@ -317,6 +347,7 @@ mod tests {
             l: 0,
             t: 1_788_000_000,
             v: None,
+            d: None,
         };
         assert_eq!(
             decide(&c, Some(&row), None, 0).unwrap_err(),
@@ -333,6 +364,7 @@ mod tests {
             l: 0,
             t: 1_788_000_000,
             v: None,
+            d: None,
         };
         let grant = decide(
             &counters(100),
