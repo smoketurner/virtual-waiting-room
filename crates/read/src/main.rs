@@ -8,8 +8,10 @@ use read::{
     CountersCache, PollPolicy, QueueNumError, ResolvedQueueNum, parse_poll_policy, queue_num,
     status,
 };
-use wr_common::expr::Key;
-use wr_common::{Counters, PreQueueItem};
+use std::sync::Arc;
+
+use wr_common::expr::{DEMOTION_ENTRIES_ATTR, Key};
+use wr_common::{Counters, DemotionCache, DemotionSet, PreQueueItem};
 
 /// How long one execution environment holds the `Counters` item. Matched to the
 /// edge's own TTL on the polled behaviours, so a reader is never staler than
@@ -23,6 +25,11 @@ struct Ctx {
     positions_table: String,
     event_id: String,
     counters_cache: CountersCache,
+    /// The sealed event's demotion set (issue #145), loaded once per
+    /// execution environment and keyed by the nonce the event item names.
+    /// Immutable once sealed, so it never expires; a new event's nonce
+    /// replaces it.
+    demotion_cache: DemotionCache,
     /// The adaptive poll policy (#69), parsed once at cold start
     /// from Terraform-set env vars. `None` when any is absent or invalid.
     poll_policy: Option<PollPolicy>,
@@ -45,6 +52,7 @@ async fn main() -> Result<(), Error> {
         positions_table: std::env::var("POSITIONS_TABLE")?,
         event_id: std::env::var("EVENT_ID")?,
         counters_cache: CountersCache::new(COUNTERS_TTL),
+        demotion_cache: DemotionCache::new(),
         poll_policy: load_poll_policy(),
     };
 
@@ -118,7 +126,8 @@ async fn handle_queue_num(ctx: &Ctx, req: &Request) -> Result<Response<Body>, Er
         return respond_from_position(ctx, request_id).await;
     };
 
-    match queue_num(&counters, &row) {
+    let demotion = load_demotion(ctx, &counters).await?;
+    match queue_num(&counters, &row, demotion.as_deref()) {
         Ok(ResolvedQueueNum::PreQueue(resp)) => json(200, &resp),
         // The row raced the seal: it holds no real position, so fall through
         // to the same Positions lookup a live joiner uses. A row there means
@@ -131,6 +140,67 @@ async fn handle_queue_num(ctx: &Ctx, req: &Request) -> Result<Response<Body>, Er
         }
         Err(QueueNumError::BadShard) => {
             json(500, &serde_json::json!({ "error": "corrupt registration" }))
+        }
+        // Retryable: the set exists (the seal named it) and the next poll
+        // gets another chance to load it. Answering from the primary slot
+        // would silently un-demote every demoted row.
+        Err(QueueNumError::DemotionUnavailable) => {
+            json(503, &serde_json::json!({ "error": "try again" }))
+        }
+    }
+}
+
+/// The demotion set the event item names, from the per-environment cache or
+/// one read of its chunk items. `None` when the seal demoted nobody. A read
+/// or parse failure is `None` too — the resolver then refuses rather than
+/// answering from half a set — and is logged, since a set that stays
+/// unreadable stalls every demoting event's position lookups.
+async fn load_demotion(ctx: &Ctx, counters: &Counters) -> Result<Option<Arc<DemotionSet>>, Error> {
+    let Some(demotion) = &counters.demotion else {
+        return Ok(None);
+    };
+    if let Some(set) = ctx.demotion_cache.get(&demotion.nonce) {
+        return Ok(Some(set));
+    }
+    let mut entries: Vec<String> = Vec::new();
+    for chunk in 0..demotion.chunks {
+        let out = ctx
+            .client
+            .get_item()
+            .table_name(&ctx.counters_table)
+            .set_key(Some(
+                Key::DemotionGroups {
+                    event_id: &ctx.event_id,
+                    nonce: &demotion.nonce,
+                    chunk,
+                }
+                .build(),
+            ))
+            .send()
+            .await?;
+        let Some(list) = out
+            .item()
+            .and_then(|item| item.get(DEMOTION_ENTRIES_ATTR))
+            .and_then(|v| v.as_l().ok())
+        else {
+            tracing::error!(nonce = %demotion.nonce, chunk, "demotion set chunk missing");
+            return Ok(None);
+        };
+        for value in list {
+            if let Ok(entry) = value.as_s() {
+                entries.push(entry.clone());
+            }
+        }
+    }
+    match DemotionSet::from_entries(entries) {
+        Ok(set) => {
+            let set = Arc::new(set);
+            ctx.demotion_cache.put(&demotion.nonce, Arc::clone(&set));
+            Ok(Some(set))
+        }
+        Err(e) => {
+            tracing::error!(nonce = %demotion.nonce, error = %e, "demotion set unreadable");
+            Ok(None)
         }
     }
 }

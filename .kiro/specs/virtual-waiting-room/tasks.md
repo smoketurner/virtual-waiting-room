@@ -79,9 +79,10 @@ Throwaway code. Measures what documentation cannot settle.
 - [ ] Deferred bot enforcement: admit to pre-queue, block at randomization [F6.3]
       `Partial:` built as seal-time demotion (ADR-0029, issue #145): `seal_event` groups the
       cohort by the join-time telemetry (address, ASN, JA4, user agent) under operator-set
-      `signal:max` rules, demotes every group over its threshold to a compact tail
-      (`N + PRP(seed, d, D)`, live joins from `N + D`), holds the phase while the tail indices
-      land, and writes a report the dashboard renders. Off by default (no rules) and `observe`
+      `signal:max` rules, stores the demoted group set once (no per-row write), and every
+      resolver matches rows against it (`N + PRP(seed, i, N)`, live joins from `2N`); the
+      controller walks the sparse tail at its known density. A report the dashboard renders is
+      written at the seal. Off by default (no rules) and `observe`
       by default. Missing: the false-positive measurement against a real event that the
       acceptance requires before the control is enforced by default, and the WAF-derived
       signals (Bot Control labels, reputation lists) as further inputs.

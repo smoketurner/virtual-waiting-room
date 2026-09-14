@@ -10,12 +10,13 @@
 //! phase, so the TLS handshake does not land on a visitor's request.
 
 use std::env;
+use std::sync::Arc;
 
 use generate_token::dynamo::DynamoStore;
 use generate_token::{DEFAULT_SESSION_TTL_SECS, Denied, Store, decide};
 use lambda_http::{Body, Error, Request, RequestExt, Response, run, service_fn};
 use tracing::{error, info};
-use wr_common::{Session, SigningKey};
+use wr_common::{Counters, DemotionCache, DemotionSet, Session, SigningKey};
 
 /// Resolved once at cold start and shared across invocations.
 struct AppState {
@@ -24,6 +25,9 @@ struct AppState {
     event_id: String,
     session_cookie_name: String,
     session_ttl_secs: u64,
+    /// The sealed event's demotion set (issue #145), loaded once per
+    /// execution environment under the nonce the event item names.
+    demotion_cache: DemotionCache,
 }
 
 #[tokio::main]
@@ -73,7 +77,44 @@ async fn init() -> Result<AppState, Error> {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_SESSION_TTL_SECS),
+        demotion_cache: DemotionCache::new(),
     })
+}
+
+/// The demotion set the event item names, from the per-environment cache or
+/// one read of its chunk items; `None` when the seal demoted nobody, and also
+/// when the set cannot be read — `decide` then refuses with a retryable
+/// status rather than admitting from the primary slot. Logged, because a set
+/// that stays unreadable refuses every demoting event's admissions.
+async fn load_demotion(
+    state: &AppState,
+    counters: &Counters,
+) -> Result<Option<Arc<DemotionSet>>, Error> {
+    let Some(demotion) = &counters.demotion else {
+        return Ok(None);
+    };
+    if let Some(set) = state.demotion_cache.get(&demotion.nonce) {
+        return Ok(Some(set));
+    }
+    let Some(entries) = state
+        .store
+        .load_demotion_entries(&state.event_id, &demotion.nonce, demotion.chunks)
+        .await?
+    else {
+        error!(nonce = %demotion.nonce, "demotion set chunk missing");
+        return Ok(None);
+    };
+    match DemotionSet::from_entries(entries) {
+        Ok(set) => {
+            let set = Arc::new(set);
+            state.demotion_cache.put(&demotion.nonce, Arc::clone(&set));
+            Ok(Some(set))
+        }
+        Err(e) => {
+            error!(nonce = %demotion.nonce, error = %e, "demotion set unreadable");
+            Ok(None)
+        }
+    }
 }
 
 fn now_secs() -> u64 {
@@ -101,7 +142,14 @@ async fn handle(state: &AppState, req: Request) -> Result<Response<Body>, Error>
     };
 
     let now = now_secs();
-    let grant = match decide(&counters, prequeue.as_ref(), position_row, now) {
+    let demotion = load_demotion(state, &counters).await?;
+    let grant = match decide(
+        &counters,
+        prequeue.as_ref(),
+        position_row,
+        now,
+        demotion.as_deref(),
+    ) {
         Ok(grant) => grant,
         Err(denied) => return refusal(&denied),
     };
@@ -189,6 +237,7 @@ fn refusal(denied: &Denied) -> Result<Response<Body>, Error> {
         Denied::NotRegistered => 404,
         Denied::Spent => 410,
         Denied::Corrupt => 500,
+        Denied::Unavailable => 503,
     };
     let mut payload = serde_json::json!({
         "admitted": false,

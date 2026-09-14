@@ -37,12 +37,18 @@ visible fairness failure at 1,000,000 people. Tests are the primary evidence.
     of domain for it, falling through to the `Positions` row instead (a live-join position if
     one has landed, 404 — recoverable by re-join — if not).
 - **Seal-time demotion (ADR-0029, issue #145).** A group over its rule's threshold is demoted
-  whole and a group under it is not; a row in two demoted groups is listed once; a straggler is
-  never classified; every demoted row resolves into `[N, N + D)` and every other into `[0, N)`
-  with no position held twice; a tail index at or past `D` falls back to the row's own primary
-  slot; `observe` writes the report and no tail index; a lost election writes nothing after
-  classifying; a tail write that fails part way still opens the event with what landed; rules
-  that do not parse seal without demotion and say so in the report.
+  whole and a group under it is not; a row in two demoted groups is counted once; a straggler is
+  never classified; every row the set matches resolves into `[N, 2N)` at `N + p` and every other
+  into `[0, N)` with no position held twice; an untelemetered row is never demoted; a demoting
+  event refuses to resolve without its set rather than answering from the primary slot; the set
+  round-trips through chunks and a garbled entry fails the whole read; `observe` writes the
+  report and no set; the set is written before the election and a lost election deletes its own
+  chunks; rules that do not parse seal without demotion and say so in the report. Controller
+  `Tiers`: the identity without a tail; inside the tail one person is `N / D` positions; a
+  release crossing a tier boundary is exact per tier; a tier holding nobody is skipped whole;
+  by property, the people released per interval never fall short of the target and never exceed
+  it by more than the rounding a boundary costs, and the expiry grace walked back covers at
+  least as many people as were released.
 - **Atomic counter (design §5).** Under concurrent load, the set of issued positions has
   **zero duplicates**; gaps are permitted and their rate is measured, not eliminated.
 - **Idempotent join** — repeating a join with the same `request_id` consumes no extra

@@ -8,7 +8,10 @@ use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
 use aws_sdk_dynamodb::types::AttributeValue;
 use tokio::task::JoinSet;
-use wr_common::expr::{Condition, DEMOTED_COUNT_ATTR, DEMOTION_APPLIED_ATTR, Key, Update};
+use wr_common::expr::{
+    Condition, DEMOTED_COUNT_ATTR, DEMOTION_CHUNKS_ATTR, DEMOTION_ENTRIES_ATTR,
+    DEMOTION_NONCE_ATTR, Key, Update,
+};
 use wr_common::{
     DemotionReport, Phase, PreQueueItem, SHARDS, Shard, shard_count_of, shard_index_of,
 };
@@ -18,11 +21,6 @@ use crate::{ScannedRow, SealValues, Store, StoreError};
 /// Parallel scan segments. The scan is bounded by page round trips, not CPU:
 /// at a million rows and 1 MB pages, eight segments finish in seconds.
 const SCAN_SEGMENTS: i32 = 8;
-
-/// Tail-index writes in flight at once. The pre-queue table just absorbed
-/// registration at thousands of writes per second, so this is far below what
-/// it serves; it bounds this Lambda's own open connections.
-const TAIL_WRITE_CONCURRENCY: usize = 32;
 
 /// A live `DynamoDB` store bound to the counters and pre-queue tables.
 pub struct DynamoStore {
@@ -115,7 +113,7 @@ impl Store for DynamoStore {
         let count = AttributeValue::N(values.participant_count.to_string());
         // queue_counter starts behind the cohort *and its tail*: the live-join
         // sequence must not hand a post-seal joiner a position already owned
-        // inside `[0, N)` or inside the tail `[N, N + D)`.
+        // inside `[0, N)` or inside the tail `[N, 2N)`.
         let live_join_start = values
             .queue_counter_start()
             .map_err(|e| StoreError(format!("live-join start: {e}")))?;
@@ -132,13 +130,22 @@ impl Store for DynamoStore {
             .set("prequeue_offsets", AttributeValue::L(offsets_list))
             .set(
                 "phase",
-                AttributeValue::S(values.phase.as_wire_str().to_owned()),
+                AttributeValue::S(Phase::Active.as_wire_str().to_owned()),
             );
-        if values.demoted_count > 0 {
-            seal = seal.set(
-                DEMOTED_COUNT_ATTR,
-                AttributeValue::N(values.demoted_count.to_string()),
-            );
+        if let Some(demotion) = &values.demotion {
+            seal = seal
+                .set(
+                    DEMOTED_COUNT_ATTR,
+                    AttributeValue::N(values.demoted_count.to_string()),
+                )
+                .set(
+                    DEMOTION_NONCE_ATTR,
+                    AttributeValue::S(demotion.nonce.clone()),
+                )
+                .set(
+                    DEMOTION_CHUNKS_ATTR,
+                    AttributeValue::N(demotion.chunks.to_string()),
+                );
         }
         let seal = seal.build();
 
@@ -195,145 +202,60 @@ impl Store for DynamoStore {
         Ok(())
     }
 
-    async fn write_tail_indices(&self, request_ids: &[String]) -> Result<u64, StoreError> {
-        let mut writes = JoinSet::new();
-        let mut applied = 0u64;
-        let mut failures = 0u64;
-        for (tail_index, request_id) in request_ids.iter().enumerate() {
-            if writes.len() >= TAIL_WRITE_CONCURRENCY
-                && let Some(joined) = writes.join_next().await
-            {
-                tally(joined, &mut applied, &mut failures);
-            }
-            let client = self.client.clone();
-            let table = self.prequeue_table.clone();
-            let request_id = request_id.clone();
-            let tail_index = u64::try_from(tail_index).unwrap_or(u64::MAX);
-            writes.spawn(
-                async move { write_tail_index(client, table, request_id, tail_index).await },
-            );
+    async fn write_demotion_chunks(
+        &self,
+        event_id: &str,
+        nonce: &str,
+        chunks: &[Vec<String>],
+    ) -> Result<(), StoreError> {
+        // A handful of items at most (a chunk is 300 KB of entries), written
+        // in order so a partial failure leaves a prefix; the seal that would
+        // name them is never written after a failure here.
+        for (index, chunk) in chunks.iter().enumerate() {
+            let chunk_index = u32::try_from(index)
+                .map_err(|_err| StoreError("demotion set has too many chunks".to_owned()))?;
+            let key = Key::DemotionGroups {
+                event_id,
+                nonce,
+                chunk: chunk_index,
+            };
+            let entries: Vec<AttributeValue> = chunk
+                .iter()
+                .map(|entry| AttributeValue::S(entry.clone()))
+                .collect();
+            self.client
+                .put_item()
+                .table_name(&self.counters_table)
+                .item(key.attr(), AttributeValue::S(key.value()))
+                .item(DEMOTION_ENTRIES_ATTR, AttributeValue::L(entries))
+                .send()
+                .await
+                .map_err(|e| StoreError(format!("put_item demotion chunk {chunk_index}: {e}")))?;
         }
-        while let Some(joined) = writes.join_next().await {
-            tally(joined, &mut applied, &mut failures);
-        }
-        if failures > 0 {
-            return Err(StoreError(format!(
-                "{failures} tail index writes failed ({applied} applied)"
-            )));
-        }
-        Ok(applied)
+        Ok(())
     }
 
-    async fn finish_demotion(&self, event_id: &str, applied: u64) -> Result<(), StoreError> {
-        let update = Update::new()
-            .set(
-                "phase",
-                AttributeValue::S(Phase::Active.as_wire_str().to_owned()),
-            )
-            .set(
-                DEMOTION_APPLIED_ATTR,
-                AttributeValue::N(applied.to_string()),
-            )
-            .build();
-        let mut values = update.values;
-        values.insert(
-            ":held".to_owned(),
-            AttributeValue::S(Phase::PreQueue.as_wire_str().to_owned()),
-        );
-        let result = self
-            .client
-            .update_item()
-            .table_name(&self.counters_table)
-            .set_key(Some(Key::Event { event_id }.build()))
-            .update_expression(update.expression)
-            // Only the held phase flips: an operator who already moved the
-            // event on (or into maintenance) is not overridden by the seal.
-            .condition_expression("phase = :held")
-            .set_expression_attribute_names(Some(update.names))
-            .set_expression_attribute_values(Some(values))
-            .send()
-            .await;
-        match result {
-            Ok(_) => Ok(()),
-            Err(SdkError::ServiceError(se))
-                if matches!(
-                    se.err(),
-                    UpdateItemError::ConditionalCheckFailedException(_)
-                ) =>
-            {
-                tracing::warn!(
-                    event_id,
-                    "phase was no longer held at pre_queue; left as is"
-                );
-                Ok(())
-            }
-            Err(e) => Err(StoreError(format!("update_item finish: {e}"))),
+    async fn delete_demotion_chunks(
+        &self,
+        event_id: &str,
+        nonce: &str,
+        count: u32,
+    ) -> Result<(), StoreError> {
+        for chunk in 0..count {
+            let key = Key::DemotionGroups {
+                event_id,
+                nonce,
+                chunk,
+            };
+            self.client
+                .delete_item()
+                .table_name(&self.counters_table)
+                .set_key(Some(key.build()))
+                .send()
+                .await
+                .map_err(|e| StoreError(format!("delete_item demotion chunk {chunk}: {e}")))?;
         }
-    }
-}
-
-/// Folds one tail write's outcome into the running totals.
-fn tally(
-    joined: Result<Result<bool, StoreError>, tokio::task::JoinError>,
-    applied: &mut u64,
-    failures: &mut u64,
-) {
-    match joined {
-        Ok(Ok(true)) => *applied = applied.saturating_add(1),
-        // The row already carried a tail index: not this run's write, so not
-        // counted as applied here, and never overwritten.
-        Ok(Ok(false)) => {}
-        Ok(Err(e)) => {
-            tracing::error!(error = %e, "tail index write failed");
-            *failures = failures.saturating_add(1);
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "tail index write panicked");
-            *failures = failures.saturating_add(1);
-        }
-    }
-}
-
-/// `SET d = :k` on one row, guarded by `attribute_not_exists(d)`. `Ok(false)`
-/// when the row already had one.
-async fn write_tail_index(
-    client: Client,
-    table: String,
-    request_id: String,
-    tail_index: u64,
-) -> Result<bool, StoreError> {
-    let update = Update::new()
-        .set("d", AttributeValue::N(tail_index.to_string()))
-        .build();
-    let guard = Condition::attribute_not_exists("d").build();
-    let mut names = update.names;
-    names.extend(guard.names);
-    let result = client
-        .update_item()
-        .table_name(&table)
-        .set_key(Some(
-            Key::Prequeue {
-                request_id: &request_id,
-            }
-            .build(),
-        ))
-        .update_expression(update.expression)
-        .condition_expression(guard.expression)
-        .set_expression_attribute_names(Some(names))
-        .set_expression_attribute_values(Some(update.values))
-        .send()
-        .await;
-    match result {
-        Ok(_) => Ok(true),
-        Err(SdkError::ServiceError(se))
-            if matches!(
-                se.err(),
-                UpdateItemError::ConditionalCheckFailedException(_)
-            ) =>
-        {
-            Ok(false)
-        }
-        Err(e) => Err(StoreError(format!("update_item tail {request_id}: {e}"))),
+        Ok(())
     }
 }
 
@@ -370,7 +292,6 @@ async fn scan_segment(
             }
         };
         visit(ScannedRow {
-            request_id: row.r,
             shard: row.s,
             local_index: row.l,
             telemetry: row.v,
@@ -458,19 +379,5 @@ mod tests {
         )]);
         let items = vec![shard_item(0, 3), corrupt];
         assert!(counts_from_shard_items(&items).is_err());
-    }
-
-    #[test]
-    fn tally_counts_applied_and_failures_separately() {
-        let mut applied = 0;
-        let mut failures = 0;
-        tally(Ok(Ok(true)), &mut applied, &mut failures);
-        tally(Ok(Ok(false)), &mut applied, &mut failures);
-        tally(
-            Ok(Err(StoreError("boom".to_owned()))),
-            &mut applied,
-            &mut failures,
-        );
-        assert_eq!((applied, failures), (1, 1));
     }
 }

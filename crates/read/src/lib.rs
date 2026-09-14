@@ -9,8 +9,8 @@ use serde::Serialize;
 #[cfg(test)]
 use wr_common::StoredControl;
 use wr_common::{
-    Counters, Phase, PreQueueItem, ResolveError, ResolvedPosition, SHARDS, ServingState, resolve,
-    serving_state,
+    Counters, DemotionSet, Phase, PreQueueItem, ResolveError, ResolvedPosition, SHARDS,
+    ServingState, resolve, serving_state,
 };
 
 /// Holds the event's `Counters` item for a beat inside one execution
@@ -251,6 +251,10 @@ pub enum QueueNumError {
     /// The stored shard is outside `0..SHARDS` (corrupt row).
     #[error("shard index out of range")]
     BadShard,
+    /// The seal demoted rows and the demotion set could not be supplied, so
+    /// no position can be answered without risking un-demoting one.
+    #[error("demotion set unavailable")]
+    DemotionUnavailable,
 }
 
 /// Resolves a pre-queue registrant's queue position.
@@ -266,12 +270,14 @@ pub enum QueueNumError {
 /// # Errors
 ///
 /// [`QueueNumError::NotSealed`] before the seal; [`QueueNumError::BadShard`] if
-/// the stored shard is out of range.
+/// the stored shard is out of range; [`QueueNumError::DemotionUnavailable`]
+/// when the event demoted rows (issue #145) and `demotion` is `None`.
 pub fn queue_num(
     counters: &Counters,
     row: &PreQueueItem,
+    demotion: Option<&DemotionSet>,
 ) -> Result<ResolvedQueueNum, QueueNumError> {
-    match counters.resolve_prequeue(row) {
+    match counters.resolve_prequeue(row, demotion) {
         Ok(ResolvedPosition::PreQueue(position)) => {
             Ok(ResolvedQueueNum::PreQueue(QueueNumResponse {
                 position,
@@ -281,6 +287,7 @@ pub fn queue_num(
         Ok(ResolvedPosition::LiveJoin) => Ok(ResolvedQueueNum::Straggler),
         Err(ResolveError::NotSealed) => Err(QueueNumError::NotSealed),
         Err(ResolveError::BadShard) => Err(QueueNumError::BadShard),
+        Err(ResolveError::DemotionUnavailable) => Err(QueueNumError::DemotionUnavailable),
     }
 }
 
@@ -312,6 +319,7 @@ mod tests {
             participant_count: Some(sealed.participant_count()),
             prequeue_offsets: Some(offsets),
             demoted_count: 0,
+            demotion: None,
             message: None,
             target_rate: None,
             stored_control: StoredControl::Open,
@@ -327,7 +335,6 @@ mod tests {
             l,
             t: 1_788_000_000,
             v: None,
-            d: None,
         }
     }
 
@@ -342,6 +349,7 @@ mod tests {
             participant_count: None,
             prequeue_offsets: None,
             demoted_count: 0,
+            demotion: None,
             message: None,
             target_rate: None,
             stored_control: StoredControl::Open,
@@ -394,7 +402,7 @@ mod tests {
         for (shard, &count) in counts.iter().enumerate() {
             for l in 0..count {
                 let recomputed = prp(&seed, offsets[shard] + l, n);
-                match queue_num(&counters, &row(shard as u8, l)).unwrap() {
+                match queue_num(&counters, &row(shard as u8, l), None).unwrap() {
                     ResolvedQueueNum::PreQueue(resp) => assert_eq!(resp.position, recomputed),
                     ResolvedQueueNum::Straggler => panic!("issued index resolved as a straggler"),
                 }
@@ -406,31 +414,50 @@ mod tests {
 
     #[test]
     fn a_demoted_row_is_served_behind_the_whole_cohort() {
-        // Issue #145: a row carrying a tail index resolves past N, and the
-        // whole tail sits between the cohort and the live-join sequence.
+        // Issue #145: a row the demotion set matches resolves to N + p, and
+        // an event that demoted rows will not answer without the set.
         let counts = [3, 0, 5, 1, 0, 0, 2, 0, 0, 4];
         let mut counters = sealed_counters(counts, [42u8; 32]);
-        counters.demoted_count = 4;
-        counters.queue_counter = counters.participant_count.unwrap() + 4;
         let n = counters.participant_count.unwrap();
-        let mut tail = std::collections::HashSet::new();
-        for k in 0..4 {
-            let mut demoted = row(2, k);
-            demoted.d = Some(k);
-            match queue_num(&counters, &demoted).unwrap() {
-                ResolvedQueueNum::PreQueue(resp) => {
-                    assert!(!resp.live_join);
-                    assert!((n..n + 4).contains(&resp.position));
-                    assert!(tail.insert(resp.position));
-                }
-                ResolvedQueueNum::Straggler => panic!("demoted row resolved as a straggler"),
+        counters.demoted_count = 4;
+        counters.demotion = Some(wr_common::DemotionRef {
+            nonce: "0badcafe".to_owned(),
+            chunks: 1,
+        });
+        counters.queue_counter = 2 * n;
+        let set = DemotionSet::from_entries(vec!["asn:64500".to_owned()]).unwrap();
+
+        let mut demoted = row(2, 1);
+        demoted.v = Some(wr_common::Telemetry {
+            a: None,
+            n: Some("64500".to_owned()),
+            c: None,
+            j: None,
+            u: None,
+            q: None,
+        });
+        let plain = row(2, 1);
+        let primary = match queue_num(&counters, &plain, Some(&set)).unwrap() {
+            ResolvedQueueNum::PreQueue(resp) => resp.position,
+            ResolvedQueueNum::Straggler => panic!("issued index resolved as a straggler"),
+        };
+        match queue_num(&counters, &demoted, Some(&set)).unwrap() {
+            ResolvedQueueNum::PreQueue(resp) => {
+                assert!(!resp.live_join);
+                assert_eq!(resp.position, n + primary);
             }
+            ResolvedQueueNum::Straggler => panic!("demoted row resolved as a straggler"),
         }
+        assert_eq!(
+            queue_num(&counters, &demoted, None).unwrap_err(),
+            QueueNumError::DemotionUnavailable
+        );
         // The published seal outputs are unchanged by demotion: N is still the
         // cohort, and the tail is not announced to visitors.
         let json = serde_json::to_value(status(&counters, None, 0)).unwrap();
         assert_eq!(json["participant_count"], n);
         assert!(json.get("demoted_count").is_none());
+        assert!(json.get("demotion_nonce").is_none());
     }
 
     #[test]
@@ -743,6 +770,7 @@ mod tests {
             participant_count: None,
             prequeue_offsets: None,
             demoted_count: 0,
+            demotion: None,
             message: None,
             target_rate: None,
             stored_control: StoredControl::Open,
@@ -750,7 +778,7 @@ mod tests {
             starts_at: None,
         };
         assert_eq!(
-            queue_num(&counters, &row(0, 0)),
+            queue_num(&counters, &row(0, 0), None),
             Err(QueueNumError::NotSealed)
         );
     }
@@ -764,7 +792,7 @@ mod tests {
         let mut positions = std::collections::BTreeSet::new();
         for (shard, &count) in counts.iter().enumerate() {
             for l in 0..count {
-                match queue_num(&counters, &row(shard as u8, l)).unwrap() {
+                match queue_num(&counters, &row(shard as u8, l), None).unwrap() {
                     ResolvedQueueNum::PreQueue(resp) => {
                         assert!(!resp.live_join);
                         assert!(resp.position < n);
@@ -783,7 +811,7 @@ mod tests {
         let counters = sealed_counters(counts, [42u8; 32]);
         // Last shard local index 4 is past its own count: a straggler.
         assert_eq!(
-            queue_num(&counters, &row(9, 4)).unwrap(),
+            queue_num(&counters, &row(9, 4), None).unwrap(),
             ResolvedQueueNum::Straggler
         );
     }
@@ -797,7 +825,7 @@ mod tests {
         let counts = [3, 0, 5, 1, 0, 0, 2, 0, 0, 4];
         let counters = sealed_counters(counts, [42u8; 32]);
         assert_eq!(
-            queue_num(&counters, &row(2, 5)).unwrap(),
+            queue_num(&counters, &row(2, 5), None).unwrap(),
             ResolvedQueueNum::Straggler
         );
     }
@@ -811,9 +839,11 @@ mod tests {
             l: 0,
             t: 1_788_000_000,
             v: None,
-            d: None,
         };
-        assert_eq!(queue_num(&counters, &bad), Err(QueueNumError::BadShard));
+        assert_eq!(
+            queue_num(&counters, &bad, None),
+            Err(QueueNumError::BadShard)
+        );
     }
 
     // --- counters cache -----------------------------------------------------

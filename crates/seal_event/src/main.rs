@@ -69,7 +69,20 @@ async fn handle(
     let mut seed = [0u8; 32];
     rng.fill(&mut seed)
         .map_err(|_| Error::from("failed to generate seal seed"))?;
-    seal_event(store, &event.payload.event_id, seed, demotion, now_secs()).await?;
+    // The nonce keys this run's demotion set; a losing double-fire's set is
+    // then an orphan the winning seal never names.
+    let mut nonce = [0u8; 8];
+    rng.fill(&mut nonce)
+        .map_err(|_| Error::from("failed to generate seal nonce"))?;
+    seal_event(
+        store,
+        &event.payload.event_id,
+        seed,
+        nonce,
+        demotion,
+        now_secs(),
+    )
+    .await?;
     Ok(())
 }
 

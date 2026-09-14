@@ -8,7 +8,7 @@ use aws_sdk_dynamodb::types::AttributeValue;
 use jiff::Timestamp;
 
 use crate::arrival::ArrivalTime;
-use wr_common::expr::{DEMOTED_COUNT_ATTR, DEMOTION_APPLIED_ATTR, Key};
+use wr_common::expr::Key;
 use wr_common::{DemotionReport, Phase, StoredControl};
 
 use crate::{ControlState, Store, StoreError};
@@ -82,8 +82,6 @@ impl Store for DynamoStore {
                 .and_then(|ms| Timestamp::from_millisecond(ms).ok()),
             starts_at: num(wr_common::STARTS_AT_ATTR),
             starts_at_timezone: str_attr(wr_common::STARTS_AT_TZ_ATTR),
-            demoted_count: num(DEMOTED_COUNT_ATTR).unwrap_or(0),
-            demotion_applied: num(DEMOTION_APPLIED_ATTR),
         }))
     }
 

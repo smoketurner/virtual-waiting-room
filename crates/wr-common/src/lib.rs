@@ -22,8 +22,9 @@ pub mod rules;
 
 pub use crypto::{AdmissionToken, Session, SigningKey, VerifyError};
 pub use demotion::{
-    Classification, Cohort, DemotedGroup, DemotionMode, DemotionReport, DemotionRule,
-    DemotionRules, MAX_REPORT_GROUPS, ReportGroup, RuleParseError, Signal, UnknownMode,
+    ChunkParseError, Classification, Cohort, DemotedGroup, DemotionCache, DemotionMode,
+    DemotionRef, DemotionReport, DemotionRule, DemotionRules, DemotionSet, MAX_CHUNK_BYTES,
+    MAX_REPORT_GROUPS, ReportGroup, RuleParseError, Signal, UnknownMode,
 };
 pub use expr::{STARTS_AT_ATTR, STARTS_AT_TZ_ATTR};
 pub use ids::{

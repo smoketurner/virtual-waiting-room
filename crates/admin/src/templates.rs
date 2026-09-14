@@ -112,9 +112,8 @@ pub struct Dashboard {
     /// outside it can still be posted and is still validated.
     #[serde(skip)]
     pub timezones: Vec<&'static str>,
-    /// Seal-time demotion (issue #145), for the operator's card. `D` and the
-    /// applied count come from `ControlState`; the rest is the report item,
-    /// read separately by the handler like the ruleset. Render-only.
+    /// Seal-time demotion (issue #145), for the operator's card: the report
+    /// item, read separately by the handler like the ruleset. Render-only.
     #[serde(skip)]
     pub demotion: DemotionView,
 }
@@ -143,14 +142,6 @@ pub struct DemotionView {
     pub groups_shown: u64,
     /// The rules did not parse, and this is why. The seal ran without them.
     pub error: String,
-    /// Tail indices written, as "7 of 7" or "3 of 7", or empty when the seal
-    /// did not enforce anything.
-    pub applied: String,
-    /// The seal enforced a demotion and has not yet recorded finishing: the
-    /// phase is held at `pre_queue` while tail indices are written. If this
-    /// outlives the seal's own timeout, the seal died and the operator opens
-    /// the event by hand.
-    pub applying: bool,
 }
 
 /// One row of the demotion card's group table.
@@ -313,25 +304,7 @@ impl Dashboard {
                 .clone()
                 .unwrap_or_else(|| crate::DEFAULT_TIMEZONE.to_owned()),
             timezones: OFFERED_TIMEZONES.to_vec(),
-            demotion: DemotionView {
-                reported: false,
-                mode: String::new(),
-                rules: String::new(),
-                cohort: 0,
-                demoted: 0,
-                groups_total: 0,
-                groups: Vec::new(),
-                groups_shown: 0,
-                error: String::new(),
-                applied: match (state.demoted_count, state.demotion_applied) {
-                    (0, _) => String::new(),
-                    (demoted, Some(applied)) => format!("{applied} of {demoted}"),
-                    (demoted, None) => format!("0 of {demoted} recorded"),
-                },
-                applying: state.demoted_count > 0
-                    && state.demotion_applied.is_none()
-                    && state.phase == wr_common::Phase::PreQueue,
-            },
+            demotion: DemotionView::default(),
         }
     }
 }
@@ -375,8 +348,6 @@ mod tests {
             last_action_time: jiff::Timestamp::from_millisecond(1_788_000_000_000).ok(),
             starts_at: None,
             starts_at_timezone: None,
-            demoted_count: 0,
-            demotion_applied: None,
         }
     }
 
@@ -394,17 +365,13 @@ mod tests {
         let html = Dashboard::from_state(&state(), 0).render().unwrap();
         assert!(html.contains("Seal-time demotion"));
         assert!(html.contains("No report yet"));
-        assert!(!html.contains("Demotion is being applied"));
     }
 
     #[test]
     fn the_demotion_card_shows_what_was_demoted_and_on_what_basis() {
         // Issue #145's acceptance: the operator can see what was mitigated
         // and why, group by group, with the threshold each one exceeded.
-        let mut s = state();
-        s.demoted_count = 7;
-        s.demotion_applied = Some(7);
-        let mut view = Dashboard::from_state(&s, 0);
+        let mut view = Dashboard::from_state(&state(), 0);
         let report = wr_common::DemotionReport {
             mode: "enforce".to_owned(),
             rules: "address:5".to_owned(),
@@ -425,16 +392,13 @@ mod tests {
         assert!(html.contains("<strong>enforce</strong>"));
         assert!(html.contains("address:5"));
         assert!(html.contains("<strong>7</strong> of 1000 registrations in 1 group<"));
-        assert!(html.contains("7 of 7"));
         assert!(html.contains("198.51.100.1"));
         assert!(!html.contains("groups shown"));
-        assert!(!html.contains("Demotion is being applied"));
     }
 
     #[test]
-    fn an_observe_report_reads_as_would_demote_and_a_held_phase_as_applying() {
-        let mut s = state();
-        let mut view = Dashboard::from_state(&s, 0);
+    fn an_observe_report_reads_as_would_demote_and_a_bad_ruleset_says_so() {
+        let mut view = Dashboard::from_state(&state(), 0);
         let mut report = wr_common::DemotionReport {
             mode: "observe".to_owned(),
             rules: "ja4:100".to_owned(),
@@ -455,19 +419,12 @@ mod tests {
         assert!(html.contains("Would demote"));
         assert!(html.contains("(reported, not applied)"));
 
-        // A seal that enforced and has not recorded finishing, with the phase
-        // still held, is applying; the operator is told what to do if it
-        // never finishes.
-        s.phase = Phase::PreQueue;
-        s.demoted_count = 3;
-        s.demotion_applied = None;
+        // A ruleset that failed to parse is said in so many words.
         report.mode = "enforce".to_owned();
         report.error = Some("rule \"ja4\" is not of the form signal:max".to_owned());
-        let mut view = Dashboard::from_state(&s, 0);
+        let mut view = Dashboard::from_state(&state(), 0);
         view.with_demotion_report(Some(&report));
         let html = view.render().unwrap();
-        assert!(html.contains("Demotion is being applied"));
-        assert!(html.contains("0 of 3 recorded"));
         assert!(html.contains("did not parse"));
         assert!(html.contains("Largest 1 of 250 groups shown"));
     }

@@ -14,12 +14,17 @@
 //! revealed while there is still time to retool and re-register, and a group
 //! is judged on its whole pre-queue footprint rather than a moving window.
 //!
-//! The mitigation is a **demotion to a compact tail**, never a block. A rule
-//! that catches a farm also catches an office NAT or a campus network, and a
-//! demoted office still gets in — after everyone the rules did not touch. The
-//! tail is compact rather than sparse (each demoted row takes a fresh tail
-//! index `d` in `[0, D)`) so the controller does not have to sweep `N`
-//! positions of mostly-gaps to reach the live joiners behind it.
+//! The mitigation is a **demotion to the tail**, never a block. A rule that
+//! catches a farm also catches an office NAT or a campus network, and a
+//! demoted office still gets in — after everyone the rules did not touch.
+//!
+//! Nothing is written per row. The seal stores the demoted *groups* once, as a
+//! [`DemotionSet`] in its own items, and every resolver matches a row's
+//! telemetry against that set on read: a match resolves to `N + p` instead of
+//! `p`, a second copy of the index space behind the whole cohort. The tail is
+//! therefore sparse — `D` people over `N` positions — and the controller,
+//! which knows `N` and `D`, walks it at the density it has rather than one
+//! position at a time.
 //!
 //! Every rule here is a **count threshold** chosen by the operator, applied to
 //! one signal: a group whose registrations exceed the threshold is demoted
@@ -228,18 +233,19 @@ impl std::str::FromStr for DemotionMode {
 /// The most rules a cohort row can belong to: one group per signal.
 const MAX_RULES: usize = 4;
 
-/// One scanned cohort row: its id and, per rule, the interned id of the group
-/// it fell into (`None` when the row did not report that signal).
+/// One scanned cohort row: per rule, the interned id of the group it fell into
+/// (`None` when the row did not report that signal). No request id: nothing
+/// is written back per row, so the seal never needs to know which rows were
+/// demoted, only how many.
 struct CohortRow {
-    request_id: String,
     groups: [Option<u32>; MAX_RULES],
 }
 
 /// Accumulates the sealed cohort during the seal's scan, then classifies it.
 ///
 /// Group values are interned once and rows carry only interned ids, so a
-/// million-row cohort costs roughly its request ids plus a few words per row
-/// in memory rather than a copy of every telemetry string.
+/// million-row cohort costs a few words per row in memory rather than a copy
+/// of every telemetry string.
 pub struct Cohort {
     rules: DemotionRules,
     rows: Vec<CohortRow>,
@@ -266,7 +272,7 @@ impl Cohort {
     /// Records one cohort row. Callers pass only rows the sealed offsets place
     /// inside the cohort; a straggler that raced the seal is a live joiner and
     /// has no pre-queue position to demote.
-    pub fn observe(&mut self, request_id: &str, telemetry: Option<&Telemetry>) {
+    pub fn observe(&mut self, telemetry: Option<&Telemetry>) {
         let mut groups = [None; MAX_RULES];
         if let Some(telemetry) = telemetry {
             let rules: Vec<DemotionRule> = self
@@ -287,10 +293,7 @@ impl Cohort {
                 groups[rule_index] = Some(id);
             }
         }
-        self.rows.push(CohortRow {
-            request_id: request_id.to_owned(),
-            groups,
-        });
+        self.rows.push(CohortRow { groups });
     }
 
     fn intern(&mut self, rule_index: usize, value: &str) -> u32 {
@@ -316,7 +319,7 @@ impl Cohort {
     }
 
     /// Applies the rules: every group over its rule's threshold is demoted,
-    /// and every row in any demoted group is listed for the tail.
+    /// and every row in any demoted group is counted toward `D`.
     #[must_use]
     pub fn classify(self) -> Classification {
         let mut demoted_group = vec![false; self.keys.len()];
@@ -346,21 +349,17 @@ impl Cohort {
         });
 
         let cohort = self.len();
-        let mut demoted = Vec::new();
-        for row in self.rows {
+        let mut demoted = 0u64;
+        for row in &self.rows {
             let hit = row
                 .groups
                 .iter()
                 .flatten()
                 .any(|&id| demoted_group.get(id as usize).copied().unwrap_or(false));
             if hit {
-                demoted.push(row.request_id);
+                demoted = demoted.saturating_add(1);
             }
         }
-        // Sorted so the tail index a row receives does not depend on the
-        // scan's segment interleaving; the permutation over the tail
-        // randomizes the order regardless.
-        demoted.sort_unstable();
 
         Classification {
             cohort,
@@ -388,16 +387,168 @@ pub struct Classification {
     pub cohort: u64,
     /// Demoted groups, largest first.
     pub groups: Vec<DemotedGroup>,
-    /// Request ids of every row in a demoted group, sorted. A row's index in
-    /// this list is the tail index `d` it is written with under `Enforce`.
-    pub demoted: Vec<String>,
+    /// `D`: rows in at least one demoted group. A row in two demoted groups
+    /// counts once.
+    pub demoted: u64,
 }
 
-impl Classification {
-    /// `D`, the tail's size.
+/// The demoted groups a sealed event resolves rows against: the whole set,
+/// not the report's capped list. Written once by the seal, read once per
+/// execution environment by every resolver, matched on every read.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DemotionSet {
+    by_signal: HashMap<Signal, std::collections::HashSet<String>>,
+    len: u64,
+}
+
+/// The largest serialized chunk of a [`DemotionSet`] one item carries, well
+/// under `DynamoDB`'s 400 KB item ceiling with room for the key and the list
+/// encoding's own overhead.
+pub const MAX_CHUNK_BYTES: usize = 300_000;
+
+/// An entry of a stored chunk that is not `signal:value` with a known signal.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("demotion set entry {0:?} is not signal:value with a known signal")]
+pub struct ChunkParseError(pub String);
+
+impl DemotionSet {
+    /// The set for a classification's demoted groups.
     #[must_use]
-    pub fn demoted_count(&self) -> u64 {
-        u64::try_from(self.demoted.len()).unwrap_or(u64::MAX)
+    pub fn from_groups(groups: &[DemotedGroup]) -> Self {
+        let mut set = Self::default();
+        for group in groups {
+            set.insert(group.signal, group.value.clone());
+        }
+        set
+    }
+
+    fn insert(&mut self, signal: Signal, value: String) {
+        if self.by_signal.entry(signal).or_default().insert(value) {
+            self.len = self.len.saturating_add(1);
+        }
+    }
+
+    /// Whether a registration with this telemetry is in any demoted group. An
+    /// untelemetered row is in none.
+    #[must_use]
+    pub fn matches(&self, telemetry: Option<&Telemetry>) -> bool {
+        let Some(telemetry) = telemetry else {
+            return false;
+        };
+        for (signal, values) in &self.by_signal {
+            if let Some(value) = signal.extract(telemetry)
+                && values.contains(value)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Groups in the set.
+    #[must_use]
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The set as `signal:value` entries, split into chunks of at most
+    /// `max_bytes` of entry text each, in a stable order. A set whose largest
+    /// group value alone exceeds `max_bytes` still yields that entry in a
+    /// chunk of its own; the item ceiling is the writer's to enforce.
+    #[must_use]
+    pub fn to_chunks(&self, max_bytes: usize) -> Vec<Vec<String>> {
+        let mut entries: Vec<String> = Vec::new();
+        for (signal, values) in &self.by_signal {
+            for value in values {
+                entries.push(format!("{}:{value}", signal.as_wire_str()));
+            }
+        }
+        entries.sort_unstable();
+
+        let mut chunks: Vec<Vec<String>> = Vec::new();
+        let mut current: Vec<String> = Vec::new();
+        let mut current_bytes = 0usize;
+        for entry in entries {
+            if !current.is_empty() && current_bytes.saturating_add(entry.len()) > max_bytes {
+                chunks.push(std::mem::take(&mut current));
+                current_bytes = 0;
+            }
+            current_bytes = current_bytes.saturating_add(entry.len());
+            current.push(entry);
+        }
+        if !current.is_empty() {
+            chunks.push(current);
+        }
+        chunks
+    }
+
+    /// Rebuilds the set from every entry of every chunk.
+    ///
+    /// # Errors
+    ///
+    /// [`ChunkParseError`] on the first entry that is not `signal:value` with
+    /// a known signal. A resolver must not run against a set it could only
+    /// half-read: that would un-demote whichever groups it lost.
+    pub fn from_entries<I>(entries: I) -> Result<Self, ChunkParseError>
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let mut set = Self::default();
+        for entry in entries {
+            let Some((signal, value)) = entry.split_once(':') else {
+                return Err(ChunkParseError(entry));
+            };
+            let Ok(signal) = signal.parse::<Signal>() else {
+                return Err(ChunkParseError(entry));
+            };
+            set.insert(signal, value.to_owned());
+        }
+        Ok(set)
+    }
+}
+
+/// Where a sealed event's [`DemotionSet`] lives: the nonce its items are keyed
+/// under and how many chunks there are. On the event item, so every resolver
+/// finds the set the seal actually wrote and never one from a lost election.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DemotionRef {
+    /// Lowercase hex; never contains `#`.
+    pub nonce: String,
+    pub chunks: u32,
+}
+
+/// Holds one [`DemotionSet`] per execution environment, keyed by the nonce the
+/// event item names. The set is immutable once sealed, so a hit never goes
+/// stale; a different nonce (a new event in the same environment) replaces it.
+#[derive(Debug, Default)]
+pub struct DemotionCache {
+    slot: std::sync::Mutex<Option<(String, std::sync::Arc<DemotionSet>)>>,
+}
+
+impl DemotionCache {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The cached set for `nonce`, if it is the one held.
+    #[must_use]
+    pub fn get(&self, nonce: &str) -> Option<std::sync::Arc<DemotionSet>> {
+        let guard = self.slot.lock().ok()?;
+        let (held, set) = guard.as_ref()?;
+        (held == nonce).then(|| std::sync::Arc::clone(set))
+    }
+
+    /// Records the set for `nonce`, replacing whatever was held.
+    pub fn put(&self, nonce: &str, set: std::sync::Arc<DemotionSet>) {
+        if let Ok(mut guard) = self.slot.lock() {
+            *guard = Some((nonce.to_owned(), set));
+        }
     }
 }
 
@@ -466,7 +617,7 @@ impl DemotionReport {
             mode: mode.as_wire_str().to_owned(),
             rules: rules.to_wire_string(),
             cohort: classification.cohort,
-            demoted: classification.demoted_count(),
+            demoted: classification.demoted,
             groups_total: u64::try_from(classification.groups.len()).unwrap_or(u64::MAX),
             groups,
             sealed_at,
@@ -582,24 +733,18 @@ mod tests {
         let mut cohort = Cohort::new(rules);
         // Three from one address (over 2), two from another (not over), one
         // untelemetered row.
-        for (i, port) in [1, 2, 3].iter().enumerate() {
-            cohort.observe(
-                &format!("farm-{i}"),
-                Some(&telemetry(
-                    &format!("198.51.100.1:{port}"),
-                    "64500",
-                    "j",
-                    "u",
-                )),
-            );
+        for port in [1, 2, 3] {
+            cohort.observe(Some(&telemetry(
+                &format!("198.51.100.1:{port}"),
+                "64500",
+                "j",
+                "u",
+            )));
         }
-        for i in 0..2 {
-            cohort.observe(
-                &format!("office-{i}"),
-                Some(&telemetry("203.0.113.7:9", "64501", "j", "u")),
-            );
+        for _ in 0..2 {
+            cohort.observe(Some(&telemetry("203.0.113.7:9", "64501", "j", "u")));
         }
-        cohort.observe("blank", None);
+        cohort.observe(None);
 
         let classification = cohort.classify();
         assert_eq!(classification.cohort, 6);
@@ -612,19 +757,92 @@ mod tests {
                 max: 2,
             }]
         );
-        assert_eq!(classification.demoted, vec!["farm-0", "farm-1", "farm-2"]);
-        assert_eq!(classification.demoted_count(), 3);
+        assert_eq!(classification.demoted, 3);
+        // The set the seal stores resolves exactly those rows.
+        let set = DemotionSet::from_groups(&classification.groups);
+        assert_eq!(set.len(), 1);
+        assert!(set.matches(Some(&telemetry("198.51.100.1:9", "1", "j", "u"))));
+        assert!(!set.matches(Some(&telemetry("203.0.113.7:9", "64500", "j", "u"))));
+        assert!(!set.matches(None));
     }
 
     #[test]
-    fn a_row_in_two_demoted_groups_is_listed_once() {
+    fn a_row_in_two_demoted_groups_is_counted_once() {
         let rules = DemotionRules::parse("address:1,asn:1").unwrap();
         let mut cohort = Cohort::new(rules);
-        cohort.observe("a", Some(&telemetry("1.1.1.1:1", "64500", "j", "u")));
-        cohort.observe("b", Some(&telemetry("1.1.1.1:2", "64500", "j", "u")));
+        cohort.observe(Some(&telemetry("1.1.1.1:1", "64500", "j", "u")));
+        cohort.observe(Some(&telemetry("1.1.1.1:2", "64500", "j", "u")));
         let classification = cohort.classify();
         assert_eq!(classification.groups.len(), 2);
-        assert_eq!(classification.demoted, vec!["a", "b"]);
+        assert_eq!(classification.demoted, 2);
+    }
+
+    #[test]
+    fn the_set_round_trips_through_chunks_and_rejects_a_garbled_entry() {
+        let groups = vec![
+            DemotedGroup {
+                signal: Signal::Address,
+                value: "198.51.100.1".to_owned(),
+                count: 9,
+                max: 5,
+            },
+            DemotedGroup {
+                signal: Signal::UserAgent,
+                value: "Python-urllib/3.13".to_owned(),
+                count: 9,
+                max: 5,
+            },
+            DemotedGroup {
+                signal: Signal::Ja4,
+                value: "t13d1516h2_8daaf6152771_02713d6af862".to_owned(),
+                count: 9,
+                max: 5,
+            },
+        ];
+        let set = DemotionSet::from_groups(&groups);
+        // Tiny chunks force a split; the union must still be the whole set.
+        let chunks = set.to_chunks(40);
+        assert!(chunks.len() >= 2, "expected a split, got {chunks:?}");
+        assert!(chunks.iter().all(|c| !c.is_empty()));
+        let back = DemotionSet::from_entries(chunks.into_iter().flatten()).unwrap();
+        assert_eq!(back, set);
+        // A value with a colon in it (an IPv6 address) survives the split on
+        // the first colon only.
+        let v6 = DemotionSet::from_groups(&[DemotedGroup {
+            signal: Signal::Address,
+            value: "2001:db8::1".to_owned(),
+            count: 2,
+            max: 1,
+        }]);
+        let back =
+            DemotionSet::from_entries(v6.to_chunks(MAX_CHUNK_BYTES).into_iter().flatten()).unwrap();
+        assert!(back.matches(Some(&telemetry("2001:db8::1:443", "1", "j", "u"))));
+        // Half a set is worse than none: a garbled entry fails the whole read.
+        assert!(
+            DemotionSet::from_entries(vec!["address:1.1.1.1".to_owned(), "nope".to_owned()])
+                .is_err()
+        );
+        assert!(DemotionSet::from_entries(vec!["country:US".to_owned()]).is_err());
+        // Empty in, empty out.
+        assert!(DemotionSet::default().to_chunks(MAX_CHUNK_BYTES).is_empty());
+    }
+
+    #[test]
+    fn the_cache_answers_only_for_the_nonce_it_holds() {
+        let cache = DemotionCache::new();
+        assert!(cache.get("a1").is_none());
+        let set = std::sync::Arc::new(DemotionSet::from_groups(&[DemotedGroup {
+            signal: Signal::Asn,
+            value: "64500".to_owned(),
+            count: 2,
+            max: 1,
+        }]));
+        cache.put("a1", std::sync::Arc::clone(&set));
+        assert_eq!(cache.get("a1").as_deref(), Some(&*set));
+        // A new event's nonce is a miss, and replaces the old one.
+        assert!(cache.get("b2").is_none());
+        cache.put("b2", std::sync::Arc::new(DemotionSet::default()));
+        assert!(cache.get("a1").is_none());
     }
 
     #[test]
@@ -633,11 +851,13 @@ mod tests {
         let mut cohort = Cohort::new(rules);
         for g in 0..(MAX_REPORT_GROUPS + 5) {
             // Group g has g + 2 members, so later groups are larger.
-            for m in 0..(g + 2) {
-                cohort.observe(
-                    &format!("r-{g}-{m}"),
-                    Some(&telemetry("1.1.1.1:1", "1", "j", &format!("agent-{g}"))),
-                );
+            for _ in 0..(g + 2) {
+                cohort.observe(Some(&telemetry(
+                    "1.1.1.1:1",
+                    "1",
+                    "j",
+                    &format!("agent-{g}"),
+                )));
             }
         }
         let classification = cohort.classify();
@@ -662,21 +882,18 @@ mod tests {
         );
         assert_eq!(report.mode, "enforce");
         assert_eq!(report.rules, "ua:1");
-        assert_eq!(report.demoted, classification.demoted_count());
+        assert_eq!(report.demoted, classification.demoted);
     }
 
     #[test]
     fn no_rules_means_nothing_is_demoted_whatever_the_cohort_looks_like() {
         let mut cohort = Cohort::new(DemotionRules::default());
-        for i in 0..100 {
-            cohort.observe(
-                &format!("r{i}"),
-                Some(&telemetry("1.1.1.1:1", "1", "j", "u")),
-            );
+        for _ in 0..100 {
+            cohort.observe(Some(&telemetry("1.1.1.1:1", "1", "j", "u")));
         }
         let classification = cohort.classify();
         assert!(classification.groups.is_empty());
-        assert!(classification.demoted.is_empty());
+        assert_eq!(classification.demoted, 0);
         assert_eq!(classification.cohort, 100);
     }
 

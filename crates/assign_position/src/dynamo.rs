@@ -191,8 +191,6 @@ impl Store for DynamoStore {
             l: write.local_index,
             t: now_epoch_secs(),
             v: telemetry_or_none(write.telemetry.clone()),
-            // Never at registration: only a winning seal writes a tail index.
-            d: None,
         };
         let attrs: HashMap<String, AttributeValue> =
             serde_dynamo::to_item(&item).map_err(|e| StoreError(format!("serialize: {e}")))?;

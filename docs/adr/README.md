@@ -32,7 +32,7 @@ One record per decision. Each states the context, the decision, and its conseque
 | [0026](0026-entry-tickets.md) | One position per identity, from a customer-signed entry ticket (superseded by 0028) |
 | [0027](0027-ticket-delivery-fragment-not-query.md) | Deliver the entry ticket by cookie, or by URL fragment — never a query string (superseded by 0028) |
 | [0028](0028-remove-entry-tickets.md) | Remove entry tickets: nothing could use them without customer-side work we do not supply |
-| [0029](0029-seal-time-demotion.md) | Demote telemetry groups to a compact tail at the seal |
+| [0029](0029-seal-time-demotion.md) | Demote telemetry groups to the tail at the seal, matching on read |
 
 ## Open
 

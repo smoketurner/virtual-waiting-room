@@ -53,15 +53,22 @@ pub const POSITIONS_KEY_ATTR: &str = "request_id";
 /// row is still valid compares this attribute to the current time itself.
 pub const TOKENS_TTL_ATTR: &str = "expires_at";
 
-/// The event item's tail size `D` (issue #145), written by the seal when it
-/// enforces demotion and read by every resolver of a pre-queue row. Named here
-/// so the seal's writer and the item parser cannot drift apart.
+/// The event item's demoted count `D` (issue #145), written by the seal when
+/// it enforces demotion and read by every resolver of a pre-queue row and by
+/// the controller. Named here so the seal's writer and the item parsers cannot
+/// drift apart.
 pub const DEMOTED_COUNT_ATTR: &str = "demoted_count";
 
-/// The event item's count of tail indices the seal actually wrote (issue
-/// #145), for the operator: equal to `D` after a clean seal, less when the
-/// seal died part way and some demoted rows kept their primary slots.
-pub const DEMOTION_APPLIED_ATTR: &str = "demotion_applied";
+/// The nonce the sealed event's demotion set is keyed under
+/// ([`Key::DemotionGroups`]), on the event item beside `demoted_count`.
+pub const DEMOTION_NONCE_ATTR: &str = "demotion_nonce";
+
+/// How many chunk items the demotion set spans, on the event item.
+pub const DEMOTION_CHUNKS_ATTR: &str = "demotion_chunks";
+
+/// The one attribute of a demotion-set chunk item: a list of `signal:value`
+/// strings.
+pub const DEMOTION_ENTRIES_ATTR: &str = "g";
 
 /// The attribute a shard item records its own index in, so a reader that
 /// fetched a batch of shards knows which is which without taking the key apart
@@ -138,6 +145,16 @@ pub enum Key<'a> {
     /// what basis. Its own item so the event item, which every poll reads,
     /// stays small; only the operator's dashboard reads this one.
     DemotionReport { event_id: &'a str },
+    /// One chunk of a sealed event's demotion set (issue #145): the groups
+    /// every resolver matches rows against. Keyed by a per-seal nonce, so a
+    /// lost election's chunks are orphans the winning event item never names,
+    /// and chunked because a farm across ten thousand addresses is bigger
+    /// than one item.
+    DemotionGroups {
+        event_id: &'a str,
+        nonce: &'a str,
+        chunk: u32,
+    },
     /// A single-use admission token reservation.
     AdmissionToken { request_id: &'a str },
     /// An operator's OIDC session.
@@ -158,7 +175,8 @@ impl Key<'_> {
             Key::Event { .. }
             | Key::PrequeueShard { .. }
             | Key::ArrivalsShard { .. }
-            | Key::DemotionReport { .. } => KEY_ATTR,
+            | Key::DemotionReport { .. }
+            | Key::DemotionGroups { .. } => KEY_ATTR,
             Key::AdmissionToken { .. } | Key::OidcSession { .. } | Key::PkceTransaction { .. } => {
                 TOKENS_KEY_ATTR
             }
@@ -179,6 +197,11 @@ impl Key<'_> {
                 format!("EVT#{event_id}#AR#{}", shard.index())
             }
             Key::DemotionReport { event_id } => format!("EVT#{event_id}#DM"),
+            Key::DemotionGroups {
+                event_id,
+                nonce,
+                chunk,
+            } => format!("EVT#{event_id}#DG#{nonce}#{chunk}"),
             Key::AdmissionToken { request_id } => format!("TKN#{request_id}"),
             Key::OidcSession { session_id } => format!("SESS#{session_id}"),
             Key::PkceTransaction { state } => format!("PKCE#{state}"),
@@ -395,6 +418,15 @@ mod tests {
         assert_eq!(
             Key::DemotionReport { event_id: "evt" }.value(),
             "EVT#evt#DM"
+        );
+        assert_eq!(
+            Key::DemotionGroups {
+                event_id: "evt",
+                nonce: "0badcafe",
+                chunk: 3
+            }
+            .value(),
+            "EVT#evt#DG#0badcafe#3"
         );
         assert_eq!(Key::AdmissionToken { request_id: "abc" }.value(), "TKN#abc");
         assert_eq!(Key::OidcSession { session_id: "abc" }.value(), "SESS#abc");

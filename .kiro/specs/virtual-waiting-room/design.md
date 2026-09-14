@@ -274,13 +274,15 @@ queue_position = PRP(shuffle_seed, i, participant_count)     // i = offset[s] + 
 **Seal-time demotion ([ADR-0029](../../../docs/adr/0029-seal-time-demotion.md), issue #145).** When the
 operator has set demotion rules, the seal also scans the pre-queue between reading the shard
 counts and the write above, groups the cohort by each ruled signal (viewer address, ASN, JA4
-fingerprint, user agent) and demotes every group larger than its threshold. The seal write then
-also carries `demoted_count = D` and starts `queue_counter` at `N + D`; after winning it, the seal
-writes a tail index `d` in `[0, D)` on each demoted row, holding the phase at `pre_queue` until
-the last one lands. A row carrying `d` resolves to `N + PRP(shuffle_seed, d, D)` — a compact tail
-behind the whole undemoted cohort, its own bijection — so primary slots, tail slots and live
-joins occupy three disjoint ranges. Under the default `observe` mode the seal classifies and
-reports but demotes nobody; with no rules it never scans.
+fingerprint, user agent) and demotes every group larger than its threshold. Nothing is written
+per row: the seal stores the demoted group set once, as chunk items keyed by a per-run nonce,
+and the seal write then also carries `demoted_count = D`, the nonce and the chunk count, and
+starts `queue_counter` at `2N`. Every resolver loads the set once per execution environment and
+matches a row's telemetry against it; a match resolves to `N + PRP(shuffle_seed, i, N)` — the
+same slot in a second copy of the index space behind the whole cohort — so primary slots, demoted
+slots and live joins occupy three disjoint ranges. The tail is sparse, and the controller (§7)
+walks it at the density the seal recorded. Under the default `observe` mode the seal classifies
+and reports but demotes nobody; with no rules it never scans.
 
 `/queue_num` reads the visitor's `PreQueue` item for `(s, l)` and the seed, count, and offsets
 from `/status`; it reconstructs `i` with one addition. All three are already being fetched. A
@@ -455,9 +457,9 @@ the actual mapping is different every event. What is *not* illustrative is the g
 
 Given `shuffle_seed`, `participant_count`, `prequeue_offsets`, and the `(request_id, s, l)`
 tuples in `PreQueue`, any third party recomputes every global index `i = offset[s] + l` and
-every position, and confirms the ordering. A demoted row (ADR-0029) carries its tail index `d`
-beside `s` and `l`, and `demoted_count` is on the event item, so the same party recomputes the
-tail as `N + PRP(shuffle_seed, d, D)`.
+every position, and confirms the ordering. Which rows sit at `N + position` instead
+(ADR-0029) follows from the stored demotion set and each row's own telemetry `v`; the set is a
+handful of `Counters` items named by the event item.
 
 Positions are written to `Positions` lazily, when a visitor is admitted, carrying
 `entry_time`, `status` and `expires_at` for the outflow controller. Only visitors who reach
@@ -551,8 +553,8 @@ skipped number.
 | `target_rate` | N | Operator-set admissions per minute |
 | `shuffle_seed` | B | 256-bit permutation key, written once at T−0 |
 | `participant_count` | N | Pre-queue cohort size, the permutation domain |
-| `demoted_count` | N | `D`, the seal-time demotion tail's size (ADR-0029); absent or `0` when nothing was demoted. `queue_counter` starts at `N + D` |
-| `demotion_applied` | N | Tail indices the seal actually wrote, recorded when it finished; less than `D` means it died part way and the rest kept their primary slots |
+| `demoted_count` | N | `D`, how many cohort rows the seal-time demotion set matches (ADR-0029); absent or `0` when nothing was demoted. Positive means the tail `[N, 2N)` is in use and `queue_counter` started at `2N` |
+| `demotion_nonce`, `demotion_chunks` | S, N | Where the demotion set lives: its chunk items are `EVT#{event_id}#DG#{nonce}#{k}` for `k` below the chunk count. Present exactly when `demoted_count > 0` |
 
 The two striped counters — the pre-queue registration index and the arrivals count — are
 **not** attributes on this item. Each shard is its own item in the same table, keyed
@@ -562,14 +564,18 @@ back under that item's single 1,000-write/s ceiling and distribute nothing.
 | `operator_message` | S | Delivered in `/status` |
 
 **`PreQueue`** — partition key `r`. Attributes `s` (shard), `l` (local index), `t`, `v`
-(join-time telemetry) and, on a row the seal demoted, `d` (tail index, ADR-0029). Short
-attribute names because the table is scanned during audit and, when demotion rules are set,
-once by the seal. The global registration index `i = offset[s] + l` is derived on read, never
-stored. Read by `/queue_num` as a single `GetItem`; never scanned on the hot path.
+(join-time telemetry). Short attribute names because the table is scanned during audit and,
+when demotion rules are set, once by the seal — which reads it and writes nothing back. The
+global registration index `i = offset[s] + l` is derived on read, never stored, and so is a
+demotion (ADR-0029): the row is matched against the stored set on every read. Read by
+`/queue_num` as a single `GetItem`; never scanned on the hot path.
 
-The seal's demotion report is one more item in `Counters`, keyed `EVT#{event_id}#DM`: mode,
-rules, cohort size, demoted count and the largest demoted groups with their thresholds. Its own
-item so the event item every poll reads stays small; the dashboard is its only reader.
+The seal's demotion set and report are further items in `Counters`. The set is one or more
+chunks `EVT#{event_id}#DG#{nonce}#{k}`, each a list `g` of `signal:value` strings, written before
+the seal and named by it. The report, `EVT#{event_id}#DM`, holds the mode, rules, cohort size,
+demoted count and the largest demoted groups with their thresholds. Their own items so the event
+item every poll reads stays small; resolvers read the set once per execution environment, and the
+dashboard is the report's only reader.
 
 **`Positions`** — partition key `request_id`. Attributes `event_id`, `queue_position`,
 `entry_time`, `status`, `expires_at`, `ttl`. Written with
@@ -647,6 +653,14 @@ observed_arrival_rate = arrivals in the last interval
 no_show_rate          = 1 − (observed_arrival_rate / released_last_interval)
 release_next          = target_rate / (1 − smoothed_no_show_rate)
 ```
+
+**Positions versus people (ADR-0029).** With a demotion tail the position space has three
+tiers: `[0, N)` holding `N − D` people, `[N, 2N)` holding the `D` demoted, and live joins from
+`2N`, dense. The seal counted both densities, so the controller converts rather than corrects:
+the interval's target is a number of people, turned into positions at the density of the tier
+the cursor is in; no-shows are measured as arrivals against people released; and the expiry
+grace is walked back as a count of people, so it stays a duration inside the tail. With nothing
+demoted every conversion is the identity and the control law above is unchanged.
 
 The rate is smoothed across intervals to avoid oscillation and the correction is bounded, so
 a transient measurement error cannot release a damaging burst.
@@ -767,9 +781,10 @@ The input is the join-time telemetry every registration row carries — viewer a
 country, JA4 fingerprint and user agent — captured as SQS message attributes on the compute-free
 join path. The operator sets rules of the form `signal:max` (`address:25,asn:5000`) in
 `terraform.tfvars`. At the seal, every group of registrations sharing one value of a ruled signal
-and larger than its threshold is demoted whole: moved to a compact tail behind the rest of the
-cohort (§4.2), never blocked, because a rule that catches a farm also catches an office NAT and
-a demoted office still gets in. The seal writes a report — mode, rules, cohort, demoted count,
+and larger than its threshold is demoted whole: served behind the rest of the cohort (§4.2),
+never blocked, because a rule that catches a farm also catches an office NAT and a demoted office
+still gets in. Nothing is written per row; the demoted groups are stored once and every position
+lookup matches against them. The seal writes a report — mode, rules, cohort, demoted count,
 largest groups — that the dashboard renders, so what was mitigated and on what basis is visible.
 
 The default mode is `observe`: the classification runs and the report is written, nobody is

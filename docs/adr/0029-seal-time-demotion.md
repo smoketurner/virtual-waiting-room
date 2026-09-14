@@ -1,4 +1,4 @@
-# ADR-0029: Demote telemetry groups to a compact tail at the seal
+# ADR-0029: Demote telemetry groups to the tail at the seal, matching on read
 
 **Status:** Accepted
 
@@ -23,20 +23,32 @@ The moment is the design decision here; the signal source is not.
 
 ## 2. Decision
 
-**Classify at the seal, over the whole cohort, and demote whole groups to a compact tail.**
+**Classify at the seal, over the whole cohort; store the demoted groups once; match every row
+against them on read.**
 
 `seal_event` takes an operator-configured rule list, `signal:max` entries over `address`, `asn`,
 `ja4` and `ua`. When any rule is set it scans the pre-queue after reading the shard counts and
 before the seal write, groups the cohort's rows by each ruled signal, and marks every group whose
 size exceeds its threshold as demoted. Every row in a demoted group is demoted.
 
-A demoted row does not lose its place; it resolves behind everyone the rules did not touch. The
-seal writes `D`, the number of demoted rows, in the same conditional update as the seed, and
-starts the live-join sequence at `N + D`. After winning that write, the seal writes a fresh tail
-index `d` in `[0, D)` on each demoted row. A row carrying one resolves to `N + PRP(seed, d, D)`;
-every other row resolves to `PRP(seed, i, N)` as before. Primary slots are below `N`, tail slots
-are in `[N, N + D)`, live joins start at `N + D`: three disjoint ranges, each its own bijection,
-so no position is ever held twice.
+Nothing is written per row. The seal writes the demoted group set — the `signal:value` pairs —
+as chunk items keyed by a per-run nonce (`EVT#{event_id}#DG#{nonce}#{k}`), then the one
+conditional seal write also carries `D` (the count of matched rows), the nonce and the chunk
+count, and starts the live-join sequence at `2N`. A resolver (`read`, `generate_token`) loads the
+set once per execution environment and matches a row's telemetry against it: a match resolves to
+`N + PRP(seed, i, N)` instead of `PRP(seed, i, N)`, the same slot in a second copy of the index
+space behind the whole cohort. Primary slots are below `N`, demoted slots are in `[N, 2N)`, live
+joins start at `2N`: three disjoint ranges, each its own bijection, so no position is ever held
+twice.
+
+A demoted row does not lose its place; it resolves behind everyone the rules did not touch.
+
+**The controller knows the density.** The tail is sparse: `D` people over `N` positions, and the
+primary range is `N − D` people over `N`. The seal counted both, so the controller converts
+rather than corrects: it releases the operator's target as a number of *people* per interval,
+converting to positions at the density of the tier the cursor is in; it measures no-shows as
+arrivals against people released, not positions; and it walks the expiry grace back as a count of
+people, so 120 seconds stays 120 seconds inside the tail.
 
 **`observe` is the default mode.** It runs the whole classification and writes the report
 without demoting anyone. `enforce` acts. No rules means no scan, and the seal is the single write
@@ -60,27 +72,38 @@ rules left alone. Blocked, it does not, and the operator finds out from the offi
 bounds the damage a false positive can do to "later", which is the only bound that lets a
 threshold be tried on a real event at all.
 
-**Why a compact tail and not `N + PRP(seed, i, N)`.** Mapping demoted rows into a second copy of
-the whole index space needs no per-row write, but it leaves a tail of `N` positions of which
-`N − D` are gaps. The controller advances the cursor by a bounded multiple of the target rate
-and treats an unclaimed position like a no-show; at a 1% demotion rate it would spend `N / 2r`
-sweeping a tail that is 99% empty, with every live joiner stuck behind it. The compact tail
-costs `D` conditional writes at the seal, which is proportional to the problem rather than to
-the cohort.
+**Why the group set and not a per-row mark.** The first cut of this design wrote a compact tail
+index on every demoted row after the seal: `D` conditional writes, a phase held at `pre_queue`
+while they landed, a partial-failure story, and a seal whose duration grew with the attack — at
+32 writes in flight, roughly 40 seconds per 100,000 demoted rows and a ceiling near three million
+inside the Lambda limit. The dollars were trivial (a write unit per row); the shape was wrong.
+The problem being defended against is one whose size the attacker chooses, and the mitigation's
+cost should not scale with it. Storing the groups once costs a few items however large the farm,
+the seal stays one atomic write with nothing to apply afterwards, there is no window in which a
+demoted row is visible at its primary slot, and the tail is reproducible from the published set
+rather than from marks on rows. The read-time cost is four hash lookups per resolution and one
+read of the set per execution environment; the set is immutable once sealed, so that read never
+repeats.
 
-**Why the phase is held during the tail writes.** The seal write is the election: exactly one
-run wins it, and only the winner writes tail indices. Between that write and the last tail index
-a demoted row would resolve to its primary slot. The waiting page never asks for a position while
-the phase is `pre_queue`, so the winner seals with the phase held there and flips it to `active`
-in a final guarded update once the tail is written. The window is seconds, and the client
-already shows "opening now" past the start time for exactly this kind of gap.
+**Why the controller has to know.** Mapping demoted rows to `N + p` leaves `N − D` gaps in the
+tail. The controller advances the cursor by a bounded multiple of the target rate and treats an
+unclaimed position like a no-show, capped at twice the target; at a 1% demotion rate it would
+admit 2% of the target while crossing the tail and spend `N / 2r` doing it, with every live
+joiner stuck behind. The same cap made in positions would also shrink the expiry grace to seconds
+of wall clock there. The densities are exact, not estimates, so converting at them is a
+bookkeeping change rather than a heuristic, and it is property-tested: the people released per
+interval never fall short of the target and never exceed it by more than the rounding a tier
+boundary costs.
 
-**Why a partial failure is safe.** A demoted row that never receives its `d` — the winner died
-part way — keeps its primary slot, which no other row holds. Partial application can misplace a
-registration; it cannot duplicate a position. Each tail write is guarded by
-`attribute_not_exists(d)`, so nothing overwrites one. A retry of the seal finds the event already
-sealed and does nothing; if the phase is still held, the dashboard says so and the operator sets
-it to `active` by hand. The event item records how many tail indices landed against `D`.
+**Why the set is written before the election.** The seal write names the set by nonce; a reader
+that finds the nonce must find the chunks. Writing them first means a winning seal never points
+at something that does not exist yet. A losing double-fire deletes its own chunks; if that fails
+they are orphans keyed under a nonce nothing names.
+
+**Why a reader without the set refuses.** A sealed event with `D > 0` whose set cannot be loaded
+could answer from the primary slot, and every demoted row would silently be un-demoted. The
+resolver returns an error instead, `read` answers 503 and `generate_token` refuses with a
+retryable status, and the next poll tries the load again.
 
 **Why the rules are deploy-time settings.** The same reason the poll policy is (ADR-0023): a
 fairness control that can be flipped from a dashboard mid-event can be flipped by mistake at the
@@ -99,20 +122,24 @@ than a classifier nobody can explain.
 
 ## 4. Consequences
 
-- `PreQueue` rows gain an optional `d`; the event item gains `demoted_count` and
-  `demotion_applied`; a report item `EVT#{event_id}#DM` joins the `Counters` table. No new
+- The event item gains `demoted_count`, `demotion_nonce` and `demotion_chunks`; the demotion set
+  chunks and a report item join the `Counters` table. `PreQueue` rows are untouched. No new
   Terraform resources.
-- `seal_event` needs `dynamodb:Scan` and `dynamodb:UpdateItem` on `PreQueue` and `PutItem` on
-  `Counters`, a 15-minute timeout and 2 GB of memory. With no rules it uses none of it.
-- The seal's duration becomes a function of the cohort when rules are set: a consistent parallel
-  scan of a million rows takes seconds, and the tail writes take on the order of `D / 3,000`
-  seconds. The phase flips to `active` when both are done, not at T−0 exactly.
-- Auditability (design §4.4) now needs the tail: the published seed, offsets and cohort size
-  reproduce every primary position, and the `d` values on the demoted rows reproduce the tail.
-  `D` is on the event item; the `d` values are on the rows, as `s` and `l` are.
-- The controller sees `D` gaps inside `[0, N)` and corrects for them as it does for no-shows.
-  Above roughly half the cohort demoted, the bounded correction cannot keep the target rate; a
-  threshold that demotes half a cohort is an operator error the report will show.
+- `seal_event` needs `dynamodb:Scan` on `PreQueue` and `PutItem`/`DeleteItem` on `Counters`, a
+  five-minute timeout and 1 GB of memory (a few words per cohort row plus the interned signal
+  values). With no rules it uses none of it.
+- The seal's duration becomes a function of the cohort when rules are set — a consistent parallel
+  scan of a million rows takes seconds — and of nothing else.
+- Every resolver of a pre-queue row takes the demotion set as an argument. `read` and
+  `generate_token` hold one per execution environment, keyed by nonce.
+- The controller's `ReleaseInputs` carry `N` and `D`, and its release, no-show measurement and
+  expiry cutoff convert between positions and people through `Tiers`. With `D = 0` every
+  conversion is the identity and the control law is exactly what it was.
+- A demoted visitor's `/queue_num` position is `N + p`, so the waiting page's wait estimate and
+  poll interval treat the whole primary range as ahead of them, which overstates the wait by the
+  tail's gaps. They are demoted; a pessimistic estimate is the least of it.
+- Auditability (design §4.4): the published seed, offsets and cohort size reproduce every primary
+  position; the stored group set and each row's telemetry reproduce which rows sit at `N + p`.
 - Terraform gains `demotion_rules` and `demotion_mode`, defaulting to off and `observe`.
 - Requirement F6.3 is built. The false-positive measurement it calls for still needs a real
   event, which is why nothing is enforced by default (`.kiro/specs/virtual-waiting-room/tasks.md`).

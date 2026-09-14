@@ -5,34 +5,32 @@
 //! guarded by the seed's absence — so a retry or a double-fire seals exactly
 //! once.
 //!
-//! The seal is also where `queue_counter` starts at the cohort size, so live
-//! joiners are numbered behind the whole pre-queue cohort instead of colliding
-//! with `[0, N)`. That clause is in the same atomic update as the rest of the
-//! seal write: a separate write could be lost between the seal and the first
-//! live join.
+//! The seal is also where `queue_counter` starts behind the cohort, so live
+//! joiners are numbered behind every pre-queue position instead of colliding
+//! with one. That clause is in the same atomic update as the rest of the seal
+//! write: a separate write could be lost between the seal and the first live
+//! join.
 //!
 //! # Demotion (issue #145)
 //!
 //! When the operator has set demotion rules, the seal also reads the cohort's
-//! join-time telemetry and demotes whole groups that exceed a threshold to a
-//! compact tail (`wr_common::demotion`). The order of operations is what keeps
-//! the seal's guarantees intact:
+//! join-time telemetry and demotes whole groups that exceed a threshold
+//! (`wr_common::demotion`). Nothing is written per row; the order of
+//! operations is what keeps the seal's guarantees intact:
 //!
 //! 1. Read the shard counts, so the cohort is fixed.
 //! 2. Scan the pre-queue and classify it. Nothing is written yet, so a
 //!    double-fire at this point costs a duplicate scan and nothing else.
-//! 3. The one conditional seal write, now also carrying `D` and starting the
-//!    live-join sequence at `N + D`. This is the election: exactly one run
-//!    wins it.
-//! 4. The winner alone writes the report and a tail index `d` on every demoted
-//!    row. It holds the phase at `pre_queue` while it does, so the waiting
-//!    page — which never asks for a position during the pre-queue — cannot
-//!    observe a demoted row at its primary slot before its tail index lands.
-//!    A row that never receives its `d` (the winner died part way) keeps its
-//!    primary slot, which nobody else holds, so partial application can
-//!    misplace a registration but never duplicate a position.
-//! 5. The winner flips the phase to `active` and records how many tail
-//!    indices it wrote.
+//! 3. Write the demoted group set — the [`wr_common::DemotionSet`] every
+//!    resolver will match rows against — as chunk items under a per-run
+//!    nonce. Written *before* the election so the winning seal never names a
+//!    set that does not exist yet.
+//! 4. The one conditional seal write, now also carrying `D`, the nonce, and
+//!    the chunk count, and starting the live-join sequence at `2N`. This is
+//!    the election: exactly one run wins it, and only its nonce is ever read.
+//!    A loser deletes its own chunks; if that fails they are orphans nothing
+//!    names.
+//! 5. The winner writes the report.
 //!
 //! No rules means no scan at all: the seal is then exactly the single write it
 //! was before this existed.
@@ -41,36 +39,39 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use wr_common::{
-    Classification, Cohort, DemotionMode, DemotionReport, DemotionRules, Phase, RuleParseError,
-    SHARDS, SealError, SealedOffsets, Telemetry,
+    Classification, Cohort, DemotionMode, DemotionRef, DemotionReport, DemotionRules, DemotionSet,
+    MAX_CHUNK_BYTES, RuleParseError, SHARDS, SealError, SealedOffsets, Telemetry,
 };
 
 pub mod dynamo;
 
-/// The values written by a seal: the seed, cohort size, prefix offsets, the
-/// tail size, and the phase the seal leaves the event in.
+/// The values written by a seal: the seed, cohort size, prefix offsets, and
+/// what was demoted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SealValues {
     pub seed: [u8; 32],
     pub participant_count: u64,
     pub offsets: [u64; SHARDS],
-    /// `D`: the tail's size, `0` unless demotion is enforced and caught
-    /// something. `queue_counter` starts at `participant_count + demoted_count`.
+    /// `D`: cohort rows the demotion set matches, `0` unless demotion is
+    /// enforced and caught something. Positive means the tail `[N, 2N)` is in
+    /// use and `queue_counter` starts at `2N`.
     pub demoted_count: u64,
-    /// `Active`, or `PreQueue` when tail indices are still to be written and
-    /// the winner will flip it once they are.
-    pub phase: Phase,
+    /// The set's location, present exactly when `demoted_count > 0`.
+    pub demotion: Option<DemotionRef>,
 }
 
 impl SealValues {
-    /// Where the live-join sequence starts: behind the cohort and its tail.
+    /// Where the live-join sequence starts: `N` with no tail, `2N` with one.
     ///
     /// # Errors
     ///
-    /// [`SealError::Overflow`] if `N + D` exceeds `u64`.
+    /// [`SealError::Overflow`] if `2N` exceeds `u64`.
     pub fn queue_counter_start(&self) -> Result<u64, SealError> {
+        if self.demoted_count == 0 {
+            return Ok(self.participant_count);
+        }
         self.participant_count
-            .checked_add(self.demoted_count)
+            .checked_mul(2)
             .ok_or(SealError::Overflow)
     }
 }
@@ -128,7 +129,6 @@ pub enum SealResult {
 /// One pre-queue row as the seal's scan sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScannedRow {
-    pub request_id: String,
     pub shard: u8,
     pub local_index: u64,
     pub telemetry: Option<Telemetry>,
@@ -149,9 +149,27 @@ pub trait Store {
         visit: Arc<dyn Fn(ScannedRow) + Send + Sync>,
     ) -> impl Future<Output = Result<u64, StoreError>> + Send;
 
-    /// Writes the seal values, starts `queue_counter` at `N + D`, and sets the
-    /// phase, guarded by `attribute_not_exists(shuffle_seed)`. Returns `false`
-    /// if the guard rejected the write (already sealed).
+    /// Writes the demotion set's chunks under `nonce`, chunk `k` holding
+    /// `chunks[k]`.
+    fn write_demotion_chunks(
+        &self,
+        event_id: &str,
+        nonce: &str,
+        chunks: &[Vec<String>],
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// Deletes the `count` chunks written under `nonce`: a lost election's
+    /// leftovers. Best effort; the winning event item never names them.
+    fn delete_demotion_chunks(
+        &self,
+        event_id: &str,
+        nonce: &str,
+        count: u32,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// Writes the seal values, starts `queue_counter`, and flips the phase to
+    /// active, guarded by `attribute_not_exists(shuffle_seed)`. Returns
+    /// `false` if the guard rejected the write (already sealed).
     fn write_seal(
         &self,
         event_id: &str,
@@ -164,26 +182,10 @@ pub trait Store {
         event_id: &str,
         report: &DemotionReport,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
-
-    /// Writes tail index `k` on the row at index `k` of `request_ids`, each
-    /// guarded by `attribute_not_exists(d)`. Returns how many rows took one.
-    fn write_tail_indices(
-        &self,
-        request_ids: &[String],
-    ) -> impl Future<Output = Result<u64, StoreError>> + Send;
-
-    /// Flips a held `pre_queue` phase to `active` and records `applied`,
-    /// guarded on the phase still being `pre_queue`.
-    fn finish_demotion(
-        &self,
-        event_id: &str,
-        applied: u64,
-    ) -> impl Future<Output = Result<(), StoreError>> + Send;
 }
 
 /// Folds the shard counts into the offsets and cohort size and pairs them with
-/// a freshly generated seed. The tail is empty and the phase `Active`; a
-/// demoting seal overrides both.
+/// a freshly generated seed. Nothing demoted; a demoting seal fills that in.
 ///
 /// # Errors
 ///
@@ -199,25 +201,39 @@ pub fn seal_values(counts: [u64; SHARDS], seed: [u8; 32]) -> Result<SealValues, 
         participant_count: sealed.participant_count(),
         offsets,
         demoted_count: 0,
-        phase: Phase::Active,
+        demotion: None,
     })
+}
+
+/// Lowercase hex of the per-run nonce. Never contains `#`, so it is safe
+/// inside a `Counters` key.
+#[must_use]
+pub fn nonce_hex(nonce: [u8; 8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(16);
+    for byte in nonce {
+        // Writing two hex digits into a String cannot fail.
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 /// Reads the shard counts, computes the seal values with the supplied seed,
 /// classifies the cohort if rules are set, and writes the seal under the
-/// once-only guard. The seed is passed in so the logic is deterministic under
-/// test; production generates it from a CSPRNG. `now` stamps the report.
+/// once-only guard. The seed and nonce are passed in so the logic is
+/// deterministic under test; production generates both from a CSPRNG. `now`
+/// stamps the report.
 ///
 /// # Errors
 ///
-/// Returns [`StoreError`] if reading the shard counts, scanning, folding, or
-/// writing the seal fails. A failure *after* the seal write (report, tail
-/// indices, phase flip) is also returned, but the seal itself has landed by
-/// then and a retry finds the event already sealed.
+/// Returns [`StoreError`] if reading the shard counts, scanning, folding,
+/// writing the set, or writing the seal fails. A report write failure after
+/// the seal is logged, not returned: the seal has landed by then.
 pub async fn seal_event<S: Store>(
     store: &S,
     event_id: &str,
     seed: [u8; 32],
+    nonce: [u8; 8],
     config: &DemotionConfig,
     now: u64,
 ) -> Result<SealResult, StoreError> {
@@ -256,20 +272,37 @@ pub async fn seal_event<S: Store>(
     }
 
     let classification = classify_cohort(store, &values, rules.clone()).await?;
-    let demoted = classification.demoted_count();
-    let enforcing = config.mode == DemotionMode::Enforce && demoted > 0;
+    let enforcing = config.mode == DemotionMode::Enforce && classification.demoted > 0;
     if enforcing {
-        values.demoted_count = demoted;
-        values.phase = Phase::PreQueue;
-        // Fail before the election, not after: an overflow here would leave
-        // the phase held with nothing to flip it.
+        let set = DemotionSet::from_groups(&classification.groups);
+        let chunks = set.to_chunks(MAX_CHUNK_BYTES);
+        let chunk_count = u32::try_from(chunks.len())
+            .map_err(|_err| StoreError("demotion set has too many chunks".to_owned()))?;
+        values.demoted_count = classification.demoted;
+        values.demotion = Some(DemotionRef {
+            nonce: nonce_hex(nonce),
+            chunks: chunk_count,
+        });
+        // Fail before anything is written: an overflow here would seal an
+        // event whose live joins collide with its tail.
         values
             .queue_counter_start()
             .map_err(|e| StoreError(format!("live-join start: {e}")))?;
+        store
+            .write_demotion_chunks(event_id, &nonce_hex(nonce), &chunks)
+            .await?;
     }
 
     if !store.write_seal(event_id, &values).await? {
         tracing::info!(event_id, "event already sealed; no-op");
+        if let Some(demotion) = &values.demotion
+            && let Err(e) = store
+                .delete_demotion_chunks(event_id, &demotion.nonce, demotion.chunks)
+                .await
+        {
+            // Orphans nothing names; worth a line, not a failure.
+            tracing::warn!(event_id, error = %e, "could not delete a lost election's demotion chunks");
+        }
         return Ok(SealResult::AlreadySealed);
     }
     tracing::info!(
@@ -277,36 +310,17 @@ pub async fn seal_event<S: Store>(
         participant_count = values.participant_count,
         cohort = classification.cohort,
         demoted_groups = classification.groups.len(),
-        demoted,
+        demoted = classification.demoted,
+        enforced = enforcing,
         mode = config.mode.as_wire_str(),
         "event sealed"
     );
 
     let report = DemotionReport::from_classification(config.mode, rules, &classification, now);
     if let Err(e) = store.write_report(event_id, &report).await {
-        // The report is for the operator; the seal has landed and the tail
-        // still has to be applied, so this is logged rather than fatal.
+        // The report is for the operator; the seal has landed, so this is
+        // logged rather than fatal.
         tracing::error!(event_id, error = %e, "could not write the demotion report");
-    }
-
-    if enforcing {
-        let applied = match store.write_tail_indices(&classification.demoted).await {
-            Ok(applied) => applied,
-            Err(e) => {
-                tracing::error!(event_id, error = %e, "tail indices failed part way; unwritten rows keep their primary slots");
-                0
-            }
-        };
-        if applied != demoted {
-            tracing::warn!(
-                event_id,
-                applied,
-                demoted,
-                "not every demoted row took a tail index"
-            );
-        }
-        store.finish_demotion(event_id, applied).await?;
-        tracing::info!(event_id, applied, "demotion applied; event active");
     }
 
     Ok(SealResult::Sealed(Box::new(values)))
@@ -328,7 +342,7 @@ async fn classify_cohort<S: Store>(
             match offsets.assign(usize::from(row.shard), row.local_index) {
                 wr_common::Assignment::PreQueue { .. } => {
                     if let Ok(mut cohort) = sink.lock() {
-                        cohort.observe(&row.request_id, row.telemetry.as_ref());
+                        cohort.observe(row.telemetry.as_ref());
                     }
                 }
                 wr_common::Assignment::LiveJoin => {}
@@ -343,10 +357,10 @@ async fn classify_cohort<S: Store>(
     Ok(cohort.classify())
 }
 
-/// The phase a sealed event is in once any demotion has been applied.
+/// The phase the seal leaves the event in.
 #[must_use]
-pub fn sealed_phase() -> Phase {
-    Phase::Active
+pub fn sealed_phase() -> wr_common::Phase {
+    wr_common::Phase::Active
 }
 
 #[cfg(test)]
@@ -359,6 +373,8 @@ mod tests {
 
     use std::sync::Mutex;
 
+    use wr_common::Phase;
+
     use super::*;
 
     struct FakeStore {
@@ -367,10 +383,10 @@ mod tests {
         rows: Vec<ScannedRow>,
         written: Mutex<Option<SealValues>>,
         report: Mutex<Option<DemotionReport>>,
-        tails: Mutex<Vec<String>>,
-        finished: Mutex<Option<u64>>,
-        /// How many tail writes to accept before failing the rest.
-        tail_budget: Option<usize>,
+        /// `(nonce, chunks)` written, in order.
+        chunks: Mutex<Vec<(String, Vec<Vec<String>>)>>,
+        /// `(nonce, count)` deleted, in order.
+        deleted: Mutex<Vec<(String, u32)>>,
     }
 
     impl FakeStore {
@@ -381,9 +397,8 @@ mod tests {
                 rows: Vec::new(),
                 written: Mutex::new(None),
                 report: Mutex::new(None),
-                tails: Mutex::new(Vec::new()),
-                finished: Mutex::new(None),
-                tail_budget: None,
+                chunks: Mutex::new(Vec::new()),
+                deleted: Mutex::new(Vec::new()),
             }
         }
 
@@ -411,6 +426,29 @@ mod tests {
             std::future::ready(Ok(self.rows.len() as u64))
         }
 
+        fn write_demotion_chunks(
+            &self,
+            _event_id: &str,
+            nonce: &str,
+            chunks: &[Vec<String>],
+        ) -> impl Future<Output = Result<(), StoreError>> + Send {
+            self.chunks
+                .lock()
+                .unwrap()
+                .push((nonce.to_owned(), chunks.to_vec()));
+            std::future::ready(Ok(()))
+        }
+
+        fn delete_demotion_chunks(
+            &self,
+            _event_id: &str,
+            nonce: &str,
+            count: u32,
+        ) -> impl Future<Output = Result<(), StoreError>> + Send {
+            self.deleted.lock().unwrap().push((nonce.to_owned(), count));
+            std::future::ready(Ok(()))
+        }
+
         fn write_seal(
             &self,
             _event_id: &str,
@@ -433,37 +471,12 @@ mod tests {
             *self.report.lock().unwrap() = Some(report.clone());
             std::future::ready(Ok(()))
         }
-
-        fn write_tail_indices(
-            &self,
-            request_ids: &[String],
-        ) -> impl Future<Output = Result<u64, StoreError>> + Send {
-            let take = self.tail_budget.unwrap_or(request_ids.len());
-            let mut tails = self.tails.lock().unwrap();
-            for id in request_ids.iter().take(take) {
-                tails.push(id.clone());
-            }
-            let result = if take < request_ids.len() {
-                Err(StoreError("tail write failed".to_owned()))
-            } else {
-                Ok(request_ids.len() as u64)
-            };
-            std::future::ready(result)
-        }
-
-        fn finish_demotion(
-            &self,
-            _event_id: &str,
-            applied: u64,
-        ) -> impl Future<Output = Result<(), StoreError>> + Send {
-            *self.finished.lock().unwrap() = Some(applied);
-            std::future::ready(Ok(()))
-        }
     }
 
-    fn row(request_id: &str, shard: u8, local_index: u64, address: &str) -> ScannedRow {
+    const NONCE: [u8; 8] = [0x0b, 0xad, 0xca, 0xfe, 0x00, 0x11, 0x22, 0x33];
+
+    fn row(shard: u8, local_index: u64, address: &str) -> ScannedRow {
         ScannedRow {
-            request_id: request_id.to_owned(),
             shard,
             local_index,
             telemetry: Some(Telemetry {
@@ -481,10 +494,10 @@ mod tests {
     fn farmed_rows() -> Vec<ScannedRow> {
         let mut rows = Vec::new();
         for l in 0..7 {
-            rows.push(row(&format!("farm-{l}"), 0, l, "198.51.100.1"));
+            rows.push(row(0, l, "198.51.100.1"));
         }
         for l in 7..10 {
-            rows.push(row(&format!("home-{l}"), 0, l, "203.0.113.5"));
+            rows.push(row(0, l, "203.0.113.5"));
         }
         rows
     }
@@ -500,30 +513,38 @@ mod tests {
         assert_eq!(values.offsets, [0, 3, 3, 8, 9, 9, 9, 11, 11, 11]);
         assert_eq!(values.seed, [7u8; 32]);
         assert_eq!(values.demoted_count, 0);
-        assert_eq!(values.phase, Phase::Active);
+        assert!(values.demotion.is_none());
         assert_eq!(values.queue_counter_start().unwrap(), 15);
+    }
+
+    #[test]
+    fn the_nonce_is_lowercase_hex_with_no_separator() {
+        let hex = nonce_hex(NONCE);
+        assert_eq!(hex, "0badcafe00112233");
+        assert!(!hex.contains('#'));
     }
 
     #[tokio::test]
     async fn first_seal_writes_values() {
         let store = FakeStore::new([2, 2, 2, 2, 2, 0, 0, 0, 0, 0], false);
-        let result = seal_event(&store, "evt-1", [9u8; 32], &DemotionConfig::off(), 1)
+        let result = seal_event(&store, "evt-1", [9u8; 32], NONCE, &DemotionConfig::off(), 1)
             .await
             .unwrap();
         match result {
             SealResult::Sealed(values) => assert_eq!(values.participant_count, 10),
             SealResult::AlreadySealed => panic!("expected a first seal"),
         }
-        assert!(store.written.lock().unwrap().is_some());
-        // No rules: no report, no tail, no phase hold.
+        let written = store.written.lock().unwrap().clone().unwrap();
+        assert_eq!(written.demoted_count, 0);
+        // No rules: no report, no chunks.
         assert!(store.report.lock().unwrap().is_none());
-        assert!(store.finished.lock().unwrap().is_none());
+        assert!(store.chunks.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn second_seal_is_noop() {
         let store = FakeStore::new([1; SHARDS], true);
-        let result = seal_event(&store, "evt-1", [9u8; 32], &DemotionConfig::off(), 1)
+        let result = seal_event(&store, "evt-1", [9u8; 32], NONCE, &DemotionConfig::off(), 1)
             .await
             .unwrap();
         assert_eq!(result, SealResult::AlreadySealed);
@@ -533,7 +554,7 @@ mod tests {
     #[tokio::test]
     async fn empty_cohort_seals_to_zero() {
         let store = FakeStore::new([0; SHARDS], false);
-        let result = seal_event(&store, "evt-1", [1u8; 32], &DemotionConfig::off(), 1)
+        let result = seal_event(&store, "evt-1", [1u8; 32], NONCE, &DemotionConfig::off(), 1)
             .await
             .unwrap();
         match result {
@@ -552,6 +573,7 @@ mod tests {
             &store,
             "evt-1",
             [1u8; 32],
+            NONCE,
             &config("address:5", DemotionMode::Observe),
             77,
         )
@@ -562,10 +584,9 @@ mod tests {
         };
         // The seal itself is untouched by observation.
         assert_eq!(values.demoted_count, 0);
-        assert_eq!(values.phase, Phase::Active);
+        assert!(values.demotion.is_none());
         assert_eq!(values.queue_counter_start().unwrap(), 10);
-        assert!(store.tails.lock().unwrap().is_empty());
-        assert!(store.finished.lock().unwrap().is_none());
+        assert!(store.chunks.lock().unwrap().is_empty());
         // But the operator can see exactly what enforcing would have done.
         let report = store.report.lock().unwrap().clone().unwrap();
         assert_eq!(report.mode, "observe");
@@ -581,12 +602,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enforce_mode_holds_the_phase_writes_the_tail_then_opens() {
+    async fn enforce_mode_writes_the_set_before_the_seal_and_names_it_in_the_seal() {
         let store = FakeStore::new([10, 0, 0, 0, 0, 0, 0, 0, 0, 0], false).with_rows(farmed_rows());
         let result = seal_event(
             &store,
             "evt-1",
             [1u8; 32],
+            NONCE,
             &config("address:5", DemotionMode::Enforce),
             1,
         )
@@ -596,24 +618,32 @@ mod tests {
             panic!("expected a first seal");
         };
         assert_eq!(values.demoted_count, 7);
-        // The seal write itself holds the phase; live joins start past the tail.
-        assert_eq!(values.phase, Phase::PreQueue);
-        assert_eq!(values.queue_counter_start().unwrap(), 17);
+        // Live joins start behind the tail, which is a second copy of [0, N).
+        assert_eq!(values.queue_counter_start().unwrap(), 20);
+        let demotion = values.demotion.clone().unwrap();
+        assert_eq!(demotion.nonce, "0badcafe00112233");
+        assert_eq!(demotion.chunks, 1);
+        // Exactly the demoted group, under the nonce the seal names, and
+        // nothing written per row anywhere.
+        let chunks = store.chunks.lock().unwrap().clone();
         assert_eq!(
-            store.written.lock().unwrap().clone().unwrap().phase,
-            Phase::PreQueue
+            chunks,
+            vec![(
+                "0badcafe00112233".to_owned(),
+                vec![vec!["address:198.51.100.1".to_owned()]]
+            )]
         );
-        // Every farmed row, and only those, took a tail index, in sorted order
-        // so `d` is the row's index in this list.
-        let tails = store.tails.lock().unwrap().clone();
-        assert_eq!(
-            tails,
-            (0..7).map(|l| format!("farm-{l}")).collect::<Vec<_>>()
-        );
-        assert_eq!(*store.finished.lock().unwrap(), Some(7));
+        let set = DemotionSet::from_entries(chunks[0].1.iter().flatten().cloned()).unwrap();
+        assert!(set.matches(farmed_rows()[0].telemetry.as_ref()));
+        assert!(!set.matches(farmed_rows()[9].telemetry.as_ref()));
+        assert!(store.deleted.lock().unwrap().is_empty());
         assert_eq!(
             store.report.lock().unwrap().clone().unwrap().mode,
             "enforce"
+        );
+        assert_eq!(
+            store.written.lock().unwrap().clone().unwrap().demotion,
+            Some(demotion)
         );
     }
 
@@ -624,6 +654,7 @@ mod tests {
             &store,
             "evt-1",
             [1u8; 32],
+            NONCE,
             &config("address:7", DemotionMode::Enforce),
             1,
         )
@@ -633,9 +664,9 @@ mod tests {
             panic!("expected a first seal");
         };
         assert_eq!(values.demoted_count, 0);
-        assert_eq!(values.phase, Phase::Active);
-        assert!(store.tails.lock().unwrap().is_empty());
-        assert!(store.finished.lock().unwrap().is_none());
+        assert!(values.demotion.is_none());
+        assert_eq!(values.queue_counter_start().unwrap(), 10);
+        assert!(store.chunks.lock().unwrap().is_empty());
         // Still reported, so the operator sees the rule ran and caught nothing.
         assert_eq!(store.report.lock().unwrap().clone().unwrap().demoted, 0);
     }
@@ -650,6 +681,7 @@ mod tests {
             &store,
             "evt-1",
             [1u8; 32],
+            NONCE,
             &config("address:5", DemotionMode::Enforce),
             1,
         )
@@ -658,46 +690,31 @@ mod tests {
         let report = store.report.lock().unwrap().clone().unwrap();
         assert_eq!(report.cohort, 5);
         assert_eq!(report.demoted, 0);
-        assert!(store.tails.lock().unwrap().is_empty());
+        assert!(store.chunks.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn a_lost_election_writes_nothing_after_classifying() {
+    async fn a_lost_election_deletes_its_own_chunks_and_writes_nothing_else() {
         let store = FakeStore::new([10, 0, 0, 0, 0, 0, 0, 0, 0, 0], true).with_rows(farmed_rows());
         let result = seal_event(
             &store,
             "evt-1",
             [1u8; 32],
+            NONCE,
             &config("address:5", DemotionMode::Enforce),
             1,
         )
         .await
         .unwrap();
         assert_eq!(result, SealResult::AlreadySealed);
+        // The chunks were written before the election (they must exist before
+        // a seal could name them) and cleaned up after losing it.
+        assert_eq!(store.chunks.lock().unwrap().len(), 1);
+        assert_eq!(
+            store.deleted.lock().unwrap().clone(),
+            vec![("0badcafe00112233".to_owned(), 1)]
+        );
         assert!(store.report.lock().unwrap().is_none());
-        assert!(store.tails.lock().unwrap().is_empty());
-        assert!(store.finished.lock().unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn a_tail_write_failure_still_opens_the_event_with_what_landed() {
-        // The winner died after three of seven tail writes. The other four
-        // keep their primary slots — never a duplicate — and the phase must
-        // still flip, or the event never opens.
-        let mut store =
-            FakeStore::new([10, 0, 0, 0, 0, 0, 0, 0, 0, 0], false).with_rows(farmed_rows());
-        store.tail_budget = Some(3);
-        seal_event(
-            &store,
-            "evt-1",
-            [1u8; 32],
-            &config("address:5", DemotionMode::Enforce),
-            1,
-        )
-        .await
-        .unwrap();
-        assert_eq!(store.tails.lock().unwrap().len(), 3);
-        assert_eq!(*store.finished.lock().unwrap(), Some(0));
     }
 
     #[tokio::test]
@@ -707,6 +724,7 @@ mod tests {
             &store,
             "evt-1",
             [1u8; 32],
+            NONCE,
             &config("address:lots", DemotionMode::Enforce),
             5,
         )
@@ -716,11 +734,17 @@ mod tests {
             panic!("expected a first seal");
         };
         assert_eq!(values.demoted_count, 0);
-        assert_eq!(values.phase, Phase::Active);
         let report = store.report.lock().unwrap().clone().unwrap();
         assert_eq!(report.rules, "address:lots");
         assert!(report.error.is_some());
         assert_eq!(report.sealed_at, 5);
-        assert!(store.tails.lock().unwrap().is_empty());
+        assert!(store.chunks.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_seal_always_opens_the_event() {
+        // There is no held phase any more: with nothing to write per row after
+        // the election, the seal write itself is the moment the event opens.
+        assert_eq!(sealed_phase(), Phase::Active);
     }
 }

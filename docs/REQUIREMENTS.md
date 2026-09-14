@@ -83,7 +83,7 @@ activation queues first-in, first-out (FIFO).
 
 | ID | Requirement | Acceptance |
 |---|---|---|
-| F6.3 | Bot-blocking decisions SHOULD be enforceable at event start rather than during the pre-queue. | Built as seal-time demotion ([ADR-0029](adr/0029-seal-time-demotion.md)), off by default. Join-time telemetry (viewer address, ASN, country, JA4 fingerprint, user agent) is captured on every registration row; at the seal, operator-set `signal:max` rules demote every group larger than its threshold to a compact tail behind the rest of the cohort, invisibly until T−0, and a report of what was demoted and why is on the dashboard. `observe` mode reports without demoting; the false-positive rate of a threshold is read off a real event before `enforce` is set. |
+| F6.3 | Bot-blocking decisions SHOULD be enforceable at event start rather than during the pre-queue. | Built as seal-time demotion ([ADR-0029](adr/0029-seal-time-demotion.md)), off by default. Join-time telemetry (viewer address, ASN, country, JA4 fingerprint, user agent) is captured on every registration row; at the seal, operator-set `signal:max` rules demote every group larger than its threshold behind the rest of the cohort, invisibly until T−0, and a report of what was demoted and why is on the dashboard. `observe` mode reports without demoting; the false-positive rate of a threshold is read off a real event before `enforce` is set. |
 
 **No one-position-per-visitor control exists.** `request_id` is client-supplied, so nothing
 stops one visitor taking N places, and randomization converts volume into expected share of the

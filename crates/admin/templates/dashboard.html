@@ -222,12 +222,9 @@
     <section class="card span-2">
       <div class="card-header">
         <h2>Seal-time demotion</h2>
-        <p class="sub">Groups of registrations sharing one address, ASN, JA4 fingerprint or user agent beyond a threshold are moved whole to a tail behind the rest of the cohort at the seal. Rules and mode are set in <code>terraform.tfvars</code>.</p>
+        <p class="sub">Groups of registrations sharing one address, ASN, JA4 fingerprint or user agent beyond a threshold are served behind the rest of the cohort. The seal stores the demoted groups once; every position lookup matches against them. Rules and mode are set in <code>terraform.tfvars</code>.</p>
       </div>
       <div class="card-body">
-        {% if demotion.applying %}
-        <p class="status status-warning">Demotion is being applied: the seal has run and is writing tail indices, so the phase is held at pre_queue until it finishes. If this outlasts the seal function's timeout (15 minutes), the seal died part way: set the phase to active by hand. Every row it missed keeps its ordinary position; none is duplicated.</p>
-        {% endif %}
         {% if !demotion.reported %}
         <p class="deferred">No report yet. The seal writes one when it runs with demotion rules set; with no rules it never scans the cohort.</p>
         {% else %}
@@ -247,12 +244,6 @@
             <dt class="kv-key">{% if demotion.mode == "enforce" %}Demoted{% else %}Would demote{% endif %}</dt>
             <dd class="kv-val"><strong>{{ demotion.demoted }}</strong> of {{ demotion.cohort }} registrations in {{ demotion.groups_total }} group{% if demotion.groups_total != 1 %}s{% endif %}</dd>
           </div>
-          {% if !demotion.applied.is_empty() %}
-          <div>
-            <dt class="kv-key">Tail indices written</dt>
-            <dd class="kv-val">{{ demotion.applied }}</dd>
-          </div>
-          {% endif %}
         </dl>
         {% if !demotion.groups.is_empty() %}
         <table class="groups">
