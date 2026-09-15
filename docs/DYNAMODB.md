@@ -30,12 +30,14 @@ a global or local secondary index. No table has streams enabled, and none declar
 Only key attributes are declared in Terraform. DynamoDB needs nothing else at create time, and
 every other attribute is schemaless.
 
-### 1.1 `Counters` holds three kinds of item
+### 1.1 `Counters` holds five kinds of item
 
 ```
 EVT#{event_id}            the event
 EVT#{event_id}#PQ#{0..9}  pre-queue registration shards
 EVT#{event_id}#AR#{0..9}  arrival shards
+EVT#{event_id}#DM         demotion report, when demotion rules are set
+EVT#{event_id}#DG#{nonce}#{k}  demotion-set chunks, when the seal demoted
 ```
 
 The event item carries, by writer:
@@ -53,6 +55,8 @@ The event item carries, by writer:
 | `shuffle_seed` | `seal_event` | 256-bit permutation key (B), written once |
 | `participant_count` | `seal_event` | Cohort size `N` |
 | `prequeue_offsets` | `seal_event` | Ten prefix offsets (L) |
+| `demoted_count` | `seal_event` | `D`, cohort rows the demotion set matches; absent or `0` when nothing was demoted |
+| `demotion_nonce`, `demotion_chunks` | `seal_event` | Locate the demotion set's chunk items; present when `demoted_count > 0` |
 | `message` | `admin` | Operator broadcast |
 | `last_action`, `last_action_by`, `last_action_at`, `last_action_epoch_ms` | `admin` | Audit trail and debounce guard |
 
@@ -110,6 +114,7 @@ the expiry write both bind `#s` to `status`.
 | `assign_position` | `Counters` | `GetItem` event item (fix-up re-read) | **Strong** | 1 per pre-queue batch |
 | `assign_position` | `Positions` | `PutItem` if `attribute_not_exists(request_id)` | — | 1 per live joiner |
 | `seal_event` | `Counters` | `BatchGetItem` of ten pre-queue shards | **Strong** | Once per event |
+| `seal_event` | `PreQueue` | `Scan` of the cohort, parallel | **Strong** | Once per event, when demotion rules are set |
 | `seal_event` | `Counters` | `UpdateItem` if `attribute_not_exists(shuffle_seed)` | — | Once per event |
 | `read` | `Counters` | `GetItem` event item | Eventual, 1 s in-process cache | ≤1/s per execution environment |
 | `read` | `PreQueue` | `GetItem` by `r` | Eventual | 1 per `/v1/queue_num` |
@@ -129,7 +134,7 @@ the expiry write both bind `#s` to `status`.
 | `admin` | `Counters` | `GetItem`, five `UpdateItem` forms | Eventual | Operator actions |
 | `admin` | `Tokens` | `PutItem`, `GetItem`, `DeleteItem` | Eventual | Operator logins |
 
-There is exactly one `Scan` in the codebase and no `Query`. Everything else is a key lookup.
+There are two `Scan`s in the codebase — `controller`'s expiry scan (§11) and `seal_event`'s scan of the pre-queue when demotion rules are set — and no `Query`. Everything else is a key lookup.
 
 ---
 
@@ -464,7 +469,7 @@ PreQueue GetItem  = 174,000 × 0.5 RRU       ≈  87,000 RRU/s   (2.2× the defa
 
 ---
 
-## 11. The one `Scan`
+## 11. The expiry `Scan`
 
 `Positions` is keyed only by `request_id` and has no secondary index, so finding the positions the
 cursor left behind unclaimed is a `Scan`:
