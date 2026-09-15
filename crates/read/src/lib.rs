@@ -271,7 +271,9 @@ pub enum QueueNumError {
 ///
 /// [`QueueNumError::NotSealed`] before the seal; [`QueueNumError::BadShard`] if
 /// the stored shard is out of range; [`QueueNumError::DemotionUnavailable`]
-/// when the event demoted rows (issue #145) and `demotion` is `None`.
+/// when the event demoted rows (issue #145), the demotion set is `None`, and
+/// the row is a cohort row — a straggler resolves to
+/// [`ResolvedQueueNum::Straggler`] regardless of the set.
 pub fn queue_num(
     counters: &Counters,
     row: &PreQueueItem,
@@ -826,6 +828,43 @@ mod tests {
         let counters = sealed_counters(counts, [42u8; 32]);
         assert_eq!(
             queue_num(&counters, &row(2, 5), None).unwrap(),
+            ResolvedQueueNum::Straggler
+        );
+    }
+
+    #[test]
+    fn a_straggler_on_a_demoting_event_falls_through_even_without_the_set() {
+        // The straggler rule runs before the demotion-availability gate, so a
+        // row that raced the seal resolves to `Straggler` (→ a `Positions`
+        // lookup) even when the demotion set could not be supplied — the
+        // cold-start / transient-failure window, where the set is `None`
+        // while `demoted_count > 0`. A straggler answers no primary slot, so
+        // nothing is un-demoted; the symmetric cohort row still refuses.
+        let counts = [3, 0, 5, 1, 0, 0, 2, 0, 0, 4]; // shard 2's own count is 5
+        let mut counters = sealed_counters(counts, [42u8; 32]);
+        let n = counters.participant_count.unwrap();
+        counters.demoted_count = 4;
+        counters.demotion = Some(wr_common::DemotionRef {
+            nonce: "0badcafe".to_owned(),
+            chunks: 1,
+        });
+        counters.queue_counter = 2 * n;
+        let set = DemotionSet::from_entries(vec!["asn:64500".to_owned()]).unwrap();
+        let straggler = row(2, 5); // local 5 is past shard 2's issued count of 5
+        let cohort = row(2, 1);
+        // No set: the straggler falls through; the cohort row refuses.
+        assert_eq!(
+            queue_num(&counters, &straggler, None).unwrap(),
+            ResolvedQueueNum::Straggler
+        );
+        assert_eq!(
+            queue_num(&counters, &cohort, None).unwrap_err(),
+            QueueNumError::DemotionUnavailable
+        );
+        // With the set supplied the straggler is still a straggler, matching
+        // the no-set case and the existing `Some(set)` straggler test.
+        assert_eq!(
+            queue_num(&counters, &straggler, Some(&set)).unwrap(),
             ResolvedQueueNum::Straggler
         );
     }
