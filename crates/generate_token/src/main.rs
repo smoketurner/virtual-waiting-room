@@ -18,9 +18,11 @@ use lambda_http::{Body, Error, Request, RequestExt, Response, run, service_fn};
 use tracing::{error, info};
 use wr_common::{Counters, DemotionCache, DemotionSet, Session, SigningKey};
 
-/// Resolved once at cold start and shared across invocations.
-struct AppState {
-    store: DynamoStore,
+/// Resolved once at cold start and shared across invocations. Parameterized
+/// over [`Store`] so the handler's branching — what it loads, and in what
+/// order — is exercisable against a mock without the AWS SDK.
+struct AppState<S: Store> {
+    store: S,
     key: SigningKey,
     event_id: String,
     session_cookie_name: String,
@@ -43,7 +45,7 @@ async fn main() -> Result<(), Error> {
     run(service_fn(|req: Request| handle(&state, req))).await
 }
 
-async fn init() -> Result<AppState, Error> {
+async fn init() -> Result<AppState<DynamoStore>, Error> {
     let config = aws_config::load_from_env().await;
     let dynamo = aws_sdk_dynamodb::Client::new(&config);
     let ssm = aws_sdk_ssm::Client::new(&config);
@@ -86,8 +88,8 @@ async fn init() -> Result<AppState, Error> {
 /// when the set cannot be read — `decide` then refuses with a retryable
 /// status rather than admitting from the primary slot. Logged, because a set
 /// that stays unreadable refuses every demoting event's admissions.
-async fn load_demotion(
-    state: &AppState,
+async fn load_demotion<S: Store>(
+    state: &AppState<S>,
     counters: &Counters,
 ) -> Result<Option<Arc<DemotionSet>>, Error> {
     let Some(demotion) = &counters.demotion else {
@@ -124,7 +126,7 @@ fn now_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-async fn handle(state: &AppState, req: Request) -> Result<Response<Body>, Error> {
+async fn handle<S: Store>(state: &AppState<S>, req: Request) -> Result<Response<Body>, Error> {
     let Some(request_id) = request_id(&req) else {
         return json(400, &serde_json::json!({ "error": "request_id required" }));
     };
@@ -134,15 +136,32 @@ async fn handle(state: &AppState, req: Request) -> Result<Response<Body>, Error>
     };
 
     // A live-join row is the authoritative position when one exists, so it is
-    // read first and the pre-queue lookup is skipped when it answers.
+    // read first and the pre-queue lookup is skipped when it answers. The
+    // demotion set (issue #145) is consulted only on the pre-queue path — a
+    // live `Positions` row resolves directly in `decide` without ever reading
+    // the set — so its load is gated to that path too. Loading it
+    // unconditionally made a live joiner pay a DynamoDB read whose result
+    // `decide` provably ignores, and worse, propagated a transient send error
+    // from that read as `Err` out of `handle`, failing a request whose own
+    // admission logic would never have touched the set. This mirrors how
+    // `crates/read/src/main.rs` keeps `load_demotion` on the pre-queue branch.
     let position_row = state.store.load_position(&request_id).await?;
-    let prequeue = match position_row {
-        Some(_) => None,
-        None => state.store.load_prequeue(&request_id).await?,
+    let prequeue = if position_row.is_none() {
+        state.store.load_prequeue(&request_id).await?
+    } else {
+        None
+    };
+    // `decide` reaches the demotion set only through the pre-queue resolver,
+    // so a visitor with no pre-queue row never needs it either; skip the load
+    // there too rather than failing an unregistered request on an irrelevant
+    // read.
+    let demotion = if prequeue.is_some() {
+        load_demotion(state, &counters).await?
+    } else {
+        None
     };
 
     let now = now_secs();
-    let demotion = load_demotion(state, &counters).await?;
     let grant = match decide(
         &counters,
         prequeue.as_ref(),
@@ -257,4 +276,134 @@ fn json<T: serde::Serialize>(status: u16, body: &T) -> Result<Response<Body>, Er
         .header("content-type", "application/json")
         .header("cache-control", "no-store")
         .body(Body::from(payload))?)
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
+    #![expect(
+        clippy::unused_async_trait_impl,
+        reason = "mock store methods are synchronous stubs with no I/O to await"
+    )]
+
+    use std::collections::HashMap;
+
+    use generate_token::StoreError;
+    use wr_common::{
+        DemotionRef, Phase, PositionStatus, PreQueueItem, SHARDS, SealedOffsets, Shard,
+        StoredControl,
+    };
+
+    use super::*;
+
+    /// An in-memory `Store` over a sealed, demoting event, whose demotion-chunk
+    /// read always fails with a transient send error. It proves the handler
+    /// gates `load_demotion` to the pre-queue path: a live joiner never reaches
+    /// that read, so a live-join admission succeeds even when the read errors.
+    struct MockStore {
+        position: Option<(u64, PositionStatus)>,
+        counters: Counters,
+    }
+
+    impl Store for MockStore {
+        async fn load_counters(&self, _event_id: &str) -> Result<Option<Counters>, StoreError> {
+            Ok(Some(self.counters.clone()))
+        }
+
+        async fn load_prequeue(
+            &self,
+            _request_id: &str,
+        ) -> Result<Option<PreQueueItem>, StoreError> {
+            Ok(None)
+        }
+
+        async fn load_position(
+            &self,
+            _request_id: &str,
+        ) -> Result<Option<(u64, PositionStatus)>, StoreError> {
+            Ok(self.position)
+        }
+
+        async fn load_demotion_entries(
+            &self,
+            _event_id: &str,
+            _nonce: &str,
+            _chunks: u32,
+        ) -> Result<Option<Vec<String>>, StoreError> {
+            Err(StoreError("transient send error".to_owned()))
+        }
+
+        async fn record_arrival(&self, _event_id: &str, _shard: Shard) -> Result<(), StoreError> {
+            Ok(())
+        }
+    }
+
+    /// A sealed, active event that demoted one cohort row: `counters.demotion`
+    /// is `Some`, so `load_demotion` would actually issue a chunk read rather
+    /// than short-circuit on the `None` arm.
+    fn mock_counters() -> Counters {
+        let counts = [2u64; SHARDS];
+        let sealed = SealedOffsets::seal(counts).unwrap();
+        let mut offsets = [0u64; SHARDS];
+        for (s, slot) in offsets.iter_mut().enumerate() {
+            *slot = sealed.offset(s);
+        }
+        Counters {
+            event_id: "evt".to_owned(),
+            phase: Phase::Active,
+            queue_counter: sealed.participant_count(),
+            // Past position 3, so a live joiner holding it is admitted.
+            serving_counter: 10,
+            shuffle_seed: Some([9u8; 32]),
+            participant_count: Some(sealed.participant_count()),
+            prequeue_offsets: Some(offsets),
+            demoted_count: 1,
+            demotion: Some(DemotionRef {
+                nonce: "deadbeef".to_owned(),
+                chunks: 1,
+            }),
+            message: None,
+            target_rate: None,
+            stored_control: StoredControl::Open,
+            fail_open_until: 0,
+            starts_at: None,
+        }
+    }
+
+    fn request_with_id(id: &str) -> Request {
+        let query: HashMap<String, String> =
+            HashMap::from([("request_id".to_owned(), id.to_owned())]);
+        Request::default().with_query_string_parameters(query)
+    }
+
+    /// A live joiner holding an issued `Positions` row at position 3, against a
+    /// sealed, demoting event whose demotion-chunk read always errors.
+    fn live_join_state() -> AppState<MockStore> {
+        AppState {
+            store: MockStore {
+                position: Some((3, PositionStatus::Issued)),
+                counters: mock_counters(),
+            },
+            key: SigningKey::new(b"test-key-for-singing-and-verify-for-real-use"),
+            event_id: "evt".to_owned(),
+            session_cookie_name: "vwr_session".to_owned(),
+            session_ttl_secs: 3600,
+            demotion_cache: DemotionCache::new(),
+        }
+    }
+
+    /// A live joiner is admitted even when the demotion-chunk read errors,
+    /// because `decide` never consults the demotion set for a live `Positions`
+    /// row. The buggy code ran `load_demotion().await?` unconditionally, so a
+    /// transient `StoreError` from that read propagated as `Err` out of
+    /// `handle`, failing the request with a generic 5xx instead of the 200 the
+    /// visitor's own admission logic earns.
+    #[tokio::test]
+    async fn live_join_admits_when_demotion_read_errors() {
+        let state = live_join_state();
+        let req = request_with_id("test-req-id");
+
+        let resp = handle(&state, req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+    }
 }
