@@ -20,7 +20,11 @@
 //!
 //! 1. Read the shard counts, so the cohort is fixed.
 //! 2. Scan the pre-queue and classify it. Nothing is written yet, so a
-//!    double-fire at this point costs a duplicate scan and nothing else.
+//!    double-fire at this point costs a duplicate scan and nothing else. The
+//!    scan is not event-scoped (the `PreQueue` table is shared), so the seal
+//!    also refuses to proceed if the classified cohort exceeds the
+//!    participant count — a signature that foreign rows from another event
+//!    leaked into the scan.
 //! 3. Write the demoted group set — the [`wr_common::DemotionSet`] every
 //!    resolver will match rows against — as chunk items under a per-run
 //!    nonce. Written *before* the election so the winning seal never names a
@@ -272,6 +276,22 @@ pub async fn seal_event<S: Store>(
     }
 
     let classification = classify_cohort(store, &values, rules.clone()).await?;
+
+    // Fail before anything is written: in a valid single-event run the cohort
+    // cannot exceed the participant count (every `assign_position` row has a
+    // local index below its shard's sealed count, so `offsets.assign` returns
+    // `PreQueue` for all of them, and `request_id` reuse or stragglers can only
+    // reduce the cohort below `N`). A cohort above `N` means the shared
+    // PreQueue table holds rows from a different event — the scan is the one
+    // store boundary that is not event-scoped — and the seal must not write a
+    // demotion set built from foreign rows.
+    if classification.cohort > values.participant_count {
+        return Err(StoreError(format!(
+            "cohort {} exceeds participant_count {}; PreQueue table contains foreign rows",
+            classification.cohort, values.participant_count
+        )));
+    }
+
     let enforcing = config.mode == DemotionMode::Enforce && classification.demoted > 0;
     if enforcing {
         let set = DemotionSet::from_groups(&classification.groups);
@@ -746,5 +766,169 @@ mod tests {
         // There is no held phase any more: with nothing to write per row after
         // the election, the seal write itself is the moment the event opens.
         assert_eq!(sealed_phase(), Phase::Active);
+    }
+
+    // --- Seal-time demotion: foreign-row contamination guard (issue #145) ---
+
+    /// Five real event-B rows on shard 0, all from one address; their local
+    /// indices fall inside event B's sealed offsets.
+    fn event_b_rows() -> Vec<ScannedRow> {
+        (0..5).map(|l| row(0, l, "198.51.100.1")).collect()
+    }
+
+    /// Three foreign rows that a prior event wrote to the same shared
+    /// `PreQueue` table; their local indices happen to fall inside event B's
+    /// offsets, so the scan folds them into the cohort.
+    fn foreign_rows() -> Vec<ScannedRow> {
+        (0..3).map(|l| row(0, l, "198.51.100.1")).collect()
+    }
+
+    #[tokio::test]
+    async fn a_clean_cohort_at_exactly_participant_count_seals_normally() {
+        // Event B alone: five rows, all one address, threshold 5 — 5 is not
+        // > 5, so nothing is demoted and the cohort equals the participant
+        // count. The invariant check must not false-positive on this boundary.
+        let store = FakeStore::new([5, 0, 0, 0, 0, 0, 0, 0, 0, 0], false).with_rows(event_b_rows());
+        let result = seal_event(
+            &store,
+            "evt-B",
+            [1u8; 32],
+            NONCE,
+            &config("address:5", DemotionMode::Enforce),
+            1,
+        )
+        .await
+        .unwrap();
+        let SealResult::Sealed(values) = result else {
+            panic!("expected a first seal");
+        };
+        assert_eq!(values.demoted_count, 0);
+        assert_eq!(values.participant_count, 5);
+        assert_eq!(values.queue_counter_start().unwrap(), 5);
+        let report = store.report.lock().unwrap().clone().unwrap();
+        assert_eq!(report.cohort, 5);
+        assert_eq!(report.demoted, 0);
+    }
+
+    #[tokio::test]
+    async fn a_cohort_below_participant_count_seals_normally() {
+        // Only 3 of 5 possible registrations survived (request_id reuse or
+        // stragglers classified LiveJoin can reduce the cohort below N). The
+        // invariant `cohort <= N` holds, so the seal must proceed.
+        let rows: Vec<ScannedRow> = (0..3).map(|l| row(0, l, "198.51.100.1")).collect();
+        let store = FakeStore::new([5, 0, 0, 0, 0, 0, 0, 0, 0, 0], false).with_rows(rows);
+        let result = seal_event(
+            &store,
+            "evt-B",
+            [1u8; 32],
+            NONCE,
+            &config("address:2", DemotionMode::Enforce),
+            1,
+        )
+        .await
+        .unwrap();
+        let SealResult::Sealed(values) = result else {
+            panic!("expected a first seal");
+        };
+        assert_eq!(values.participant_count, 5);
+        let report = store.report.lock().unwrap().clone().unwrap();
+        assert_eq!(report.cohort, 3);
+    }
+
+    #[tokio::test]
+    async fn foreign_event_rows_in_the_scan_are_refused_at_seal() {
+        // A prior event left 3 rows in the shared PreQueue table; combined
+        // with event B's 5 rows the cohort is 8 > 5. Without the guard the
+        // seal would write a wrong DemotionSet and start queue_counter at 2N.
+        let all_rows: Vec<ScannedRow> = event_b_rows().into_iter().chain(foreign_rows()).collect();
+        let store = FakeStore::new([5, 0, 0, 0, 0, 0, 0, 0, 0, 0], false).with_rows(all_rows);
+        let result = seal_event(
+            &store,
+            "evt-B",
+            [1u8; 32],
+            NONCE,
+            &config("address:5", DemotionMode::Enforce),
+            1,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "seal should refuse when cohort exceeds participant_count"
+        );
+        // Nothing was written: no seal item, no demotion chunks, no report.
+        assert!(store.written.lock().unwrap().is_none());
+        assert!(store.chunks.lock().unwrap().is_empty());
+        assert!(store.report.lock().unwrap().is_none());
+        assert!(store.deleted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn foreign_event_rows_are_refused_even_under_observe() {
+        // The guard is mode-independent: even in Observe (the documented
+        // default), a contaminated cohort must not produce an inflated
+        // report or an incorrect seal.
+        let all_rows: Vec<ScannedRow> = event_b_rows().into_iter().chain(foreign_rows()).collect();
+        let store = FakeStore::new([5, 0, 0, 0, 0, 0, 0, 0, 0, 0], false).with_rows(all_rows);
+        let result = seal_event(
+            &store,
+            "evt-B",
+            [1u8; 32],
+            NONCE,
+            &config("address:5", DemotionMode::Observe),
+            1,
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(store.written.lock().unwrap().is_none());
+        assert!(store.report.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn foreign_rows_from_a_different_address_still_trigger_the_refusal() {
+        // Foreign rows need not share a group with any real row; the cohort
+        // count alone exceeds N, which is the signal.
+        let mut rows: Vec<ScannedRow> = (0..5).map(|l| row(0, l, "198.51.100.1")).collect();
+        rows.extend((0..3).map(|l| row(0, l, "203.0.113.5")));
+        let store = FakeStore::new([5, 0, 0, 0, 0, 0, 0, 0, 0, 0], false).with_rows(rows);
+        let result = seal_event(
+            &store,
+            "evt-B",
+            [1u8; 32],
+            NONCE,
+            &config("address:5", DemotionMode::Enforce),
+            1,
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(store.written.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn the_refusal_error_names_both_cohort_and_participant_count() {
+        let all_rows: Vec<ScannedRow> = event_b_rows().into_iter().chain(foreign_rows()).collect();
+        let store = FakeStore::new([5, 0, 0, 0, 0, 0, 0, 0, 0, 0], false).with_rows(all_rows);
+        let error = seal_event(
+            &store,
+            "evt-B",
+            [1u8; 32],
+            NONCE,
+            &config("address:5", DemotionMode::Enforce),
+            1,
+        )
+        .await
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains('8'),
+            "error should name the inflated cohort: {message}"
+        );
+        assert!(
+            message.contains('5'),
+            "error should name the participant count: {message}"
+        );
+        assert!(
+            message.contains("foreign"),
+            "error should point at the cause: {message}"
+        );
     }
 }
