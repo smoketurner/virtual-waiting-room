@@ -271,6 +271,19 @@ Position is derived on read:
 queue_position = PRP(shuffle_seed, i, participant_count)     // i = offset[s] + l
 ```
 
+**Seal-time demotion ([ADR-0029](../../../docs/adr/0029-seal-time-demotion.md), issue #145).** When the
+operator has set demotion rules, the seal also scans the pre-queue between reading the shard
+counts and the write above, groups the cohort by each ruled signal (viewer address, ASN, JA4
+fingerprint, user agent) and demotes every group larger than its threshold. Nothing is written
+per row: the seal stores the demoted group set once, as chunk items keyed by a per-run nonce,
+and the seal write then also carries `demoted_count = D`, the nonce and the chunk count, and
+starts `queue_counter` at `2N`. Every resolver loads the set once per execution environment and
+matches a row's telemetry against it; a match resolves to `N + PRP(shuffle_seed, i, N)` — the
+same slot in a second copy of the index space behind the whole cohort — so primary slots, demoted
+slots and live joins occupy three disjoint ranges. The tail is sparse, and the controller (§7)
+walks it at the density the seal recorded. Under the default `observe` mode the seal classifies
+and reports but demotes nobody; with no rules it never scans.
+
 `/queue_num` reads the visitor's `PreQueue` item for `(s, l)` and the seed, count, and offsets
 from `/status`; it reconstructs `i` with one addition. All three are already being fetched. A
 join that raced the seal is a **straggler**, but that is a per-shard fact, not a global one:
@@ -444,7 +457,9 @@ the actual mapping is different every event. What is *not* illustrative is the g
 
 Given `shuffle_seed`, `participant_count`, `prequeue_offsets`, and the `(request_id, s, l)`
 tuples in `PreQueue`, any third party recomputes every global index `i = offset[s] + l` and
-every position, and confirms the ordering.
+every position, and confirms the ordering. Which rows sit at `N + position` instead
+(ADR-0029) follows from the stored demotion set and each row's own telemetry `v`; the set is a
+handful of `Counters` items named by the event item.
 
 Positions are written to `Positions` lazily, when a visitor is admitted, carrying
 `entry_time`, `status` and `expires_at` for the outflow controller. Only visitors who reach
@@ -538,6 +553,8 @@ skipped number.
 | `target_rate` | N | Operator-set admissions per minute |
 | `shuffle_seed` | B | 256-bit permutation key, written once at T−0 |
 | `participant_count` | N | Pre-queue cohort size, the permutation domain |
+| `demoted_count` | N | `D`, how many cohort rows the seal-time demotion set matches (ADR-0029); absent or `0` when nothing was demoted. Positive means the tail `[N, 2N)` is in use and `queue_counter` started at `2N` |
+| `demotion_nonce`, `demotion_chunks` | S, N | Where the demotion set lives: its chunk items are `EVT#{event_id}#DG#{nonce}#{k}` for `k` below the chunk count. Present exactly when `demoted_count > 0` |
 
 The two striped counters — the pre-queue registration index and the arrivals count — are
 **not** attributes on this item. Each shard is its own item in the same table, keyed
@@ -546,10 +563,19 @@ The two striped counters — the pre-queue registration index and the arrivals c
 back under that item's single 1,000-write/s ceiling and distribute nothing.
 | `operator_message` | S | Delivered in `/status` |
 
-**`PreQueue`** — partition key `r`. Attributes `s` (shard), `l` (local index), `t`. Short
-attribute names because the table is scanned during audit. The global registration index
-`i = offset[s] + l` is derived on read, never stored. Read by `/queue_num` as a single
-`GetItem`; never scanned on the hot path.
+**`PreQueue`** — partition key `r`. Attributes `s` (shard), `l` (local index), `t`, `v`
+(join-time telemetry). Short attribute names because the table is scanned during audit and,
+when demotion rules are set, once by the seal — which reads it and writes nothing back. The
+global registration index `i = offset[s] + l` is derived on read, never stored, and so is a
+demotion (ADR-0029): the row is matched against the stored set on every read. Read by
+`/queue_num` as a single `GetItem`; never scanned on the hot path.
+
+The seal's demotion set and report are further items in `Counters`. The set is one or more
+chunks `EVT#{event_id}#DG#{nonce}#{k}`, each a list `g` of `signal:value` strings, written before
+the seal and named by it. The report, `EVT#{event_id}#DM`, holds the mode, rules, cohort size,
+demoted count and the largest demoted groups with their thresholds. Their own items so the event
+item every poll reads stays small; resolvers read the set once per execution environment, and the
+dashboard is the report's only reader.
 
 **`Positions`** — partition key `request_id`. Attributes `event_id`, `queue_position`,
 `entry_time`, `status`, `expires_at`, `ttl`. Written with
@@ -627,6 +653,14 @@ observed_arrival_rate = arrivals in the last interval
 no_show_rate          = 1 − (observed_arrival_rate / released_last_interval)
 release_next          = target_rate / (1 − smoothed_no_show_rate)
 ```
+
+**Positions versus people (ADR-0029).** With a demotion tail the position space has three
+tiers: `[0, N)` holding `N − D` people, `[N, 2N)` holding the `D` demoted, and live joins from
+`2N`, dense. The seal counted both densities, so the controller converts rather than corrects:
+the interval's target is a number of people, turned into positions at the density of the tier
+the cursor is in; no-shows are measured as arrivals against people released; and the expiry
+grace is walked back as a count of people, so it stays a duration inside the tail. With nothing
+demoted every conversion is the identity and the control law above is unchanged.
 
 The rate is smoothed across intervals to avoid oscillation and the correction is bounded, so
 a transient measurement error cannot release a damaging burst.
@@ -738,17 +772,31 @@ behavioural classification over the join telemetry described below. Neither is b
 
 ### Deferred bot enforcement
 
-**Not built.** The intent is that where an operator can identify likely bots during the
-pre-queue, blocking is deferred to randomization rather than applied on arrival, so detection is
-not revealed while there is still time to modify a client and rejoin.
+**Built as seal-time demotion ([ADR-0029](../../../docs/adr/0029-seal-time-demotion.md), issue #145), off by
+default.** Where an operator can identify likely bots during the pre-queue, the decision is
+deferred to randomization rather than applied on arrival, so detection is not revealed while
+there is still time to modify a client and rejoin.
 
-What exists is the input: every registration row carries join-time telemetry — viewer address,
-ASN, country, JA4 fingerprint and user agent — captured as SQS message attributes on the
-compute-free join path. A farm running one automation toolkit across many addresses collapses to
-a handful of JA4 values, so the data supports the classification. **Nothing reads it.** There is
-no classifier, no operator action, and no seal-time mitigation. The mechanism as specified
-depends on WAF Bot Control for its labels, which this deployment does not enable on cost
-grounds.
+The input is the join-time telemetry every registration row carries — viewer address, ASN,
+country, JA4 fingerprint and user agent — captured as SQS message attributes on the compute-free
+join path. The operator sets rules of the form `signal:max` (`address:25,asn:5000`) in
+`terraform.tfvars`. At the seal, every group of registrations sharing one value of a ruled signal
+and larger than its threshold is demoted whole: served behind the rest of the cohort (§4.2),
+never blocked, because a rule that catches a farm also catches an office NAT and a demoted office
+still gets in. Nothing is written per row; the demoted groups are stored once and every position
+lookup matches against them. The seal writes a report — mode, rules, cohort, demoted count,
+largest groups — that the dashboard renders, so what was mitigated and on what basis is visible.
+
+The default mode is `observe`: the classification runs and the report is written, nobody is
+demoted. The count-then-block discipline (O5) applies: the false-positive behaviour of a
+threshold is read off a real event's report before `enforce` is set. The signals are weak
+individually — every honest user of one browser release shares one JA4, so that signal separates
+tooling from browsers, not one visitor from another — which is the other reason the thresholds
+are the operator's and the mode starts at observe.
+
+WAF Bot Control's labels, and the anonymous-IP and hosting-provider reputation lists, are a
+later input to the same mechanism: another attribute on the row, another signal in the rules,
+acted on at the same seal. They are not enabled on cost grounds (§8, §12).
 
 ### Web Application Firewall (WAF)
 
@@ -987,7 +1035,7 @@ Which section implements which requirement from the Kiro spec's `requirements.md
 | F4.5 — client retries 429 with jitter | §10 |
 | F5.1, F5.2, F5.3, F5.4, F5.5 — metrics, branding, messaging, wait estimate, API-first | §9 |
 | F6.1, F6.2 — entry gating on a client-signed identifier | §8 |
-| F6.3 — deferred bot enforcement | §8 |
+| F6.3 — deferred bot enforcement | §4.2, §8 (ADR-0029) |
 | F7.1, F7.2, F7.3, F7.4, F7.5, F7.6 — operator web dashboard | Admin web interface (Cloudscape-styled Axum Lambda) |
 | C1, C2 — pre-queue scale, atomic assignment | §4.2 |
 | C3 — live-join throughput | §5.3 |

@@ -14,7 +14,8 @@
 use std::future::Future;
 
 use wr_common::{
-    Counters, Phase, PositionStatus, PreQueueItem, ResolveError, ResolvedPosition, Shard,
+    Counters, DemotionSet, Phase, PositionStatus, PreQueueItem, ResolveError, ResolvedPosition,
+    Shard,
 };
 
 pub mod dynamo;
@@ -50,6 +51,15 @@ pub trait Store {
         request_id: &str,
     ) -> impl Future<Output = Result<Option<(u64, PositionStatus)>, StoreError>> + Send;
 
+    /// Reads the entries of every chunk of the demotion set keyed by `nonce`
+    /// (issue #145), or `None` if any chunk is missing.
+    fn load_demotion_entries(
+        &self,
+        event_id: &str,
+        nonce: &str,
+        chunks: u32,
+    ) -> impl Future<Output = Result<Option<Vec<String>>, StoreError>> + Send;
+
     /// `ADD arrivals#<shard> :one` — records that this visitor showed up, which
     /// is what the controller measures its no-show rate against.
     fn record_arrival(
@@ -81,6 +91,10 @@ pub enum Denied {
     /// The stored registration is corrupt.
     #[error("corrupt registration")]
     Corrupt,
+    /// The seal demoted rows (issue #145) and the demotion set could not be
+    /// read, so the position cannot be resolved right now. Retryable.
+    #[error("queue state temporarily unavailable")]
+    Unavailable,
 }
 
 /// An admitted visitor: the position that was reached. The arrival shard is no
@@ -108,6 +122,7 @@ pub fn decide(
     prequeue: Option<&PreQueueItem>,
     position_row: Option<(u64, PositionStatus)>,
     now: u64,
+    demotion: Option<&DemotionSet>,
 ) -> Result<Grant, Denied> {
     use wr_common::AdmissionControl;
     match wr_common::resolve(counters.stored_control, counters.fail_open_until, now) {
@@ -118,7 +133,7 @@ pub fn decide(
         return Err(Denied::NotAdmitting);
     }
 
-    let position = resolve_position(counters, prequeue, position_row)?;
+    let position = resolve_position(counters, prequeue, position_row, demotion)?;
 
     if position >= counters.serving_counter {
         return Err(Denied::StillQueued {
@@ -138,6 +153,7 @@ fn resolve_position(
     counters: &Counters,
     prequeue: Option<&PreQueueItem>,
     position_row: Option<(u64, PositionStatus)>,
+    demotion: Option<&DemotionSet>,
 ) -> Result<u64, Denied> {
     if let Some((position, status)) = position_row {
         return match status {
@@ -155,13 +171,14 @@ fn resolve_position(
         return Err(Denied::NotRegistered);
     };
 
-    match counters.resolve_prequeue(row) {
+    match counters.resolve_prequeue(row, demotion) {
         Ok(ResolvedPosition::PreQueue(position)) => Ok(position),
         // Raced the seal, so a live-join row should exist; without one there is
         // no claimed position to admit against.
         Ok(ResolvedPosition::LiveJoin) => Err(Denied::NotRegistered),
         Err(ResolveError::NotSealed) => Err(Denied::NotSealed),
         Err(ResolveError::BadShard) => Err(Denied::Corrupt),
+        Err(ResolveError::DemotionUnavailable) => Err(Denied::Unavailable),
     }
 }
 
@@ -188,6 +205,8 @@ mod tests {
             shuffle_seed: Some([9u8; 32]),
             participant_count: Some(sealed.participant_count()),
             prequeue_offsets: Some(offsets),
+            demoted_count: 0,
+            demotion: None,
             message: None,
             target_rate: None,
             stored_control: StoredControl::Open,
@@ -201,13 +220,27 @@ mod tests {
     #[test]
     fn a_reached_position_is_admitted() {
         // Live joiner holding position 3, cursor past it.
-        let grant = decide(&counters(10), None, Some((3, PositionStatus::Issued)), 0).unwrap();
+        let grant = decide(
+            &counters(10),
+            None,
+            Some((3, PositionStatus::Issued)),
+            0,
+            None,
+        )
+        .unwrap();
         assert_eq!(grant.position, 3);
     }
 
     #[test]
     fn a_position_not_yet_reached_is_refused() {
-        let err = decide(&counters(3), None, Some((7, PositionStatus::Issued)), 0).unwrap_err();
+        let err = decide(
+            &counters(3),
+            None,
+            Some((7, PositionStatus::Issued)),
+            0,
+            None,
+        )
+        .unwrap_err();
         assert_eq!(
             err,
             Denied::StillQueued {
@@ -222,8 +255,26 @@ mod tests {
         // serving_counter is the count released, so position N is admitted only
         // once the cursor has passed it. Off by one here admits one visitor too
         // many on every interval.
-        assert!(decide(&counters(5), None, Some((4, PositionStatus::Issued)), 0).is_ok());
-        assert!(decide(&counters(5), None, Some((5, PositionStatus::Issued)), 0).is_err());
+        assert!(
+            decide(
+                &counters(5),
+                None,
+                Some((4, PositionStatus::Issued)),
+                0,
+                None
+            )
+            .is_ok()
+        );
+        assert!(
+            decide(
+                &counters(5),
+                None,
+                Some((5, PositionStatus::Issued)),
+                0,
+                None
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -231,7 +282,7 @@ mod tests {
         let mut c = counters(10);
         c.stored_control = StoredControl::Paused;
         assert_eq!(
-            decide(&c, None, Some((3, PositionStatus::Issued)), 0).unwrap_err(),
+            decide(&c, None, Some((3, PositionStatus::Issued)), 0, None).unwrap_err(),
             Denied::NotAdmitting
         );
     }
@@ -244,11 +295,11 @@ mod tests {
         let mut c = counters(10);
         c.fail_open_until = 1000;
         assert_eq!(
-            decide(&c, None, Some((3, PositionStatus::Issued)), 500).unwrap_err(),
+            decide(&c, None, Some((3, PositionStatus::Issued)), 500, None).unwrap_err(),
             Denied::NotAdmitting
         );
         // Once the epoch lapses, the stored Open control governs again.
-        assert!(decide(&c, None, Some((3, PositionStatus::Issued)), 1000).is_ok());
+        assert!(decide(&c, None, Some((3, PositionStatus::Issued)), 1000, None).is_ok());
     }
 
     #[test]
@@ -262,7 +313,7 @@ mod tests {
             let mut c = counters(10);
             c.phase = phase;
             assert_eq!(
-                decide(&c, None, Some((3, PositionStatus::Issued)), 0).unwrap_err(),
+                decide(&c, None, Some((3, PositionStatus::Issued)), 0, None).unwrap_err(),
                 Denied::NotAdmitting
             );
         }
@@ -276,7 +327,7 @@ mod tests {
             PositionStatus::Abandoned,
         ] {
             assert_eq!(
-                decide(&counters(10), None, Some((3, status)), 0).unwrap_err(),
+                decide(&counters(10), None, Some((3, status)), 0, None).unwrap_err(),
                 Denied::Spent
             );
         }
@@ -285,7 +336,7 @@ mod tests {
     #[test]
     fn an_unregistered_visitor_is_refused() {
         assert_eq!(
-            decide(&counters(10), None, None, 0).unwrap_err(),
+            decide(&counters(10), None, None, 0, None).unwrap_err(),
             Denied::NotRegistered
         );
     }
@@ -300,9 +351,66 @@ mod tests {
             t: 1_788_000_000,
             v: None,
         };
-        let grant = decide(&c, Some(&row), None, 0).unwrap();
+        let grant = decide(&c, Some(&row), None, 0, None).unwrap();
         // Inside the sealed cohort.
         assert!(grant.position < c.participant_count.unwrap());
+    }
+
+    #[test]
+    fn a_demoted_registrant_is_admitted_only_once_the_cursor_reaches_the_tail() {
+        // Issue #145: a row the set matches resolves to N + p, so a cursor that
+        // has served the whole undemoted cohort has not yet reached it, and
+        // without the set the decision is a retryable refusal, never a grant
+        // from the primary slot.
+        let mut c = counters(0);
+        let n = c.participant_count.unwrap();
+        c.demoted_count = 1;
+        c.demotion = Some(wr_common::DemotionRef {
+            nonce: "0badcafe".to_owned(),
+            chunks: 1,
+        });
+        c.queue_counter = 2 * n;
+        let set = DemotionSet::from_entries(vec!["asn:64500".to_owned()]).unwrap();
+        let row = PreQueueItem {
+            r: REQ.to_owned(),
+            s: 3,
+            l: 1,
+            t: 1_788_000_000,
+            v: Some(wr_common::Telemetry {
+                a: None,
+                n: Some("64500".to_owned()),
+                c: None,
+                j: None,
+                u: None,
+                q: None,
+            }),
+        };
+        assert_eq!(
+            decide(&c, Some(&row), None, 0, None).unwrap_err(),
+            Denied::Unavailable
+        );
+        let mut plain = row.clone();
+        plain.v = None;
+        c.serving_counter = u64::MAX;
+        let primary = decide(&c, Some(&plain), None, 0, Some(&set))
+            .unwrap()
+            .position;
+        assert!(primary < n);
+        c.serving_counter = n + primary;
+        assert_eq!(
+            decide(&c, Some(&row), None, 0, Some(&set)).unwrap_err(),
+            Denied::StillQueued {
+                position: n + primary,
+                serving: n + primary
+            }
+        );
+        c.serving_counter = n + primary + 1;
+        assert_eq!(
+            decide(&c, Some(&row), None, 0, Some(&set))
+                .unwrap()
+                .position,
+            n + primary
+        );
     }
 
     #[test]
@@ -319,7 +427,7 @@ mod tests {
             v: None,
         };
         assert_eq!(
-            decide(&c, Some(&row), None, 0).unwrap_err(),
+            decide(&c, Some(&row), None, 0, None).unwrap_err(),
             Denied::NotSealed
         );
     }
@@ -339,6 +447,7 @@ mod tests {
             Some(&row),
             Some((42, PositionStatus::Issued)),
             0,
+            None,
         )
         .unwrap();
         assert_eq!(grant.position, 42);

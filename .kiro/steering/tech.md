@@ -134,7 +134,7 @@ spike.
 |---|---|
 | Edge / CDN / request collapsing | CloudFront — polled, write, waiting-page and protected behaviours (ADR-0013) |
 | **The admission gate** | CloudFront Function (`cloudfront-js-2.0`) at viewer-request on the protected behaviour only, deciding locally from a KeyValueStore (ADR-0021, issue #71); `generate_token` signs an HMAC-SHA256 session cookie the function verifies. Sub-millisecond compute at the edge, not zero, but no round trip to the origin |
-| Bot & abuse mitigation | WAF: Bot Control, ASN matching, anti-DDoS in Count mode — **not built** (N7, #59, #70) |
+| Bot & abuse mitigation | Seal-time demotion over the join telemetry (ADR-0029, #145): operator `signal:max` rules, demoted groups stored once and matched on read, density-aware controller, `observe` by default. WAF: Bot Control, ASN matching, anti-DDoS in Count mode — **not built** (N7, #59, #70) |
 | Ingest | API Gateway **REST** (regional) with request validator → SQS |
 | Buffer | SQS standard queue + DLQ (`maxReceiveCount` 5), ESM `ReportBatchItemFailures` |
 | Compute | Lambda (Rust, arm64) — the seven functions above |

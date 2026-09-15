@@ -73,6 +73,15 @@ Position assignment has two paths:
   seed + offsets + count + phase in **one conditional `UpdateItem`** guarded by
   `attribute_not_exists(shuffle_seed)`, so a double-fire seals exactly once. A visitor's
   position is `PRP(seed, offset[s] + l, N)`, computed on read — never stored (ADR-0002).
+  With demotion rules set (ADR-0029, issue #145) the seal first scans the pre-queue, groups the
+  cohort by the join telemetry (`wr_common::demotion`), and demotes every group over its
+  `signal:max` threshold. Nothing is written per row: the demoted group set is stored once as
+  chunk items under a per-run nonce, and the seal write carries `demoted_count = D` plus the
+  nonce and starts `queue_counter` at `2N`. Every resolver loads the set once per execution
+  environment and a matching row resolves to `N + PRP(seed, i, N)`; a resolver without the set
+  refuses rather than un-demotes. The tail is sparse, so the controller's `Tiers` convert
+  between positions and people at the densities the seal recorded. `demotion_mode` defaults to
+  `observe` (report only); no rules, no scan.
 - **Live join.** `assign_position` claims a contiguous block with one
   `UpdateItem ADD queue_counter :n / ALL_NEW`, incrementing by the count of **valid** records
   only, then writes each row with `attribute_not_exists(request_id)`. Gaps are acceptable;

@@ -14,7 +14,8 @@ use std::collections::HashMap;
 use aws_sdk_dynamodb::types::AttributeValue;
 use serde::{Deserialize, Serialize};
 
-use crate::expr::STARTS_AT_ATTR;
+use crate::demotion::{DemotionRef, DemotionSet};
+use crate::expr::{DEMOTED_COUNT_ATTR, DEMOTION_CHUNKS_ATTR, DEMOTION_NONCE_ATTR, STARTS_AT_ATTR};
 use crate::ids::{Phase, StoredControl};
 use crate::permutation::{Assignment, SHARDS, SealedOffsets, Seed};
 
@@ -122,6 +123,17 @@ pub struct Counters {
     pub participant_count: Option<u64>,
     /// Set at the seal: prefix offsets `offset[s] = Σ counts[0..s)`.
     pub prequeue_offsets: Option<[u64; SHARDS]>,
+    /// Set at the seal when demotion is enforced (issue #145): `D`, how many
+    /// cohort rows the stored demotion set matches. They resolve into the
+    /// tail `[N, 2N)`, a second copy of the index space behind the whole
+    /// cohort, and `queue_counter` starts at `2N` to keep live joiners behind
+    /// it. `0` when nothing was demoted.
+    pub demoted_count: u64,
+    /// Where the demotion set the seal wrote lives, when `demoted_count > 0`:
+    /// the nonce its chunk items are keyed under and how many there are. A
+    /// resolver loads it once per execution environment and matches every
+    /// pre-queue row against it.
+    pub demotion: Option<DemotionRef>,
     /// Operator broadcast text shown to waiting visitors. Absent until an
     /// operator sets it; cleared by setting it empty.
     pub message: Option<String>,
@@ -164,6 +176,8 @@ pub struct Counters {
 pub struct Sealed {
     pub offsets: SealedOffsets,
     pub seed: Seed,
+    /// The tail's size `D` (issue #145); `0` when nothing was demoted.
+    pub demoted: u64,
 }
 
 impl Counters {
@@ -182,6 +196,7 @@ impl Counters {
         Some(Sealed {
             offsets: SealedOffsets::from_parts(offsets, participant_count),
             seed: Seed(seed_bytes),
+            demoted: self.demoted_count,
         })
     }
 
@@ -193,23 +208,59 @@ impl Counters {
     /// and belongs to the live-join sequence instead, so the permutation is
     /// never evaluated outside its domain.
     ///
+    /// A row the seal demoted (issue #145) — one the stored [`DemotionSet`]
+    /// matches — resolves to `N + PRP(seed, i, N)` instead: the same slot in a
+    /// second copy of the index space behind the whole cohort, so every
+    /// position stays unique (primary slots are `< N`, tail slots are in
+    /// `[N, 2N)`) and the live-join sequence, started at `2N`, stays behind
+    /// both. Nothing is written per row; the tail is sparse, and the
+    /// controller walks it at its known density.
+    ///
+    /// `demotion` is the set the event item names. It may be `None` only when
+    /// the seal demoted nobody; a sealed event with `demoted_count > 0` and no
+    /// set to match against cannot be resolved, because answering from the
+    /// primary slot alone would silently un-demote every demoted row.
+    ///
     /// # Errors
     ///
     /// [`ResolveError::NotSealed`] before the seal has written the seed, cohort
     /// size, and offsets; [`ResolveError::BadShard`] if the row's shard is
-    /// outside `0..SHARDS`.
-    pub fn resolve_prequeue(&self, row: &PreQueueItem) -> Result<ResolvedPosition, ResolveError> {
-        let Sealed { offsets, seed } = self.sealed().ok_or(ResolveError::NotSealed)?;
+    /// outside `0..SHARDS`; [`ResolveError::DemotionUnavailable`] when the
+    /// event demoted rows and the caller could not supply the set.
+    pub fn resolve_prequeue(
+        &self,
+        row: &PreQueueItem,
+        demotion: Option<&DemotionSet>,
+    ) -> Result<ResolvedPosition, ResolveError> {
+        let Sealed {
+            offsets,
+            seed,
+            demoted,
+        } = self.sealed().ok_or(ResolveError::NotSealed)?;
 
         let shard = usize::from(row.s);
         if shard >= SHARDS {
             return Err(ResolveError::BadShard);
         }
+        let demotion = match (demoted, demotion) {
+            (0, _) => None,
+            (_, Some(set)) => Some(set),
+            (_, None) => return Err(ResolveError::DemotionUnavailable),
+        };
 
         let participant_count = offsets.participant_count();
         Ok(match offsets.assign(shard, row.l) {
             Assignment::PreQueue { index } => {
-                ResolvedPosition::PreQueue(crate::permutation::prp(&seed, index, participant_count))
+                let primary = crate::permutation::prp(&seed, index, participant_count);
+                let position = match demotion {
+                    Some(set) if set.matches(row.v.as_ref()) => {
+                        // `2N` was checked to fit at the seal; a saturated
+                        // add here cannot happen for any cohort that sealed.
+                        participant_count.saturating_add(primary)
+                    }
+                    Some(_) | None => primary,
+                };
+                ResolvedPosition::PreQueue(position)
             }
             // The exact live-join position is claimed by the live-join path,
             // not reconstructed here — every caller falls through to a
@@ -262,6 +313,20 @@ impl Counters {
             shuffle_seed,
             participant_count: num("participant_count"),
             prequeue_offsets,
+            demoted_count: num(DEMOTED_COUNT_ATTR).unwrap_or(0),
+            demotion: item
+                .get(DEMOTION_NONCE_ATTR)
+                .and_then(|v| v.as_s().ok())
+                .filter(|nonce| !nonce.is_empty())
+                .and_then(|nonce| {
+                    let chunks = num(DEMOTION_CHUNKS_ATTR)
+                        .and_then(|n| u32::try_from(n).ok())
+                        .filter(|n| *n > 0)?;
+                    Some(DemotionRef {
+                        nonce: nonce.clone(),
+                        chunks,
+                    })
+                }),
             target_rate: num("target_rate").and_then(|n| u32::try_from(n).ok()),
             message: item
                 .get("message")
@@ -300,6 +365,10 @@ pub enum ResolveError {
     /// The stored shard is outside `0..SHARDS` (a corrupt row).
     #[error("shard index out of range")]
     BadShard,
+    /// The seal demoted rows but the caller had no demotion set to match
+    /// against, so no position can be answered without risking un-demoting.
+    #[error("demotion set unavailable")]
+    DemotionUnavailable,
 }
 
 /// Reads a shard item's own index, or `None` if it is missing or out of range.
@@ -500,6 +569,8 @@ mod tests {
             shuffle_seed: None,
             participant_count: None,
             prequeue_offsets: None,
+            demoted_count: 0,
+            demotion: None,
             message: None,
             target_rate: None,
             stored_control: StoredControl::Open,
@@ -532,6 +603,165 @@ mod tests {
         counters.prequeue_offsets = Some([0, 0, 0, 1, 1, 1, 2, 2, 2, 2]);
         let sealed = counters.sealed().unwrap();
         assert_eq!(sealed.offsets.participant_count(), 3);
+    }
+
+    fn sealed_counters(counts: [u64; SHARDS], demoted: u64) -> Counters {
+        let sealed = SealedOffsets::seal(counts).unwrap();
+        let mut offsets = [0u64; SHARDS];
+        for (s, slot) in offsets.iter_mut().enumerate() {
+            *slot = sealed.offset(s);
+        }
+        let mut counters = unsealed_counters(Phase::Active);
+        counters.shuffle_seed = Some([3u8; 32]);
+        counters.participant_count = Some(sealed.participant_count());
+        counters.prequeue_offsets = Some(offsets);
+        counters.demoted_count = demoted;
+        counters.queue_counter = if demoted > 0 {
+            sealed.participant_count().saturating_mul(2)
+        } else {
+            sealed.participant_count()
+        };
+        counters
+    }
+
+    fn prequeue_row(s: u8, l: u64, asn: Option<&str>) -> PreQueueItem {
+        PreQueueItem {
+            r: format!("r-{s}-{l}"),
+            s,
+            l,
+            t: 0,
+            v: asn.map(|asn| Telemetry {
+                a: None,
+                n: Some(asn.to_owned()),
+                c: None,
+                j: None,
+                u: None,
+                q: None,
+            }),
+        }
+    }
+
+    fn farm_set() -> DemotionSet {
+        DemotionSet::from_groups(&[crate::demotion::DemotedGroup {
+            signal: crate::demotion::Signal::Asn,
+            value: "64500".to_owned(),
+            count: 5,
+            max: 2,
+        }])
+    }
+
+    fn position_of(counters: &Counters, row: &PreQueueItem, set: Option<&DemotionSet>) -> u64 {
+        match counters.resolve_prequeue(row, set).unwrap() {
+            ResolvedPosition::PreQueue(p) => Some(p),
+            ResolvedPosition::LiveJoin => None,
+        }
+        .unwrap()
+    }
+
+    #[test]
+    fn a_row_the_set_matches_resolves_into_the_tail_behind_the_whole_cohort() {
+        // Cohort of 20 across two shards; every fourth row reports the farm's
+        // ASN. Matched rows must land in [N, 2N) at their own slot, unmatched
+        // rows in [0, N), and no two rows may share a position — a duplicate
+        // position is a visible fairness failure.
+        let counters = sealed_counters([10, 10, 0, 0, 0, 0, 0, 0, 0, 0], 5);
+        let set = farm_set();
+        let n = 20;
+        let mut positions = std::collections::HashSet::new();
+        for s in 0..2u8 {
+            for l in 0..10u64 {
+                let farmed = l % 4 == 0;
+                let asn = if farmed { Some("64500") } else { Some("7922") };
+                let row = prequeue_row(s, l, asn);
+                let p = position_of(&counters, &row, Some(&set));
+                let primary = position_of(&counters, &prequeue_row(s, l, None), Some(&set));
+                if farmed {
+                    assert!((n..2 * n).contains(&p), "demoted row landed at {p}");
+                    // The same slot, one copy of the index space later.
+                    assert_eq!(p, n + primary);
+                } else {
+                    assert!(p < n, "primary row landed at {p}");
+                }
+                assert!(positions.insert(p), "duplicate position {p}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_untelemetered_row_is_never_demoted() {
+        let counters = sealed_counters([10, 10, 0, 0, 0, 0, 0, 0, 0, 0], 5);
+        let p = position_of(&counters, &prequeue_row(0, 3, None), Some(&farm_set()));
+        assert!(p < 20);
+    }
+
+    #[test]
+    fn a_demoting_event_refuses_to_resolve_without_its_set() {
+        // Answering from the primary slot alone would silently un-demote
+        // every demoted row, so no answer is the only safe answer.
+        let counters = sealed_counters([10, 10, 0, 0, 0, 0, 0, 0, 0, 0], 5);
+        assert_eq!(
+            counters.resolve_prequeue(&prequeue_row(0, 3, Some("64500")), None),
+            Err(ResolveError::DemotionUnavailable)
+        );
+        // An event that demoted nobody needs no set, and ignores one.
+        let plain = sealed_counters([10, 10, 0, 0, 0, 0, 0, 0, 0, 0], 0);
+        let without = position_of(&plain, &prequeue_row(0, 3, Some("64500")), None);
+        let with = position_of(
+            &plain,
+            &prequeue_row(0, 3, Some("64500")),
+            Some(&farm_set()),
+        );
+        assert_eq!(without, with);
+        assert!(without < 20);
+    }
+
+    #[test]
+    fn a_straggler_is_a_live_join_even_when_the_set_matches_it() {
+        // The straggler rule runs first: a row past its shard's issued count
+        // was never in the cohort the seal classified.
+        let counters = sealed_counters([10, 10, 0, 0, 0, 0, 0, 0, 0, 0], 5);
+        assert_eq!(
+            counters
+                .resolve_prequeue(&prequeue_row(0, 10, Some("64500")), Some(&farm_set()))
+                .unwrap(),
+            ResolvedPosition::LiveJoin
+        );
+    }
+
+    #[test]
+    fn from_item_reads_the_demotion_ref_only_when_whole() {
+        let mut item = HashMap::new();
+        item.insert(
+            DEMOTION_NONCE_ATTR.to_owned(),
+            AttributeValue::S("0badcafe".to_owned()),
+        );
+        // Nonce without a chunk count is not a usable reference.
+        assert!(Counters::from_item("evt-1", &item).demotion.is_none());
+        item.insert(
+            DEMOTION_CHUNKS_ATTR.to_owned(),
+            AttributeValue::N("3".to_owned()),
+        );
+        assert_eq!(
+            Counters::from_item("evt-1", &item).demotion,
+            Some(DemotionRef {
+                nonce: "0badcafe".to_owned(),
+                chunks: 3
+            })
+        );
+    }
+
+    #[test]
+    fn from_item_reads_the_demoted_count_and_defaults_it_to_zero() {
+        assert_eq!(
+            Counters::from_item("evt-1", &HashMap::new()).demoted_count,
+            0
+        );
+        let mut item = HashMap::new();
+        item.insert(
+            DEMOTED_COUNT_ATTR.to_owned(),
+            AttributeValue::N("42".to_owned()),
+        );
+        assert_eq!(Counters::from_item("evt-1", &item).demoted_count, 42);
     }
 
     #[test]

@@ -32,6 +32,7 @@ One record per decision. Each states the context, the decision, and its conseque
 | [0026](0026-entry-tickets.md) | One position per identity, from a customer-signed entry ticket (superseded by 0028) |
 | [0027](0027-ticket-delivery-fragment-not-query.md) | Deliver the entry ticket by cookie, or by URL fragment — never a query string (superseded by 0028) |
 | [0028](0028-remove-entry-tickets.md) | Remove entry tickets: nothing could use them without customer-side work we do not supply |
+| [0029](0029-seal-time-demotion.md) | Demote telemetry groups to the tail at the seal, matching on read |
 
 ## Open
 
@@ -40,6 +41,7 @@ Decisions deferred until measurement or a client engagement supplies the input.
 | Question | Resolves how |
 |---|---|
 | Bot Control Common versus Targeted | Run Targeted in Count mode during a real event and measure what it catches that Common does not. Ten times the per-request cost. |
+| Demotion thresholds (ADR-0029) | Run a real event with rules set and `demotion_mode = observe`; read the report's groups against what the operator knows about their audience (NAT, campus, carrier egress) before enforcing anything. |
 | Flat-rate versus pay-as-you-go CloudFront pricing | Flat-rate is usually the better fit for a large planned event (predictable, caps exposure), but the Terraform provider cannot create a flat-rate distribution yet ([#45450](https://github.com/hashicorp/terraform-provider-aws/issues/45450), PR #49235). PAYG is the default until it lands; flat-rate is selected manually per event. The crossover is otherwise non-monotonic in event size, poll interval and Bot Control tier. |
 | Signing key rotation | Compromise permits minting admission for every event in the deployment. |
 | Standby inflow measurement placement | Authorizer-local versus centrally aggregated. |

@@ -1,28 +1,41 @@
 //! The `aws-sdk-dynamodb`-backed [`Store`] for the seal.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
 use aws_sdk_dynamodb::types::AttributeValue;
-use wr_common::expr::{Condition, Key, Update};
-use wr_common::{Phase, SHARDS, Shard, shard_count_of, shard_index_of};
+use tokio::task::JoinSet;
+use wr_common::expr::{
+    Condition, DEMOTED_COUNT_ATTR, DEMOTION_CHUNKS_ATTR, DEMOTION_ENTRIES_ATTR,
+    DEMOTION_NONCE_ATTR, Key, Update,
+};
+use wr_common::{
+    DemotionReport, Phase, PreQueueItem, SHARDS, Shard, shard_count_of, shard_index_of,
+};
 
-use crate::{SealValues, Store, StoreError};
+use crate::{ScannedRow, SealValues, Store, StoreError};
 
-/// A live `DynamoDB` store bound to the counters table.
+/// Parallel scan segments. The scan is bounded by page round trips, not CPU:
+/// at a million rows and 1 MB pages, eight segments finish in seconds.
+const SCAN_SEGMENTS: i32 = 8;
+
+/// A live `DynamoDB` store bound to the counters and pre-queue tables.
 pub struct DynamoStore {
     client: Client,
     counters_table: String,
+    prequeue_table: String,
 }
 
 impl DynamoStore {
     #[must_use]
-    pub fn new(client: Client, counters_table: String) -> Self {
+    pub fn new(client: Client, counters_table: String, prequeue_table: String) -> Self {
         Self {
             client,
             counters_table,
+            prequeue_table,
         }
     }
 }
@@ -71,6 +84,25 @@ impl Store for DynamoStore {
         counts_from_shard_items(items)
     }
 
+    async fn scan_prequeue(
+        &self,
+        visit: Arc<dyn Fn(ScannedRow) + Send + Sync>,
+    ) -> Result<u64, StoreError> {
+        let mut segments = JoinSet::new();
+        for segment in 0..SCAN_SEGMENTS {
+            let client = self.client.clone();
+            let table = self.prequeue_table.clone();
+            let visit = Arc::clone(&visit);
+            segments.spawn(async move { scan_segment(client, table, segment, visit).await });
+        }
+        let mut scanned = 0u64;
+        while let Some(joined) = segments.join_next().await {
+            let count = joined.map_err(|e| StoreError(format!("scan segment panicked: {e}")))??;
+            scanned = scanned.saturating_add(count);
+        }
+        Ok(scanned)
+    }
+
     async fn write_seal(&self, event_id: &str, values: &SealValues) -> Result<bool, StoreError> {
         let offsets_list: Vec<AttributeValue> = values
             .offsets
@@ -79,23 +111,43 @@ impl Store for DynamoStore {
             .collect();
 
         let count = AttributeValue::N(values.participant_count.to_string());
-        // queue_counter takes the cohort size too: the live-join sequence
-        // starts behind the whole pre-queue cohort, or `ADD queue_counter`
-        // would hand a post-seal joiner position 1, already owned inside
-        // `[0, N)`.
-        let seal = Update::new()
+        // queue_counter starts behind the cohort *and its tail*: the live-join
+        // sequence must not hand a post-seal joiner a position already owned
+        // inside `[0, N)` or inside the tail `[N, 2N)`.
+        let live_join_start = values
+            .queue_counter_start()
+            .map_err(|e| StoreError(format!("live-join start: {e}")))?;
+        let mut seal = Update::new()
             .set(
                 "shuffle_seed",
                 AttributeValue::B(aws_sdk_dynamodb::primitives::Blob::new(values.seed)),
             )
-            .set("participant_count", count.clone())
-            .set("queue_counter", count)
+            .set("participant_count", count)
+            .set(
+                "queue_counter",
+                AttributeValue::N(live_join_start.to_string()),
+            )
             .set("prequeue_offsets", AttributeValue::L(offsets_list))
             .set(
                 "phase",
                 AttributeValue::S(Phase::Active.as_wire_str().to_owned()),
-            )
-            .build();
+            );
+        if let Some(demotion) = &values.demotion {
+            seal = seal
+                .set(
+                    DEMOTED_COUNT_ATTR,
+                    AttributeValue::N(values.demoted_count.to_string()),
+                )
+                .set(
+                    DEMOTION_NONCE_ATTR,
+                    AttributeValue::S(demotion.nonce.clone()),
+                )
+                .set(
+                    DEMOTION_CHUNKS_ATTR,
+                    AttributeValue::N(demotion.chunks.to_string()),
+                );
+        }
+        let seal = seal.build();
 
         // The seed is written by the seal and nothing else, so its absence
         // means "not yet sealed" and a double-fire is rejected rather than
@@ -130,6 +182,123 @@ impl Store for DynamoStore {
             Err(e) => Err(StoreError(format!("update_item: {e}"))),
         }
     }
+
+    async fn write_report(
+        &self,
+        event_id: &str,
+        report: &DemotionReport,
+    ) -> Result<(), StoreError> {
+        let mut item: HashMap<String, AttributeValue> = serde_dynamo::to_item(report)
+            .map_err(|e| StoreError(format!("serialize report: {e}")))?;
+        let key = Key::DemotionReport { event_id };
+        item.insert(key.attr().to_owned(), AttributeValue::S(key.value()));
+        self.client
+            .put_item()
+            .table_name(&self.counters_table)
+            .set_item(Some(item))
+            .send()
+            .await
+            .map_err(|e| StoreError(format!("put_item report: {e}")))?;
+        Ok(())
+    }
+
+    async fn write_demotion_chunks(
+        &self,
+        event_id: &str,
+        nonce: &str,
+        chunks: &[Vec<String>],
+    ) -> Result<(), StoreError> {
+        // A handful of items at most (a chunk is 300 KB of entries), written
+        // in order so a partial failure leaves a prefix; the seal that would
+        // name them is never written after a failure here.
+        for (index, chunk) in chunks.iter().enumerate() {
+            let chunk_index = u32::try_from(index)
+                .map_err(|_err| StoreError("demotion set has too many chunks".to_owned()))?;
+            let key = Key::DemotionGroups {
+                event_id,
+                nonce,
+                chunk: chunk_index,
+            };
+            let entries: Vec<AttributeValue> = chunk
+                .iter()
+                .map(|entry| AttributeValue::S(entry.clone()))
+                .collect();
+            self.client
+                .put_item()
+                .table_name(&self.counters_table)
+                .item(key.attr(), AttributeValue::S(key.value()))
+                .item(DEMOTION_ENTRIES_ATTR, AttributeValue::L(entries))
+                .send()
+                .await
+                .map_err(|e| StoreError(format!("put_item demotion chunk {chunk_index}: {e}")))?;
+        }
+        Ok(())
+    }
+
+    async fn delete_demotion_chunks(
+        &self,
+        event_id: &str,
+        nonce: &str,
+        count: u32,
+    ) -> Result<(), StoreError> {
+        for chunk in 0..count {
+            let key = Key::DemotionGroups {
+                event_id,
+                nonce,
+                chunk,
+            };
+            self.client
+                .delete_item()
+                .table_name(&self.counters_table)
+                .set_key(Some(key.build()))
+                .send()
+                .await
+                .map_err(|e| StoreError(format!("delete_item demotion chunk {chunk}: {e}")))?;
+        }
+        Ok(())
+    }
+}
+
+/// One segment of the parallel scan, feeding every row to `visit`.
+async fn scan_segment(
+    client: Client,
+    table: String,
+    segment: i32,
+    visit: Arc<dyn Fn(ScannedRow) + Send + Sync>,
+) -> Result<u64, StoreError> {
+    let mut scanned = 0u64;
+    let mut pages = client
+        .scan()
+        .table_name(&table)
+        .segment(segment)
+        .total_segments(SCAN_SEGMENTS)
+        // Consistent, like the shard-count read: the cohort is every row
+        // written before the seal, and an eventually consistent scan could
+        // miss the last seconds of registrations — exactly the ones a farm
+        // times for T−0.
+        .consistent_read(true)
+        .into_paginator()
+        .items()
+        .send();
+    while let Some(item) = pages.next().await {
+        let item = item.map_err(|e| StoreError(format!("scan segment {segment}: {e}")))?;
+        let row: PreQueueItem = match serde_dynamo::from_item(item) {
+            Ok(row) => row,
+            Err(e) => {
+                // A row this crate cannot read is a row it cannot classify;
+                // it keeps its primary slot, and the seal goes on.
+                tracing::warn!(error = %e, "skipping an unreadable pre-queue row");
+                continue;
+            }
+        };
+        visit(ScannedRow {
+            shard: row.s,
+            local_index: row.l,
+            telemetry: row.v,
+        });
+        scanned = scanned.saturating_add(1);
+    }
+    Ok(scanned)
 }
 
 /// Folds a batch-get response's shard items into per-shard counts.

@@ -391,6 +391,18 @@ async fn dashboard(State(state): State<Shared>, headers: HeaderMap, now: Arrival
                     view.rules_load_failed = true;
                 }
             }
+            // The seal's demotion report (issue #145) is its own item, so a
+            // third read; like the ruleset, a failure hides the card's detail
+            // rather than the dashboard.
+            {
+                use admin::Store;
+                match state.store.load_demotion_report(&state.event_id).await {
+                    Ok(report) => view.with_demotion_report(report.as_ref()),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "could not read the demotion report");
+                    }
+                }
+            }
             match view.render() {
                 Ok(html) => {
                     let mut response = Html(html).into_response();

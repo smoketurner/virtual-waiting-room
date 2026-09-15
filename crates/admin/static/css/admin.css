@@ -314,6 +314,32 @@ body {
   color: var(--gray-200);
 }
 
+/* --- Group table (seal-time demotion report, issue #145) ------------------ */
+
+table.groups {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 20px;
+  font-size: 14px;
+}
+
+table.groups th {
+  text-align: left;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--gray-500);
+  padding: 0 12px 8px 0;
+  border-bottom: 1px solid var(--vouch-border);
+}
+
+table.groups td {
+  padding: 8px 12px 8px 0;
+  border-bottom: 1px solid var(--vouch-border);
+  color: var(--gray-200);
+  font-variant-numeric: tabular-nums;
+}
+
 /* --- Badges (Vouch .badge / .badge-success / .badge-warning) --------------- */
 
 .status {

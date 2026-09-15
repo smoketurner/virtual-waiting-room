@@ -2,7 +2,9 @@
 #
 #   seal_event  fired once at the event start by an EventBridge schedule; reads
 #               the shard counts and writes the seal (seed + offsets + count +
-#               phase) in one conditional UpdateItem.
+#               phase) in one conditional UpdateItem. With demotion rules set
+#               (issue #145) it first scans the pre-queue, classifies it, and
+#               stores the demoted groups once for every resolver to match on.
 #   read        serves GET /v1/status and /v1/queue_num over API Gateway; the
 #               route wiring lives in api.tf.
 #
@@ -28,8 +30,14 @@ resource "aws_lambda_function" "seal_event" {
   runtime       = "provided.al2023"
   architectures = [local.lambda_runtime_arch]
   handler       = "bootstrap"
-  timeout       = 30
-  memory_size   = 256
+  # Sized for the demotion scan (issue #145), not the seal write: with rules
+  # set the function reads every pre-queue row and holds a few words per row
+  # plus the interned signal values in memory — tens of megabytes at a million
+  # registrations — and writes nothing per row. With no rules it is the same
+  # single write it always was and finishes in well under a second; the
+  # ceiling costs nothing unused.
+  timeout     = 300
+  memory_size = 1024
 
   filename         = local.lambda_zip["seal_event"]
   source_code_hash = local.lambda_hash["seal_event"]
@@ -37,6 +45,10 @@ resource "aws_lambda_function" "seal_event" {
   environment {
     variables = merge(local.dynamo_lambda_env, {
       COUNTERS_TABLE = aws_dynamodb_table.counters.name
+      PREQUEUE_TABLE = aws_dynamodb_table.prequeue.name
+      # Seal-time demotion (issue #145). Empty rules = no scan at all.
+      DEMOTION_RULES = var.demotion_rules
+      DEMOTION_MODE  = var.demotion_mode
     })
   }
 

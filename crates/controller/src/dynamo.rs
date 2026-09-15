@@ -117,6 +117,8 @@ impl Store for DynamoStore {
                 serving_counter: num(item, "serving_counter"),
                 queue_counter: num(item, "queue_counter"),
                 target_rate,
+                participant_count: num(item, "participant_count"),
+                demoted_count: num(item, wr_common::expr::DEMOTED_COUNT_ATTR),
             },
             prev_no_show,
             max_expired_position: num(item, "max_expired_position"),

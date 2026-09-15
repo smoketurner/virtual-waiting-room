@@ -35,6 +35,7 @@ reqwest = { workspace = true, features = ["json", "rustls-tls-webpki-roots-no-pr
 rust-embed = { workspace = true }
 rustls = { workspace = true, features = ["aws_lc_rs", "std", "tls12"] }
 serde = { workspace = true, features = ["derive"] }
+serde_dynamo = { workspace = true, features = ["aws-sdk-dynamodb+1"] }
 serde_json = { workspace = true, features = ["std"] }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
