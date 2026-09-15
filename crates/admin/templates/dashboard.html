@@ -241,7 +241,7 @@
             <dd class="kv-val"><code>{{ demotion.rules }}</code></dd>
           </div>
           <div>
-            <dt class="kv-key">{% if demotion.mode == "enforce" %}Demoted{% else %}Would demote{% endif %}</dt>
+            <dt class="kv-key">{% if !demotion.error.is_empty() %}Scanned{% else if demotion.mode == "enforce" %}Demoted{% else %}Would demote{% endif %}</dt>
             <dd class="kv-val"><strong>{{ demotion.demoted }}</strong> of {{ demotion.cohort }} registrations in {{ demotion.groups_total }} group{% if demotion.groups_total != 1 %}s{% endif %}</dd>
           </div>
         </dl>

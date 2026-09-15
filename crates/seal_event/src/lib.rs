@@ -250,7 +250,7 @@ pub async fn seal_event<S: Store>(
                 tracing::info!(event_id, "event already sealed; no-op");
                 return Ok(SealResult::AlreadySealed);
             }
-            let report = DemotionReport::from_error(&config.rules_text, error, now);
+            let report = DemotionReport::from_error(&config.rules_text, config.mode, error, now);
             if let Err(e) = store.write_report(event_id, &report).await {
                 tracing::error!(event_id, error = %e, "could not write the demotion report");
             }
@@ -735,10 +735,49 @@ mod tests {
         };
         assert_eq!(values.demoted_count, 0);
         let report = store.report.lock().unwrap().clone().unwrap();
+        assert_eq!(report.mode, "enforce");
         assert_eq!(report.rules, "address:lots");
         assert!(report.error.is_some());
         assert_eq!(report.sealed_at, 5);
         assert!(store.chunks.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unparsable_rules_preserve_the_configured_mode_in_the_report() {
+        // A misconfigured `enforce` event that fails to parse must record
+        // `enforce` in the audit item, not `observe` — observe, per ADR-0029,
+        // means a classification ran, and the error path runs none.
+        let store = FakeStore::new([10, 0, 0, 0, 0, 0, 0, 0, 0, 0], false).with_rows(farmed_rows());
+        seal_event(
+            &store,
+            "evt-1",
+            [1u8; 32],
+            NONCE,
+            &config("address:lots", DemotionMode::Enforce),
+            5,
+        )
+        .await
+        .unwrap();
+        let report = store.report.lock().unwrap().clone().unwrap();
+        assert_eq!(report.mode, "enforce");
+    }
+
+    #[tokio::test]
+    async fn unparsable_rules_in_observe_mode_record_observe_in_the_report() {
+        // The configured mode is forwarded verbatim, so observe stays observe.
+        let store = FakeStore::new([10, 0, 0, 0, 0, 0, 0, 0, 0, 0], false).with_rows(farmed_rows());
+        seal_event(
+            &store,
+            "evt-1",
+            [1u8; 32],
+            NONCE,
+            &config("address:lots", DemotionMode::Observe),
+            5,
+        )
+        .await
+        .unwrap();
+        let report = store.report.lock().unwrap().clone().unwrap();
+        assert_eq!(report.mode, "observe");
     }
 
     #[test]

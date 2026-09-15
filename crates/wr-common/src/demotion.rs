@@ -625,11 +625,20 @@ impl DemotionReport {
         }
     }
 
-    /// The report for a seal whose rules string could not be parsed.
+    /// The report for a seal whose rules string could not be parsed. The
+    /// configured `mode` is recorded verbatim — the report's job is to say
+    /// what the operator set out to do, and the outcome ("did not apply") is
+    /// carried by `error` and the zeroed counts, not by relabelling the mode
+    /// as `observe`, which ADR-0029 defines as running the classification.
     #[must_use]
-    pub fn from_error(rules_text: &str, error: &RuleParseError, sealed_at: u64) -> Self {
+    pub fn from_error(
+        rules_text: &str,
+        mode: DemotionMode,
+        error: &RuleParseError,
+        sealed_at: u64,
+    ) -> Self {
         Self {
-            mode: DemotionMode::Observe.as_wire_str().to_owned(),
+            mode: mode.as_wire_str().to_owned(),
             rules: rules_text.to_owned(),
             cohort: 0,
             demoted: 0,
@@ -883,6 +892,31 @@ mod tests {
         assert_eq!(report.mode, "enforce");
         assert_eq!(report.rules, "ua:1");
         assert_eq!(report.demoted, classification.demoted);
+    }
+
+    #[test]
+    fn from_error_records_the_configured_mode_not_a_hardcoded_observe() {
+        // The parse-error path runs no classification, so the report must say
+        // what the operator *configured* rather than relabelling the run as
+        // observe — ADR-0029 defines observe as running the classification,
+        // which this path never does. The outcome ("did not apply") is carried
+        // by `error` and the zeroed counts.
+        let error = RuleParseError::Malformed("address:lots".to_owned());
+        let enforce = DemotionReport::from_error("address:lots", DemotionMode::Enforce, &error, 9);
+        assert_eq!(enforce.mode, "enforce");
+        assert_eq!(enforce.rules, "address:lots");
+        assert_eq!(enforce.sealed_at, 9);
+        assert_eq!(
+            enforce.error.as_deref(),
+            Some("rule \"address:lots\" is not of the form signal:max")
+        );
+        assert_eq!(enforce.cohort, 0);
+        assert_eq!(enforce.demoted, 0);
+        assert_eq!(enforce.groups_total, 0);
+        assert!(enforce.groups.is_empty());
+
+        let observe = DemotionReport::from_error("address:lots", DemotionMode::Observe, &error, 9);
+        assert_eq!(observe.mode, "observe");
     }
 
     #[test]

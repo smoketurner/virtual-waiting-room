@@ -427,6 +427,41 @@ mod tests {
         let html = view.render().unwrap();
         assert!(html.contains("did not parse"));
         assert!(html.contains("Largest 1 of 250 groups shown"));
+        // The error path ran no classification, so the count is labelled
+        // "Scanned", never "Demoted" (which implies a scan ran and won).
+        assert!(html.contains("Scanned"));
+        assert!(!html.contains("Demoted"));
+        assert!(!html.contains("Would demote"));
+    }
+
+    #[test]
+    fn a_parse_error_report_does_not_pretend_a_scan_ran_whatever_the_mode() {
+        // The real error path zeroes cohort/groups and carries the parse error.
+        // For both configured modes the count label reads "Scanned", so the
+        // operator is not told the seal scanned an empty cohort it never
+        // classified.
+        for mode in ["enforce", "observe"] {
+            let mut view = Dashboard::from_state(&state(), 0);
+            let report = wr_common::DemotionReport {
+                mode: mode.to_owned(),
+                rules: "address:lots".to_owned(),
+                cohort: 0,
+                demoted: 0,
+                groups_total: 0,
+                groups: vec![],
+                sealed_at: 1,
+                error: Some("rule \"address:lots\" is not of the form signal:max".to_owned()),
+            };
+            view.with_demotion_report(Some(&report));
+            let html = view.render().unwrap();
+            assert!(
+                html.contains(&format!("<strong>{mode}</strong>")),
+                "mode {mode}"
+            );
+            assert!(html.contains("Scanned"), "mode {mode}");
+            assert!(!html.contains("Demoted"), "mode {mode}");
+            assert!(!html.contains("Would demote"), "mode {mode}");
+        }
     }
 
     #[test]
