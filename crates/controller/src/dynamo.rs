@@ -1,10 +1,6 @@
 //! The `aws-sdk-dynamodb`-backed [`Store`] for the controller.
 //!
-//! `Positions` is keyed only by `request_id` with no secondary index, so the
-//! expiry read is a `Scan` filtering on `queue_position` and `status` — the
-//! positions the admission cursor has left behind that nobody claimed.
-//!
-//! The event's own state is a single-item `GetItem`/`UpdateItem`. The arrivals
+//! The controller reads and writes one table. The event's own state is a single-item `GetItem`/`UpdateItem`. The arrivals
 //! shards are separate items under their own partition keys, so summing them
 //! is a `BatchGetItem` rather than attributes already in hand.
 
@@ -109,7 +105,6 @@ impl Store for DynamoStore {
                 serving_counter: num(item, "serving_counter"),
                 queue_counter: num(item, "queue_counter"),
                 target_rate,
-                participant_count: num(item, "participant_count"),
             },
             prev_no_show,
         })
@@ -170,12 +165,10 @@ impl Store for DynamoStore {
                     UpdateItemError::ConditionalCheckFailedException(_)
                 ) =>
             {
-                // Another invoke advanced first; this pass's release is stale.
-                // The release did not persist, so `decision.next_serving_counter`
-                // is *not* the live cursor — the caller must not derive an expiry
-                // cutoff from it. Returning `LostRace` lets `run_pass` skip
-                // expiry on this pass; the next pass's consistent read of
-                // `serving_counter` produces the correct cutoff.
+                // Another invoke advanced first; this pass's release is stale
+                // and did not persist. Returning `LostRace` rather than `Ok`
+                // lets `run_pass` report that it released nobody instead of
+                // claiming the release the winner actually made.
                 tracing::info!(event_id, "release write lost the race; skipping");
                 Ok(ReleaseOutcome::LostRace)
             }

@@ -1,11 +1,14 @@
-//! Closed-loop outflow controller with position expiry.
+//! Closed-loop outflow controller.
 //!
 //! Each interval the controller runs one pass over an event's `Counters` item:
 //! it measures the arrival rate against what it released last interval, derives
 //! the no-show rate, smooths it, and advances `serving_counter` by a bounded
 //! correction so the origin runs at the operator's target rate despite visitors
-//! who never click through. It then expires positions whose `expires_at` has
-//! passed and advances `max_expired_position`.
+//! who never click through.
+//!
+//! It expires nothing. A position lives until `DynamoDB` TTL reclaims its row,
+//! and the no-show correction is what compensates for people who never arrive
+//! ([`ADR-0031`](../../../docs/adr/0031-remove-controller-driven-expiry.md)).
 //!
 //! A pass runs only when the event is `Active` **and** the operator's
 //! [`AdmissionControl`] is `Open`. The phase says the event is running; the
@@ -94,9 +97,6 @@ pub struct ReleaseInputs {
     pub queue_counter: u64,
     /// Operator target rate in visitors per second (the `/admin/rate` value).
     pub target_rate: u32,
-    /// `N`, the opened pre-queue cohort size; `0` before an open or for a
-    /// live-join-only event.
-    pub participant_count: u64,
 }
 
 /// The outcome of one release computation.
@@ -301,25 +301,22 @@ pub struct StoreError(pub String);
 /// landed, or a concurrent invoke advanced the cursor first and this pass's
 /// release was a no-op.
 ///
-/// `run_pass` derives the expiry cutoff from `decision.next_serving_counter`,
-/// which only reflects the persisted cursor when the release landed. On
-/// [`ReleaseOutcome::LostRace`] that value was never written, so using it for
-/// expiry would mark positions `expired` against a phantom cursor — positions
-/// whose owners were offered a place fewer than [`ADMISSION_GRACE_SECS`] ago.
-/// The next pass reads the persisted cursor with a consistent read and emits
-/// the correct cutoff, so the lost pass skips expiry entirely.
+/// The distinction is what the pass reports. `decision.next_serving_counter`
+/// reflects the persisted cursor only when the write landed; on
+/// [`ReleaseOutcome::LostRace`] it is a value the guard specifically refused,
+/// and the winner released those people. Collapsing the two into `Ok` would
+/// have the losing pass claim a release it did not make, double-counting the
+/// winner's in the logs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReleaseOutcome {
     /// The `UpdateItem` landed: `serving_counter` advanced to
     /// `decision.next_serving_counter`, and the carried-forward smoothing
     /// state is persisted. The decision's `next_serving_counter` is the real
-    /// cursor and is safe to derive an expiry cutoff from.
+    /// cursor, and this pass released `decision.release` people.
     Advanced,
     /// Another invoke advanced the cursor first; this pass's release is stale
     /// and did not persist. `decision.next_serving_counter` is **not** the
-    /// persisted cursor — deriving an expiry cutoff from it would over-expire
-    /// positions still inside the grace window. Expiry must be skipped on this
-    /// pass.
+    /// persisted cursor, and this pass released nobody.
     LostRace,
 }
 
@@ -369,9 +366,9 @@ pub trait Store {
     /// [`ReleaseOutcome::LostRace`] when a concurrent invoke advanced first and
     /// this pass's `UpdateItem` failed its `serving_counter = :expected`
     /// condition. A lost race is **not** an error: the winner persisted a
-    /// consistent cursor. But the caller must not derive an expiry cutoff from
-    /// the (non-persisted) `decision.next_serving_counter` on a lost race, so
-    /// the outcome distinguishes the two cases that [`Ok`] used to collapse.
+    /// consistent cursor. The outcome distinguishes the two cases that [`Ok`]
+    /// used to collapse, so a losing pass reports releasing nobody rather than
+    /// claiming the release the winner made.
     fn write_release(
         &self,
         event_id: &str,
@@ -399,17 +396,12 @@ pub enum PassOutcome {
 }
 
 /// Runs one controller pass for the event: read state, gate on `Active` and on
-/// the operator's admission override, compute and write the release, then expire
-/// due positions and advance `max_expired_position`.
+/// the operator's admission override, then compute and write the release.
 ///
 /// If the guarded `write_release` loses its race against a concurrent invoke,
-/// the release did not persist and `decision.next_serving_counter` is a
-/// phantom the guard refused to land. Expiry is skipped on that pass: the
-/// cutoff is derived from the persisted cursor, and a non-persisted cursor
-/// would over-expire positions still inside the grace window. The next pass
-/// reads the persisted cursor with a consistent read and emits the correct
-/// cutoff, so the pass reports `Ran { released: 0, expired: 0 }` only when it
-/// did nothing observable.
+/// the release did not persist: the winner advanced the cursor, and this pass
+/// released nobody. It reports `Ran { released: 0 }` rather than claiming the
+/// release its own `UpdateItem` was refused.
 ///
 /// `now` (epoch seconds) is a parameter rather than read from the system
 /// clock inside this function, so the controller's arithmetic — including
@@ -435,11 +427,11 @@ pub async fn run_pass<S: Store>(
 
     let admission_control = resolve(state.stored_control, state.fail_open_until, now);
 
-    // Any control other than Open returns the whole pass, so neither
-    // `serving_counter` nor the expiry cursor advances: a visitor cannot lose a
-    // position to expiry during a hold they had no way to act through. Under
-    // fail-open the waiting room is bypassed, so a release would meter nothing;
-    // leaving the counter put lets a recovery resume from it.
+    // Any control other than Open returns the whole pass, so `serving_counter`
+    // does not advance: a hold means nobody is admitted, not that admissions
+    // accrue silently. Under fail-open the waiting room is bypassed, so a
+    // release would meter nothing; leaving the counter put lets a recovery
+    // resume from it.
     match admission_control {
         AdmissionControl::Open => {}
         control @ (AdmissionControl::Paused | AdmissionControl::FailOpen) => {
@@ -508,7 +500,6 @@ mod tests {
             // computation rather than the end-of-line clamp.
             queue_counter: u64::MAX,
             target_rate: rate,
-            participant_count: 0,
         }
     }
 
@@ -896,10 +887,8 @@ mod tests {
             phase: Phase::Active,
             stored_control: StoredControl::Open,
             fail_open_until: 0,
-            // The cursor is far enough along that the grace window has closed
-            // behind it: at 50/s over 120s it covers 6000 positions, so nothing
-            // expires until it is past that. Early in an event nothing has been
-            // offered long enough ago to count as declined.
+            // A cursor well into the event, with a release already behind it,
+            // so the no-show measurement has something to measure.
             inputs: {
                 let mut i = inputs(250, 0, 20_000, 19_500, 50);
                 i.queue_counter = u64::MAX;
@@ -1089,7 +1078,6 @@ mod tests {
                     serving_counter: serving,
                     queue_counter: queue,
                     target_rate: rate,
-                    participant_count: 0,
                         },
                 prev_rate,
             );
@@ -1139,7 +1127,6 @@ mod tests {
             last_serving in any::<u64>(),
             queue in any::<u64>(),
             rate in 1u32..=100_000,
-            n in any::<u64>(),
         ) {
             let d = compute_release(
                 ReleaseInputs {
@@ -1149,7 +1136,6 @@ mod tests {
                     serving_counter: serving,
                     queue_counter: queue,
                     target_rate: rate,
-                    participant_count: n,
                 },
                 None,
             );
