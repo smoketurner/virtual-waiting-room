@@ -10,6 +10,9 @@ event, and rewrites the event's own item from scratch, so the next test run
 starts from a known state instead of inheriting positions, open outputs and
 counters from the last one.
 
+This is a test convenience, not a deployment step: Terraform seeds the event
+item at apply, so a fresh stack serves without it.
+
 The `Counters` item is deleted and rewritten rather than patched. Stale
 attributes are the whole problem this script exists to solve: a leftover
 `shuffle_seed` and `participant_count` describe a cohort whose `PreQueue` rows

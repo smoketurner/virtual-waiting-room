@@ -148,6 +148,31 @@ resource "aws_lambda_function" "admin" {
   }
 
   tags = var.tags
+
+  # The admin Lambda reads OIDC_CLIENT_ID and OIDC_REDIRECT_URI at Init and
+  # treats either being absent as a hard error, so deploying without them
+  # produces a function that fails on every invoke -- a dead control plane whose
+  # only symptom is a 502 from API Gateway, on an apply that reported success.
+  # An empty allowlist is the same shape of failure one step later: the login
+  # completes and every operator is denied. Fail the apply instead.
+  #
+  # The redirect URI cannot be derived here: it is a path on the CloudFront
+  # distribution, and edge consumes core's KeyValueStore ARN, so core cannot
+  # depend on edge without a cycle. Apply once to create the distribution, read
+  # cloudfront_domain_name, then set these three -- which is the one sequencing
+  # step the deployment genuinely has, and it now fails loudly instead of
+  # silently.
+  lifecycle {
+    precondition {
+      condition     = var.oidc_client_id != "" && var.oidc_redirect_uri != ""
+      error_message = "oidc_client_id and oidc_redirect_uri must both be set, or the admin Lambda deploys and then fails at Init on every invoke. The redirect URI is https://<cloudfront_domain_name>/admin/callback -- apply once to create the distribution, then set them and apply again."
+    }
+
+    precondition {
+      condition     = trimspace(var.oidc_allowed_emails) != ""
+      error_message = "oidc_allowed_emails must list at least one operator, or every login is denied and the event has no control plane."
+    }
+  }
 }
 
 # API Gateway invokes the admin Lambda for the SigV4 /admin, /metrics, and
@@ -180,9 +205,13 @@ resource "aws_scheduler_schedule" "open" {
     mode = "OFF"
   }
 
-  schedule_expression          = "at(2099-12-31T23:59:59)"
-  schedule_expression_timezone = "UTC"
-  state                        = "DISABLED"
+  # Seeded from var.starts_at when one is configured, so an event scheduled in
+  # terraform.tfvars opens without an operator logging in first. Unset, the
+  # schedule is created disabled at a placeholder instant that is never the real
+  # value -- an accidental enable cannot fire an open.
+  schedule_expression          = var.starts_at == "" ? "at(2099-12-31T23:59:59)" : "at(${var.starts_at})"
+  schedule_expression_timezone = var.starts_at_timezone
+  state                        = var.starts_at == "" ? "DISABLED" : "ENABLED"
 
   target {
     arn      = aws_lambda_function.open_event.arn

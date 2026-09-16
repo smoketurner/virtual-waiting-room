@@ -41,6 +41,42 @@ resource "aws_dynamodb_table" "counters" {
   tags = var.tags
 }
 
+# The event's own Counters item, seeded so a freshly applied stack has an event.
+# Nothing else writes it: before this existed the only writer was
+# scripts/reset-env.py, so /status answered 404 and every admin action returned
+# NotFound until an operator had run a script whose docstring is headed
+# DESTRUCTIVE.
+#
+# Only the attributes a fresh event genuinely has. The sequences are written
+# explicitly at zero rather than left absent -- readers default a missing
+# counter to zero, so the two are equivalent to the code, but an explicit zero
+# is the difference between "this event has not started" and "somebody deleted
+# an attribute". shuffle_seed, participant_count and prequeue_offsets are
+# deliberately absent: the open writes those, and their absence is what
+# "not yet open" means.
+#
+# ignore_changes on the whole item because the control plane owns it from here:
+# the admin Lambda moves the phase, the rate and the message, the open writes
+# the seed and offsets, and the controller advances serving_counter. Terraform
+# seeds it and then never touches it again.
+resource "aws_dynamodb_table_item" "event" {
+  table_name = aws_dynamodb_table.counters.name
+  hash_key   = aws_dynamodb_table.counters.hash_key
+
+  item = jsonencode({
+    event_id          = { S = "EVT#${var.event_id}" }
+    phase             = { S = "idle" }
+    admission_control = { S = "open" }
+    queue_counter     = { N = "0" }
+    serving_counter   = { N = "0" }
+    target_rate       = { N = tostring(var.admission_rate) }
+  })
+
+  lifecycle {
+    ignore_changes = [item]
+  }
+}
+
 resource "aws_dynamodb_table" "prequeue" {
   name         = local.table_names.prequeue
   billing_mode = "PAY_PER_REQUEST"

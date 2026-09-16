@@ -15,15 +15,19 @@ resource "aws_cloudfront_key_value_store" "gate" {
   comment = "Virtual Waiting Room edge gate config (issue #71): 'c' the ruleset + epochs, 'k' the signing secret."
 }
 
-# 'c': the gate's whole configuration. Seeded as valid, dormant JSON — 'r': []
-# matches no rule, so a fresh stack passes every request through *by
-# configuration* rather than being broken-open by an unrecognised or
-# unparsable value (issue #60). ignore_changes because the admin Lambda
-# mutates fail_open_until (the 'f' field) out of band.
+# 'c': the gate's whole configuration, seeded from var.gate_rules so protection
+# can be declared at apply time rather than typed into the dashboard before the
+# stack protects anything. An empty variable seeds 'r': [], which matches no
+# rule and passes every request through — dormancy *by configuration* rather
+# than broken-open by an unrecognised or unparsable value (issue #60).
+#
+# ignore_changes because the admin Lambda owns this key from here: it mutates
+# fail_open_until (the 'f' field) and replaces the ruleset out of band, so
+# Terraform seeds the value and then never touches it again.
 resource "aws_cloudfrontkeyvaluestore_key" "config" {
   key                 = "c"
   key_value_store_arn = aws_cloudfront_key_value_store.gate.arn
-  value               = jsonencode({ v = 1, s = 0, f = 0, r = [] })
+  value               = jsonencode({ v = 1, s = 0, f = 0, r = local.gate_rule_wire })
 
   lifecycle {
     ignore_changes = [value]

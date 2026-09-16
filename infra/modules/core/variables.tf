@@ -237,3 +237,50 @@ variable "poll_divisor" {
     error_message = "poll_divisor must be a whole number — a fractional value fails read's u32 parse and silently disables the whole policy."
   }
 }
+
+variable "admission_rate" {
+  description = "Target admission rate in visitors per second, seeded onto the event item so the controller drains from the first apply. An absent or zero target_rate releases nobody and expires nobody, forever, while the controller logs a successful pass every ten seconds -- which is why this has a real default rather than zero. The operator changes it live from the dashboard; Terraform only seeds it."
+  type        = number
+  default     = 5
+
+  validation {
+    condition     = var.admission_rate >= 1 && var.admission_rate <= 100000 && floor(var.admission_rate) == var.admission_rate
+    error_message = "admission_rate must be a whole number of visitors per second between 1 and 100000 (MAX_ADMISSION_RATE)."
+  }
+}
+
+variable "gate_rules" {
+  description = "Which requests the edge gate covers, one rule per line, in the same grammar the dashboard's Set rules form takes: `p <path prefix>`, `c <cookie name>`, `u <user agent substring>`, or `h <header name> <header value>`. Blank lines and `#` comments are ignored. Empty means dormant -- every request passes through untouched (issue #60) -- which is a deliberate configuration, not a broken one. Seeded at apply so protection can be declared in terraform.tfvars; the dashboard owns it live thereafter."
+  type        = string
+  default     = ""
+
+  validation {
+    condition = alltrue([
+      for line in compact([for l in split("\n", var.gate_rules) : trimspace(l)]) :
+      startswith(line, "#") || can(regex("^(?:[pcu]\\s+\\S.*|h\\s+\\S+\\s+\\S.*)$", line))
+    ])
+    error_message = "each gate_rules line must be `p <path prefix>`, `c <cookie name>`, `u <user agent substring>`, `h <header name> <header value>`, a # comment, or blank."
+  }
+}
+
+variable "starts_at" {
+  description = "When the event opens, as a local date-time without a zone (`2027-03-14T10:00:00`), evaluated in starts_at_timezone. Seeds the one-time schedule so a scheduled event opens without an operator logging in first. Empty leaves the schedule disabled at a placeholder instant that is never the real value, so an accidental enable cannot fire an open. The dashboard owns the time from here; Terraform only seeds it."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.starts_at == "" || can(regex("^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}$", var.starts_at))
+    error_message = "starts_at must be empty or a local date-time with no zone or offset, e.g. 2027-03-14T10:00:00 -- the zone is starts_at_timezone."
+  }
+}
+
+variable "starts_at_timezone" {
+  description = "IANA zone the start time is evaluated in (`America/New_York`). The operator picks the zone their event opens in, and EventBridge Scheduler evaluates the expression in it, so a daylight-saving change between now and then does not move the opening."
+  type        = string
+  default     = "UTC"
+
+  validation {
+    condition     = can(regex("^(UTC|[A-Za-z]+/[A-Za-z_+-]+)$", var.starts_at_timezone))
+    error_message = "starts_at_timezone must be UTC or an IANA zone name such as America/New_York."
+  }
+}

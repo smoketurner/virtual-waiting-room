@@ -37,8 +37,8 @@ prek run             # pre-commit hooks (fmt, actionlint, zizmor, shellcheck)
 never run apply or destroy unless explicitly asked.
 
 Deployment configuration (region, `aws_profile`, `event_id`, `lambda_architecture`,
-artifact paths) lives in `infra/environments/dev/terraform.tfvars` and is
-authoritative — the Makefile deliberately passes no `-var`, since a command-line `-var` would
+artifact paths, and the event seed — `admission_rate`, `gate_rules`, `starts_at`) lives in
+`infra/environments/dev/terraform.tfvars` and is authoritative — the Makefile deliberately passes no `-var`, since a command-line `-var` would
 override the file. `make build` reads `lambda_architecture` out of that file to pick its cross-compile
 target, so the binaries cannot be built for a different architecture than the functions are
 deployed with. `ARCH=` still overrides it for a one-off build.
@@ -183,6 +183,15 @@ event-source mapping is enabled when `assign_position` is real, and the controll
 schedule is created when the controller is. `make build` compiles every Lambda crate, reading
 its target architecture from `terraform.tfvars`.
 
+**The apply seeds a working stack.** Terraform writes the event's `Counters` item, the gate's
+ruleset and the open schedule, then ignores changes to all three — the control plane owns them
+from there. Before this, none of them had a Terraform writer: the event item's only writer was
+`scripts/reset-env.py`, so a freshly applied stack answered 404 on `/status` and `NotFound` on
+every admin action until a destructive test script had been run. The admin Lambda's OIDC
+configuration is the one thing an apply cannot derive — the redirect URI is a path on the
+distribution, and `edge` already depends on `core` — so a missing value fails the apply through
+a `precondition` rather than deploying a Lambda that dies at Init.
+
 `core` owns the edge gate's CloudFront KeyValueStore (issue #71) — the store's only *writer* is
 the admin Lambda, which lives in `core`, so putting the store in `edge` would need `edge` to
 export its ARN back to `core`, a module cycle. `core` exports `gate_kvs_arn`; `edge` consumes it
@@ -193,7 +202,7 @@ needs SigV4A, which the Rust SDK signs with RustCrypto (`p256`/`hmac`/`sha2`, th
 admission path mints and verifies with `aws-lc-rs`.
 
 Keep the `core` module at or under 80 Terraform resources (requirement N6); justify additions.
-Currently 68.
+Currently 69: the event-item seed is the one addition, and it is what makes an applied stack serve.
 
 ## Conventions specific to this repo
 
