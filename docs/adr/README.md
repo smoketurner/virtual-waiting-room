@@ -15,7 +15,7 @@ One record per decision. Each states the context, the decision, and its conseque
 | [0008](0008-partition-isolation-not-shuffle-sharding.md) | Isolate concurrent events by partition, not shuffle sharding |
 | [0009](0009-fail-open.md) | Fail open when the waiting room is unavailable |
 | [0010](0010-client-supplied-request-id.md) | Client supplies the request identifier |
-| [0011](0011-session-cookie-after-token.md) | Establish a session after validating the admission token |
+| [0011](0011-session-cookie-after-token.md) | Establish a session after validating the admission token (amended by 0032) |
 | [0012](0012-anti-ddos-count-mode.md) | Ship the anti-DDoS rule group in Count mode |
 | [0013](0013-cache-behaviour-separation.md) | Separate cache behaviours to preserve request collapsing |
 | [0014](0014-admin-ui-askama-cloudscape-tokens.md) | Render the admin UI with askama compile-time templates (styling superseded by 0018) |
@@ -27,7 +27,7 @@ One record per decision. Each states the context, the decision, and its conseque
 | [0021](0021-edge-function-gate.md) | Gate the protected origin with a CloudFront Function |
 | [0022](0022-durable-controller-cadence.md) | Build the controller's 10-second cadence from durable waits |
 | [0023](0023-adaptive-poll-interval.md) | Scale the client poll interval with distance to the front |
-| [0024](0024-jws-credentials.md) | Carry credentials as a JWS (amends 0011) |
+| [0024](0024-jws-credentials.md) | Carry credentials as a JWS (amends 0011; amended by 0032) |
 | [0025](0025-operator-owned-seal-schedule.md) | The operator owns the open schedule's time; Terraform owns the schedule |
 | [0026](0026-entry-tickets.md) | One position per identity, from a customer-signed entry ticket (superseded by 0028) |
 | [0027](0027-ticket-delivery-fragment-not-query.md) | Deliver the entry ticket by cookie, or by URL fragment — never a query string (superseded by 0028) |
@@ -35,6 +35,7 @@ One record per decision. Each states the context, the decision, and its conseque
 | [0029](0029-seal-time-demotion.md) | Demote telemetry groups to the tail at the open, matching on read (superseded by 0030) |
 | [0030](0030-remove-open-time-demotion.md) | Remove open-time demotion: never enabled, sixteen concepts, and a room-wide refusal if one chunk item went unread |
 | [0031](0031-remove-controller-driven-expiry.md) | Remove controller-driven expiry: an unbounded Scan six times a minute that could not see the pre-queue cohort |
+| [0032](0032-remove-the-origin-authorizer.md) | Remove the origin authorizer: nothing invoked it, and as wired it forwarded every request |
 
 ## Open
 

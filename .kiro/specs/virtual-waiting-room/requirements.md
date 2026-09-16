@@ -113,33 +113,21 @@ activation queues first-in, first-out (FIFO).
 - WHEN the operator changes the admission rate during an event, THE SYSTEM SHALL apply the new target rate.
 - Acceptance: `POST /admin/rate` changes the target rate; effect visible within the cache time to live (TTL).
 
-**F3.3** — As an admitted visitor, I want a verifiable token so that admission needs no backend call.
-- WHEN a visitor is admitted, THE SYSTEM SHALL issue a cryptographically verifiable token.
-- Acceptance: Token is signed; signature verifies at the authorizer without a backend call.
+**F3.3** — As an admitted visitor, I want a verifiable credential so that admission needs no backend call.
+- WHEN a visitor is admitted, THE SYSTEM SHALL issue a cryptographically verifiable session credential.
+- Acceptance: The session cookie is signed; the edge gate verifies the signature locally, with no backend call.
 
-**F3.4** — As the origin, I want unauthenticated requests denied so that only admitted visitors get through.
-- IF a request has no valid token or session, THEN THE SYSTEM SHALL reject it at the origin.
-- Acceptance: A request with no credential, an expired one, or one for another event is denied.
+**F3.4** — As the origin, I want unauthenticated requests refused so that only admitted visitors get through.
+- IF a request has no valid session, THEN THE SYSTEM SHALL refuse it at the edge, before the origin.
+- Acceptance: A request with no credential, an expired one, or one for another event is refused at the edge.
 
 **F3.5** — As an admitted visitor, I want a session so that I am not re-checked on every request.
-- WHEN an admission token is validated for the first time, THE SYSTEM SHALL establish a **session** so the visitor is not re-checked against a single-use token on every subsequent request.
-- Acceptance: A visitor navigates to a second page without re-presenting the admission token and is not re-queued.
-
-**F3.6** — As the system, I want distinct signing so that a token and a session cannot be swapped.
-- THE SYSTEM SHALL sign the session separately from the admission token, over different inputs.
-- Acceptance: A captured admission token cannot be replayed as a session credential, or vice versa.
-
-**F3.7** — As an operator, I want configurable session lifetime so that both sliding and hard-cap policies are supported.
-- THE SYSTEM SHALL support both a sliding-window session lifetime (extended on activity) and a hard cap from issue time.
-- Acceptance: Both modes configurable per event; hard cap does not extend regardless of activity.
+- WHEN a visitor's position is reached, THE SYSTEM SHALL establish a **session** so they are not re-checked on every subsequent request.
+- Acceptance: A visitor navigates to a second page without re-presenting anything and is not re-queued.
 
 **F3.8** — As an operator, I want no-show compensation so that actual origin arrivals hit the target.
 - THE SYSTEM SHALL compensate admission rate control for **no-shows** — admitted visitors who never arrive at the origin.
 - Acceptance: With a 30% no-show rate and a target of 500/min, actual origin arrivals converge on 500/min, not 350.
-
-**F3.10** — As an operator, I want session outcomes recorded so that completion and abandonment are measurable.
-- THE SYSTEM SHALL allow sessions to be marked as completed or abandoned.
-- Acceptance: `POST /update_session` updates the completion and abandonment counters.
 
 ### 1.5 Failure behaviour
 
@@ -207,6 +195,9 @@ here rather than deleted.
 | F6.1 | Gate queue entry on a client-issued signed entry ticket carrying an opaque per-identity subject. | Nothing could use it without customer-side work the product does not supply. | ADR-0028 |
 | F6.2 | The entry ticket is signed by the client, not the waiting room, and its subject is opaque. | Retired with F6.1. | ADR-0028 |
 | F3.9 | Queue positions expire if unused within an operator-configured period. | Implemented as a controller `Scan` of `Positions` six times a minute: unbounded, blind to the pre-queue cohort (which has no `Positions` row), advancing an attribute nothing read, and applying a grace expressed in seconds as a distance in positions — so a hidden tab lost its place (#97). The no-show correction already compensates for absentees. | ADR-0031 |
+| F3.6 | The session is separately signed from the admission token. | There is no admission token. `Kind` keeps its enum shape so a future second kind must carry its own label. | ADR-0032 |
+| F3.7 | Session lifetime supports a sliding window and a hard cap. | `SessionMode::Sliding` lived only in the origin authorizer; the edge does not re-issue a cookie. Retired rather than left as a `MUST` with no mechanism. | ADR-0032 |
+| F3.10 | Sessions are markable as completed or abandoned. | `POST /update_session` returned 501 and nothing wrote `Completed` or `Abandoned`. | ADR-0032 |
 | F6.3 | Bot-blocking decisions enforceable at event start rather than during the pre-queue. | Built as open-time demotion and never enabled; structurally blind to a client that bypassed CloudFront. | ADR-0030 |
 
 ### 1.8 Operator web interface
@@ -281,9 +272,9 @@ pre-event preparation in the Operational section.
 - THE SYSTEM SHALL NOT require the vendor to operate shared infrastructure on clients' behalf.
 - Acceptance: No component runs in a Smoke Turner account.
 
-**N4** — As a client, I want commercial and GovCloud support so that both partitions are covered.
-- THE SYSTEM SHALL support commercial AWS regions and AWS GovCloud (US).
-- Acceptance: Both variants deploy and pass functional tests.
+**N4** — As a client, I want commercial-region support so that the product deploys where the gate exists.
+- THE SYSTEM SHALL support commercial AWS regions. GovCloud (US) is out of scope until a gate exists for it.
+- Acceptance: The commercial variant deploys and passes functional tests. GovCloud has no shipped gate: the edge gate is a CloudFront Function, which the partition does not offer, and the origin authorizer that filled that role was removed (ADR-0032).
 
 **N5** — As an operator, I want everything in Terraform so that deployment has no manual steps.
 - THE SYSTEM SHALL express infrastructure as Terraform.
@@ -348,7 +339,7 @@ Not required for the current release. Rationale in `adr/README.md`.
 - Invite-only waiting rooms with multi-factor authentication (MFA) gating.
 - Proof-of-Work challenges and CAPTCHA softblock before queue entry.
 - Native application software development kits (SDKs) for iOS, Android and React Native.
-- Platform connector breadth beyond the CloudFront/origin authorizer.
+- Platform connector breadth beyond the CloudFront gate.
 
 ## 6. Explicit non-goals
 

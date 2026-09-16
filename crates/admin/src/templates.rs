@@ -460,9 +460,10 @@ mod tests {
 
     #[test]
     fn the_dashboard_offers_no_control_that_is_not_wired() {
-        // Stronger than labelling a deferred panel "not yet available": a
-        // control the operator cannot use is not rendered at all. The session
-        // plane answers 501, so nothing here may post to it.
+        // A control the operator cannot use is not rendered at all, rather
+        // than shown disabled or labelled "not yet available". /update_session
+        // was the last one; it is gone, and nothing may reintroduce a form
+        // posting to a route the router does not serve.
         let html = Dashboard::from_state(&state(), 0).render().unwrap();
         assert!(
             !html.contains("/update_session"),

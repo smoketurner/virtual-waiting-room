@@ -19,7 +19,7 @@ output "table_arns" {
 }
 
 output "signing_key_parameter_name" {
-  description = "Name of the SSM SecureString parameter holding the signing key. The authorizer, generate_token, and admin functions read it by name (ssm:GetParameter)."
+  description = "Name of the SSM SecureString parameter holding the signing key. generate_token and admin read it by name (ssm:GetParameter)."
   value       = aws_ssm_parameter.signing_key.name
 }
 

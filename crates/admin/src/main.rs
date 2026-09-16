@@ -150,7 +150,6 @@ async fn main() -> Result<(), Error> {
         .route("/admin/fail_open", post(fail_open))
         .route("/admin/recover", post(recover))
         .route("/admin/rules", post(set_rules))
-        .route("/update_session", post(deferred))
         .route("/static/{*path}", get(static_asset))
         .with_state(state)
         // Security-headers middleware: apply the hardening + no-cache headers to
@@ -639,15 +638,6 @@ async fn set_rules(
         )
         .await,
     )
-}
-
-/// A route whose backing plane (authorizer / sessions) is not in the MVP.
-async fn deferred() -> Response {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        "Not yet available. The authorizer and session plane ship after the MVP.",
-    )
-        .into_response()
 }
 
 /// Serves an embedded static asset (`/static/<path>`) with a guessed

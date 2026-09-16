@@ -2,6 +2,8 @@
 
 **Status:** Accepted
 
+> **Amended by [0032](0032-remove-the-origin-authorizer.md).** The origin authorizer was removed, and with it the admission token this record describes. `generate_token` mints the session directly; the CloudFront Function gate verifies it.
+
 **Amends:** [ADR-0011](0011-session-cookie-after-token.md), which established the two credentials
 and their domain separation. The separation stands; how it is achieved changes.
 

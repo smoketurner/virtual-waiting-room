@@ -26,7 +26,6 @@ infra/                        All Terraform — kept separate from the Rust work
                               the edge gate's CloudFront KeyValueStore (issue #71)
     edge/                     CloudFront cache behaviours, the S3-hosted waiting page, and the
                               admission gate CloudFront Function (functions/gate.js.tftpl)
-    authorizer/               Origin authorizer + optional CloudFront VPC origin
     demo-origin/              Fixture standing in for an operator origin in the dev root
 crates/                       Rust workspace — one crate per Lambda + shared lib
   wr-common/                  permutation, ids + items, expr, crypto, rules — re-exported flat.
@@ -39,7 +38,6 @@ crates/                       Rust workspace — one crate per Lambda + shared l
   controller/                 Outflow control
   admin/                      Axum operator UI and /admin/* actions, including the edge gate's
                               KeyValueStore writer (edge.rs)
-  authorizer/                 The alternative origin gate
 scripts/
 examples/                     Deployable example + generated variable reference — not built
 openapi/                      OpenAPI spec (N8) — not built

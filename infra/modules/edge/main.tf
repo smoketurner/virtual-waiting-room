@@ -63,8 +63,8 @@ resource "aws_cloudfront_cache_policy" "polled_keyed" {
 }
 
 # --- Origin request policy (protected default behaviour) ----------------------
-# Forwards the session cookie to the client origin so the authorizer can read
-# it. This is the ONLY behaviour that forwards a cookie - doing so on a polled
+# Forwards the session cookie to the client origin, which may want to read it.
+# This is the ONLY behaviour that forwards a cookie - doing so on a polled
 # behaviour would disable request collapsing (ADR-0013).
 
 # --- Origin request policy (/v1/join) -----------------------------------------

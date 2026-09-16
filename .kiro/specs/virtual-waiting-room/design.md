@@ -20,8 +20,8 @@ Two operating modes, which may run simultaneously on one origin:
 - **Standby** — dormant until measured inflow crosses a threshold, then queues new visitors
   first-in, first-out (FIFO).
 
-Admission is a signed token, exchanged once for a session cookie, verified locally at the
-authorizer without a call to the waiting-room backend.
+Admission is a signed session cookie, verified locally at the edge gate without a call to the
+waiting-room backend.
 
 ---
 
@@ -110,13 +110,6 @@ CloudFront KeyValueStore, so it decides locally instead of only verifying a sign
 compute in the *origin* request path — the function runs at the edge in sub-millisecond time,
 never calling the origin or any backend.
 
-**The alternative gate** (ADR-0011, ADR-0020 §5.1's authorizer half). For an origin the operator
-controls and wants per-request rules on — header, cookie, user agent — `modules/authorizer` runs
-a Rust Lambda at that origin instead: session cookie → admission token → protection-rule match →
-302, deciding locally with no backend call. It shares `wr_common::rules::ProtectionRule` with the
-edge gate's config writer, and it is the only gate available in GovCloud, where CloudFront
-Functions do not exist. It is built and deployable and is not in the CloudFront path.
-
 **Fail-open (#58) is a mechanism, not yet an automatic response.** `Counters.fail_open_until` is
 an epoch the gate evaluates against its own clock and `/admin/fail_open` sets it (mirrored to the
 KeyValueStore, admin-writer-first on entry so a crash leaves the edge minting and counting rather
@@ -161,16 +154,16 @@ A visitor in `IDLE` or `POST-EVENT` generates one CloudFront cache hit and nothi
 
 **Scheduled** — idle → pre-queue → randomized assignment at T−0 → active (§4).
 
-**Standby** — the authorizer evaluates every request but its action is *continue* until
-inflow crosses a threshold, then new visitors are queued FIFO.
+**Standby** — the gate evaluates every request but its action is *continue* until inflow
+crosses a threshold, then new visitors are queued FIFO.
 
 Fairness differs by mode: scheduled events randomize because the start time is published, so
 arrival order measures connection latency rather than intent; standby is FIFO because the
 spike is unplanned and arrival order carries information.
 
 **Protection rules** declare which requests are subject to queueing, matching on path,
-header, cookie, or user agent, evaluated locally at the authorizer. Unmatched requests are
-never queued in any phase or mode.
+header, cookie, or user agent, evaluated locally at the gate. Unmatched requests are never
+queued in any phase or mode.
 
 ### Standby activation
 
@@ -181,7 +174,7 @@ CloudFront publishes a `Requests` metric per distribution to CloudWatch in `us-e
 |---|---|
 | Inflow measurement | CloudWatch alarm on `AWS/CloudFront` `Requests`, `Sum`, 60 s period |
 | Activation | Alarm → EventBridge rule → phase transition to `ACTIVE` — **not built** ([#60](https://github.com/smoketurner/virtual-waiting-room/issues/60)) |
-| Propagation | Authorizer reads phase from `/status`, cached 5 s |
+| Propagation | The gate reads its configuration from the KeyValueStore |
 | Deactivation | Second alarm on sustained low `Requests`, longer evaluation period |
 | Manual override | Admin API sets a forced phase suppressing both alarms |
 
@@ -642,7 +635,7 @@ waiting ([ADR-0022](../../../docs/adr/0022-durable-controller-cadence.md)). Each
 durable step, checkpointed so replay returns its result rather than advancing `serving_counter`
 a second time.
 
-**Counting arrivals.** The authorizer increments an arrival counter when it converts an
+**Counting arrivals.** `generate_token` increments an arrival counter when it converts an
 admission token into a session — one write per admitted visitor. At a 60,000/minute admission
 rate that is 1,000 writes/s, the single-item ceiling, so the counter is sharded across 10
 items chosen by `hash(request_id) % 10`. Cost: 10 reads per interval, independent of event
@@ -694,30 +687,24 @@ serves the previous value if the origin is slow.
 | `/admin/recover` | Clear the fail-open epoch — not "resume": a queued pause still applies once it clears |
 | `/admin/rules` | Update protection rules — **not built**: the edge gate's ruleset and `enforce_from` are written directly to the KeyValueStore today |
 | `/metrics` | Event metrics as JSON |
-| `/update_session` | Report session completion or abandonment |
 
 Every operator action is here; the scheduled paths call the same Lambdas. No capability
 requires a console.
 
 ### Credentials
 
-Two artifacts, signed with the same key over different inputs so neither can be replayed as
-the other ([ADR-0011](../../../docs/adr/0011-session-cookie-after-token.md)):
+One credential (ADR-0011, ADR-0024):
 
-- **Admission token** — carries event id, queue id, and expiry. Travels on the URL,
-  short-lived, validated once. Used only on the `authorizer` path (an origin the operator
-  controls); the CloudFront path (below) has no token-then-session exchange, since
-  `generate_token` mints the session cookie directly (ADR-0021 §3.1).
-- **Session cookie** — one HMAC-SHA256 credential (`wr_common::crypto`), event-scoped, signed
-  over a domain-separating kind byte so it cannot be replayed as an admission token or vice versa
-  (ADR-0011). On the `authorizer` path it is set after a token validates and supports a sliding
-  window; on the CloudFront path (ADR-0021, issue #71) `generate_token` sets it directly and it is
-  the only credential the edge gate checks. It is a bearer credential until it expires: it carries
-  no visitor binding, is scoped by `event_id`
-  ([#61](https://github.com/smoketurner/virtual-waiting-room/issues/61), closed on the CloudFront
-  path — the gate refuses a credential minted for another event), and cannot be revoked
-  ([#63](https://github.com/smoketurner/virtual-waiting-room/issues/63), still open — no design
-  chosen).
+- **Session cookie** — one HMAC-SHA256 credential (`wr_common::crypto`), event-scoped, minted by
+  `generate_token` once a visitor's position is reached and checked by the edge gate. It is
+  signed under a key derived from the deployment secret rather than the secret itself, so a
+  future second credential kind cannot validate as a session. The admission token that used to
+  precede it was removed with the origin authorizer (ADR-0032). It is a bearer credential until
+  it expires: it carries no visitor binding, is scoped by `event_id`
+  ([#61](https://github.com/smoketurner/virtual-waiting-room/issues/61), closed for the
+  event-scoping half — the gate refuses a credential minted for another event), and cannot be
+  revoked ([#63](https://github.com/smoketurner/virtual-waiting-room/issues/63), still open — no
+  design chosen).
 
 The signing key is per-deployment, held in an SSM Parameter Store SecureString (a SecureString is free where a Secrets Manager secret is $0.40/mo, which N1 does not allow). Its compromise permits minting
 admission for every event in that deployment.
@@ -884,8 +871,8 @@ This section is **additive to F5.5** (API-first operator surface) and satisfies 
 
 ## 10. Failure behaviour
 
-If the waiting room API is unreachable, the authorizer admits the visitor with a time-limited
-bypass cookie while the client retries in the background
+If the waiting room's backend is unreachable, an operator can engage fail-open and the edge
+passes every request through until the window lapses
 ([ADR-0009](../../../docs/adr/0009-fail-open.md)). Configurable to fail closed per client.
 
 API Gateway's account throttle is a token bucket: tokens refill at the requests per second
@@ -931,8 +918,9 @@ Authorizing Official (AO).
 
 Consequences: no edge gating, no managed origin protection, and no CDN request collapsing for
 `/status` inside the boundary. Origin protection is built from primitives — an internal
-Application Load Balancer (ALB), the token authorizer, security groups and IAM. This is a
-different topology, not a configuration flag, and is priced separately.
+Application Load Balancer (ALB), security groups and IAM, plus a gate that does not exist yet —
+the one that filled that role was removed (ADR-0032). This is a different topology, not a
+configuration flag, and is priced separately.
 
 ---
 

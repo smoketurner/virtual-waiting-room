@@ -48,11 +48,10 @@ is served end to end.
   origin runs at the capacity the operator paid for.
 - **Fails open.** If the waiting room is unavailable, visitors reach the site. A waiting room
   that fails closed turns its own outage into the operator's.
-  **Currently violated by the shipped gate** (#58): CloudFront verifies admission cookies
-  itself, so an outage of the token path 403s every visitor to the whole distribution. Either
-  we build a fail-open path for the CloudFront gate, or we rewrite this principle to say it
-  only holds for the authorizer gate. That decision is open, and until it lands no document
-  should claim the property.
+  **Only half-held today** (#58): the mechanism exists — an operator engages fail-open and the
+  edge honours it at once — but nothing trips it automatically, because the gate makes no
+  network calls and cannot observe the backend. Until something can, an outage of the token
+  path 403s every visitor, and no document should claim the property unqualified.
 - **Near-zero idle cost.** No always-on compute or cache tier. Idle bill under $5/mo (N1).
 - **Your account, your data.** No visitor data leaves the operator's account — this rules out
   email/SMS position notifications and marketing data collection (see non-goals).

@@ -1,6 +1,8 @@
 # ADR-0021: Move the gate to a CloudFront Function
 
 **Status:** Accepted. The spike measured everything that could have invalidated the approach and
+
+> **Narrowed by [0032](0032-remove-the-origin-authorizer.md).** The origin authorizer was removed, so this is now the gate rather than the gate for CloudFront deployments.
 none of it did: the runtime verifies an unchanged `wr_common::crypto` credential, the gate fits in
 4,759 of 10,240 bytes, the hot path costs 11 of 100 compute utilization, and a configuration change
 reaches an edge in a median of 31 seconds. What remains in §5 are design decisions — what trips
