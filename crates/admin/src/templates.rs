@@ -140,7 +140,8 @@ pub struct DemotionView {
     /// `groups.len()`, as the same width as `groups_total` for the template's
     /// "largest X of Y" line.
     pub groups_shown: u64,
-    /// The rules did not parse, and this is why. The seal ran without them.
+    /// The seal ran without demoting anyone, and this is why: the rules did
+    /// not parse, or the scan covered another event's rows.
     pub error: String,
 }
 

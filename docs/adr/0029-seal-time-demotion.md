@@ -130,6 +130,12 @@ than a classifier nobody can explain.
   values). With no rules it uses none of it.
 - The seal's duration becomes a function of the cohort when rules are set — a consistent parallel
   scan of a million rows takes seconds — and of nothing else.
+- The scan cannot be scoped to the event: `PreQueue` rows carry no event id and the table name
+  does not change when `event_id` does. A cohort wider than the event's own participant count is
+  therefore another event's rows, left behind by a stack reused instead of destroyed. The seal
+  reports that and demotes nobody rather than refusing to seal, on the same reasoning as the
+  unparsable-rules path: an event that never opens is worse than one that opened without a
+  control the operator can see, in the report, did not apply.
 - Every resolver of a pre-queue row takes the demotion set as an argument. `read` and
   `generate_token` hold one per execution environment, keyed by nonce.
 - The controller's `ReleaseInputs` carry `N` and `D`, and its release, no-show measurement and
