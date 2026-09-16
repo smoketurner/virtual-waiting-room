@@ -1,6 +1,6 @@
-//! Seal-time demotion (issue #145, requirement F6.3): classifying the
+//! Open-time demotion (issue #145, requirement F6.3): classifying the
 //! pre-queue cohort by its join-time telemetry and moving whole groups of
-//! registrations to the tail of the queue at the seal.
+//! registrations to the tail of the queue at the open.
 //!
 //! Registration is compute-free and `request_id` is client-supplied, so
 //! nothing bounds how many positions one party takes; randomization converts
@@ -10,7 +10,7 @@
 //! agent. Thousands of registrations collapsing onto one value of any of those
 //! is the signature this module acts on.
 //!
-//! Acting at the seal, not at join, is the point: nothing is written or
+//! Acting at the open, not at join, is the point: nothing is written or
 //! revealed while there is still time to retool and re-register, and a group
 //! is judged on its whole pre-queue footprint rather than a moving window.
 //!
@@ -18,7 +18,7 @@
 //! catches a farm also catches an office NAT or a campus network, and a
 //! demoted office still gets in — after everyone the rules did not touch.
 //!
-//! Nothing is written per row. The seal stores the demoted *groups* once, as a
+//! Nothing is written per row. The open stores the demoted *groups* once, as a
 //! [`DemotionSet`] in its own items, and every resolver matches a row's
 //! telemetry against that set on read: a match resolves to `N + p` instead of
 //! `p`, a second copy of the index space behind the whole cohort. The tail is
@@ -133,7 +133,7 @@ pub enum RuleParseError {
 }
 
 /// The operator's demotion rules, parsed from the `signal:max` list Terraform
-/// sets (`address:25,asn:5000`). Empty means the feature is off and the seal
+/// sets (`address:25,asn:5000`). Empty means the feature is off and the open
 /// never scans the cohort.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DemotionRules(Vec<DemotionRule>);
@@ -235,13 +235,13 @@ const MAX_RULES: usize = 4;
 
 /// One scanned cohort row: per rule, the interned id of the group it fell into
 /// (`None` when the row did not report that signal). No request id: nothing
-/// is written back per row, so the seal never needs to know which rows were
+/// is written back per row, so the open never needs to know which rows were
 /// demoted, only how many.
 struct CohortRow {
     groups: [Option<u32>; MAX_RULES],
 }
 
-/// Accumulates the sealed cohort during the seal's scan, then classifies it.
+/// Accumulates the cohort during the open's scan, then classifies it.
 ///
 /// Group values are interned once and rows carry only interned ids, so a
 /// million-row cohort costs a few words per row in memory rather than a copy
@@ -269,8 +269,8 @@ impl Cohort {
         }
     }
 
-    /// Records one cohort row. Callers pass only rows the sealed offsets place
-    /// inside the cohort; a straggler that raced the seal is a live joiner and
+    /// Records one cohort row. Callers pass only rows the fixed offsets place
+    /// inside the cohort; a straggler that raced the open is a live joiner and
     /// has no pre-queue position to demote.
     pub fn observe(&mut self, telemetry: Option<&Telemetry>) {
         let mut groups = [None; MAX_RULES];
@@ -392,8 +392,8 @@ pub struct Classification {
     pub demoted: u64,
 }
 
-/// The demoted groups a sealed event resolves rows against: the whole set,
-/// not the report's capped list. Written once by the seal, read once per
+/// The demoted groups an opened event resolves rows against: the whole set,
+/// not the report's capped list. Written once by the open, read once per
 /// execution environment by every resolver, matched on every read.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DemotionSet {
@@ -512,9 +512,9 @@ impl DemotionSet {
     }
 }
 
-/// Where a sealed event's [`DemotionSet`] lives: the nonce its items are keyed
+/// Where an opened event's [`DemotionSet`] lives: the nonce its items are keyed
 /// under and how many chunks there are. On the event item, so every resolver
-/// finds the set the seal actually wrote and never one from a lost election.
+/// finds the set the open actually wrote and never one from a lost election.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DemotionRef {
     /// Lowercase hex; never contains `#`.
@@ -523,7 +523,7 @@ pub struct DemotionRef {
 }
 
 /// Holds one [`DemotionSet`] per execution environment, keyed by the nonce the
-/// event item names. The set is immutable once sealed, so a hit never goes
+/// event item names. The set is immutable once opened, so a hit never goes
 /// stale; a different nonce (a new event in the same environment) replaces it.
 #[derive(Debug, Default)]
 pub struct DemotionCache {
@@ -567,7 +567,7 @@ pub struct ReportGroup {
     pub max: u64,
 }
 
-/// What the seal decided and why, written to its own `Counters`-table item
+/// What the open decided and why, written to its own `Counters`-table item
 /// (`EVT#{event_id}#DM`, [`crate::expr::Key::DemotionReport`]) rather than the
 /// event item: the event item is read by every poll and must stay small, and
 /// only the operator's dashboard reads this.
@@ -577,7 +577,7 @@ pub struct DemotionReport {
     pub mode: String,
     /// The rules in effect, canonical `signal:max` form.
     pub rules: String,
-    /// Cohort rows the seal classified.
+    /// Cohort rows the open classified.
     pub cohort: u64,
     /// Rows in a demoted group: demoted under `enforce`, *would have been*
     /// under `observe`.
@@ -587,9 +587,9 @@ pub struct DemotionReport {
     pub groups_total: u64,
     /// The largest demoted groups.
     pub groups: Vec<ReportGroup>,
-    /// When the seal ran, epoch seconds.
-    pub sealed_at: u64,
-    /// Set when the rules could not be parsed at all: the seal then ran with no
+    /// When the open ran, epoch seconds.
+    pub opened_at: u64,
+    /// Set when the rules could not be parsed at all: the open then ran with no
     /// demotion rather than not at all, and this says so.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub error: Option<String>,
@@ -602,7 +602,7 @@ impl DemotionReport {
         mode: DemotionMode,
         rules: &DemotionRules,
         classification: &Classification,
-        sealed_at: u64,
+        opened_at: u64,
     ) -> Self {
         let mut groups = Vec::with_capacity(classification.groups.len().min(MAX_REPORT_GROUPS));
         for group in classification.groups.iter().take(MAX_REPORT_GROUPS) {
@@ -620,12 +620,12 @@ impl DemotionReport {
             demoted: classification.demoted,
             groups_total: u64::try_from(classification.groups.len()).unwrap_or(u64::MAX),
             groups,
-            sealed_at,
+            opened_at,
             error: None,
         }
     }
 
-    /// The report for a seal whose rules string could not be parsed. The
+    /// The report for an open whose rules string could not be parsed. The
     /// configured `mode` is recorded verbatim — the report's job is to say
     /// what the operator set out to do, and the outcome ("did not apply") is
     /// carried by `error` and the zeroed counts, not by relabelling the mode
@@ -635,7 +635,7 @@ impl DemotionReport {
         rules_text: &str,
         mode: DemotionMode,
         error: &RuleParseError,
-        sealed_at: u64,
+        opened_at: u64,
     ) -> Self {
         Self {
             mode: mode.as_wire_str().to_owned(),
@@ -644,7 +644,7 @@ impl DemotionReport {
             demoted: 0,
             groups_total: 0,
             groups: Vec::new(),
-            sealed_at,
+            opened_at,
             error: Some(error.to_string()),
         }
     }
@@ -767,7 +767,7 @@ mod tests {
             }]
         );
         assert_eq!(classification.demoted, 3);
-        // The set the seal stores resolves exactly those rows.
+        // The set the open stores resolves exactly those rows.
         let set = DemotionSet::from_groups(&classification.groups);
         assert_eq!(set.len(), 1);
         assert!(set.matches(Some(&telemetry("198.51.100.1:9", "1", "j", "u"))));
@@ -905,7 +905,7 @@ mod tests {
         let enforce = DemotionReport::from_error("address:lots", DemotionMode::Enforce, &error, 9);
         assert_eq!(enforce.mode, "enforce");
         assert_eq!(enforce.rules, "address:lots");
-        assert_eq!(enforce.sealed_at, 9);
+        assert_eq!(enforce.opened_at, 9);
         assert_eq!(
             enforce.error.as_deref(),
             Some("rule \"address:lots\" is not of the form signal:max")
@@ -945,7 +945,7 @@ mod tests {
                 count: 3,
                 max: 25,
             }],
-            sealed_at: 1_788_000_000,
+            opened_at: 1_788_000_000,
             error: None,
         };
         let av: HashMap<String, aws_sdk_dynamodb::types::AttributeValue> =

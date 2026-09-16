@@ -43,9 +43,9 @@ output "assign_position_function_name" {
   value       = aws_lambda_function.assign_position.function_name
 }
 
-output "seal_event_function_name" {
-  description = "Name of the seal_event Lambda. Invoke it manually or via the seal schedule to open the event."
-  value       = aws_lambda_function.seal_event.function_name
+output "open_event_function_name" {
+  description = "Name of the open_event Lambda. Invoke it manually or via the open schedule to open the event."
+  value       = aws_lambda_function.open_event.function_name
 }
 
 output "read_function_name" {
@@ -94,7 +94,7 @@ output "generate_token_function_name" {
   value       = aws_lambda_function.generate_token.function_name
 }
 
-output "seal_schedule_name" {
-  description = "Name of the one-time seal schedule (issue #128). Terraform creates it disabled; the admin Lambda sets its expression and state, and scripts/reset-env.py disables it so a reset cannot leave a seal armed for a cohort it just deleted."
-  value       = aws_scheduler_schedule.seal.name
+output "open_schedule_name" {
+  description = "Name of the one-time open schedule (issue #128). Terraform creates it disabled; the admin Lambda sets its expression and state, and scripts/reset-env.py disables it so a reset cannot leave an open armed for a cohort it just deleted."
+  value       = aws_scheduler_schedule.open.name
 }

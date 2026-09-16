@@ -7,7 +7,7 @@
 
 Empties the per-visitor tables, deletes the striped counter shards, and
 rewrites the event's `Counters` item from scratch, so the next test run starts
-from a known state instead of inheriting positions, seal outputs, and counters
+from a known state instead of inheriting positions, open outputs, and counters
 from the last one.
 
 The `Counters` item is deleted and rewritten rather than patched. Stale
@@ -66,7 +66,7 @@ PHASES = ("idle", "pre_queue", "active", "post_event", "maintenance")
 # partition key per shard, so that incrementing them never contends with the
 # sequences on the event's own item. That means deleting the event item alone
 # leaves the shards behind, and a stale pre-queue count would be folded into
-# the next seal as a cohort of visitors who do not exist.
+# the next open as a cohort of visitors who do not exist.
 SHARDS = 10
 SHARD_TAGS = ("PQ", "AR")
 
@@ -214,7 +214,7 @@ def fresh_counters(event_id: str, phase: str, target_rate: int, queue_ahead: int
     returns `Held` and the cursor does not move until an operator resumes.
 
     Deliberately absent: shuffle_seed, participant_count, and prequeue_offsets
-    (written only by the seal), the prequeue_counter and arrivals shards, and
+    (written only by the open), the prequeue_counter and arrivals shards, and
     the controller's carried state (last_arrivals_total, last_serving_counter,
     no_show_rate).
     """
@@ -229,11 +229,11 @@ def fresh_counters(event_id: str, phase: str, target_rate: int, queue_ahead: int
 
 
 def disable_schedule(scheduler, name: str) -> None:
-    """Disable the one-time seal schedule, preserving everything else on it.
+    """Disable the one-time open schedule, preserving everything else on it.
 
     UpdateSchedule replaces the schedule rather than patching it, so every
     field has to be sent back — omitting the target would drop the event id the
-    seal reads and silently break the next run. Same read-then-resend the admin
+    open reads and silently break the next run. Same read-then-resend the admin
     Lambda does.
     """
     current = scheduler.get_schedule(Name=name)
@@ -359,19 +359,19 @@ def main() -> int:
     for key in sorted(item):
         print(f"  {key:18} {next(iter(item[key].values()))}")
 
-    say("Disabling the seal schedule")
+    say("Disabling the open schedule")
     # The Counters item was just rewritten without a start time (issue #128).
-    # Leaving the schedule armed would seal a cohort whose PreQueue rows this
+    # Leaving the schedule armed would open a cohort whose PreQueue rows this
     # script has already deleted, at a moment nothing is counting down to.
     try:
-        schedule_name = tf_output("seal_schedule_name")
+        schedule_name = tf_output("open_schedule_name")
     except subprocess.CalledProcessError:
         schedule_name = ""
     if schedule_name:
         disable_schedule(scheduler, schedule_name)
     else:
         print(
-            "no seal_schedule_name output; skipping.\n"
+            "no open_schedule_name output; skipping.\n"
             "Apply the stack to pick it up, or a previously set start time stays armed."
         )
 

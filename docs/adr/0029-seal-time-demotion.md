@@ -1,4 +1,4 @@
-# ADR-0029: Demote telemetry groups to the tail at the seal, matching on read
+# ADR-0029: Demote telemetry groups to the tail at the open, matching on read
 
 **Status:** Accepted
 
@@ -23,17 +23,17 @@ The moment is the design decision here; the signal source is not.
 
 ## 2. Decision
 
-**Classify at the seal, over the whole cohort; store the demoted groups once; match every row
+**Classify at the open, over the whole cohort; store the demoted groups once; match every row
 against them on read.**
 
-`seal_event` takes an operator-configured rule list, `signal:max` entries over `address`, `asn`,
+`open_event` takes an operator-configured rule list, `signal:max` entries over `address`, `asn`,
 `ja4` and `ua`. When any rule is set it scans the pre-queue after reading the shard counts and
-before the seal write, groups the cohort's rows by each ruled signal, and marks every group whose
+before the open write, groups the cohort's rows by each ruled signal, and marks every group whose
 size exceeds its threshold as demoted. Every row in a demoted group is demoted.
 
-Nothing is written per row. The seal writes the demoted group set — the `signal:value` pairs —
+Nothing is written per row. The open writes the demoted group set — the `signal:value` pairs —
 as chunk items keyed by a per-run nonce (`EVT#{event_id}#DG#{nonce}#{k}`), then the one
-conditional seal write also carries `D` (the count of matched rows), the nonce and the chunk
+conditional open write also carries `D` (the count of matched rows), the nonce and the chunk
 count, and starts the live-join sequence at `2N`. A resolver (`read`, `generate_token`) loads the
 set once per execution environment and matches a row's telemetry against it: a match resolves to
 `N + PRP(seed, i, N)` instead of `PRP(seed, i, N)`, the same slot in a second copy of the index
@@ -44,24 +44,24 @@ twice.
 A demoted row does not lose its place; it resolves behind everyone the rules did not touch.
 
 **The controller knows the density.** The tail is sparse: `D` people over `N` positions, and the
-primary range is `N − D` people over `N`. The seal counted both, so the controller converts
+primary range is `N − D` people over `N`. The open counted both, so the controller converts
 rather than corrects: it releases the operator's target as a number of *people* per interval,
 converting to positions at the density of the tier the cursor is in; it measures no-shows as
 arrivals against people released, not positions; and it walks the expiry grace back as a count of
 people, so 120 seconds stays 120 seconds inside the tail.
 
 **`observe` is the default mode.** It runs the whole classification and writes the report
-without demoting anyone. `enforce` acts. No rules means no scan, and the seal is the single write
+without demoting anyone. `enforce` acts. No rules means no scan, and the open is the single write
 it always was.
 
-**The operator sees it.** The seal writes a report item, `EVT#{event_id}#DM`, holding the mode,
+**The operator sees it.** The open writes a report item, `EVT#{event_id}#DM`, holding the mode,
 the rules, the cohort size, the demoted count, and the largest demoted groups with the threshold
 each exceeded. The dashboard renders it. A fairness control that acts invisibly is not defensible
 after the event, and a threshold cannot be tuned against a report nobody can read.
 
 ## 3. Why these choices
 
-**Why the seal and not the join.** Acting at join reveals the classification while there is time
+**Why the open and not the join.** Acting at join reveals the classification while there is time
 to retool and re-register; a group is also better judged on its whole pre-queue footprint than
 on the window a rate rule sees. This is what F6.3 asked for, and it is Queue-it's Hype Event
 Protection shape without a partner.
@@ -73,16 +73,16 @@ bounds the damage a false positive can do to "later", which is the only bound th
 threshold be tried on a real event at all.
 
 **Why the group set and not a per-row mark.** The first cut of this design wrote a compact tail
-index on every demoted row after the seal: `D` conditional writes, a phase held at `pre_queue`
-while they landed, a partial-failure story, and a seal whose duration grew with the attack — at
+index on every demoted row after the open: `D` conditional writes, a phase held at `pre_queue`
+while they landed, a partial-failure story, and an open whose duration grew with the attack — at
 32 writes in flight, roughly 40 seconds per 100,000 demoted rows and a ceiling near three million
 inside the Lambda limit. The dollars were trivial (a write unit per row); the shape was wrong.
 The problem being defended against is one whose size the attacker chooses, and the mitigation's
 cost should not scale with it. Storing the groups once costs a few items however large the farm,
-the seal stays one atomic write with nothing to apply afterwards, there is no window in which a
+the open stays one atomic write with nothing to apply afterwards, there is no window in which a
 demoted row is visible at its primary slot, and the tail is reproducible from the published set
 rather than from marks on rows. The read-time cost is four hash lookups per resolution and one
-read of the set per execution environment; the set is immutable once sealed, so that read never
+read of the set per execution environment; the set is immutable once opened, so that read never
 repeats.
 
 **Why the controller has to know.** Mapping demoted rows to `N + p` leaves `N − D` gaps in the
@@ -95,20 +95,20 @@ bookkeeping change rather than a heuristic, and it is property-tested: the peopl
 interval never fall short of the target and never exceed it by more than the rounding a tier
 boundary costs.
 
-**Why the set is written before the election.** The seal write names the set by nonce; a reader
-that finds the nonce must find the chunks. Writing them first means a winning seal never points
+**Why the set is written before the election.** The open write names the set by nonce; a reader
+that finds the nonce must find the chunks. Writing them first means a winning open never points
 at something that does not exist yet. A losing double-fire deletes its own chunks; if that fails
 they are orphans keyed under a nonce nothing names.
 
-**Why a reader without the set refuses.** A sealed event with `D > 0` whose set cannot be loaded
+**Why a reader without the set refuses.** An opened event with `D > 0` whose set cannot be loaded
 could answer from the primary slot, and every demoted row would silently be un-demoted. The
 resolver returns an error instead, `read` answers 503 and `generate_token` refuses with a
 retryable status, and the next poll tries the load again.
 
 **Why the rules are deploy-time settings.** The same reason the poll policy is (ADR-0023): a
 fairness control that can be flipped from a dashboard mid-event can be flipped by mistake at the
-moment it matters most, and the seal fires once. Terraform validates the syntax at plan time; a
-rules string that still fails to parse at runtime is logged, recorded in the report, and sealed
+moment it matters most, and the open fires once. Terraform validates the syntax at plan time; a
+rules string that still fails to parse at runtime is logged, recorded in the report, and opened
 past without demotion, because an event that never opens is worse than one that opened without
 a control the operator can see did not apply.
 
@@ -125,17 +125,17 @@ than a classifier nobody can explain.
 - The event item gains `demoted_count`, `demotion_nonce` and `demotion_chunks`; the demotion set
   chunks and a report item join the `Counters` table. `PreQueue` rows are untouched. No new
   Terraform resources.
-- `seal_event` needs `dynamodb:Scan` on `PreQueue` and `PutItem`/`DeleteItem` on `Counters`, a
+- `open_event` needs `dynamodb:Scan` on `PreQueue` and `PutItem`/`DeleteItem` on `Counters`, a
   five-minute timeout and 1 GB of memory (a few words per cohort row plus the interned signal
   values). With no rules it uses none of it.
-- The seal's duration becomes a function of the cohort when rules are set — a consistent parallel
+- The open's duration becomes a function of the cohort when rules are set — a consistent parallel
   scan of a million rows takes seconds — and of nothing else.
 - The scan cannot be scoped to the event: `PreQueue` rows carry no event id and the table name
   does not change when `event_id` does. The classification trusts every row it reads anyway, and
-  the seal has no guard against a previous event's rows, because a deployment serves one event
+  the open has no guard against a previous event's rows, because a deployment serves one event
   and `scripts/reset-env.py` — the only supported way to run a second one on a live stack —
   deletes every `PreQueue` row before anything can scan it. A stack reused without that reset is
-  already broken well before the classification: the leftover `shuffle_seed` fails the seal's own
+  already broken well before the classification: the leftover `shuffle_seed` fails the open's own
   condition, so the event never opens and positions resolve against a cohort that no longer
   exists. A guard here would be a cohort-sized read defending a state in which nothing works.
 - Every resolver of a pre-queue row takes the demotion set as an argument. `read` and
@@ -153,4 +153,4 @@ than a classifier nobody can explain.
   event, which is why nothing is enforced by default (`.kiro/specs/virtual-waiting-room/tasks.md`).
 - The WAF signals (#59: Bot Control labels, the anonymous-IP and hosting-provider lists) are
   a later input to the same classification: another attribute on the row, another signal name
-  in the rules, the same seal. Nothing here precludes them; nothing here needs them.
+  in the rules, the same open. Nothing here precludes them; nothing here needs them.

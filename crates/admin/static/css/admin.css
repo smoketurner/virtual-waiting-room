@@ -314,7 +314,7 @@ body {
   color: var(--gray-200);
 }
 
-/* --- Group table (seal-time demotion report, issue #145) ------------------ */
+/* --- Group table (open-time demotion report, issue #145) ------------------ */
 
 table.groups {
   width: 100%;

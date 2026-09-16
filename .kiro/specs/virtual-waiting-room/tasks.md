@@ -43,7 +43,7 @@ Throwaway code. Measures what documentation cannot settle.
 - [x] Seeded permutation (DESIGN §4.2, ADR-0002): at T−0 one `UpdateItem` on `Counters` that reads the 10 shard counts, computes `prequeue_offsets` (prefix sums) and `participant_count = ΣΣcounts`, and sets `shuffle_seed`, `participant_count`, `prequeue_offsets`, `phase`, guarded by `attribute_not_exists(shuffle_seed)`. Global index `i = offset[s] + l`; position derived on read as `PRP(seed, i, N)` [F1.3, F1.4, F1.5, C2]
 - [x] Pseudorandom permutation (PRP): 4-round balanced Feistel, `HMAC-SHA256(seed, round || x)` round function, cycle-walking into `[0, N)`. Property tests for bijectivity over the full domain at N ≤ 10⁶, uniformity by chi-square, determinism across processes; assert the assembled global index space is exactly contiguous `[0, N)` across all 10 shards [F1.5] — Note: proptest bijectivity covers N < 2000 exhaustively; the 10⁶ cohort is Phase 3.
 - [x] Property test — **burned slot** (ADR-0015, F2.3): with an injected registration-write failure rate (counter incremented, `PreQueue` row absent), assert (a) the assembled index space is still a contiguous `[0, N)` where `N` = Σ shard counts, (b) `PRP` remains bijective over `[0, N)`, (c) a burned index resolves to a valid position that maps to no `PreQueue` row, and (d) the serving counter advancing past it admits nobody — no duplicate, no panic, no gap in the permutation [F1.5, F2.3]
-- [x] Property test — **straggler join racing the seal** (ADR-0015): for a join whose local index was claimed after the seal counted its shard, assert it is a straggler **by that shard's own issued count** (not by the reconstructed global index `i = offset[s] + l`, which can still land inside `[0, N)` on an interior shard) and that `/queue_num` never evaluates `PRP` out of domain for it, falling through to the `Positions` row instead — a live-join position if one has landed, 404 if not [F1.5]
+- [x] Property test — **straggler join racing the open** (ADR-0015): for a join whose local index was claimed after the open counted its shard, assert it is a straggler **by that shard's own issued count** (not by the reconstructed global index `i = offset[s] + l`, which can still land inside `[0, N)` on an interior shard) and that `/queue_num` never evaluates `PRP` out of domain for it, falling through to the `Positions` row instead — a live-join position if one has landed, 404 if not [F1.5]
 
 ### 1d. Live join
 
@@ -77,12 +77,12 @@ Throwaway code. Measures what documentation cannot settle.
 ### 1g. Entry gating and abuse mitigation
 
 - [ ] Deferred bot enforcement: admit to pre-queue, block at randomization [F6.3]
-      `Partial:` built as seal-time demotion (ADR-0029, issue #145): `seal_event` groups the
+      `Partial:` built as open-time demotion (ADR-0029, issue #145): `open_event` groups the
       cohort by the join-time telemetry (address, ASN, JA4, user agent) under operator-set
       `signal:max` rules, stores the demoted group set once (no per-row write), and every
       resolver matches rows against it (`N + PRP(seed, i, N)`, live joins from `2N`); the
       controller walks the sparse tail at its known density. A report the dashboard renders is
-      written at the seal. Off by default (no rules) and `observe`
+      written at the open. Off by default (no rules) and `observe`
       by default. Missing: the false-positive measurement against a real event that the
       acceptance requires before the control is enforced by default, and the WAF-derived
       signals (Bot Control labels, reputation lists) as further inputs.
@@ -90,7 +90,7 @@ Throwaway code. Measures what documentation cannot settle.
       `Partial:` nothing does. `request_id` is client-supplied, so volume converts into share
       of the front of the queue linearly and every deployment is a bare raffle. The entry
       tickets that bounded identifier *minting* were removed (ADR-0028) — they needed the
-      customer to build a signing endpoint, and they never bounded volume. Seal-time demotion
+      customer to build a signing endpoint, and they never bounded volume. Open-time demotion
       (ADR-0029) now bounds the share a farm that shares an address, ASN, JA4 or user agent can
       take of the *front*; it does not bound how many positions one visitor holds. Proof of
       work at registration is what would.

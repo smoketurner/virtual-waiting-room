@@ -1,17 +1,17 @@
 //! Lambda entry point: the scheduler fires this once at the event start time.
-//! It generates the permutation seed and performs the one-time seal, applying
+//! It generates the permutation seed and performs the one-time open, applying
 //! the operator's demotion rules (issue #145) when any are set.
 
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 use lambda_runtime::{Error, LambdaEvent, service_fn};
-use seal_event::dynamo::DynamoStore;
-use seal_event::{DemotionConfig, seal_event};
+use open_event::dynamo::DynamoStore;
+use open_event::{DemotionConfig, open_event};
 use serde::Deserialize;
 use wr_common::DemotionMode;
 
-/// The scheduler payload names the event to seal.
+/// The scheduler payload names the event to open.
 #[derive(Debug, Deserialize)]
-struct SealRequest {
+struct OpenRequest {
     event_id: String,
 }
 
@@ -32,15 +32,15 @@ async fn main() -> Result<(), Error> {
     let rng = SystemRandom::new();
     let demotion = load_demotion_config();
 
-    lambda_runtime::run(service_fn(|event: LambdaEvent<SealRequest>| {
+    lambda_runtime::run(service_fn(|event: LambdaEvent<OpenRequest>| {
         handle(&store, &rng, &demotion, event)
     }))
     .await
 }
 
 /// Reads the demotion rules and mode Terraform set. Neither is fatal when
-/// malformed: the seal is the one thing that must happen at T−0, so a bad
-/// value is logged, recorded in the report, and sealed past without demotion.
+/// malformed: the open is the one thing that must happen at T−0, so a bad
+/// value is logged, recorded in the report, and opened past without demotion.
 fn load_demotion_config() -> DemotionConfig {
     let rules_text = std::env::var("DEMOTION_RULES").unwrap_or_default();
     let mode = match std::env::var("DEMOTION_MODE") {
@@ -55,7 +55,7 @@ fn load_demotion_config() -> DemotionConfig {
     };
     let config = DemotionConfig::parse(&rules_text, mode);
     if let Err(e) = &config.rules {
-        tracing::error!(error = %e, rules = %rules_text, "DEMOTION_RULES rejected; the seal will run without demotion");
+        tracing::error!(error = %e, rules = %rules_text, "DEMOTION_RULES rejected; the open will run without demotion");
     }
     config
 }
@@ -64,17 +64,17 @@ async fn handle(
     store: &DynamoStore,
     rng: &SystemRandom,
     demotion: &DemotionConfig,
-    event: LambdaEvent<SealRequest>,
+    event: LambdaEvent<OpenRequest>,
 ) -> Result<(), Error> {
     let mut seed = [0u8; 32];
     rng.fill(&mut seed)
-        .map_err(|_| Error::from("failed to generate seal seed"))?;
+        .map_err(|_| Error::from("failed to generate open seed"))?;
     // The nonce keys this run's demotion set; a losing double-fire's set is
-    // then an orphan the winning seal never names.
+    // then an orphan the winning open never names.
     let mut nonce = [0u8; 8];
     rng.fill(&mut nonce)
-        .map_err(|_| Error::from("failed to generate seal nonce"))?;
-    seal_event(
+        .map_err(|_| Error::from("failed to generate open nonce"))?;
+    open_event(
         store,
         &event.payload.event_id,
         seed,

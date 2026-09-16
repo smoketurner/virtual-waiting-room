@@ -346,7 +346,7 @@ impl DynamoStore {
 
 /// Folds a batch-get response's arrivals shard items into per-shard counts.
 ///
-/// The arrivals shards mirror the pre-queue shards the seal reads: each is its
+/// The arrivals shards mirror the pre-queue shards the open reads: each is its
 /// own item under its own partition key, so a `BatchGetItem` response only
 /// contains one when something has written it. A present item whose count
 /// attribute (`n`) cannot be read is therefore corruption, not an empty shard

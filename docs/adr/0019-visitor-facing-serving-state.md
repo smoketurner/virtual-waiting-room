@@ -49,7 +49,7 @@ Two things this makes explicit:
 `ServingState` does **not** replace `Phase`. They answer different questions:
 
 - `Phase` (`idle/pre_queue/active/post_event`) is the event's **timeline**: it governs the
-  mechanism — when the seed is written (T-0 seal), when positions become computable, when the
+  mechanism — when the seed is written (T-0 open), when positions become computable, when the
   queue is draining. It is largely time/schedule-driven.
 - `ServingState` is the **operator's live override of the visitor experience**, on top of
   wherever the timeline is.

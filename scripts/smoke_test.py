@@ -10,14 +10,14 @@ stack and asserts the core invariant: no two visitors get the same queue
 position. Registers fresh UUIDv7 request ids each run.
 
 Re-runnable: it resets the environment first, via `scripts/reset-env.py`, which
-clears the seal outputs from any previous run. Without that a second run finds
+clears the open outputs from any previous run. Without that a second run finds
 `shuffle_seed` already set, so the joins take the live path, no PreQueue rows
 appear, and step 2 fails after 90s with nothing to say why. Pass `--no-reset`
 if you have just reset by hand.
 
-The script reads the API URL, table names, seal function, and event id from
+The script reads the API URL, table names, open function, and event id from
 `terraform output` and never touches Terraform state — deploy with `make apply`
-first. It exercises the app only (writes PreQueue rows, invokes seal, polls the
+first. It exercises the app only (writes PreQueue rows, invokes open, polls the
 API).
 
 It does NOT touch the signing key. Terraform generates that during apply and
@@ -123,7 +123,7 @@ def main() -> int:
         "--no-reset",
         action="store_true",
         help="Skip the reset-env.py call. Only correct if you just reset by hand: "
-        "a stack whose event is already sealed will hang in step 2.",
+        "a stack whose event is already open will hang in step 2.",
     )
     args = p.parse_args()
 
@@ -146,7 +146,7 @@ def main() -> int:
         tables["prequeue"],
         tables["positions"],
     )
-    seal_fn = tf_output("seal_event_function_name")
+    open_fn = tf_output("open_event_function_name")
     cf_host = tf_output("cloudfront_domain_name")
     print(f"API: {api_url}  CDN: {cf_host}  event_id: {event_id}")
 
@@ -200,7 +200,7 @@ def main() -> int:
     # The shard is drawn server-side at random per invocation (issue #59), so
     # there is no expected shard for a given id any more — only that it is in
     # range and that no two registrations share a (shard, local index) pair,
-    # which is what the seal's prefix offsets turn into a unique position.
+    # which is what the open's prefix offsets turn into a unique position.
     slots: dict[tuple[int, int], str] = {}
     for rid, item in rows.items():
         shard = int(item["s"]["N"])
@@ -248,9 +248,9 @@ def main() -> int:
     assert shard_total == COHORT, (shard_total, COHORT)
     print(f"shard counts sum to {shard_total} == COHORT")
 
-    say("4. Seal the event (invoke seal_event) and confirm phase=active via /status")
+    say("4. Open the event (invoke open_event) and confirm phase=active via /status")
     lam.invoke(
-        FunctionName=seal_fn, Payload=json.dumps({"event_id": event_id}).encode()
+        FunctionName=open_fn, Payload=json.dumps({"event_id": event_id}).encode()
     )
     time.sleep(2)
     status = api_get(api_url, "/v1/status")

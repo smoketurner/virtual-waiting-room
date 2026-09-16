@@ -53,13 +53,13 @@ pub const POSITIONS_KEY_ATTR: &str = "request_id";
 /// row is still valid compares this attribute to the current time itself.
 pub const TOKENS_TTL_ATTR: &str = "expires_at";
 
-/// The event item's demoted count `D` (issue #145), written by the seal when
+/// The event item's demoted count `D` (issue #145), written by the open when
 /// it enforces demotion and read by every resolver of a pre-queue row and by
-/// the controller. Named here so the seal's writer and the item parsers cannot
+/// the controller. Named here so the open's writer and the item parsers cannot
 /// drift apart.
 pub const DEMOTED_COUNT_ATTR: &str = "demoted_count";
 
-/// The nonce the sealed event's demotion set is keyed under
+/// The nonce the opened event's demotion set is keyed under
 /// ([`Key::DemotionGroups`]), on the event item beside `demoted_count`.
 pub const DEMOTION_NONCE_ATTR: &str = "demotion_nonce";
 
@@ -126,7 +126,7 @@ pub const STATUS_EXPIRED: &str = "expired";
 /// another event's item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Key<'a> {
-    /// The event's own item, holding the sequences, phase, seal outputs, and
+    /// The event's own item, holding the sequences, phase, open outputs, and
     /// operator state.
     Event { event_id: &'a str },
     /// One pre-queue registration shard.
@@ -141,12 +141,12 @@ pub enum Key<'a> {
     /// One arrivals shard, incremented when a visitor claims their admission
     /// and summed by the controller to measure the no-show rate.
     ArrivalsShard { event_id: &'a str, shard: Shard },
-    /// The seal's demotion report (issue #145): what the rules demoted and on
+    /// The open's demotion report (issue #145): what the rules demoted and on
     /// what basis. Its own item so the event item, which every poll reads,
     /// stays small; only the operator's dashboard reads this one.
     DemotionReport { event_id: &'a str },
-    /// One chunk of a sealed event's demotion set (issue #145): the groups
-    /// every resolver matches rows against. Keyed by a per-seal nonce, so a
+    /// One chunk of an opened event's demotion set (issue #145): the groups
+    /// every resolver matches rows against. Keyed by a per-open nonce, so a
     /// lost election's chunks are orphans the winning event item never names,
     /// and chunked because a farm across ten thousand addresses is bigger
     /// than one item.
@@ -597,7 +597,7 @@ mod tests {
 
     #[test]
     fn repeating_an_attribute_binds_each_clause_separately() {
-        // The seal writes the cohort size to two attributes at once. Two
+        // The open writes the cohort size to two attributes at once. Two
         // clauses, two placeholders, no shared binding to get out of step.
         let built = Update::new()
             .set("participant_count", AttributeValue::N("9".to_owned()))

@@ -45,10 +45,10 @@ endif
 #
 # The authorizer is built and deployed like the rest, but nothing in this
 # account invokes it: it attaches at the customer's own origin.
-LAMBDA_CRATES := assign_position seal_event read admin controller authorizer generate_token
+LAMBDA_CRATES := assign_position open_event read admin controller authorizer generate_token
 
 ASSIGN_ARTIFACT     := $(ARTIFACTS)/assign_position/bootstrap/bootstrap.zip
-SEAL_ARTIFACT       := $(ARTIFACTS)/seal_event/bootstrap/bootstrap.zip
+OPEN_ARTIFACT       := $(ARTIFACTS)/open_event/bootstrap/bootstrap.zip
 READ_ARTIFACT       := $(ARTIFACTS)/read/bootstrap/bootstrap.zip
 ADMIN_ARTIFACT      := $(ARTIFACTS)/admin/bootstrap/bootstrap.zip
 CONTROLLER_ARTIFACT := $(ARTIFACTS)/controller/bootstrap/bootstrap.zip
@@ -74,7 +74,7 @@ build: ## Cross-compile every Lambda to a zip under .artifacts/<crate>/.
 			--lambda-dir $(ARTIFACTS)/$$crate \
 			-p $$crate --manifest-path $(MANIFEST); \
 	done
-	@echo "built: $(ASSIGN_ARTIFACT) $(SEAL_ARTIFACT) $(READ_ARTIFACT) $(ADMIN_ARTIFACT) $(CONTROLLER_ARTIFACT) $(AUTHORIZER_ARTIFACT) $(TOKEN_ARTIFACT)"
+	@echo "built: $(ASSIGN_ARTIFACT) $(OPEN_ARTIFACT) $(READ_ARTIFACT) $(ADMIN_ARTIFACT) $(CONTROLLER_ARTIFACT) $(AUTHORIZER_ARTIFACT) $(TOKEN_ARTIFACT)"
 
 init: ## terraform init (safe, idempotent).
 	terraform -chdir=$(ENV_DIR) init -input=false

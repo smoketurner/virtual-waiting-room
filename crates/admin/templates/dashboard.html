@@ -164,7 +164,7 @@
     <section class="card">
       <div class="card-header">
         <h2>Start time</h2>
-        <p class="sub">When the pre-queue is sealed and the event opens.</p>
+        <p class="sub">When the pre-queue closes and the event opens.</p>
       </div>
       <div class="card-body">
         <form method="post" action="/admin/start_time">
@@ -179,12 +179,12 @@
               <option value="{{ tz }}"{% if starts_at_timezone == *tz %} selected{% endif %}>{{ tz }}</option>
               {% endfor %}
             </select>
-            <span class="help">Currently <strong>{{ starts_at }}</strong>. The time is read in the timezone you pick, not your browser's, and the event opens at that local time even if daylight saving changes between now and then. Waiting visitors see a countdown to it. Setting a time arms the seal; clearing it disables the seal without deleting the schedule.</span>
+            <span class="help">Currently <strong>{{ starts_at }}</strong>. The time is read in the timezone you pick, not your browser's, and the event opens at that local time even if daylight saving changes between now and then. Waiting visitors see a countdown to it. Setting a time schedules the opening; clearing it stops the event opening on its own, without deleting the schedule.</span>
           </div>
           <button type="submit" title="Schedule when the event opens.">Set start time</button>
         </form>
         {% if !starts_at_raw.is_empty() %}
-        <form method="post" action="/admin/start_time" data-confirm="Clear the start time? The seal will no longer fire on its own and the countdown disappears." style="margin-top:12px;">
+        <form method="post" action="/admin/start_time" data-confirm="Clear the start time? The event will no longer open on its own and the countdown disappears." style="margin-top:12px;">
           <input type="hidden" name="starts_at" value="">
           <input type="hidden" name="timezone" value="{{ starts_at_timezone }}">
           <button type="submit" class="normal" title="Unschedule the event.">Clear start time</button>
@@ -217,19 +217,19 @@
       </div>
     </section>
 
-    <!-- Seal-time demotion (issue #145): what the seal moved to the tail and
+    <!-- Demotion at open (issue #145): what opening the event moved to the tail and
          on what basis. Read-only — the rules are deploy-time settings. -->
     <section class="card span-2">
       <div class="card-header">
-        <h2>Seal-time demotion</h2>
-        <p class="sub">Groups of registrations sharing one address, ASN, JA4 fingerprint or user agent beyond a threshold are served behind the rest of the cohort. The seal stores the demoted groups once; every position lookup matches against them. Rules and mode are set in <code>terraform.tfvars</code>.</p>
+        <h2>Demotion at open</h2>
+        <p class="sub">Groups of registrations sharing one address, ASN, JA4 fingerprint or user agent beyond a threshold are served behind the rest of the cohort. The demoted groups are stored once when the event opens; every position lookup matches against them. Rules and mode are set in <code>terraform.tfvars</code>.</p>
       </div>
       <div class="card-body">
         {% if !demotion.reported %}
-        <p class="deferred">No report yet. The seal writes one when it runs with demotion rules set; with no rules it never scans the cohort.</p>
+        <p class="deferred">No report yet. One is written when the event opens with demotion rules set; with no rules the cohort is never scanned.</p>
         {% else %}
         {% if !demotion.error.is_empty() %}
-        <p class="status status-error">The configured rules did not parse and the seal ran without demotion: {{ demotion.error }}</p>
+        <p class="status status-error">The configured rules did not parse and the event opened without demotion: {{ demotion.error }}</p>
         {% endif %}
         <dl class="kv-pairs">
           <div>

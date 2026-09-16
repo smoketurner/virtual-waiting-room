@@ -100,23 +100,23 @@ data "aws_iam_policy_document" "apigw_sqs" {
   }
 }
 
-# Execution-role permissions for seal_event: read the shard counts and write the
-# seal (seed + offsets + count + phase) on the Counters item, write the demotion
+# Execution-role permissions for open_event: read the shard counts and write the
+# open (seed + offsets + count + phase) on the Counters item, write the demotion
 # set chunks and report beside it and scan the pre-queue (issue #145), plus logs.
-data "aws_iam_policy_document" "seal_event" {
+data "aws_iam_policy_document" "open_event" {
   statement {
-    sid    = "ReadAndSealCounters"
+    sid    = "ReadAndOpenCounters"
     effect = "Allow"
     actions = [
       "dynamodb:GetItem",
-      # The pre-queue shards are separate items, so the seal gathers them in one
+      # The pre-queue shards are separate items, so the open gathers them in one
       # BatchGetItem. GetItem does not authorise it — it is its own action.
       "dynamodb:BatchGetItem",
       "dynamodb:UpdateItem",
       # The demotion set (EVT#<id>#DG#<nonce>#<k>) and report (EVT#<id>#DM) are
       # their own items, written whole.
       "dynamodb:PutItem",
-      # A seal that loses the election deletes the set chunks it wrote.
+      # An open that loses the election deletes the set chunks it wrote.
       "dynamodb:DeleteItem",
     ]
     resources = [aws_dynamodb_table.counters.arn]
@@ -126,9 +126,9 @@ data "aws_iam_policy_document" "seal_event" {
     sid    = "ClassifyPreQueue"
     effect = "Allow"
     actions = [
-      # The one sanctioned scan of the pre-queue: once, at the seal, and only
+      # The one sanctioned scan of the pre-queue: once, at the open, and only
       # when demotion rules are set. Never on the hot path. Read-only: the
-      # seal writes nothing per row.
+      # open writes nothing per row.
       "dynamodb:Scan",
     ]
     resources = [aws_dynamodb_table.prequeue.arn]
@@ -142,7 +142,7 @@ data "aws_iam_policy_document" "seal_event" {
       "logs:CreateLogStream",
       "logs:PutLogEvents",
     ]
-    resources = ["arn:${local.aws_partition}:logs:${local.aws_region}:${local.aws_account_id}:log-group:/aws/lambda/${local.seal_event_name}*"]
+    resources = ["arn:${local.aws_partition}:logs:${local.aws_region}:${local.aws_account_id}:log-group:/aws/lambda/${local.open_event_name}*"]
   }
 }
 
@@ -226,7 +226,7 @@ data "aws_iam_policy_document" "admin" {
   }
 
   # Issue #128: the operator sets the event's start time from the dashboard,
-  # which rewrites the one-time seal schedule. Read as well as write, because
+  # which rewrites the one-time open schedule. Read as well as write, because
   # UpdateSchedule replaces the whole schedule rather than patching it, so the
   # writer has to fetch the current definition to resend it intact.
   #
@@ -234,25 +234,25 @@ data "aws_iam_policy_document" "admin" {
   # exists, the admin owns only when it fires. Clearing a start time therefore
   # cannot delete it even if the code asked to.
   statement {
-    sid    = "ReadAndWriteSealSchedule"
+    sid    = "ReadAndWriteOpenSchedule"
     effect = "Allow"
     actions = [
       "scheduler:GetSchedule",
       "scheduler:UpdateSchedule",
     ]
-    resources = [aws_scheduler_schedule.seal.arn]
+    resources = [aws_scheduler_schedule.open.arn]
   }
 
   # UpdateSchedule resends the target's RoleArn, so the caller must be allowed
   # to pass it. Scoped to that one role and to Scheduler as the only service it
   # may be passed to, rather than the role/* the AWS example uses. What the
   # grant is worth to an attacker is bounded by the role itself: its whole
-  # policy is a single lambda:InvokeFunction on seal_event.
+  # policy is a single lambda:InvokeFunction on open_event.
   statement {
-    sid       = "PassSealSchedulerRole"
+    sid       = "PassOpenSchedulerRole"
     effect    = "Allow"
     actions   = ["iam:PassRole"]
-    resources = [aws_iam_role.seal_scheduler.arn]
+    resources = [aws_iam_role.open_scheduler.arn]
 
     condition {
       test     = "StringEquals"
@@ -324,7 +324,7 @@ data "aws_iam_policy_document" "controller" {
   }
 }
 
-# Trust policy for the EventBridge Scheduler role that invokes the seal Lambda.
+# Trust policy for the EventBridge Scheduler role that invokes the open Lambda.
 data "aws_iam_policy_document" "scheduler_assume_role" {
   statement {
     effect  = "Allow"

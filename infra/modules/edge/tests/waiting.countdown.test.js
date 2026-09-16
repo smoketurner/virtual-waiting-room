@@ -63,7 +63,7 @@ test("an unscheduled event keeps the original text", async () => {
 });
 
 test("a start time that has passed says so instead of counting down further", async () => {
-  // The seal fires from EventBridge, not from this page, so there is a window
+  // The open fires from EventBridge, not from this page, so there is a window
   // where the start has passed and the phase has not flipped. A negative
   // duration must never be rendered.
   const headline = await headlineFor(

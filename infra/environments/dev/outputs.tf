@@ -24,9 +24,9 @@ output "api_invoke_url" {
   value       = module.core.api_invoke_url
 }
 
-output "seal_event_function_name" {
-  description = "Name of the seal_event Lambda. Invoke it manually or via the seal schedule to open the event."
-  value       = module.core.seal_event_function_name
+output "open_event_function_name" {
+  description = "Name of the open_event Lambda. Invoke it manually or via the open schedule to open the event."
+  value       = module.core.open_event_function_name
 }
 
 output "event_id" {
@@ -80,7 +80,7 @@ output "cloudfront_distribution_id" {
   value       = module.edge.distribution_id
 }
 
-output "seal_schedule_name" {
-  description = "Name of the one-time seal schedule (issue #128), so scripts can disable it alongside a reset."
-  value       = module.core.seal_schedule_name
+output "open_schedule_name" {
+  description = "Name of the one-time open schedule (issue #128), so scripts can disable it alongside a reset."
+  value       = module.core.open_schedule_name
 }

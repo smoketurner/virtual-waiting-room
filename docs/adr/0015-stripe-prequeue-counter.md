@@ -39,7 +39,7 @@ another event's item.
   batch's **local indices** within it, not one per registrant — then writes `PreQueue {r, s, l, t}`
   per request: the shard `s` and the local index `l`, never a global index.
   Ten partition keys are ten budgets, so the ceiling rises to ~10,000 registrations/second.
-- **Seal (T−0).** The seal gathers the 10 shard counts, computes **prefix offsets**
+- **Open (T−0).** The open gathers the 10 shard counts, computes **prefix offsets**
   `offset[s] = Σ counts[0..s)`, sets `participant_count = Σ counts` (= N), and stores the 10
   offsets on the `Counters` item — in the same conditional write that sets `shuffle_seed` and
   `phase = active`. Still one write; still atomic.
@@ -79,7 +79,7 @@ shard attribute is the single letter `n`.
   counter advances past an unclaimed position and the no-show controller (§7) absorbs it.
 - **Draw the shard server-side at random, not from `hash(request_id)`.** The original scheme hashed
   a *client-supplied* value with an unkeyed FNV-1a, so an attacker could retry ids until one landed
-  on a chosen shard — about ten tries — and thereby steer the seal's prefix offsets. A random draw
+  on a chosen shard — about ten tries — and thereby steer the open's prefix offsets. A random draw
   removes that control unconditionally rather than making it merely expensive.
 
   Determinism was never load-bearing. Every caller uses the shard once at write time and the row
@@ -90,7 +90,7 @@ shard attribute is the single letter `n`.
   shard claims to one.
 - `PreQueue` stores `{r, s, l, t}`. The global index is derived, never stored, so it cannot disagree
   with the offsets.
-- **The read side pays a small cost.** The seal and the controller each gather their ten shards with
+- **The read side pays a small cost.** The open and the controller each gather their ten shards with
   one `BatchGetItem` rather than reading attributes from an item they had already fetched. Both
   treat an incomplete batch as a failure rather than a zero, because a missed shard would
   under-count the cohort or over-release admission.
@@ -107,10 +107,10 @@ shard attribute is the single letter `n`.
 
 ## Failure modes
 
-- **Straggler join racing the seal.** The seal reads the 10 shard counts, then writes seed +
+- **Straggler join racing the open.** The open reads the 10 shard counts, then writes seed +
   offsets + `active` in one conditional `UpdateItem`. A registration in flight can claim a local
-  index in a shard *after* the seal read that shard's count, so its local index is beyond the range
-  the seal counted for that shard. The straggler test MUST be **per shard**, not a global
+  index in a shard *after* the open read that shard's count, so its local index is beyond the range
+  the open counted for that shard. The straggler test MUST be **per shard**, not a global
   `i ≥ participant_count`: a shard's own issued count is `offset[s+1] - offset[s]` (or
   `N - offset[s]` for the last shard), and a local index at or past it is the straggler, regardless
   of where the reconstructed global index lands. A global `i ≥ N` test is not equivalent — an
@@ -119,8 +119,8 @@ shard attribute is the single letter `n`.
   the same position. `/queue_num` falls through to the straggler's `Positions` row rather than
   calling `PRP` out of range — answering with that row's live-join position, or 404 when none has
   landed yet so the client recovers by re-joining; `assign_position` applies the same check once its
-  own writes land, to catch the case where the seal lands mid-batch. This degrades a straggler to
-  exactly the live joiner it would have been a moment later, and keeps the seal a single write.
+  own writes land, to catch the case where the open lands mid-batch. This degrades a straggler to
+  exactly the live joiner it would have been a moment later, and keeps the open a single write.
   (This race also exists for a single counter racing `participant_count`; it is not introduced by
   striping.)
 - **Torn read at T−0 is impossible.** Seed, count, offsets and phase are set in one atomic

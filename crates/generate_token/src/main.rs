@@ -27,7 +27,7 @@ struct AppState<S: Store> {
     event_id: String,
     session_cookie_name: String,
     session_ttl_secs: u64,
-    /// The sealed event's demotion set (issue #145), loaded once per
+    /// The opened event's demotion set (issue #145), loaded once per
     /// execution environment under the nonce the event item names.
     demotion_cache: DemotionCache,
 }
@@ -84,7 +84,7 @@ async fn init() -> Result<AppState<DynamoStore>, Error> {
 }
 
 /// The demotion set the event item names, from the per-environment cache or
-/// one read of its chunk items; `None` when the seal demoted nobody, and also
+/// one read of its chunk items; `None` when the open demoted nobody, and also
 /// when the set cannot be read — `decide` then refuses with a retryable
 /// status rather than admitting from the primary slot. Logged, because a set
 /// that stays unreadable refuses every demoting event's admissions.
@@ -252,7 +252,7 @@ fn request_id(req: &Request) -> Option<String> {
 fn refusal(denied: &Denied) -> Result<Response<Body>, Error> {
     let status = match denied {
         Denied::StillQueued { .. } => 425,
-        Denied::NotAdmitting | Denied::NotSealed => 409,
+        Denied::NotAdmitting | Denied::NotOpen => 409,
         Denied::NotRegistered => 404,
         Denied::Spent => 410,
         Denied::Corrupt => 500,
@@ -290,13 +290,13 @@ mod tests {
 
     use generate_token::StoreError;
     use wr_common::{
-        DemotionRef, Phase, PositionStatus, PreQueueItem, SHARDS, SealedOffsets, Shard,
+        CohortOffsets, DemotionRef, Phase, PositionStatus, PreQueueItem, SHARDS, Shard,
         StoredControl,
     };
 
     use super::*;
 
-    /// An in-memory `Store` over a sealed, demoting event, whose demotion-chunk
+    /// An in-memory `Store` over an opened, demoting event, whose demotion-chunk
     /// read always fails with a transient send error. It proves the handler
     /// gates `load_demotion` to the pre-queue path: a live joiner never reaches
     /// that read, so a live-join admission succeeds even when the read errors.
@@ -338,24 +338,24 @@ mod tests {
         }
     }
 
-    /// A sealed, active event that demoted one cohort row: `counters.demotion`
+    /// An opened, active event that demoted one cohort row: `counters.demotion`
     /// is `Some`, so `load_demotion` would actually issue a chunk read rather
     /// than short-circuit on the `None` arm.
     fn mock_counters() -> Counters {
         let counts = [2u64; SHARDS];
-        let sealed = SealedOffsets::seal(counts).unwrap();
+        let opened = CohortOffsets::from_counts(counts).unwrap();
         let mut offsets = [0u64; SHARDS];
         for (s, slot) in offsets.iter_mut().enumerate() {
-            *slot = sealed.offset(s);
+            *slot = opened.offset(s);
         }
         Counters {
             event_id: "evt".to_owned(),
             phase: Phase::Active,
-            queue_counter: sealed.participant_count(),
+            queue_counter: opened.participant_count(),
             // Past position 3, so a live joiner holding it is admitted.
             serving_counter: 10,
             shuffle_seed: Some([9u8; 32]),
-            participant_count: Some(sealed.participant_count()),
+            participant_count: Some(opened.participant_count()),
             prequeue_offsets: Some(offsets),
             demoted_count: 1,
             demotion: Some(DemotionRef {
@@ -377,7 +377,7 @@ mod tests {
     }
 
     /// A live joiner holding an issued `Positions` row at position 3, against a
-    /// sealed, demoting event whose demotion-chunk read always errors.
+    /// opened, demoting event whose demotion-chunk read always errors.
     fn live_join_state() -> AppState<MockStore> {
         AppState {
             store: MockStore {

@@ -8,7 +8,7 @@ members = [
     "crates/generate_token",
     "crates/harness",
     "crates/read",
-    "crates/seal_event",
+    "crates/open_event",
     "crates/wr-common",
 ]
 

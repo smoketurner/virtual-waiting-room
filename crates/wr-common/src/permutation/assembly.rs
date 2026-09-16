@@ -3,9 +3,9 @@
 //! Registration stripes the pre-queue counter across `K = 10` shards: each
 //! join draws a shard `s` uniformly at random (issue #59 — a client-supplied
 //! `request_id` let an attacker steer `hash(request_id) % 10` in about ten
-//! tries, biasing the seal's prefix offsets), claims a local index `l` by
+//! tries, biasing the open's prefix offsets), claims a local index `l` by
 //! atomically incrementing that shard's counter, and stores `(request_id, s,
-//! l)` — never a global index. Sealing the cohort reads the 10 shard counts,
+//! l)` — never a global index. Opening the event reads the 10 shard counts,
 //! computes prefix offsets `offset[s] = Σ counts[0..s)` and cohort size `N = Σ
 //! counts`. A visitor's global registration index is reconstructed on read as
 //! `i = offset[s] + l`.
@@ -20,10 +20,10 @@
 /// Number of pre-queue counter shards; fixed at 10 for every deployment.
 pub const SHARDS: usize = 10;
 
-/// The sealed pre-queue index space: per-shard prefix offsets and the cohort
-/// size `N`, computed once from the shard counts when the cohort is sealed.
+/// The fixed pre-queue index space: per-shard prefix offsets and the cohort
+/// size `N`, computed once from the shard counts when the event opens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SealedOffsets {
+pub struct CohortOffsets {
     offsets: [u64; SHARDS],
     participant_count: u64,
 }
@@ -35,7 +35,7 @@ pub enum Assignment {
     /// derives the pre-queue position from the reconstructed global index.
     PreQueue { index: u64 },
     /// The local index is at or past the shard's own issued count — claimed
-    /// after the seal read that shard's count. The caller assigns a live-join
+    /// after the open read that shard's count. The caller assigns a live-join
     /// position instead. This is a per-shard bound, not a global `i >= N`
     /// test: a global test would let an over-count on one shard reconstruct
     /// into the index range a *later* shard legitimately owns, handing two
@@ -43,9 +43,9 @@ pub enum Assignment {
     LiveJoin,
 }
 
-/// Error from sealing the pre-queue index space.
+/// Error from folding the shard counts into the index space.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum SealError {
+pub enum CohortError {
     /// A shard count plus the running total would exceed `u64`. Unreachable in
     /// practice (cohort sizes are ~`10^6`), but summed explicitly rather than
     /// wrapped.
@@ -53,15 +53,15 @@ pub enum SealError {
     Overflow,
 }
 
-impl SealedOffsets {
-    /// Seals the index space from the 10 shard counts: computes the prefix
+impl CohortOffsets {
+    /// Fixes the index space from the 10 shard counts: computes the prefix
     /// offsets and `N = Σ counts`.
     ///
     /// # Errors
     ///
-    /// Returns [`SealError::Overflow`] if the summed cohort size would exceed
+    /// Returns [`CohortError::Overflow`] if the summed cohort size would exceed
     /// `u64`.
-    pub fn seal(counts: [u64; SHARDS]) -> Result<Self, SealError> {
+    pub fn from_counts(counts: [u64; SHARDS]) -> Result<Self, CohortError> {
         let mut offsets = [0u64; SHARDS];
         let mut running = 0u64;
         let mut shard = 0;
@@ -69,7 +69,7 @@ impl SealedOffsets {
             offsets[shard] = running;
             running = running
                 .checked_add(counts[shard])
-                .ok_or(SealError::Overflow)?;
+                .ok_or(CohortError::Overflow)?;
             shard += 1;
         }
         Ok(Self {
@@ -78,7 +78,7 @@ impl SealedOffsets {
         })
     }
 
-    /// Reconstructs a sealed index space from the prefix offsets and cohort
+    /// Reconstructs a fixed index space from the prefix offsets and cohort
     /// size already published for an event, without re-reading the shard
     /// counts. The read path uses this to resolve positions from the values a
     /// reader already fetched.
@@ -123,14 +123,14 @@ impl SealedOffsets {
     /// Returns [`Assignment::PreQueue`] with the global index `i = offset[s] +
     /// l` when `l` is within shard `s`'s own issued count (derived from the
     /// gap to the next shard's offset), and [`Assignment::LiveJoin`] when `l`
-    /// is at or past it — a local index claimed after the seal read that
+    /// is at or past it — a local index claimed after the open read that
     /// shard's count. This is deliberately a **per-shard** bound rather than
     /// a global `i < N` test: a global test admits an over-count on shard `s`
     /// whose reconstructed index still lands inside `[0, N)`, because that
     /// range legitimately belongs to shards after `s` — the same global index
     /// would then be handed to two visitors.
     ///
-    /// A `shard` outside `[0, SHARDS)` has no sealed offset, so it also
+    /// A `shard` outside `[0, SHARDS)` has no offset, so it also
     /// degrades to a live join rather than panicking.
     #[must_use]
     pub fn assign(&self, shard: usize, local_index: u64) -> Assignment {
@@ -154,7 +154,7 @@ impl SealedOffsets {
 ///
 /// Drawn uniformly at random per Lambda invocation (issue #59) rather than
 /// hashed from `request_id`: a client-supplied id gave an attacker roughly ten
-/// tries to steer which shard — and, through it, the seal's prefix offsets —
+/// tries to steer which shard — and, through it, the open's prefix offsets —
 /// their registration landed on. Determinism was never load-bearing: every
 /// caller draws the value once at write time and the row stores it, so a
 /// retried claim never needs to reproduce the same shard.
@@ -217,35 +217,38 @@ mod tests {
     use super::*;
     use crate::{Seed, prp};
 
-    /// Seal for tests, panicking on the unreachable overflow case.
-    fn seal_ok(counts: [u64; SHARDS]) -> SealedOffsets {
-        SealedOffsets::seal(counts).unwrap()
+    /// Folds counts for tests, panicking on the unreachable overflow case.
+    fn from_counts_ok(counts: [u64; SHARDS]) -> CohortOffsets {
+        CohortOffsets::from_counts(counts).unwrap()
     }
 
     #[test]
     fn offsets_are_prefix_sums() {
-        let sealed = seal_ok([3, 0, 5, 1, 0, 0, 2, 0, 0, 4]);
-        assert_eq!(sealed.offset(0), 0);
-        assert_eq!(sealed.offset(1), 3);
-        assert_eq!(sealed.offset(2), 3);
-        assert_eq!(sealed.offset(3), 8);
-        assert_eq!(sealed.offset(6), 9);
-        assert_eq!(sealed.offset(9), 11);
-        assert_eq!(sealed.participant_count(), 15);
+        let offsets = from_counts_ok([3, 0, 5, 1, 0, 0, 2, 0, 0, 4]);
+        assert_eq!(offsets.offset(0), 0);
+        assert_eq!(offsets.offset(1), 3);
+        assert_eq!(offsets.offset(2), 3);
+        assert_eq!(offsets.offset(3), 8);
+        assert_eq!(offsets.offset(6), 9);
+        assert_eq!(offsets.offset(9), 11);
+        assert_eq!(offsets.participant_count(), 15);
     }
 
     #[test]
     fn empty_cohort_is_zero() {
-        let sealed = seal_ok([0; SHARDS]);
-        assert_eq!(sealed.participant_count(), 0);
+        let offsets = from_counts_ok([0; SHARDS]);
+        assert_eq!(offsets.participant_count(), 0);
         // Any local index in any shard is a live join over an empty cohort.
-        assert_eq!(sealed.assign(0, 0), Assignment::LiveJoin);
+        assert_eq!(offsets.assign(0, 0), Assignment::LiveJoin);
     }
 
     #[test]
-    fn seal_overflow_is_reported_not_wrapped() {
+    fn cohort_overflow_is_reported_not_wrapped() {
         let counts = [u64::MAX, 1, 0, 0, 0, 0, 0, 0, 0, 0];
-        assert_eq!(SealedOffsets::seal(counts), Err(SealError::Overflow));
+        assert_eq!(
+            CohortOffsets::from_counts(counts),
+            Err(CohortError::Overflow)
+        );
     }
 
     #[test]
@@ -256,26 +259,26 @@ mod tests {
         // [0, N), but that index belongs to a shard after it, so treating it
         // as pre-queue would hand two visitors the same position.
         // Counts [3,0,5,1,0,0,2,0,0,4] -> offsets [0,3,3,8,9,9,9,11,11,11], N=15.
-        let sealed = seal_ok([3, 0, 5, 1, 0, 0, 2, 0, 0, 4]);
+        let offsets = from_counts_ok([3, 0, 5, 1, 0, 0, 2, 0, 0, 4]);
         // Shard 2's own count is 5 (offset[3] - offset[2] = 8 - 3): local 4 is
         // its last valid index, still pre-queue.
-        assert_eq!(sealed.assign(2, 4), Assignment::PreQueue { index: 7 });
+        assert_eq!(offsets.assign(2, 4), Assignment::PreQueue { index: 7 });
         // Local 11 reconstructs to i = 3 + 11 = 14 < 15 — inside [0, N) and,
         // under the old global-index rule, indistinguishable from shard 9's
         // legitimate local 3 (which also reconstructs to i = 14). The
         // per-shard rule catches it: local 11 is far past shard 2's own
         // count of 5, so it is a straggler, not a second claimant of index 14.
-        assert_eq!(sealed.assign(2, 11), Assignment::LiveJoin);
+        assert_eq!(offsets.assign(2, 11), Assignment::LiveJoin);
         // Last shard (offset 11, count 4): local 3 -> i = 14, still pre-queue;
         // local 4 -> past the shard's own count, a straggler.
-        assert_eq!(sealed.assign(9, 3), Assignment::PreQueue { index: 14 });
-        assert_eq!(sealed.assign(9, 4), Assignment::LiveJoin);
+        assert_eq!(offsets.assign(9, 3), Assignment::PreQueue { index: 14 });
+        assert_eq!(offsets.assign(9, 4), Assignment::LiveJoin);
     }
 
     #[test]
     fn shard_out_of_range_is_live_join() {
-        let sealed = seal_ok([1; SHARDS]);
-        assert_eq!(sealed.assign(SHARDS, 0), Assignment::LiveJoin);
+        let offsets = from_counts_ok([1; SHARDS]);
+        assert_eq!(offsets.assign(SHARDS, 0), Assignment::LiveJoin);
     }
 
     #[test]
@@ -298,12 +301,12 @@ mod tests {
     #[test]
     fn assembled_index_space_is_contiguous() {
         let counts = [3u64, 0, 5, 1, 0, 7, 2, 0, 0, 4];
-        let sealed = seal_ok(counts);
-        let n = sealed.participant_count();
+        let offsets = from_counts_ok(counts);
+        let n = offsets.participant_count();
         let mut seen = BTreeSet::new();
         for (shard, &count) in counts.iter().enumerate() {
             for local in 0..count {
-                if let Assignment::PreQueue { index } = sealed.assign(shard, local) {
+                if let Assignment::PreQueue { index } = offsets.assign(shard, local) {
                     assert!(seen.insert(index), "duplicate global index {index}");
                 } else {
                     panic!("issued index (shard {shard}, local {local}) is not pre-queue");
@@ -319,12 +322,12 @@ mod tests {
         /// contiguous [0, N) — the invariant the permutation domain rests on.
         #[test]
         fn prop_contiguous_index_space(counts in prop::array::uniform10(0u64..300)) {
-            let sealed = seal_ok(counts);
-            let n = sealed.participant_count();
+            let offsets = from_counts_ok(counts);
+            let n = offsets.participant_count();
             let mut seen = BTreeSet::new();
             for (shard, &count) in counts.iter().enumerate() {
                 for local in 0..count {
-                    match sealed.assign(shard, local) {
+                    match offsets.assign(shard, local) {
                         Assignment::PreQueue { index } => {
                             prop_assert!(seen.insert(index), "duplicate index {}", index);
                         }
@@ -348,8 +351,8 @@ mod tests {
             seed_byte: u8,
             burn_pick: u64,
         ) {
-            let sealed = seal_ok(counts);
-            let n = sealed.participant_count();
+            let offsets = from_counts_ok(counts);
+            let n = offsets.participant_count();
             prop_assume!(n > 0);
             let seed = Seed([seed_byte; 32]);
 
@@ -385,14 +388,14 @@ mod tests {
             shard in 0usize..SHARDS,
             overshoot in 0u64..50,
         ) {
-            let sealed = seal_ok(counts);
+            let offsets = from_counts_ok(counts);
             let straggler_local = counts[shard] + overshoot;
-            prop_assert_eq!(sealed.assign(shard, straggler_local), Assignment::LiveJoin);
+            prop_assert_eq!(offsets.assign(shard, straggler_local), Assignment::LiveJoin);
             // And the shard's own last valid index is still pre-queue, in domain.
             let last_valid = counts[shard] - 1;
-            match sealed.assign(shard, last_valid) {
+            match offsets.assign(shard, last_valid) {
                 Assignment::PreQueue { index } => {
-                    prop_assert!(index < sealed.participant_count());
+                    prop_assert!(index < offsets.participant_count());
                 }
                 Assignment::LiveJoin => prop_assert!(false, "issued index degraded to live join"),
             }
@@ -409,12 +412,12 @@ mod tests {
         fn prop_no_duplicate_indices_with_injected_stragglers(
             counts in prop::array::uniform10(0u64..40),
         ) {
-            let sealed = seal_ok(counts);
+            let offsets = from_counts_ok(counts);
             let mut seen = BTreeSet::new();
             for (shard, &count) in counts.iter().enumerate() {
                 // One local index past this shard's own count: a straggler.
                 for local in 0..=count {
-                    match sealed.assign(shard, local) {
+                    match offsets.assign(shard, local) {
                         Assignment::PreQueue { index } => {
                             prop_assert!(
                                 local < count,

@@ -6,7 +6,7 @@ locals {
   artifact = {
     for crate in [
       "assign_position",
-      "seal_event",
+      "open_event",
       "read",
       "admin",
       "controller",

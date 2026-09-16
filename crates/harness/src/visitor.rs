@@ -105,7 +105,7 @@ pub enum Polling {
     /// Ask once and hold it, because a position cannot change. The shipped
     /// client.
     ///
-    /// A position cannot be asked for before the seal — it does not exist until
+    /// A position cannot be asked for before the open — it does not exist until
     /// the seed does — so the whole cohort asks in the window just after it,
     /// spread only as far as the client's own spread reaches.
     HoldPosition,
@@ -113,19 +113,19 @@ pub enum Polling {
     /// measure the cost of the difference instead of taking it on trust.
     EveryTick,
     /// Fetch the registration's `(shard, local index)` once during the
-    /// countdown, then compute the position locally from the seal outputs on
+    /// countdown, then compute the position locally from the open outputs on
     /// `/status`.
     ///
     /// The row exists from the moment registration lands, so this ask is not
-    /// tied to the seal, and afterwards the visitor needs nothing of their own
+    /// tied to the open, and afterwards the visitor needs nothing of their own
     /// — only the shared `/status` document, which is keyed on path and
     /// collapses.
     ///
-    /// Measuring it is what showed that being free of the seal is worth less
+    /// Measuring it is what showed that being free of the open is worth less
     /// than it sounds. Asking on arrival reproduces the arrival rush, which for
     /// a scheduled event is a wall of people just before the start: against a
     /// late-arriving million, that peaks around six times higher than waiting
-    /// for the seal and spreading deliberately. Given the same spread the two
+    /// for the open and spreading deliberately. Given the same spread the two
     /// land within a few per cent of each other, which says the spread is doing
     /// the work and the timing is close to incidental.
     DerivePosition,
@@ -227,7 +227,7 @@ pub struct RunSettings {
     pub polling: Polling,
     /// Window the cohort spreads its one position request over.
     pub spread_ms: u64,
-    /// How long the countdown runs before the seal. A position becomes askable
+    /// How long the countdown runs before the open. A position becomes askable
     /// only after this; a registration row is askable from the start.
     pub countdown_ms: u64,
     pub arrival: Arrival,
@@ -257,11 +257,11 @@ pub async fn run<F, Fut>(
 
     let first_ask_after = Duration::from_millis(match settings.polling {
         // Readable the moment the row lands, so this ask is not tied to the
-        // seal — but arriving is not the same as being spread. A real audience
+        // open — but arriving is not the same as being spread. A real audience
         // turns up in a rush just before the start, so asking on arrival
         // reproduces that rush exactly. The deliberate spread is what flattens
         // a cohort, so apply it here too, starting from when each visitor
-        // arrives rather than from the seal.
+        // arrives rather than from the open.
         Polling::DerivePosition => {
             arrives_at
                 + if settings.spread_ms == 0 {
@@ -270,7 +270,7 @@ pub async fn run<F, Fut>(
                     jitter.next() % settings.spread_ms
                 }
         }
-        // Cannot be asked before the seal, so the wait is the countdown plus
+        // Cannot be asked before the open, so the wait is the countdown plus
         // this visitor's slice of the client's spread.
         Polling::HoldPosition | Polling::Backoff => {
             settings.countdown_ms
@@ -686,7 +686,7 @@ mod tests {
                 }
             } else if closed {
                 // Mirrors read's real 409 ("event not yet open") before the
-                // seal: no position is answered, so held_position must not
+                // open: no position is answered, so held_position must not
                 // be set from this.
                 (409, r#"{"error":"event not yet open"}"#.to_owned())
             } else {

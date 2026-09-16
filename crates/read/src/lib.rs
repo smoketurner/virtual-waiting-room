@@ -30,7 +30,7 @@ use wr_common::{
 /// than scaling with it.
 ///
 /// Staleness is bounded by the TTL and costs nothing that matters:
-/// `serving_position` is the only field that moves once an event is sealed, the
+/// `serving_position` is the only field that moves once an event is opened, the
 /// controller advances it far more slowly than this, and the edge already
 /// serves the same document from cache for a comparable window.
 #[derive(Debug)]
@@ -128,7 +128,7 @@ pub fn parse_poll_policy(
 }
 
 /// The `/status` payload — one document the countdown and queue pages poll.
-/// Seal outputs appear only once the event is active.
+/// Open outputs appear only once the event is active.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StatusResponse {
     /// The event this room is serving. Published because the join request is
@@ -141,14 +141,14 @@ pub struct StatusResponse {
     /// admission control. This is the authoritative visitor-facing signal.
     pub serving_state: ServingState,
     pub serving_position: u64,
-    /// Present once sealed: the cohort size.
+    /// Present once opened: the cohort size.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub participant_count: Option<u64>,
-    /// Present once sealed: the per-shard prefix offsets, so a client can
+    /// Present once opened: the per-shard prefix offsets, so a client can
     /// reconstruct its global index without a round trip.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prequeue_offsets: Option<[u64; SHARDS]>,
-    /// Present once sealed: the 256-bit permutation key, lowercase hex.
+    /// Present once opened: the 256-bit permutation key, lowercase hex.
     ///
     /// With the offsets and the cohort size published alongside it, anyone can
     /// recompute the whole ordering from the registration indices and check it
@@ -156,10 +156,10 @@ pub struct StatusResponse {
     /// check possible, so withholding it would leave the ordering unverifiable
     /// by anyone outside the deployment.
     ///
-    /// Absent before the seal, and the absence is load-bearing: a registrant
+    /// Absent before the open, and the absence is load-bearing: a registrant
     /// holding the key early could compute which registration index lands at
     /// the front of the queue and register until they got one, which is the
-    /// advantage the permutation exists to remove. It is generated at the seal
+    /// advantage the permutation exists to remove. It is generated at the open
     /// for that reason, so there is nothing to publish before then.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shuffle_seed: Option<String>,
@@ -198,12 +198,12 @@ pub struct StatusResponse {
 pub struct QueueNumResponse {
     pub position: u64,
     /// True when the position came from the live-join sequence rather than the
-    /// permutation (a straggler that raced the seal, or a join after opening).
+    /// permutation (a straggler that raced the open, or a join after opening).
     pub live_join: bool,
 }
 
 /// A resolved pre-queue registration, distinguishing a counted registrant
-/// from a straggler whose `PreQueue` row raced the seal.
+/// from a straggler whose `PreQueue` row raced the open.
 ///
 /// The handler needs this distinction, not just a response body: a
 /// [`ResolvedQueueNum::Straggler`] has no real position of its own yet and
@@ -245,13 +245,13 @@ pub fn status(counters: &Counters, poll_policy: Option<PollPolicy>, now: u64) ->
 /// Why a `/queue_num` request cannot be answered from the queue state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum QueueNumError {
-    /// The event has not been sealed, so no pre-queue position exists yet.
-    #[error("event not yet sealed")]
-    NotSealed,
+    /// The event has not been opened, so no pre-queue position exists yet.
+    #[error("event not yet open")]
+    NotOpen,
     /// The stored shard is outside `0..SHARDS` (corrupt row).
     #[error("shard index out of range")]
     BadShard,
-    /// The seal demoted rows and the demotion set could not be supplied, so
+    /// The open demoted rows and the demotion set could not be supplied, so
     /// no position can be answered without risking un-demoting one.
     #[error("demotion set unavailable")]
     DemotionUnavailable,
@@ -259,17 +259,17 @@ pub enum QueueNumError {
 
 /// Resolves a pre-queue registrant's queue position.
 ///
-/// Reconstructs the global index `i = offset[s] + l` from the sealed offsets
+/// Reconstructs the global index `i = offset[s] + l` from the fixed offsets
 /// and the visitor's `PreQueue` row, then derives the position with the
 /// permutation. A row whose local index is at or past its shard's own issued
-/// count (a join that raced the seal) resolves to
+/// count (a join that raced the open) resolves to
 /// [`ResolvedQueueNum::Straggler`] instead — the permutation is never
 /// evaluated out of domain, and the caller falls through to a `Positions`
 /// lookup rather than answering with a position this function does not have.
 ///
 /// # Errors
 ///
-/// [`QueueNumError::NotSealed`] before the seal; [`QueueNumError::BadShard`] if
+/// [`QueueNumError::NotOpen`] before the open; [`QueueNumError::BadShard`] if
 /// the stored shard is out of range; [`QueueNumError::DemotionUnavailable`]
 /// when the event demoted rows (issue #145), the demotion set is `None`, and
 /// the row is a cohort row — a straggler resolves to
@@ -287,7 +287,7 @@ pub fn queue_num(
             }))
         }
         Ok(ResolvedPosition::LiveJoin) => Ok(ResolvedQueueNum::Straggler),
-        Err(ResolveError::NotSealed) => Err(QueueNumError::NotSealed),
+        Err(ResolveError::NotOpen) => Err(QueueNumError::NotOpen),
         Err(ResolveError::BadShard) => Err(QueueNumError::BadShard),
         Err(ResolveError::DemotionUnavailable) => Err(QueueNumError::DemotionUnavailable),
     }
@@ -302,23 +302,23 @@ mod tests {
         reason = "test code panics on setup failure; shard/len casts are provably small"
     )]
 
-    use wr_common::{SealedOffsets, Seed, prp};
+    use wr_common::{CohortOffsets, Seed, prp};
 
     use super::*;
 
-    fn sealed_counters(counts: [u64; SHARDS], seed: [u8; 32]) -> Counters {
-        let sealed = SealedOffsets::seal(counts).unwrap();
+    fn opened_counters(counts: [u64; SHARDS], seed: [u8; 32]) -> Counters {
+        let opened = CohortOffsets::from_counts(counts).unwrap();
         let mut offsets = [0u64; SHARDS];
         for (s, slot) in offsets.iter_mut().enumerate() {
-            *slot = sealed.offset(s);
+            *slot = opened.offset(s);
         }
         Counters {
             event_id: "evt-1".to_owned(),
             phase: Phase::Active,
-            queue_counter: sealed.participant_count(),
+            queue_counter: opened.participant_count(),
             serving_counter: 5,
             shuffle_seed: Some(seed),
-            participant_count: Some(sealed.participant_count()),
+            participant_count: Some(opened.participant_count()),
             prequeue_offsets: Some(offsets),
             demoted_count: 0,
             demotion: None,
@@ -341,7 +341,7 @@ mod tests {
     }
 
     #[test]
-    fn status_hides_seal_outputs_before_seal() {
+    fn status_hides_open_outputs_before_open() {
         let counters = Counters {
             event_id: "evt-1".to_owned(),
             phase: Phase::PreQueue,
@@ -362,17 +362,17 @@ mod tests {
         assert_eq!(json["phase"], "pre_queue");
         assert!(json.get("participant_count").is_none());
         assert!(json.get("prequeue_offsets").is_none());
-        // The seed is the one seal output that must never appear early:
+        // The seed is the one open output that must never appear early:
         // holding it before registration closes turns "register and take your
         // chances" into "register until you draw a front position".
-        assert!(counters.sealed().is_none());
+        assert!(counters.open_outputs().is_none());
         assert!(json.get("shuffle_seed").is_none());
     }
 
     #[test]
-    fn status_publishes_the_seed_once_sealed() {
-        let counters = sealed_counters([1; SHARDS], [0xAB; 32]);
-        assert!(counters.sealed().is_some());
+    fn status_publishes_the_seed_once_opened() {
+        let counters = opened_counters([1; SHARDS], [0xAB; 32]);
+        assert!(counters.open_outputs().is_some());
         let json = serde_json::to_value(status(&counters, None, 0)).unwrap();
         assert_eq!(json["shuffle_seed"], "ab".repeat(32));
     }
@@ -383,7 +383,7 @@ mod tests {
         // offsets off /status, recompute the permutation over the registration
         // indices, and check the result against the positions the room serves.
         let counts = [3, 0, 5, 1, 0, 0, 2, 0, 0, 4];
-        let counters = sealed_counters(counts, [42u8; 32]);
+        let counters = opened_counters(counts, [42u8; 32]);
         let json = serde_json::to_value(status(&counters, None, 0)).unwrap();
 
         let seed = Seed(
@@ -419,7 +419,7 @@ mod tests {
         // Issue #145: a row the demotion set matches resolves to N + p, and
         // an event that demoted rows will not answer without the set.
         let counts = [3, 0, 5, 1, 0, 0, 2, 0, 0, 4];
-        let mut counters = sealed_counters(counts, [42u8; 32]);
+        let mut counters = opened_counters(counts, [42u8; 32]);
         let n = counters.participant_count.unwrap();
         counters.demoted_count = 4;
         counters.demotion = Some(wr_common::DemotionRef {
@@ -454,7 +454,7 @@ mod tests {
             queue_num(&counters, &demoted, None).unwrap_err(),
             QueueNumError::DemotionUnavailable
         );
-        // The published seal outputs are unchanged by demotion: N is still the
+        // The published open outputs are unchanged by demotion: N is still the
         // cohort, and the tail is not announced to visitors.
         let json = serde_json::to_value(status(&counters, None, 0)).unwrap();
         assert_eq!(json["participant_count"], n);
@@ -468,7 +468,7 @@ mod tests {
         for (i, b) in seed.iter_mut().enumerate() {
             *b = i as u8;
         }
-        let counters = sealed_counters([1; SHARDS], seed);
+        let counters = opened_counters([1; SHARDS], seed);
         let json = serde_json::to_value(status(&counters, None, 0)).unwrap();
         let published = json["shuffle_seed"].as_str().unwrap();
         assert_eq!(published.len(), 64);
@@ -481,7 +481,7 @@ mod tests {
         // The waiting page branches on the key being absent, not on its value,
         // so serializing a null here would put it into the countdown path for
         // an event that has no start time.
-        let mut counters = sealed_counters([1; SHARDS], [7u8; 32]);
+        let mut counters = opened_counters([1; SHARDS], [7u8; 32]);
         counters.starts_at = None;
         let json = serde_json::to_value(status(&counters, None, 0)).unwrap();
         assert!(json.get("starts_at").is_none());
@@ -489,7 +489,7 @@ mod tests {
 
     #[test]
     fn status_publishes_the_scheduled_start() {
-        let mut counters = sealed_counters([1; SHARDS], [7u8; 32]);
+        let mut counters = opened_counters([1; SHARDS], [7u8; 32]);
         counters.starts_at = Some(1_800_000_000);
         let json = serde_json::to_value(status(&counters, None, 0)).unwrap();
         assert_eq!(json["starts_at"], 1_800_000_000_u64);
@@ -500,15 +500,15 @@ mod tests {
         // The join request schema requires a non-empty event_id string, so a
         // client that cannot read it from /status cannot construct a request
         // that passes the edge validator.
-        let counters = sealed_counters([1; SHARDS], [7u8; 32]);
+        let counters = opened_counters([1; SHARDS], [7u8; 32]);
         let json = serde_json::to_value(status(&counters, None, 0)).unwrap();
         assert_eq!(json["event_id"], "evt-1");
         assert!(json["event_id"].as_str().is_some_and(|s| !s.is_empty()));
     }
 
     #[test]
-    fn status_exposes_seal_outputs_when_active() {
-        let counters = sealed_counters([2, 2, 2, 2, 2, 0, 0, 0, 0, 0], [3u8; 32]);
+    fn status_exposes_open_outputs_when_active() {
+        let counters = opened_counters([2, 2, 2, 2, 2, 0, 0, 0, 0, 0], [3u8; 32]);
         let json = serde_json::to_value(status(&counters, None, 0)).unwrap();
         assert_eq!(json["phase"], "active");
         assert_eq!(json["participant_count"], 10);
@@ -518,7 +518,7 @@ mod tests {
 
     #[test]
     fn status_surfaces_the_broadcast_message_when_set() {
-        let mut counters = sealed_counters([1; SHARDS], [7u8; 32]);
+        let mut counters = opened_counters([1; SHARDS], [7u8; 32]);
         counters.message = Some("Doors open at noon".to_owned());
         let json = serde_json::to_value(status(&counters, None, 0)).unwrap();
         assert_eq!(json["message"], "Doors open at noon");
@@ -526,14 +526,14 @@ mod tests {
 
     #[test]
     fn status_omits_the_message_when_absent() {
-        let counters = sealed_counters([1; SHARDS], [7u8; 32]);
+        let counters = opened_counters([1; SHARDS], [7u8; 32]);
         let json = serde_json::to_value(status(&counters, None, 0)).unwrap();
         assert!(json.get("message").is_none());
     }
 
     #[test]
     fn status_publishes_the_target_rate_when_set() {
-        let mut counters = sealed_counters([1; SHARDS], [7u8; 32]);
+        let mut counters = opened_counters([1; SHARDS], [7u8; 32]);
         counters.target_rate = Some(250);
         let json = serde_json::to_value(status(&counters, None, 0)).unwrap();
         assert_eq!(json["target_rate"], 250);
@@ -544,21 +544,21 @@ mod tests {
         // A waiting page must be able to tell "no rate set" from "rate is
         // zero": the first means the operator has not started admitting and no
         // estimate can be made, the second would read as an infinite wait.
-        let counters = sealed_counters([1; SHARDS], [7u8; 32]);
+        let counters = opened_counters([1; SHARDS], [7u8; 32]);
         let json = serde_json::to_value(status(&counters, None, 0)).unwrap();
         assert!(json.get("target_rate").is_none());
     }
 
     #[test]
     fn status_omits_poll_policy_when_unset() {
-        let counters = sealed_counters([1; SHARDS], [7u8; 32]);
+        let counters = opened_counters([1; SHARDS], [7u8; 32]);
         let json = serde_json::to_value(status(&counters, None, 0)).unwrap();
         assert!(json.get("poll_policy").is_none());
     }
 
     #[test]
     fn status_publishes_poll_policy_when_set() {
-        let counters = sealed_counters([1; SHARDS], [7u8; 32]);
+        let counters = opened_counters([1; SHARDS], [7u8; 32]);
         let policy = PollPolicy {
             floor_ms: 5000,
             ceiling_ms: 30000,
@@ -720,11 +720,11 @@ mod tests {
         }
 
         /// An auditor reads the seed back out of the published string, so the
-        /// encoding has to survive every byte pattern a seal can generate —
+        /// encoding has to survive every byte pattern an open can generate —
         /// including the leading zeros a naive formatter drops.
         #[test]
         fn the_published_seed_decodes_back_to_the_bytes_it_encodes(bytes in any::<[u8; 32]>()) {
-            let counters = sealed_counters([1; SHARDS], bytes);
+            let counters = opened_counters([1; SHARDS], bytes);
             let published = status(&counters, None, 0).shuffle_seed;
             prop_assert_eq!(hex::decode(published.unwrap_or_default()), Ok(bytes.to_vec()));
         }
@@ -733,7 +733,7 @@ mod tests {
     #[test]
     fn status_publishes_serving_state() {
         // Active event -> running; pause it -> paused; fail-open -> fail_open.
-        let mut counters = sealed_counters([1; SHARDS], [7u8; 32]);
+        let mut counters = opened_counters([1; SHARDS], [7u8; 32]);
         assert_eq!(
             serde_json::to_value(status(&counters, None, 0)).unwrap()["serving_state"],
             "running"
@@ -753,7 +753,7 @@ mod tests {
     #[test]
     fn status_serving_state_is_closed_before_active() {
         // An idle event with open admission reads Closed to a visitor.
-        let mut counters = sealed_counters([1; SHARDS], [7u8; 32]);
+        let mut counters = opened_counters([1; SHARDS], [7u8; 32]);
         counters.phase = Phase::Idle;
         assert_eq!(
             serde_json::to_value(status(&counters, None, 0)).unwrap()["serving_state"],
@@ -762,7 +762,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_num_before_seal_is_not_sealed() {
+    fn queue_num_before_open_is_not_opened() {
         let counters = Counters {
             event_id: "evt-1".to_owned(),
             phase: Phase::PreQueue,
@@ -781,14 +781,14 @@ mod tests {
         };
         assert_eq!(
             queue_num(&counters, &row(0, 0), None),
-            Err(QueueNumError::NotSealed)
+            Err(QueueNumError::NotOpen)
         );
     }
 
     #[test]
     fn queue_num_resolves_pre_queue_position_in_domain() {
         let counts = [3, 0, 5, 1, 0, 0, 2, 0, 0, 4];
-        let counters = sealed_counters(counts, [42u8; 32]);
+        let counters = opened_counters(counts, [42u8; 32]);
         let n = counters.participant_count.unwrap();
         // Every valid (shard, local) resolves to a distinct in-domain position.
         let mut positions = std::collections::BTreeSet::new();
@@ -810,7 +810,7 @@ mod tests {
     #[test]
     fn queue_num_straggler_is_reported_distinctly() {
         let counts = [3, 0, 5, 1, 0, 0, 2, 0, 0, 4]; // last shard's own count is 4
-        let counters = sealed_counters(counts, [42u8; 32]);
+        let counters = opened_counters(counts, [42u8; 32]);
         // Last shard local index 4 is past its own count: a straggler.
         assert_eq!(
             queue_num(&counters, &row(9, 4), None).unwrap(),
@@ -825,7 +825,7 @@ mod tests {
         // [0,3,3,8,...]), so local 5 is past it even though offset[2] + 5 =
         // 8 still lands inside [0, N).
         let counts = [3, 0, 5, 1, 0, 0, 2, 0, 0, 4];
-        let counters = sealed_counters(counts, [42u8; 32]);
+        let counters = opened_counters(counts, [42u8; 32]);
         assert_eq!(
             queue_num(&counters, &row(2, 5), None).unwrap(),
             ResolvedQueueNum::Straggler
@@ -835,13 +835,13 @@ mod tests {
     #[test]
     fn a_straggler_on_a_demoting_event_falls_through_even_without_the_set() {
         // The straggler rule runs before the demotion-availability gate, so a
-        // row that raced the seal resolves to `Straggler` (→ a `Positions`
+        // row that raced the open resolves to `Straggler` (→ a `Positions`
         // lookup) even when the demotion set could not be supplied — the
         // cold-start / transient-failure window, where the set is `None`
         // while `demoted_count > 0`. A straggler answers no primary slot, so
         // nothing is un-demoted; the symmetric cohort row still refuses.
         let counts = [3, 0, 5, 1, 0, 0, 2, 0, 0, 4]; // shard 2's own count is 5
-        let mut counters = sealed_counters(counts, [42u8; 32]);
+        let mut counters = opened_counters(counts, [42u8; 32]);
         let n = counters.participant_count.unwrap();
         counters.demoted_count = 4;
         counters.demotion = Some(wr_common::DemotionRef {
@@ -871,7 +871,7 @@ mod tests {
 
     #[test]
     fn queue_num_bad_shard_is_rejected() {
-        let counters = sealed_counters([1; SHARDS], [1u8; 32]);
+        let counters = opened_counters([1; SHARDS], [1u8; 32]);
         let bad = PreQueueItem {
             r: "req-1".to_owned(),
             s: SHARDS as u8,
@@ -899,7 +899,7 @@ mod tests {
     fn a_fresh_entry_is_served_without_a_read() {
         let cache = CountersCache::new(TTL);
         let now = Instant::now();
-        let counters = sealed_counters([1, 0, 0, 0, 0, 0, 0, 0, 0, 0], [3u8; 32]);
+        let counters = opened_counters([1, 0, 0, 0, 0, 0, 0, 0, 0, 0], [3u8; 32]);
         cache.put(now, Some(counters.clone()));
         assert_eq!(cache.get(now + TTL / 2), Some(Some(counters)));
     }
@@ -910,7 +910,7 @@ mod tests {
         let now = Instant::now();
         cache.put(
             now,
-            Some(sealed_counters([1, 0, 0, 0, 0, 0, 0, 0, 0, 0], [3u8; 32])),
+            Some(opened_counters([1, 0, 0, 0, 0, 0, 0, 0, 0, 0], [3u8; 32])),
         );
         // At the boundary the entry is already stale: the handler must re-read
         // rather than serve a value older than the window it promised.
@@ -932,7 +932,7 @@ mod tests {
     fn a_later_put_replaces_an_earlier_one() {
         let cache = CountersCache::new(TTL);
         let now = Instant::now();
-        let first = sealed_counters([1, 0, 0, 0, 0, 0, 0, 0, 0, 0], [3u8; 32]);
+        let first = opened_counters([1, 0, 0, 0, 0, 0, 0, 0, 0, 0], [3u8; 32]);
         let mut second = first.clone();
         second.serving_counter = 99;
         cache.put(now, Some(first));

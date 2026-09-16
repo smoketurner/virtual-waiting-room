@@ -69,18 +69,18 @@ Position assignment has two paths:
 
 - **Pre-queue (scheduled).** Registration writes `PreQueue {r, s, l, t}`: shard
   `s = hash(request_id) % 10`, local index `l` from a striped counter (ADR-0015). At T−0
-  `seal_event` folds the ten shard counts into prefix offsets and a cohort size and writes
+  `open_event` folds the ten shard counts into prefix offsets and a cohort size and writes
   seed + offsets + count + phase in **one conditional `UpdateItem`** guarded by
-  `attribute_not_exists(shuffle_seed)`, so a double-fire seals exactly once. A visitor's
+  `attribute_not_exists(shuffle_seed)`, so a double-fire opens exactly once. A visitor's
   position is `PRP(seed, offset[s] + l, N)`, computed on read — never stored (ADR-0002).
-  With demotion rules set (ADR-0029, issue #145) the seal first scans the pre-queue, groups the
+  With demotion rules set (ADR-0029, issue #145) the open first scans the pre-queue, groups the
   cohort by the join telemetry (`wr_common::demotion`), and demotes every group over its
   `signal:max` threshold. Nothing is written per row: the demoted group set is stored once as
-  chunk items under a per-run nonce, and the seal write carries `demoted_count = D` plus the
+  chunk items under a per-run nonce, and the open write carries `demoted_count = D` plus the
   nonce and starts `queue_counter` at `2N`. Every resolver loads the set once per execution
   environment and a matching row resolves to `N + PRP(seed, i, N)`; a resolver without the set
   refuses rather than un-demotes. The tail is sparse, so the controller's `Tiers` convert
-  between positions and people at the densities the seal recorded. `demotion_mode` defaults to
+  between positions and people at the densities the open recorded. `demotion_mode` defaults to
   `observe` (report only); no rules, no scan.
 - **Live join.** `assign_position` claims a contiguous block with one
   `UpdateItem ADD queue_counter :n / ALL_NEW`, incrementing by the count of **valid** records
@@ -137,7 +137,7 @@ rather than a path that encodes which layer a type lives in.
 `crates/wr-common/tests/vectors.rs` generates the cross-language conformance vectors
 `infra/modules/edge/tests/*.conformance.test.js` check the CloudFront Function against.
 
-`assign_position`, `seal_event`, `read`, `controller`, `authorizer`, `admin`, and
+`assign_position`, `open_event`, `read`, `controller`, `authorizer`, `admin`, and
 `generate_token` are the Lambdas.
 
 Every Lambda crate follows the same three-file split, and new ones should:
@@ -239,7 +239,7 @@ most often:
 Correctness is the product here: a duplicate position or a non-uniform permutation is a
 visible fairness failure at a million people. `.kiro/steering/testing.md` lists the mechanisms
 that must stay proven — bijectivity and uniformity of the PRP, the frozen wire encoding
-vectors, contiguous shard assembly, burned slots, the straggler-racing-the-seal case, zero
+vectors, contiguous shard assembly, burned slots, the straggler-racing-the-open case, zero
 duplicate positions under concurrency, token/session non-interchangeability, cross-language
 credential and rule conformance with the edge gate (issue #71), and no-show convergence. Use
 `proptest` for the permutation and counter, and mock the AWS boundary via the `Store` trait

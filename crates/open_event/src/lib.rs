@@ -1,54 +1,54 @@
-//! Seal logic for the `seal_event` Lambda: at the scheduled start it reads the
+//! Open logic for the `open_event` Lambda: at the scheduled start it reads the
 //! 10 pre-queue shard counts, folds them into prefix offsets and the cohort
 //! size, generates the permutation seed, and writes all four plus the active
 //! phase and the live-join counter's starting value in one conditional update
-//! guarded by the seed's absence — so a retry or a double-fire seals exactly
+//! guarded by the seed's absence — so a retry or a double-fire opens exactly
 //! once.
 //!
-//! The seal is also where `queue_counter` starts behind the cohort, so live
+//! The open is also where `queue_counter` starts behind the cohort, so live
 //! joiners are numbered behind every pre-queue position instead of colliding
-//! with one. That clause is in the same atomic update as the rest of the seal
-//! write: a separate write could be lost between the seal and the first live
+//! with one. That clause is in the same atomic update as the rest of the open
+//! write: a separate write could be lost between the open and the first live
 //! join.
 //!
 //! # Demotion (issue #145)
 //!
-//! When the operator has set demotion rules, the seal also reads the cohort's
+//! When the operator has set demotion rules, the open also reads the cohort's
 //! join-time telemetry and demotes whole groups that exceed a threshold
 //! (`wr_common::demotion`). Nothing is written per row; the order of
-//! operations is what keeps the seal's guarantees intact:
+//! operations is what keeps the open's guarantees intact:
 //!
 //! 1. Read the shard counts, so the cohort is fixed.
 //! 2. Scan the pre-queue and classify it. Nothing is written yet, so a
 //!    double-fire at this point costs a duplicate scan and nothing else.
 //! 3. Write the demoted group set — the [`wr_common::DemotionSet`] every
 //!    resolver will match rows against — as chunk items under a per-run
-//!    nonce. Written *before* the election so the winning seal never names a
+//!    nonce. Written *before* the election so the winning open never names a
 //!    set that does not exist yet.
-//! 4. The one conditional seal write, now also carrying `D`, the nonce, and
+//! 4. The one conditional open write, now also carrying `D`, the nonce, and
 //!    the chunk count, and starting the live-join sequence at `2N`. This is
 //!    the election: exactly one run wins it, and only its nonce is ever read.
 //!    A loser deletes its own chunks; if that fails they are orphans nothing
 //!    names.
 //! 5. The winner writes the report.
 //!
-//! No rules means no scan at all: the seal is then exactly the single write it
+//! No rules means no scan at all: the open is then exactly the single write it
 //! was before this existed.
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use wr_common::{
-    Classification, Cohort, DemotionMode, DemotionRef, DemotionReport, DemotionRules, DemotionSet,
-    MAX_CHUNK_BYTES, RuleParseError, SHARDS, SealError, SealedOffsets, Telemetry,
+    Classification, Cohort, CohortError, CohortOffsets, DemotionMode, DemotionRef, DemotionReport,
+    DemotionRules, DemotionSet, MAX_CHUNK_BYTES, RuleParseError, SHARDS, Telemetry,
 };
 
 pub mod dynamo;
 
-/// The values written by a seal: the seed, cohort size, prefix offsets, and
-/// what was demoted.
+/// The values written when the event opens: the seed, cohort size, prefix
+/// offsets, and what was demoted.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SealValues {
+pub struct OpenValues {
     pub seed: [u8; 32],
     pub participant_count: u64,
     pub offsets: [u64; SHARDS],
@@ -60,23 +60,23 @@ pub struct SealValues {
     pub demotion: Option<DemotionRef>,
 }
 
-impl SealValues {
+impl OpenValues {
     /// Where the live-join sequence starts: `N` with no tail, `2N` with one.
     ///
     /// # Errors
     ///
-    /// [`SealError::Overflow`] if `2N` exceeds `u64`.
-    pub fn queue_counter_start(&self) -> Result<u64, SealError> {
+    /// [`CohortError::Overflow`] if `2N` exceeds `u64`.
+    pub fn queue_counter_start(&self) -> Result<u64, CohortError> {
         if self.demoted_count == 0 {
             return Ok(self.participant_count);
         }
         self.participant_count
             .checked_mul(2)
-            .ok_or(SealError::Overflow)
+            .ok_or(CohortError::Overflow)
     }
 }
 
-/// The demotion configuration the seal runs with: the operator's rules and
+/// The demotion configuration the open runs with: the operator's rules and
 /// whether to act on them. `rules_text` is kept so a report can quote what
 /// was configured even when it did not parse.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,7 +87,7 @@ pub struct DemotionConfig {
 }
 
 impl DemotionConfig {
-    /// No rules: the seal never scans.
+    /// No rules: the open never scans.
     #[must_use]
     pub fn off() -> Self {
         Self {
@@ -98,7 +98,7 @@ impl DemotionConfig {
     }
 
     /// Parses the two environment values. A rules string that does not parse
-    /// is carried as the error rather than failing here, so the seal still
+    /// is carried as the error rather than failing here, so the open still
     /// runs — an event that never opens is worse than one that opened without
     /// a control the operator can see, in the report, did not apply.
     #[must_use]
@@ -113,20 +113,20 @@ impl DemotionConfig {
 
 /// A store failure worth retrying.
 #[derive(Debug, thiserror::Error)]
-#[error("seal store error: {0}")]
+#[error("open store error: {0}")]
 pub struct StoreError(pub String);
 
-/// The result of attempting a seal.
+/// The result of attempting an open.
 #[derive(Debug, PartialEq, Eq)]
-pub enum SealResult {
-    /// This call performed the seal and wrote the values.
-    Sealed(Box<SealValues>),
-    /// The event was already sealed (the guard rejected the write); nothing
+pub enum OpenResult {
+    /// This call performed the open and wrote the values.
+    Opened(Box<OpenValues>),
+    /// The event was already open (the guard rejected the write); nothing
     /// changed. A double-fire or retry lands here.
-    AlreadySealed,
+    AlreadyOpen,
 }
 
-/// One pre-queue row as the seal's scan sees it.
+/// One pre-queue row as the open's scan sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScannedRow {
     pub shard: u8,
@@ -134,7 +134,7 @@ pub struct ScannedRow {
     pub telemetry: Option<Telemetry>,
 }
 
-/// The persistence port the seal drives.
+/// The persistence port the open drives.
 pub trait Store {
     /// Reads the 10 pre-queue shard counts for the event.
     fn read_shard_counts(
@@ -167,13 +167,13 @@ pub trait Store {
         count: u32,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
-    /// Writes the seal values, starts `queue_counter`, and flips the phase to
+    /// Writes the open values, starts `queue_counter`, and flips the phase to
     /// active, guarded by `attribute_not_exists(shuffle_seed)`. Returns
-    /// `false` if the guard rejected the write (already sealed).
-    fn write_seal(
+    /// `false` if the guard rejected the write (already open).
+    fn write_open(
         &self,
         event_id: &str,
-        values: &SealValues,
+        values: &OpenValues,
     ) -> impl Future<Output = Result<bool, StoreError>> + Send;
 
     /// Writes the demotion report item.
@@ -185,20 +185,20 @@ pub trait Store {
 }
 
 /// Folds the shard counts into the offsets and cohort size and pairs them with
-/// a freshly generated seed. Nothing demoted; a demoting seal fills that in.
+/// a freshly generated seed. Nothing demoted; a demoting open fills that in.
 ///
 /// # Errors
 ///
-/// Returns [`SealError::Overflow`] if the summed cohort size exceeds `u64`.
-pub fn seal_values(counts: [u64; SHARDS], seed: [u8; 32]) -> Result<SealValues, SealError> {
-    let sealed: SealedOffsets = SealedOffsets::seal(counts)?;
+/// Returns [`CohortError::Overflow`] if the summed cohort size exceeds `u64`.
+pub fn open_values(counts: [u64; SHARDS], seed: [u8; 32]) -> Result<OpenValues, CohortError> {
+    let opened: CohortOffsets = CohortOffsets::from_counts(counts)?;
     let mut offsets = [0u64; SHARDS];
     for (shard, slot) in offsets.iter_mut().enumerate() {
-        *slot = sealed.offset(shard);
+        *slot = opened.offset(shard);
     }
-    Ok(SealValues {
+    Ok(OpenValues {
         seed,
-        participant_count: sealed.participant_count(),
+        participant_count: opened.participant_count(),
         offsets,
         demoted_count: 0,
         demotion: None,
@@ -218,8 +218,8 @@ pub fn nonce_hex(nonce: [u8; 8]) -> String {
     out
 }
 
-/// Reads the shard counts, computes the seal values with the supplied seed,
-/// classifies the cohort if rules are set, and writes the seal under the
+/// Reads the shard counts, computes the open values with the supplied seed,
+/// classifies the cohort if rules are set, and writes the open under the
 /// once-only guard. The seed and nonce are passed in so the logic is
 /// deterministic under test; production generates both from a CSPRNG. `now`
 /// stamps the report.
@@ -227,48 +227,48 @@ pub fn nonce_hex(nonce: [u8; 8]) -> String {
 /// # Errors
 ///
 /// Returns [`StoreError`] if reading the shard counts, scanning, folding,
-/// writing the set, or writing the seal fails. A report write failure after
-/// the seal is logged, not returned: the seal has landed by then.
-pub async fn seal_event<S: Store>(
+/// writing the set, or writing the open fails. A report write failure after
+/// the open is logged, not returned: the open has landed by then.
+pub async fn open_event<S: Store>(
     store: &S,
     event_id: &str,
     seed: [u8; 32],
     nonce: [u8; 8],
     config: &DemotionConfig,
     now: u64,
-) -> Result<SealResult, StoreError> {
+) -> Result<OpenResult, StoreError> {
     let counts = store.read_shard_counts(event_id).await?;
     let mut values =
-        seal_values(counts, seed).map_err(|e| StoreError(format!("fold shard counts: {e}")))?;
+        open_values(counts, seed).map_err(|e| StoreError(format!("fold shard counts: {e}")))?;
 
     let rules = match &config.rules {
         Ok(rules) => rules,
         Err(error) => {
-            // Seal without demotion, and say so where the operator looks.
-            tracing::error!(event_id, %error, rules = %config.rules_text, "demotion rules did not parse; sealing without demotion");
-            if !store.write_seal(event_id, &values).await? {
-                tracing::info!(event_id, "event already sealed; no-op");
-                return Ok(SealResult::AlreadySealed);
+            // Open without demotion, and say so where the operator looks.
+            tracing::error!(event_id, %error, rules = %config.rules_text, "demotion rules did not parse; opening without demotion");
+            if !store.write_open(event_id, &values).await? {
+                tracing::info!(event_id, "event already open; no-op");
+                return Ok(OpenResult::AlreadyOpen);
             }
             let report = DemotionReport::from_error(&config.rules_text, config.mode, error, now);
             if let Err(e) = store.write_report(event_id, &report).await {
                 tracing::error!(event_id, error = %e, "could not write the demotion report");
             }
-            return Ok(SealResult::Sealed(Box::new(values)));
+            return Ok(OpenResult::Opened(Box::new(values)));
         }
     };
 
     if rules.is_empty() {
-        if !store.write_seal(event_id, &values).await? {
-            tracing::info!(event_id, "event already sealed; no-op");
-            return Ok(SealResult::AlreadySealed);
+        if !store.write_open(event_id, &values).await? {
+            tracing::info!(event_id, "event already open; no-op");
+            return Ok(OpenResult::AlreadyOpen);
         }
         tracing::info!(
             event_id,
             participant_count = values.participant_count,
-            "event sealed"
+            "event opened"
         );
-        return Ok(SealResult::Sealed(Box::new(values)));
+        return Ok(OpenResult::Opened(Box::new(values)));
     }
 
     let classification = classify_cohort(store, &values, rules.clone()).await?;
@@ -283,7 +283,7 @@ pub async fn seal_event<S: Store>(
             nonce: nonce_hex(nonce),
             chunks: chunk_count,
         });
-        // Fail before anything is written: an overflow here would seal an
+        // Fail before anything is written: an overflow here would open an
         // event whose live joins collide with its tail.
         values
             .queue_counter_start()
@@ -293,8 +293,8 @@ pub async fn seal_event<S: Store>(
             .await?;
     }
 
-    if !store.write_seal(event_id, &values).await? {
-        tracing::info!(event_id, "event already sealed; no-op");
+    if !store.write_open(event_id, &values).await? {
+        tracing::info!(event_id, "event already open; no-op");
         if let Some(demotion) = &values.demotion
             && let Err(e) = store
                 .delete_demotion_chunks(event_id, &demotion.nonce, demotion.chunks)
@@ -303,7 +303,7 @@ pub async fn seal_event<S: Store>(
             // Orphans nothing names; worth a line, not a failure.
             tracing::warn!(event_id, error = %e, "could not delete a lost election's demotion chunks");
         }
-        return Ok(SealResult::AlreadySealed);
+        return Ok(OpenResult::AlreadyOpen);
     }
     tracing::info!(
         event_id,
@@ -313,28 +313,28 @@ pub async fn seal_event<S: Store>(
         demoted = classification.demoted,
         enforced = enforcing,
         mode = config.mode.as_wire_str(),
-        "event sealed"
+        "event opened"
     );
 
     let report = DemotionReport::from_classification(config.mode, rules, &classification, now);
     if let Err(e) = store.write_report(event_id, &report).await {
-        // The report is for the operator; the seal has landed, so this is
+        // The report is for the operator; the open has landed, so this is
         // logged rather than fatal.
         tracing::error!(event_id, error = %e, "could not write the demotion report");
     }
 
-    Ok(SealResult::Sealed(Box::new(values)))
+    Ok(OpenResult::Opened(Box::new(values)))
 }
 
-/// Scans the pre-queue and classifies every row the sealed offsets place in
+/// Scans the pre-queue and classifies every row the fixed offsets place in
 /// the cohort. A straggler (local index at or past its shard's issued count)
 /// is a live joiner with no pre-queue position and is left out.
 async fn classify_cohort<S: Store>(
     store: &S,
-    values: &SealValues,
+    values: &OpenValues,
     rules: DemotionRules,
 ) -> Result<Classification, StoreError> {
-    let offsets = SealedOffsets::from_parts(values.offsets, values.participant_count);
+    let offsets = CohortOffsets::from_parts(values.offsets, values.participant_count);
     let cohort = Arc::new(Mutex::new(Cohort::new(rules)));
     let sink = Arc::clone(&cohort);
     let visit: Arc<dyn Fn(ScannedRow) + Send + Sync> =
@@ -357,9 +357,9 @@ async fn classify_cohort<S: Store>(
     Ok(cohort.classify())
 }
 
-/// The phase the seal leaves the event in.
+/// The phase the open leaves the event in.
 #[must_use]
-pub fn sealed_phase() -> wr_common::Phase {
+pub fn opened_phase() -> wr_common::Phase {
     wr_common::Phase::Active
 }
 
@@ -379,9 +379,9 @@ mod tests {
 
     struct FakeStore {
         counts: [u64; SHARDS],
-        already_sealed: bool,
+        already_open: bool,
         rows: Vec<ScannedRow>,
-        written: Mutex<Option<SealValues>>,
+        written: Mutex<Option<OpenValues>>,
         report: Mutex<Option<DemotionReport>>,
         /// `(nonce, chunks)` written, in order.
         chunks: Mutex<Vec<(String, Vec<Vec<String>>)>>,
@@ -390,10 +390,10 @@ mod tests {
     }
 
     impl FakeStore {
-        fn new(counts: [u64; SHARDS], already_sealed: bool) -> Self {
+        fn new(counts: [u64; SHARDS], already_open: bool) -> Self {
             Self {
                 counts,
-                already_sealed,
+                already_open,
                 rows: Vec::new(),
                 written: Mutex::new(None),
                 report: Mutex::new(None),
@@ -449,12 +449,12 @@ mod tests {
             std::future::ready(Ok(()))
         }
 
-        fn write_seal(
+        fn write_open(
             &self,
             _event_id: &str,
-            values: &SealValues,
+            values: &OpenValues,
         ) -> impl Future<Output = Result<bool, StoreError>> + Send {
-            let wrote = if self.already_sealed {
+            let wrote = if self.already_open {
                 false
             } else {
                 *self.written.lock().unwrap() = Some(values.clone());
@@ -507,8 +507,8 @@ mod tests {
     }
 
     #[test]
-    fn seal_values_are_prefix_sums_and_total() {
-        let values = seal_values([3, 0, 5, 1, 0, 0, 2, 0, 0, 4], [7u8; 32]).unwrap();
+    fn open_values_are_prefix_sums_and_total() {
+        let values = open_values([3, 0, 5, 1, 0, 0, 2, 0, 0, 4], [7u8; 32]).unwrap();
         assert_eq!(values.participant_count, 15);
         assert_eq!(values.offsets, [0, 3, 3, 8, 9, 9, 9, 11, 11, 11]);
         assert_eq!(values.seed, [7u8; 32]);
@@ -525,14 +525,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_seal_writes_values() {
+    async fn first_open_writes_values() {
         let store = FakeStore::new([2, 2, 2, 2, 2, 0, 0, 0, 0, 0], false);
-        let result = seal_event(&store, "evt-1", [9u8; 32], NONCE, &DemotionConfig::off(), 1)
+        let result = open_event(&store, "evt-1", [9u8; 32], NONCE, &DemotionConfig::off(), 1)
             .await
             .unwrap();
         match result {
-            SealResult::Sealed(values) => assert_eq!(values.participant_count, 10),
-            SealResult::AlreadySealed => panic!("expected a first seal"),
+            OpenResult::Opened(values) => assert_eq!(values.participant_count, 10),
+            OpenResult::AlreadyOpen => panic!("expected a first open"),
         }
         let written = store.written.lock().unwrap().clone().unwrap();
         assert_eq!(written.demoted_count, 0);
@@ -542,34 +542,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn second_seal_is_noop() {
+    async fn second_open_is_noop() {
         let store = FakeStore::new([1; SHARDS], true);
-        let result = seal_event(&store, "evt-1", [9u8; 32], NONCE, &DemotionConfig::off(), 1)
+        let result = open_event(&store, "evt-1", [9u8; 32], NONCE, &DemotionConfig::off(), 1)
             .await
             .unwrap();
-        assert_eq!(result, SealResult::AlreadySealed);
+        assert_eq!(result, OpenResult::AlreadyOpen);
         assert!(store.written.lock().unwrap().is_none());
     }
 
     #[tokio::test]
-    async fn empty_cohort_seals_to_zero() {
+    async fn empty_cohort_opens_to_zero() {
         let store = FakeStore::new([0; SHARDS], false);
-        let result = seal_event(&store, "evt-1", [1u8; 32], NONCE, &DemotionConfig::off(), 1)
+        let result = open_event(&store, "evt-1", [1u8; 32], NONCE, &DemotionConfig::off(), 1)
             .await
             .unwrap();
         match result {
-            SealResult::Sealed(values) => {
+            OpenResult::Opened(values) => {
                 assert_eq!(values.participant_count, 0);
                 assert_eq!(values.offsets, [0; SHARDS]);
             }
-            SealResult::AlreadySealed => panic!("expected a first seal"),
+            OpenResult::AlreadyOpen => panic!("expected a first open"),
         }
     }
 
     #[tokio::test]
     async fn observe_mode_reports_what_it_would_demote_and_demotes_nobody() {
         let store = FakeStore::new([10, 0, 0, 0, 0, 0, 0, 0, 0, 0], false).with_rows(farmed_rows());
-        let result = seal_event(
+        let result = open_event(
             &store,
             "evt-1",
             [1u8; 32],
@@ -579,10 +579,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let SealResult::Sealed(values) = result else {
-            panic!("expected a first seal");
+        let OpenResult::Opened(values) = result else {
+            panic!("expected a first open");
         };
-        // The seal itself is untouched by observation.
+        // The open itself is untouched by observation.
         assert_eq!(values.demoted_count, 0);
         assert!(values.demotion.is_none());
         assert_eq!(values.queue_counter_start().unwrap(), 10);
@@ -597,14 +597,14 @@ mod tests {
         assert_eq!(report.groups[0].value, "198.51.100.1");
         assert_eq!(report.groups[0].count, 7);
         assert_eq!(report.groups[0].max, 5);
-        assert_eq!(report.sealed_at, 77);
+        assert_eq!(report.opened_at, 77);
         assert!(report.error.is_none());
     }
 
     #[tokio::test]
-    async fn enforce_mode_writes_the_set_before_the_seal_and_names_it_in_the_seal() {
+    async fn enforce_mode_writes_the_set_before_the_open_and_names_it_in_the_open() {
         let store = FakeStore::new([10, 0, 0, 0, 0, 0, 0, 0, 0, 0], false).with_rows(farmed_rows());
-        let result = seal_event(
+        let result = open_event(
             &store,
             "evt-1",
             [1u8; 32],
@@ -614,8 +614,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let SealResult::Sealed(values) = result else {
-            panic!("expected a first seal");
+        let OpenResult::Opened(values) = result else {
+            panic!("expected a first open");
         };
         assert_eq!(values.demoted_count, 7);
         // Live joins start behind the tail, which is a second copy of [0, N).
@@ -623,7 +623,7 @@ mod tests {
         let demotion = values.demotion.clone().unwrap();
         assert_eq!(demotion.nonce, "0badcafe00112233");
         assert_eq!(demotion.chunks, 1);
-        // Exactly the demoted group, under the nonce the seal names, and
+        // Exactly the demoted group, under the nonce the open names, and
         // nothing written per row anywhere.
         let chunks = store.chunks.lock().unwrap().clone();
         assert_eq!(
@@ -648,9 +648,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enforce_mode_with_nothing_over_threshold_is_a_plain_seal() {
+    async fn enforce_mode_with_nothing_over_threshold_is_a_plain_open() {
         let store = FakeStore::new([10, 0, 0, 0, 0, 0, 0, 0, 0, 0], false).with_rows(farmed_rows());
-        let result = seal_event(
+        let result = open_event(
             &store,
             "evt-1",
             [1u8; 32],
@@ -660,8 +660,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let SealResult::Sealed(values) = result else {
-            panic!("expected a first seal");
+        let OpenResult::Opened(values) = result else {
+            panic!("expected a first open");
         };
         assert_eq!(values.demoted_count, 0);
         assert!(values.demotion.is_none());
@@ -673,11 +673,11 @@ mod tests {
 
     #[tokio::test]
     async fn stragglers_are_not_classified() {
-        // Shard 0 issued 5 indices; rows 5..9 raced the seal. All ten share an
+        // Shard 0 issued 5 indices; rows 5..9 raced the open. All ten share an
         // address, but only the five in the cohort count against the rule —
         // and a rule of 5 therefore catches nothing.
         let store = FakeStore::new([5, 0, 0, 0, 0, 0, 0, 0, 0, 0], false).with_rows(farmed_rows());
-        seal_event(
+        open_event(
             &store,
             "evt-1",
             [1u8; 32],
@@ -696,7 +696,7 @@ mod tests {
     #[tokio::test]
     async fn a_lost_election_deletes_its_own_chunks_and_writes_nothing_else() {
         let store = FakeStore::new([10, 0, 0, 0, 0, 0, 0, 0, 0, 0], true).with_rows(farmed_rows());
-        let result = seal_event(
+        let result = open_event(
             &store,
             "evt-1",
             [1u8; 32],
@@ -706,9 +706,9 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(result, SealResult::AlreadySealed);
+        assert_eq!(result, OpenResult::AlreadyOpen);
         // The chunks were written before the election (they must exist before
-        // a seal could name them) and cleaned up after losing it.
+        // an open could name them) and cleaned up after losing it.
         assert_eq!(store.chunks.lock().unwrap().len(), 1);
         assert_eq!(
             store.deleted.lock().unwrap().clone(),
@@ -718,9 +718,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unparsable_rules_seal_without_demotion_and_say_so() {
+    async fn unparsable_rules_open_without_demotion_and_say_so() {
         let store = FakeStore::new([10, 0, 0, 0, 0, 0, 0, 0, 0, 0], false).with_rows(farmed_rows());
-        let result = seal_event(
+        let result = open_event(
             &store,
             "evt-1",
             [1u8; 32],
@@ -730,15 +730,15 @@ mod tests {
         )
         .await
         .unwrap();
-        let SealResult::Sealed(values) = result else {
-            panic!("expected a first seal");
+        let OpenResult::Opened(values) = result else {
+            panic!("expected a first open");
         };
         assert_eq!(values.demoted_count, 0);
         let report = store.report.lock().unwrap().clone().unwrap();
         assert_eq!(report.mode, "enforce");
         assert_eq!(report.rules, "address:lots");
         assert!(report.error.is_some());
-        assert_eq!(report.sealed_at, 5);
+        assert_eq!(report.opened_at, 5);
         assert!(store.chunks.lock().unwrap().is_empty());
     }
 
@@ -748,7 +748,7 @@ mod tests {
         // `enforce` in the audit item, not `observe` — observe, per ADR-0029,
         // means a classification ran, and the error path runs none.
         let store = FakeStore::new([10, 0, 0, 0, 0, 0, 0, 0, 0, 0], false).with_rows(farmed_rows());
-        seal_event(
+        open_event(
             &store,
             "evt-1",
             [1u8; 32],
@@ -766,7 +766,7 @@ mod tests {
     async fn unparsable_rules_in_observe_mode_record_observe_in_the_report() {
         // The configured mode is forwarded verbatim, so observe stays observe.
         let store = FakeStore::new([10, 0, 0, 0, 0, 0, 0, 0, 0, 0], false).with_rows(farmed_rows());
-        seal_event(
+        open_event(
             &store,
             "evt-1",
             [1u8; 32],
@@ -781,9 +781,9 @@ mod tests {
     }
 
     #[test]
-    fn the_seal_always_opens_the_event() {
+    fn opening_always_activates_the_event() {
         // There is no held phase any more: with nothing to write per row after
-        // the election, the seal write itself is the moment the event opens.
-        assert_eq!(sealed_phase(), Phase::Active);
+        // the election, the open write itself is the moment the event opens.
+        assert_eq!(opened_phase(), Phase::Active);
     }
 }

@@ -125,7 +125,7 @@ pub trait EdgeConfigStore {
 #[error("edge config store error: {0}")]
 pub struct EdgeStoreError(pub String);
 
-/// The port to the one-time seal schedule (issue #128). A trait seam so the
+/// The port to the one-time open schedule (issue #128). A trait seam so the
 /// start-time actions run without AWS; the SDK-backed implementation lives in
 /// `scheduler`.
 ///
@@ -134,7 +134,7 @@ pub struct EdgeStoreError(pub String);
 /// `scheduler:DeleteSchedule`, so clearing a start time can only ever disable
 /// it — an invariant held by the shape of this trait rather than by a
 /// convention a later edit could quietly drop.
-pub trait SealSchedule {
+pub trait OpenSchedule {
     /// Arms the schedule at a bare `YYYY-MM-DDTHH:MM:SS` read in the given
     /// IANA zone, or disables it when `None`.
     ///
@@ -150,9 +150,9 @@ pub trait SealSchedule {
     ) -> impl Future<Output = Result<(), ScheduleError>> + Send;
 }
 
-/// A seal-schedule failure.
+/// An open-schedule failure.
 #[derive(Debug, thiserror::Error)]
-#[error("seal schedule error: {0}")]
+#[error("open schedule error: {0}")]
 pub struct ScheduleError(pub String);
 
 /// The persistence port the admin actions drive. Reading the current `Counters`
@@ -164,7 +164,7 @@ pub trait Store {
         event_id: &str,
     ) -> impl Future<Output = Result<Option<ControlState>, StoreError>> + Send;
 
-    /// Loads the seal's demotion report (issue #145), or `None` when no seal
+    /// Loads the open's demotion report (issue #145), or `None` when no open
     /// with rules set has run. Its own item, so its own read: the dashboard
     /// is the only reader, and the event item stays small for every poll.
     fn load_demotion_report(
@@ -362,9 +362,9 @@ pub enum AdminAction {
     /// only in the `KeyValueStore` — this label and the audit fields it stamps
     /// on `Counters` are what makes the change visible on the dashboard.
     SetRules,
-    /// Schedules the event start (issue #128), arming the seal schedule.
+    /// Schedules the event start (issue #128), arming the open schedule.
     SetStartTime,
-    /// Clears the scheduled start, disabling the seal schedule.
+    /// Clears the scheduled start, disabling the open schedule.
     ClearStartTime,
 }
 
@@ -439,7 +439,7 @@ pub enum ActionError {
     InvalidStartTime,
     /// The start time is in the past. Rejected rather than clamped: an
     /// operator who mistypes a date wants to be told, not to have the event
-    /// seal immediately.
+    /// open immediately.
     #[error("start time must be in the future")]
     StartTimeInPast,
     /// The timezone is not an IANA name in the bundled database. Validated
@@ -919,7 +919,7 @@ pub async fn apply_recover<S: Store, E: EdgeConfigStore>(
 
 /// Sets or clears the event's scheduled start (issue #128): writes
 /// `Counters.starts_at`, which the waiting page counts down to, and arms or
-/// disables the one-time seal schedule, which is what actually fires the seal.
+/// disables the one-time open schedule, which is what actually fires the open.
 /// An empty `at` clears, so one action covers both directions.
 ///
 /// Two stores describe one fact, so the order is fixed to make the residue of
@@ -941,7 +941,7 @@ pub async fn apply_recover<S: Store, E: EdgeConfigStore>(
 /// rejected value, in which case neither store is touched;
 /// [`ActionError::NotFound`] if the event is missing; [`ActionError::TooFast`]
 /// inside the debounce window; store and schedule errors otherwise.
-pub async fn apply_start_time<S: Store, K: SealSchedule>(
+pub async fn apply_start_time<S: Store, K: OpenSchedule>(
     store: &S,
     schedule: &K,
     event_id: &str,
@@ -1229,7 +1229,7 @@ mod tests {
         starts_at_timezone: Mutex<Option<String>>,
         /// Ordered log of every write to either store, so a test can assert
         /// which one moved first rather than only that both did. Shared with
-        /// [`FakeSealSchedule`], which appends to the same log.
+        /// [`FakeOpenSchedule`], which appends to the same log.
         writes: Arc<Mutex<Vec<&'static str>>>,
         /// When set, the `DynamoDB` write of the start time fails, standing in
         /// for a crash between the two stores.
@@ -1266,15 +1266,15 @@ mod tests {
     /// An in-memory [`EdgeConfigStore`], mirroring the `KeyValueStore`'s
     /// read-modify-write shape closely enough to exercise the write ordering
     /// `apply_fail_open`/`apply_recover` depend on.
-    /// A [`SealSchedule`] that records what it was told, sharing the store's
+    /// A [`OpenSchedule`] that records what it was told, sharing the store's
     /// write log so a test can assert which of the two moved first.
-    struct FakeSealSchedule {
+    struct FakeOpenSchedule {
         armed: Mutex<Option<(String, String)>>,
         writes: Arc<Mutex<Vec<&'static str>>>,
         fails: bool,
     }
 
-    impl FakeSealSchedule {
+    impl FakeOpenSchedule {
         fn new(writes: Arc<Mutex<Vec<&'static str>>>) -> Self {
             Self {
                 armed: Mutex::new(None),
@@ -1292,7 +1292,7 @@ mod tests {
         }
     }
 
-    impl SealSchedule for FakeSealSchedule {
+    impl OpenSchedule for FakeOpenSchedule {
         fn set_start_time(
             &self,
             at: Option<(&str, &str)>,
@@ -1608,9 +1608,9 @@ mod tests {
     /// for being in the past.
     const FUTURE: &str = "2030-06-15T10:00";
 
-    fn start_time_fixture() -> (FakeStore, FakeSealSchedule) {
+    fn start_time_fixture() -> (FakeStore, FakeOpenSchedule) {
         let store = FakeStore::default();
-        let schedule = FakeSealSchedule::new(Arc::clone(&store.writes));
+        let schedule = FakeOpenSchedule::new(Arc::clone(&store.writes));
         (store, schedule)
     }
 
@@ -1694,7 +1694,7 @@ mod tests {
     async fn setting_a_start_time_arms_the_schedule_before_announcing_it() {
         // The schedule may be armed without an announcement; an announcement
         // must never outlive its schedule. A crash between the two writes
-        // therefore leaves a seal that still fires with no countdown shown,
+        // therefore leaves an open that still fires with no countdown shown,
         // which is how the system behaved before start times existed.
         let (store, schedule) = start_time_fixture();
         apply_start_time(
@@ -1783,7 +1783,7 @@ mod tests {
             starts_at_write_fails: true,
             ..FakeStore::default()
         };
-        let schedule = FakeSealSchedule::new(Arc::clone(&store.writes));
+        let schedule = FakeOpenSchedule::new(Arc::clone(&store.writes));
 
         assert!(
             apply_start_time(
@@ -1805,7 +1805,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_schedule_write_does_not_announce_a_start() {
         let store = FakeStore::default();
-        let schedule = FakeSealSchedule::failing(Arc::clone(&store.writes));
+        let schedule = FakeOpenSchedule::failing(Arc::clone(&store.writes));
 
         assert!(
             apply_start_time(
@@ -1864,7 +1864,7 @@ mod tests {
             missing: true,
             ..FakeStore::default()
         };
-        let schedule = FakeSealSchedule::new(Arc::clone(&store.writes));
+        let schedule = FakeOpenSchedule::new(Arc::clone(&store.writes));
         assert!(matches!(
             apply_start_time(
                 &store,

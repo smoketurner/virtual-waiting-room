@@ -16,7 +16,7 @@ module "core" {
 
   # Rust Lambda artifacts, built by `make build` to a fixed path per crate.
   assign_position_artifact_path = local.artifact["assign_position"]
-  seal_event_artifact_path      = local.artifact["seal_event"]
+  open_event_artifact_path      = local.artifact["open_event"]
   read_artifact_path            = local.artifact["read"]
   admin_artifact_path           = local.artifact["admin"]
   controller_artifact_path      = local.artifact["controller"]
@@ -35,7 +35,7 @@ module "core" {
   poll_ceiling_ms = var.poll_ceiling_ms
   poll_divisor    = var.poll_divisor
 
-  # Seal-time demotion (#145), read by seal_event.
+  # Open-time demotion (#145), read by open_event.
   demotion_rules = var.demotion_rules
   demotion_mode  = var.demotion_mode
 

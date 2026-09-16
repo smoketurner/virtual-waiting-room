@@ -32,10 +32,12 @@ pub use ids::{
     UnknownControl, UnknownPhase, is_uuid_shape, resolve, serving_state,
 };
 pub use items::{
-    Counters, PositionItem, PositionStatus, PreQueueItem, ResolveError, ResolvedPosition, Sealed,
-    Telemetry, shard_count_of, shard_index_of,
+    Counters, OpenOutputs, PositionItem, PositionStatus, PreQueueItem, ResolveError,
+    ResolvedPosition, Telemetry, shard_count_of, shard_index_of,
 };
-pub use permutation::{Assignment, RandError, SHARDS, SealError, SealedOffsets, Seed, Shard, prp};
+pub use permutation::{
+    Assignment, CohortError, CohortOffsets, RandError, SHARDS, Seed, Shard, prp,
+};
 pub use rules::{
     MAX_COOKIE_NAME_BYTES, MAX_HEADER_NAME_BYTES, MAX_HEADER_VALUE_BYTES, MAX_PATH_PREFIX_BYTES,
     MAX_USER_AGENT_BYTES, ProtectionRule, RequestView, RuleFieldError, RuleWire, matches_any,

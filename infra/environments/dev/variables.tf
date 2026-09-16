@@ -124,11 +124,11 @@ variable "poll_divisor" {
   default     = 10
 }
 
-# --- Seal-time demotion (#145) --------------------------------------------
-# Read by seal_event; see modules/core/variables.tf for the full rationale.
+# --- Open-time demotion (#145) --------------------------------------------
+# Read by open_event; see modules/core/variables.tf for the full rationale.
 
 variable "demotion_rules" {
-  description = "Comma-separated signal:max demotion rules (address, asn, ja4, ua). Empty disables the seal-time scan."
+  description = "Comma-separated signal:max demotion rules (address, asn, ja4, ua). Empty disables the open-time scan."
   type        = string
   default     = ""
 }
