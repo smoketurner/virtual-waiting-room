@@ -174,14 +174,14 @@ on every write too, which is why the shard attribute is one letter.
 ### Infrastructure
 
 `infra/environments/dev` is the only deployable Terraform root; `apply` never runs inside a
-module. Modules are `core` (tables, SQS, Lambdas, IAM, REST API) and `edge` (CloudFront). An **empty** artifact path leaves a function on the vendored placeholder
-binary, which lets the infrastructure plane stand up before any crate is built.
+module. Modules are `core` (tables, SQS, Lambdas, IAM, REST API) and `edge` (CloudFront).
 
-Behaviour follows the artifact rather than a separate toggle, because a stack that looks
-complete and meters nobody is worse than one that plainly is not built yet: the join
-event-source mapping is enabled when `assign_position` is real, and the controller's
-schedule is created when the controller is. `make build` compiles every Lambda crate, reading
-its target architecture from `terraform.tfvars`.
+**Every function deploys a real build.** There is no placeholder fallback and no
+artifact-driven toggle: the join event-source mapping and the controller schedule are created
+unconditionally, because a stack that stands up on stub binaries looks complete and meters
+nobody — the failure this system is most prone to and least able to report. An incomplete
+apply fails at plan, on the missing zip. `make build` compiles every Lambda crate, reading its
+target architecture from `terraform.tfvars`.
 
 **The apply seeds a working stack.** Terraform writes the event's `Counters` item, the gate's
 ruleset and the open schedule, then ignores changes to all three — the control plane owns them

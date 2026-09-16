@@ -81,7 +81,8 @@ means you cannot silently `#[allow]` it — justify it or remove the cause.
 
 - `validate` and `plan` are the default verification. **Never** run `terraform apply` /
   `destroy` unless explicitly asked — they create and delete real AWS resources.
-- Keep the core module ≤ 80 resources (N6). Every new resource counts; justify additions.
+- No resource-count ceiling (N6 retired). Judge a new resource by what it costs while no
+  event is running (N1, idle cost under $5/month), not by how many blocks it takes.
 - Pin GitHub Actions to SHA with a version comment; `persist-credentials: false`; scan with
   `zizmor` and `actionlint` before committing.
 

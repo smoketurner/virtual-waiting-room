@@ -283,8 +283,9 @@ pre-event preparation in the Operational section.
 - Acceptance: No manual console steps in the deployment path.
 
 **N7** — As an operator, I want edge abuse mitigation so that bots are handled before the origin.
-- THE SYSTEM SHALL provide bot and abuse mitigation at the edge.
-- Acceptance: A Web Application Firewall (WAF) with Bot Control and Autonomous System Number (ASN) matching is deployed by default.
+- THE SYSTEM SHALL refuse every request without a valid session at the edge, before the origin is touched.
+- THE SYSTEM SHALL NOT create a WAFv2 web ACL by default: it is priced per request inspected, against a request volume that is the system's own waiting-page polling rather than an attack.
+- Acceptance: The gate runs at viewer-request on the protected behaviour and the join burst reaches SQS with no compute in the path. Rate limiting is taken at the CloudFront plan layer; a web ACL is attached per event where the cost is justified, and the distribution ARN is exported so one can be.
 
 **N8** — As an integrator, I want an OpenAPI spec so that client and admin surfaces are generated.
 - THE SYSTEM SHALL document the API as an OpenAPI specification.
@@ -306,19 +307,20 @@ Contractual deliverables. Without these the capacity requirements are not met.
 
 **O1** — As an operator, I want tables pre-warmed so that write throughput is ready at start.
 - THE SYSTEM SHALL have DynamoDB tables pre-warmed before each event.
-- Acceptance: Warm throughput ≥ the event's target write rate, verified before T−0.
+- Acceptance: Warm throughput ≥ the event's target write rate, verified before T−0. On the readiness checklist in `docs/RUNBOOK.md`; set through `warm_throughput_write_units`.
 
 **O2** — As an operator, I want quota increases filed early so that limits are not hit at start.
 - THE SYSTEM SHALL have service quota increases filed with lead time.
-- Acceptance: API Gateway RPS and DynamoDB per-table write request units (WRU) confirmed raised before T−0.
+- Acceptance: API Gateway RPS and DynamoDB per-table write request units (WRU) confirmed raised before T−0. On the readiness checklist in `docs/RUNBOOK.md`.
 
 **O3** — As an operator, I want a load test before the event so that capacity is proven.
 - THE SYSTEM SHALL have a load test at the event's target rate executed before the event.
-- Acceptance: Report produced and reviewed with the client.
+- Acceptance: Report produced and reviewed with the client. On the readiness checklist in `docs/RUNBOOK.md`; the repeatable harness itself is not built.
 
-**O4** — As an operator, I want mid-event controls so that I can adjust, reset, or pause during the event.
-- THE SYSTEM SHALL allow the operator to adjust admission rate, reset, or pause mid-event.
-- Acceptance: Documented runbook procedures, exercised in rehearsal.
+**O4** — As an operator, I want mid-event controls so that I can adjust, hold, or stop during the event.
+- THE SYSTEM SHALL allow the operator to adjust the admission rate, hold admission, open the gate, or stop the event mid-event.
+- THE SYSTEM SHALL document what each control does and what a waiting visitor sees as a result, since that is what distinguishes them under pressure.
+- Acceptance: Every control is a form on the dashboard and works with JavaScript disabled; `docs/RUNBOOK.md` documents each one. Not yet exercised in a rehearsal.
 
 **O5** — As an operator, I want WAF rules observed before blocking so that legitimate traffic is not dropped.
 - WHEN a new WAF rule is introduced, THE SYSTEM SHALL observe it in Count mode before promoting it to Block.

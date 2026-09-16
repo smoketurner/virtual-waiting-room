@@ -6,18 +6,25 @@ Requirement IDs in brackets.
 Phases are ordered by dependency and risk. Decisions referenced here are recorded in
 [`adr/`](./adr/).
 
+**This file carries no status.** It is the shape of the work and the order it has to happen
+in; what is actually built is tracked in exactly one place,
+[`.kiro/specs/virtual-waiting-room/tasks.md`](../.kiro/specs/virtual-waiting-room/tasks.md).
+Two checkbox lists over one codebase is two things to update and one that silently stops
+being true — which is what happened here, where this file read as sixty-five items outstanding
+while most of Phases 1 and 2 shipped.
+
 ---
 
 ## Phase 0 — Spike
 
 Throwaway code. Measures what documentation cannot settle.
 
-- [ ] REST API `type: aws` → SQS with a request validator; confirm client UUIDv7 survives
-      to the Lambda and malformed bodies are rejected with 400 [F2.4]
-- [ ] Concurrent `UpdateItem ADD :n` / `ALL_NEW` against one item: assert zero duplicate
-      positions across allocated ranges; measure gap rate under induced 5xx [F2.2, F2.3]
-- [ ] Rust cold start on `provided.al2023` arm64 with an AWS SDK client — decides whether
-      provisioned concurrency is needed
+- REST API `type: aws` → SQS with a request validator; confirm client UUIDv7 survives
+  to the Lambda and malformed bodies are rejected with 400 [F2.4]
+- Concurrent `UpdateItem ADD :n` / `ALL_NEW` against one item: assert zero duplicate
+  positions across allocated ranges; measure gap rate under induced 5xx [F2.2, F2.3]
+- Rust cold start on `provided.al2023` arm64 with an AWS SDK client — decides whether
+  provisioned concurrency is needed
 
 **Exit:** findings written down. Nothing else kept.
 
@@ -26,109 +33,111 @@ Throwaway code. Measures what documentation cannot settle.
 ## Phase 1 — Core
 
 ### 1a. Data and counter
-- [ ] Four tables — `Counters`, `PreQueue`, `Positions`, `Tokens` — on-demand, PITR,
-      `warm_throughput_*` and optional `max_throughput_*` as variables (DESIGN §6.7) [O1]
-- [ ] `Counters` attributes: `queue_counter`, `serving_counter`,
-      `arrivals#0..9`, `phase`, `phase_override`, `target_rate`, `shuffle_seed`,
-      `operator_message`
-- [ ] Batch range allocation via `UpdateItem ADD` / `ALL_NEW`; increment by **valid** count
-      only [F2.2, F2.6]
-- [ ] `PutItem` with `attribute_not_exists(request_id)` on every position write [F2.5]
+- Four tables — `Counters`, `PreQueue`, `Positions`, `Tokens` — on-demand, PITR,
+  `warm_throughput_*` and optional `max_throughput_*` as variables (DESIGN §6.7) [O1]
+- `Counters` attributes: `queue_counter`, `serving_counter`, `arrivals#0..9` (separate
+  shard items), `phase`, `admission_control` + `fail_open_until`, `target_rate`,
+  `shuffle_seed`, `message`
+- Batch range allocation via `UpdateItem ADD` / `ALL_NEW`; increment by **valid** count
+  only [F2.2, F2.6]
+- `PutItem` with `attribute_not_exists(request_id)` on every position write [F2.5]
 
 ### 1b. Event lifecycle and modes
-- [ ] Phase state machine: idle → pre-queue → active → post-event, plus maintenance
-      [F0.1, F0.8]
-- [ ] Operator-authored static page per phase, CDN-cached [F0.2]
-- [ ] Protection rules (path, header, cookie, user agent), evaluated locally at the
-      the edge gate [F0.6]
-- [ ] Standby mode: CloudWatch alarm on `AWS/CloudFront` `Requests` (60 s period,
-      `us-east-1`) → EventBridge → phase transition. Activation latency ~125 s worst case
-      [F0.4, F0.7]
-- [ ] Scheduled and standby coexisting on one origin [F0.3, F0.5]
+- Phase state machine: idle → pre-queue → active → post-event, plus maintenance
+  [F0.1, F0.8]
+- Operator-authored static page per phase, CDN-cached [F0.2]
+- Protection rules (path, header, cookie, user agent), evaluated locally at the
+  the edge gate [F0.6]
+- Standby mode: CloudWatch alarm on `AWS/CloudFront` `Requests` (60 s period,
+  `us-east-1`) → EventBridge → phase transition. Activation latency ~125 s worst case
+  [F0.4, F0.7]
+- Scheduled and standby coexisting on one origin [F0.3, F0.5]
 
 ### 1c. Pre-queue
-- [ ] Static countdown page, CDN-cached, zero origin calls per view [F1.1, F1.2]
-- [ ] Pre-queue registration (identity only, spread across the window) [C1]
-- [ ] `/status` carries phase, so the countdown page polls one endpoint (Min TTL 1 s,
-      no cookies forwarded — DESIGN §8)
-- [ ] Registration writes `PreQueue {r, i, t}` with `attribute_not_exists(r)`; `i` from
-      `ADD prequeue_counter` [F2.5]
-- [ ] Seeded permutation (DESIGN §4.2, ADR-0002): at T−0 one `UpdateItem` on `Counters`
-      setting `shuffle_seed`, `participant_count` and `phase`, guarded by
-      `attribute_not_exists(shuffle_seed)`. Position derived on read as `PRP(seed, i, N)`
-      [F1.3, F1.4, F1.5, C2]
-- [ ] Pseudorandom permutation (PRP): 4-round balanced Feistel, `HMAC-SHA256(seed, round
-      || x)` round function, cycle-walking into `[0, N)`. Property tests for bijectivity
-      over the full domain at N ≤ 10⁶, uniformity by chi-square, determinism across
-      processes
+- Static countdown page, CDN-cached, zero origin calls per view [F1.1, F1.2]
+- Pre-queue registration (identity only, spread across the window) [C1]
+- `/status` carries phase, so the countdown page polls one endpoint (Min TTL 1 s,
+  no cookies forwarded — DESIGN §8)
+- Registration writes `PreQueue {r, s, l, t}` with `attribute_not_exists(r)`: shard `s`
+  from the request id, local index `l` from that shard's striped counter (ADR-0015) [F2.5]
+- Seeded permutation (DESIGN §4.2, ADR-0002): at T−0 one `UpdateItem` on `Counters`
+  setting `shuffle_seed`, `participant_count` and `phase`, guarded by
+  `attribute_not_exists(shuffle_seed)`. Position derived on read as `PRP(seed, i, N)`
+  [F1.3, F1.4, F1.5, C2]
+- Pseudorandom permutation (PRP): 4-round balanced Feistel, `HMAC-SHA256(seed, round
+  || x)` round function, cycle-walking into `[0, N)`. Property tests for bijectivity
+  over the full domain at N ≤ 10⁶, uniformity by chi-square, determinism across
+  processes
 
 ### 1d. Live join
-- [ ] REST API `AWS` integration → SQS `SendMessage`, request validator with JSON Schema,
-      DLQ with `maxReceiveCount` 5, `FunctionResponseTypes: [ReportBatchItemFailures]`,
-      visibility timeout ≥ 6× function timeout + batching window [F2.1, F2.4, C5]
-- [ ] `BatchSize` / `MaximumBatchingWindowInSeconds` variables, default 100 / 1s
-- [ ] SQS ESM Provisioned Mode as an opt-in variable, default off — mutually exclusive with
-      the maximum-concurrency setting
-- [ ] Per-event partition: one SQS queue and one Lambda function per event, each with
-      reserved concurrency (ADR-0008) [N9]
+- REST API `AWS` integration → SQS `SendMessage`, request validator with JSON Schema,
+  DLQ with `maxReceiveCount` 5, `FunctionResponseTypes: [ReportBatchItemFailures]`,
+  visibility timeout ≥ 6× function timeout + batching window [F2.1, F2.4, C5]
+- `BatchSize` / `MaximumBatchingWindowInSeconds` variables, default 100 / 1s
+- SQS ESM Provisioned Mode as an opt-in variable, default off — mutually exclusive with
+  the maximum-concurrency setting
+- Per-event partition: one SQS queue and one Lambda function per event, each with
+  reserved concurrency (ADR-0008) [N9]
 
 ### 1e. Read path
-- [ ] `/status` (phase, serving position, rate, operator message — one payload),
-      `/queue_num`, `/queue_pos_expiry` [F3.1]
+- `/status` (phase, serving position, rate, operator message — one payload),
+  `/queue_num` [F3.1]
 
 ### 1f. Admission, session, and outflow control
-- [ ] Deploy-time signing key into an SSM Parameter Store SecureString
-- [x] `/generate_token` — mints the session cookie directly; the admission token it once issued was removed with the origin authorizer (ADR-0032) [F3.3]
+- Deploy-time signing key into an SSM Parameter Store SecureString
+- `/generate_token` — mints the session cookie directly; the admission token it once issued was removed with the origin authorizer (ADR-0032) [F3.3]
 - Gate decision tree: session cookie → protection match → 302. Built as a CloudFront
-      Function (ADR-0021); the origin authorizer that also implemented it was removed (ADR-0032) [F3.4]
-- [ ] Session cookie set after token validation (ADR-0011), signed over different inputs
-      from the token, scoped per event, token stripped from the URL [F3.5, F3.6]
-- [x] Sliding and fixed session validity modes [F3.7]
-- [ ] Fail open with a time-limited bypass cookie, configurable (ADR-0009)
-      [F4.1, F4.2, F4.3]
-- [ ] No-show compensating outflow controller: measure arrivals against releases, smooth,
-      bound the correction, adjust `serving_counter` on a 10 s schedule. Arrival counter
-      sharded ×10 (`arrivals#0..9`) [F3.2, F3.8]
-- [ ] Decide signing-key rotation (open question 2)
+  Function (ADR-0021); the origin authorizer that also implemented it was removed (ADR-0032) [F3.4]
+- Session cookie set after token validation (ADR-0011), signed over different inputs
+  from the token, scoped per event, token stripped from the URL [F3.5, F3.6]
+- Sliding and fixed session validity modes [F3.7]
+- Fail open with a time-limited bypass cookie, configurable (ADR-0009)
+  [F4.1, F4.2, F4.3]
+- No-show compensating outflow controller: measure arrivals against releases, smooth,
+  bound the correction, adjust `serving_counter` on a 10 s schedule. Arrival counter
+  sharded ×10 (`arrivals#0..9`) [F3.2, F3.8]
+- Decide signing-key rotation (open question 2)
 
 ### 1g. Entry gating and abuse mitigation
-- [ ] Client-signed identifier verification at join — membership ID, promo code, order
-      reference; verified but never stored [F6.1, F6.2]
-- [ ] Deferred bot enforcement: admit to pre-queue, block at randomization [F6.3]
+- Client-signed identifier verification at join — membership ID, promo code, order
+  reference; verified but never stored [F6.1, F6.2]
+- Deferred bot enforcement: admit to pre-queue, block at randomization [F6.3]
 
 ### 1h. Operator surface
-- [ ] Live metrics via EMF logs → CloudWatch: queue depth, admitted, no-show rate, expiry
-      rate. Inflow from the `AWS/CloudFront` `Requests` metric, not counted in our code
-      [F5.1]
-- [ ] Brandable waiting page — client supplies assets, no module fork [F5.2]
-- [ ] Operator message as a `Counters` attribute, delivered in the existing `/status`
-      payload — one `UpdateItem`, zero additional requests [F5.3]
-- [ ] Position and estimated wait derived from measured admission rate [F5.4]
-- [ ] Every operator action available via API; no console dependency [F5.5]
+- Live metrics: metric filters over the Lambdas' structured logs, each with an alarm at
+  threshold zero, for the conditions that are otherwise silent
+  rate. Inflow from the `AWS/CloudFront` `Requests` metric, not counted in our code
+  [F5.1]
+- Brandable waiting page — client supplies assets, no module fork [F5.2]
+- Operator message as a `Counters` attribute, delivered in the existing `/status`
+  payload — one `UpdateItem`, zero additional requests [F5.3]
+- Position and estimated wait derived from measured admission rate [F5.4]
+- Every operator action available via API; no console dependency [F5.5]
 
 ### 1i. Control plane
-- [ ] Admin API: `/admin/phase`, `/admin/rate`, `/admin/message`, `/admin/force_maintenance`,
-      `/admin/rules` [F5.5]
-- [ ] `modules/core` — DynamoDB, SQS, Lambdas, IAM, regional REST API + validator [N5]
-- [ ] `modules/edge` — CloudFront with three cache behaviours per ADR-0013: polled
-      endpoints (Min TTL 1 s, no cookie forwarding), write endpoints (uncached), protected
-      origin (uncached, session cookie forwarded). Web Application Firewall (WAF) with Bot
-      Control, Autonomous System Number (ASN) match and anti-DDoS in Count mode
-      [N7, O5, C4]
+- Admin API: `/admin/phase`, `/admin/rate`, `/admin/message`, `/admin/force_maintenance`,
+  `/admin/rules` [F5.5]
+- `modules/core` — DynamoDB, SQS, Lambdas, IAM, regional REST API + validator [N5]
+- `modules/edge` — CloudFront with three cache behaviours per ADR-0013: polled
+  endpoints (Min TTL 1 s, no cookie forwarding), write endpoints (uncached), protected
+  origin (uncached, session cookie forwarded). Web Application Firewall (WAF) with Bot
+  Control, Autonomous System Number (ASN) match and anti-DDoS in Count mode
+  [N7, O5, C4]
 - `modules/authorizer` — removed (ADR-0032): nothing invoked it, and as wired it
-      forwarded every request.
-      Note VPC origins require an internet gateway present but unused, forbid Lambda@Edge
-      origin triggers, and are unavailable in GovCloud (DESIGN §12)
-- [ ] `var.enable_vpc` for ATO-constrained clients — design the seam now, do not retrofit
-- [ ] Flat-rate plan subscription [O6] — the better fit for a large planned event, but the
-      AWS provider cannot create a flat-rate distribution yet (terraform-provider-aws#45450).
-      Default PAYG until it lands; document manual per-event selection + post-event cancellation
-- [ ] CloudWatch alarms and a shipped dashboard — the metrics an operator acts on, not
-      every metric available
-- [ ] Publish the OpenAPI specification for public and admin surfaces [N8]
-- [ ] `examples/` and generated variable reference
-- [ ] Verify resource count ≤ 80 [N6] and idle monthly cost under $5 [N1]
-- [ ] Confirm no component runs outside the client's account [N3]
+  forwarded every request.
+  Note VPC origins require an internet gateway present but unused, forbid Lambda@Edge
+  origin triggers, and are unavailable in GovCloud (DESIGN §12)
+- `var.enable_vpc` for ATO-constrained clients — design the seam now, do not retrofit
+- Flat-rate plan subscription [O6] — the better fit for a large planned event, but the
+  AWS provider cannot create a flat-rate distribution yet (terraform-provider-aws#45450).
+  Default PAYG until it lands; document manual per-event selection + post-event cancellation
+- CloudWatch alarms and a shipped dashboard — the metrics an operator acts on, not
+  every metric available
+- Publish the OpenAPI specification for public and admin surfaces [N8]
+- `examples/` and generated variable reference
+- Verify idle monthly cost under $5 with no event running [N1]. N6, the resource-count
+  ceiling, was retired: the number never measured what it stood in for.
+- Confirm no component runs outside the client's account [N3]
 
 **Exit:** `terraform apply` from a clean account to a working deployment [N2].
 
@@ -138,27 +147,27 @@ Throwaway code. Measures what documentation cannot settle.
 
 The one place where being wrong is unrecoverable in production.
 
-- [ ] Repeatable load harness as a deliverable, not a test script [O3]
-- [ ] Pre-queue path: 1M registrations, assignment as a single write. Assert bijectivity
-      across the full cohort, no correlation between registration time and assigned
-      position, and that the seed is absent before T−0 [F1.3, F1.4, C1, C2]
-- [ ] Live-join path: 10K/s at default quotas and 40K/s with increases filed; zero
-      duplicates at both; gap rate measured [F2.2, C3]
-- [ ] Raise quotas and pre-warm *before* testing the live-join path above defaults, or the
-      test measures throttling rather than the design. Pre-queue assignment needs neither,
-      since it is one write [O1, O2]
-- [ ] `/status` origin requests per second (RPS) flat from 10K to 1M waiters: assert
-      origin fetches ≈ elapsed/TTL, not a function of waiter count [C4]
-- [ ] Fail-open verified: waiting room returning 5xx, origin still reachable [F4.1]
-- [ ] Session continuity: a visitor browses N pages after admission without being
-      re-queued [F3.5]
-- [ ] No-show compensation: with an injected 30% no-show rate and a 500/min target,
-      measured origin arrivals converge on 500/min [F3.8]
-- [ ] Standby activation: inflow crossing the threshold queues new visitors within the
-      ~125 s worst case; unprotected paths stay unqueued [F0.4, F0.6]
-- [ ] Spike arriving in <5s does not drop joins [C5]
-- [ ] Event isolation: drive one event to its throughput ceiling; a second event in the
-      same deployment sees no change in join latency or error rate [N9]
+- Repeatable load harness as a deliverable, not a test script [O3]
+- Pre-queue path: 1M registrations, assignment as a single write. Assert bijectivity
+  across the full cohort, no correlation between registration time and assigned
+  position, and that the seed is absent before T−0 [F1.3, F1.4, C1, C2]
+- Live-join path: 10K/s at default quotas and 40K/s with increases filed; zero
+  duplicates at both; gap rate measured [F2.2, C3]
+- Raise quotas and pre-warm *before* testing the live-join path above defaults, or the
+  test measures throttling rather than the design. Pre-queue assignment needs neither,
+  since it is one write [O1, O2]
+- `/status` origin requests per second (RPS) flat from 10K to 1M waiters: assert
+  origin fetches ≈ elapsed/TTL, not a function of waiter count [C4]
+- Fail-open verified: waiting room returning 5xx, origin still reachable [F4.1]
+- Session continuity: a visitor browses N pages after admission without being
+  re-queued [F3.5]
+- No-show compensation: with an injected 30% no-show rate and a 500/min target,
+  measured origin arrivals converge on 500/min [F3.8]
+- Standby activation: inflow crossing the threshold queues new visitors within the
+  ~125 s worst case; unprotected paths stay unqueued [F0.4, F0.6]
+- Spike arriving in <5s does not drop joins [C5]
+- Event isolation: drive one event to its throughput ceiling; a second event in the
+  same deployment sees no change in join latency or error rate [N9]
 
 **Exit:** reproducible report. Demonstrating a million assigned positions is itself the
 primary sales asset.
@@ -169,18 +178,18 @@ primary sales asset.
 
 What makes this a service rather than a repository.
 
-- [ ] Pre-event readiness checklist [O1, O2, O3] — API Gateway RPS increase filed,
-      DynamoDB per-table write request unit (WRU) increase filed, tables pre-warmed,
-      Provisioned Mode enabled, load test executed, rollback plan
-- [ ] Operator runbook [O4, O5] — rate adjustment, reset, pause, incident response,
-      COUNT-then-BLOCK promotion, post-event flat-rate plan cancellation
-- [ ] Waiting-room reference client — countdown, position, estimated time of arrival
-      (ETA), auto-advance; 429 retry with jitter [F4.5]; 404 means re-join with a fresh
-      universally unique identifier version 7 (UUIDv7) [F4.4]; UUIDv7 via the `uuid`
-      package
-- [ ] Client integration guide: CloudFront/ALB/CDN placement
-- [ ] Per-client cost model [O6] — poll interval is the dominant variable; compute the
-      flat-rate versus pay-as-you-go (PAYG) crossover and include pre-warming
+- Pre-event readiness checklist [O1, O2, O3] — API Gateway RPS increase filed,
+  DynamoDB per-table write request unit (WRU) increase filed, tables pre-warmed,
+  Provisioned Mode enabled, load test executed, rollback plan
+- Operator runbook ([RUNBOOK.md](./RUNBOOK.md)) [O4, O5] — rate adjustment, hold, stop, incident response,
+  COUNT-then-BLOCK promotion, post-event flat-rate plan cancellation
+- Waiting-room reference client — countdown, position, estimated time of arrival
+  (ETA), auto-advance; 429 retry with jitter [F4.5]; 404 means re-join with a fresh
+  universally unique identifier version 7 (UUIDv7) [F4.4]; UUIDv7 via the `uuid`
+  package
+- Client integration guide: CloudFront/ALB/CDN placement
+- Per-client cost model [O6] — poll interval is the dominant variable; compute the
+  flat-rate versus pay-as-you-go (PAYG) crossover and include pre-warming
 
 ---
 
@@ -188,13 +197,13 @@ What makes this a service rather than a repository.
 
 Ships second, priced separately. No CloudFront, no edge compute, no VPC origins.
 
-- [ ] Internal Application Load Balancer (ALB) gating with a gate that does not exist yet; origin
-      access via security groups and Identity and Access Management (IAM) [N4]
-- [ ] Replace CDN cache collapse for `/status` — the read-scaling story differs
-      materially inside the boundary
-- [ ] Document the commercial-CloudFront-fronting-GovCloud-origin data-boundary question
-      for the client's Authorizing Official (AO)
-- [ ] Validate deploy in a real GovCloud account
+- Internal Application Load Balancer (ALB) gating with a gate that does not exist yet; origin
+  access via security groups and Identity and Access Management (IAM) [N4]
+- Replace CDN cache collapse for `/status` — the read-scaling story differs
+  materially inside the boundary
+- Document the commercial-CloudFront-fronting-GovCloud-origin data-boundary question
+  for the client's Authorizing Official (AO)
+- Validate deploy in a real GovCloud account
 
 ---
 

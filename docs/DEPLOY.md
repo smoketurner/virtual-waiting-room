@@ -28,24 +28,16 @@ steps take source to a running function:
    `source_code_hash = filebase64sha256(<zip>)` so a rebuilt zip redeploys
    automatically. No Terraform re-zip step.
 
-The seam between build and deploy is a **path variable per function**
-(`assign_position_artifact_path`, `open_event_artifact_path`,
-`read_artifact_path`, `admin_artifact_path`). You build the zips out-of-band,
-point the variables at them in `terraform.tfvars`, and Terraform deploys them
-directly.
+The seam between build and deploy is a **path variable per function**. `make
+build` compiles all six Lambda crates — `assign_position`, `open_event`, `read`,
+`admin`, `controller`, `generate_token` — into `.artifacts/`, and the dev root
+points each variable at the matching zip.
 
-The `controller` crate is not in the `make build` loop and the dev root exposes
-no `controller_artifact_path`, so the outflow controller currently deploys as
-the placeholder.
-
-### The placeholder fallback
-
-An **empty** artifact path leaves that function pointing at the vendored
-`infra/modules/core/placeholder-lambda/bootstrap` instead. This lets the whole
-infrastructure plane — API Gateway, SQS, IAM, DynamoDB tables — stand up before
-any crate is built, and lets functions land one at a time. The join queue's
-event-source mapping is enabled **only** when `assign_position` is real, so the
-placeholder never consumes the queue.
+**There is no placeholder fallback.** Every function deploys a real build, and
+the join event-source mapping and the controller schedule are created
+unconditionally. A stack that stands up with stub binaries looks deployed and
+serves nobody, which is the failure this system is most prone to and least able
+to report; an incomplete apply now fails at plan instead, on the missing zip.
 
 ## Prerequisites
 

@@ -47,8 +47,6 @@ waiting-room backend.
 ### 2.2 Live join
 
 ```
-  WAF          Bot Control · ASN match · anti-DDoS (Count mode, §8)
-        │
   CloudFront   polled behaviour: Min TTL 1 s, no cookies forwarded
         │
   API Gateway  REST, regional
@@ -434,7 +432,7 @@ skipped number.
 | `target_rate` | N | Operator-set admission rate, in visitors per second |
 | `shuffle_seed` | B | 256-bit permutation key, written once at T−0 |
 | `participant_count` | N | Pre-queue cohort size, the permutation domain |
-| `operator_message` | S | Delivered in `/status` |
+| `message` | S | Delivered in `/status` |
 
 The two striped counters — the pre-queue registration index and the arrivals count — are
 **not** attributes on this item. Each shard is its own item in the same table, keyed
@@ -560,8 +558,6 @@ releases and releasing more to cover the gap.
 |---|---|---|---|---|
 | `/status` | 1 s | path only | none | Phase, serving position, admission rate, operator message, adaptive poll policy ([#69](https://github.com/smoketurner/virtual-waiting-room/issues/69), ADR-0023); after T−0 also `shuffle_seed`, `participant_count`, `prequeue_offsets` |
 | `/queue_num` | 1 s | path + `event_id`, `request_id` | none | Own position; 404 means re-join |
-| `/queue_pos_expiry` | 1 s | path + `event_id`, `request_id` | none | Seconds until position lapses — **not routed yet** |
-| `/public_key` | 1 s | path + `event_id` | none | Signature verification material — **not routed yet** |
 | `/join` | uncached | — | none | Join the queue or pre-queue |
 | `/generate_token` | uncached | — | none | Exchange a served position for the CloudFront admission cookies |
 
@@ -569,7 +565,7 @@ releases and releasing more to cover the gap.
 
 | Behaviour | Path pattern | Caching | Cookies | Origin |
 |---|---|---|---|---|
-| Polled | `/status`, `/queue_num`, `/queue_pos_expiry`, `/public_key` | Min TTL 1 s | none | API Gateway |
+| Polled | `/status`, `/queue_num` | Min TTL 1 s | none | API Gateway |
 | Write | `/join`, `/generate_token` | disabled | none | API Gateway |
 | Protected origin | `/*` (default) | disabled | session cookie forwarded | Operator origin, gated by a CloudFront Function at viewer-request (ADR-0021, issue #71) |
 | Waiting page | `/_wr/*` | cached | none | S3, deliberately ungated — this is what a refused visitor sees |
@@ -593,7 +589,6 @@ serves the previous value if the origin is slow.
 | `/admin/fail_open` | Engage the fail-open break-glass epoch for a given duration (issue #71) |
 | `/admin/recover` | Clear the fail-open epoch — not "resume": a queued pause still applies once it clears |
 | `/admin/rules` | Replaces the edge gate's ruleset, one rule per line. Written directly to the KeyValueStore — it is the sole store for `rules`, never DynamoDB — with an audit record (`rules_digest`, `rules_count`) stamped on `Counters` after the write lands. `enforce_from` is still Terraform-only. |
-| `/metrics` | Event metrics as JSON |
 
 Every operator action is here; the scheduled paths call the same Lambdas. No capability
 requires a console.
@@ -650,18 +645,28 @@ acted on at the same open. They are not enabled on cost grounds (§8, §12).
 
 ### Web Application Firewall (WAF)
 
+**No web ACL is created.** `modules/edge` has no `aws_wafv2_web_acl`, and this is a decision
+rather than an omission: WAF bills $0.60 per million requests inspected on top of Bot Control's
+per-request fee, against the same request count CloudFront serves. At 1M visitors polling every
+10 s for 20 minutes that exceeds the CloudFront bill (§12) — and the polling it would inspect is
+the system's own waiting page, not an attack. Rate limiting for an event is taken at the
+CloudFront plan layer instead, which is priced against the traffic rather than per inspection.
+
+What does run at the edge is the gate: a CloudFront Function at viewer-request that refuses every
+request without a valid session before the origin is touched, and an ingest path where the burst
+reaches SQS through API Gateway with no compute in it at all.
+
+Three rules are worth attaching **for a specific event that warrants the cost**, and the
+distribution ARN is exported so one can be:
+
 1. **Bot Control** — bot-versus-human discrimination. Safe in Block.
 2. **Autonomous System Number (ASN) matching** — scalper infrastructure concentrates in a
    small number of hosting ASNs.
-3. **Anti-distributed-denial-of-service (anti-DDoS) managed rule group** — Count mode by
-   default ([ADR-0012](adr/0012-anti-ddos-count-mode.md)).
+3. **Anti-distributed-denial-of-service (anti-DDoS) managed rule group** — Count mode first
+   ([ADR-0012](adr/0012-anti-ddos-count-mode.md)).
 
 There is no public API key. A key on a page served to browsers ships in client-side
-JavaScript; WAF rate-based rules do that job properly.
-
-WAF bills $0.60 per million requests inspected on top of Bot Control's per-request fee,
-against the same request count CloudFront serves. At 1M visitors polling every 10 s for 20
-minutes it exceeds the CloudFront bill (§12).
+JavaScript; rate-based rules do that job properly.
 
 ---
 
@@ -669,8 +674,8 @@ minutes it exceeds the CloudFront bill (§12).
 
 | Capability | Mechanism |
 |---|---|
-| Live metrics | Lambdas emit logs in Embedded Metric Format (EMF); CloudWatch derives queue depth, admitted, no-show rate, expiry rate. Inflow comes from the `AWS/CloudFront` `Requests` metric. A dashboard ships with the module |
-| Metrics for client tooling | `GET /metrics` on the admin API |
+| Live metrics | Metric filters over the Lambdas' structured logs publish the conditions that are otherwise silent, each with an alarm at threshold zero (`modules/core/logging.tf`). Inflow comes from the `AWS/CloudFront` `Requests` metric. There is no dashboard resource; the alarms are the signal |
+| Metrics for client tooling | CloudWatch metrics and alarms published from the Lambdas' own log events (`modules/core/logging.tf`) |
 | Branding | Client HTML, CSS and assets in S3 behind CloudFront; the module ships a reference theme |
 | Operator messaging | A `Counters` attribute delivered in the existing `/status` payload |
 | Position and estimated wait | `/queue_num` returns position; the client computes wait from the measured admission rate in `/status` |
@@ -724,10 +729,11 @@ private-subnet compute regardless of IAM; the Lambda code is identical either wa
 with CloudFront as the sole ingress. VPC origins forbid Lambda@Edge origin triggers, require
 an internet gateway present but unused, and do not evaluate inbound network ACLs.
 
-**Event isolation.** Each event gets its own SQS queue and its own Lambda function with
-reserved concurrency ([ADR-0008](adr/0008-partition-isolation-not-shuffle-sharding.md)).
-Without reserved concurrency, functions draw from the shared account pool and a runaway event
-starves the others.
+**Event isolation.** A deployment serves one event and is torn down after it, so isolation
+between events is isolation between whole stacks: separate queues, tables, functions and
+distribution ([ADR-0008](adr/0008-partition-isolation-not-shuffle-sharding.md)). Within a
+deployment, `assign_position` carries reserved concurrency so the ingest burst cannot draw down
+the account pool the control plane and the controller also run in.
 
 ### GovCloud variant
 
@@ -987,7 +993,7 @@ Which section implements which requirement from [`REQUIREMENTS.md`](./REQUIREMEN
 | C5 — burst absorbed without dropping joins | §2.2, §6 |
 | N1, N2, N3 — idle cost, client account, no shared infrastructure | §11 |
 | N4 — commercial and GovCloud | §11 |
-| N5, N6 — Terraform, deployment size | §11 |
+| N5 — Terraform, no manual console steps | §11 |
 | N7 — edge bot mitigation | §8 |
 | N8 — OpenAPI specification | §8 |
 | N9 — event isolation | §11 |
