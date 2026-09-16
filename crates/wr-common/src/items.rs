@@ -216,17 +216,22 @@ impl Counters {
     /// both. Nothing is written per row; the tail is sparse, and the
     /// controller walks it at its known density.
     ///
-    /// `demotion` is the set the event item names. It may be `None` only when
-    /// the seal demoted nobody; a sealed event with `demoted_count > 0` and no
-    /// set to match against cannot be resolved, because answering from the
-    /// primary slot alone would silently un-demote every demoted row.
+    /// `demotion` is the set the event item names. It may be `None` when the
+    /// seal demoted nobody, or for a row that raced the seal: such a row
+    /// resolves to [`ResolvedPosition::LiveJoin`] without consulting the set —
+    /// the permutation is never evaluated for it, so there is no primary slot
+    /// to answer from and no demoted row to un-demote. A cohort row on a sealed
+    /// event with `demoted_count > 0` and no set to match against cannot be
+    /// resolved, because answering from the primary slot alone would silently
+    /// un-demote every demoted row.
     ///
     /// # Errors
     ///
     /// [`ResolveError::NotSealed`] before the seal has written the seed, cohort
     /// size, and offsets; [`ResolveError::BadShard`] if the row's shard is
-    /// outside `0..SHARDS`; [`ResolveError::DemotionUnavailable`] when the
-    /// event demoted rows and the caller could not supply the set.
+    /// outside `0..SHARDS`; [`ResolveError::DemotionUnavailable`] when a cohort
+    /// row's event demoted rows and the caller could not supply the set — a
+    /// straggler never yields this error.
     pub fn resolve_prequeue(
         &self,
         row: &PreQueueItem,
@@ -242,15 +247,14 @@ impl Counters {
         if shard >= SHARDS {
             return Err(ResolveError::BadShard);
         }
-        let demotion = match (demoted, demotion) {
-            (0, _) => None,
-            (_, Some(set)) => Some(set),
-            (_, None) => return Err(ResolveError::DemotionUnavailable),
-        };
-
         let participant_count = offsets.participant_count();
         Ok(match offsets.assign(shard, row.l) {
             Assignment::PreQueue { index } => {
+                let demotion = match (demoted, demotion) {
+                    (0, _) => None,
+                    (_, Some(set)) => Some(set),
+                    (_, None) => return Err(ResolveError::DemotionUnavailable),
+                };
                 let primary = crate::permutation::prp(&seed, index, participant_count);
                 let position = match demotion {
                     Some(set) if set.matches(row.v.as_ref()) => {
@@ -725,6 +729,25 @@ mod tests {
                 .resolve_prequeue(&prequeue_row(0, 10, Some("64500")), Some(&farm_set()))
                 .unwrap(),
             ResolvedPosition::LiveJoin
+        );
+    }
+
+    #[test]
+    fn a_straggler_is_a_live_join_even_when_the_set_is_unavailable() {
+        // The straggler rule runs before the demotion-availability gate: a row
+        // past its shard's issued count was never in the cohort the seal
+        // classified, so it has no primary slot to un-demote from and falls
+        // through to a `Positions` lookup even when the set could not be loaded
+        // (cold-start / transient-failure window, where `demoted_count > 0`
+        // and the set is `None`). The symmetric cohort row still refuses.
+        let counters = sealed_counters([10, 10, 0, 0, 0, 0, 0, 0, 0, 0], 5);
+        assert_eq!(
+            counters.resolve_prequeue(&prequeue_row(0, 10, Some("64500")), None),
+            Ok(ResolvedPosition::LiveJoin)
+        );
+        assert_eq!(
+            counters.resolve_prequeue(&prequeue_row(0, 3, Some("64500")), None),
+            Err(ResolveError::DemotionUnavailable)
         );
     }
 
