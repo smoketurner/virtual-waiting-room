@@ -1,6 +1,6 @@
 # ADR-0029: Demote telemetry groups to the tail at the open, matching on read
 
-**Status:** Accepted
+**Status:** Superseded by [0030](0030-remove-open-time-demotion.md).
 
 ## 1. Context
 

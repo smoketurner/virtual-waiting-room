@@ -530,8 +530,8 @@ async fn process_prequeue_batch<S: Store>(
 /// `PreQueue` row this invocation already wrote must never be redelivered:
 /// redelivery would find the event opened and take the live path directly,
 /// minting a second position for a row that (if it turns out to be within its
-/// shard's count) is already correctly counted in the pre-queue cohort — the
-/// same demotion by a different route. Left alone, an uncorrected straggler
+/// shard's count) is already correctly counted in the pre-queue cohort, so it
+/// would be served twice. Left alone, an uncorrected straggler
 /// row self-heals through the read path instead (a 404 on `/queue_num` that
 /// eventually re-joins).
 async fn fixup_stragglers<S: Store>(store: &S, event_id: &str, written: Vec<PreQueueWrite>) {
@@ -793,8 +793,6 @@ mod tests {
             shuffle_seed: None,
             participant_count: None,
             prequeue_offsets: None,
-            demoted_count: 0,
-            demotion: None,
             message: None,
             target_rate: None,
             stored_control: StoredControl::Open,
@@ -820,8 +818,6 @@ mod tests {
             shuffle_seed: Some([7u8; 32]),
             participant_count: Some(opened.participant_count()),
             prequeue_offsets: Some(offsets),
-            demoted_count: 0,
-            demotion: None,
             message: None,
             target_rate: None,
             stored_control: StoredControl::Open,

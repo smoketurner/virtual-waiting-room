@@ -36,8 +36,6 @@ every other attribute is schemaless.
 EVT#{event_id}            the event
 EVT#{event_id}#PQ#{0..9}  pre-queue registration shards
 EVT#{event_id}#AR#{0..9}  arrival shards
-EVT#{event_id}#DM         demotion report, when demotion rules are set
-EVT#{event_id}#DG#{nonce}#{k}  demotion-set chunks, when the open demoted
 ```
 
 The event item carries, by writer:
@@ -55,8 +53,6 @@ The event item carries, by writer:
 | `shuffle_seed` | `open_event` | 256-bit permutation key (B), written once |
 | `participant_count` | `open_event` | Cohort size `N` |
 | `prequeue_offsets` | `open_event` | Ten prefix offsets (L) |
-| `demoted_count` | `open_event` | `D`, cohort rows the demotion set matches; absent or `0` when nothing was demoted |
-| `demotion_nonce`, `demotion_chunks` | `open_event` | Locate the demotion set's chunk items; present when `demoted_count > 0` |
 | `message` | `admin` | Operator broadcast |
 | `last_action`, `last_action_by`, `last_action_at`, `last_action_epoch_ms` | `admin` | Audit trail and debounce guard |
 
@@ -114,7 +110,6 @@ the expiry write both bind `#s` to `status`.
 | `assign_position` | `Counters` | `GetItem` event item (fix-up re-read) | **Strong** | 1 per pre-queue batch |
 | `assign_position` | `Positions` | `PutItem` if `attribute_not_exists(request_id)` | — | 1 per live joiner |
 | `open_event` | `Counters` | `BatchGetItem` of ten pre-queue shards | **Strong** | Once per event |
-| `open_event` | `PreQueue` | `Scan` of the cohort, parallel | **Strong** | Once per event, when demotion rules are set |
 | `open_event` | `Counters` | `UpdateItem` if `attribute_not_exists(shuffle_seed)` | — | Once per event |
 | `read` | `Counters` | `GetItem` event item | Eventual, 1 s in-process cache | ≤1/s per execution environment |
 | `read` | `PreQueue` | `GetItem` by `r` | Eventual | 1 per `/v1/queue_num` |
@@ -134,7 +129,7 @@ the expiry write both bind `#s` to `status`.
 | `admin` | `Counters` | `GetItem`, five `UpdateItem` forms | Eventual | Operator actions |
 | `admin` | `Tokens` | `PutItem`, `GetItem`, `DeleteItem` | Eventual | Operator logins |
 
-There are two `Scan`s in the codebase — `controller`'s expiry scan (§11) and `open_event`'s scan of the pre-queue when demotion rules are set — and no `Query`. Everything else is a key lookup.
+There is one `Scan` in the codebase — `controller`'s expiry scan (§11) — and no `Query`. Everything else is a key lookup.
 
 ---
 

@@ -35,9 +35,6 @@ module "core" {
   poll_ceiling_ms = var.poll_ceiling_ms
   poll_divisor    = var.poll_divisor
 
-  # Open-time demotion (#145), read by open_event.
-  demotion_rules = var.demotion_rules
-  demotion_mode  = var.demotion_mode
 
   # Shared with module.edge below so generate_token and the gate's CloudFront
   # Function cannot drift onto different cookie names (issue #71).

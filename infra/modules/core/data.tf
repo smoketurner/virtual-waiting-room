@@ -101,8 +101,7 @@ data "aws_iam_policy_document" "apigw_sqs" {
 }
 
 # Execution-role permissions for open_event: read the shard counts and write the
-# open (seed + offsets + count + phase) on the Counters item, write the demotion
-# set chunks and report beside it and scan the pre-queue (issue #145), plus logs.
+# open (seed + offsets + count + phase) on the Counters item, plus logs.
 data "aws_iam_policy_document" "open_event" {
   statement {
     sid    = "ReadAndOpenCounters"
@@ -113,25 +112,8 @@ data "aws_iam_policy_document" "open_event" {
       # BatchGetItem. GetItem does not authorise it — it is its own action.
       "dynamodb:BatchGetItem",
       "dynamodb:UpdateItem",
-      # The demotion set (EVT#<id>#DG#<nonce>#<k>) and report (EVT#<id>#DM) are
-      # their own items, written whole.
-      "dynamodb:PutItem",
-      # An open that loses the election deletes the set chunks it wrote.
-      "dynamodb:DeleteItem",
     ]
     resources = [aws_dynamodb_table.counters.arn]
-  }
-
-  statement {
-    sid    = "ClassifyPreQueue"
-    effect = "Allow"
-    actions = [
-      # The one sanctioned scan of the pre-queue: once, at the open, and only
-      # when demotion rules are set. Never on the hot path. Read-only: the
-      # open writes nothing per row.
-      "dynamodb:Scan",
-    ]
-    resources = [aws_dynamodb_table.prequeue.arn]
   }
 
   statement {

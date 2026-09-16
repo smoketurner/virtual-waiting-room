@@ -9,7 +9,7 @@ use jiff::Timestamp;
 
 use crate::arrival::ArrivalTime;
 use wr_common::expr::Key;
-use wr_common::{DemotionReport, Phase, StoredControl};
+use wr_common::{Phase, StoredControl};
 
 use crate::{ControlState, Store, StoreError};
 
@@ -83,26 +83,6 @@ impl Store for DynamoStore {
             starts_at: num(wr_common::STARTS_AT_ATTR),
             starts_at_timezone: str_attr(wr_common::STARTS_AT_TZ_ATTR),
         }))
-    }
-
-    async fn load_demotion_report(
-        &self,
-        event_id: &str,
-    ) -> Result<Option<DemotionReport>, StoreError> {
-        let out = self
-            .client
-            .get_item()
-            .table_name(&self.counters_table)
-            .set_key(Some(Key::DemotionReport { event_id }.build()))
-            .send()
-            .await
-            .map_err(|e| StoreError::Backend(format!("get_item report: {e}")))?;
-        let Some(item) = out.item() else {
-            return Ok(None);
-        };
-        let report: DemotionReport = serde_dynamo::from_item(item.clone())
-            .map_err(|e| StoreError::Backend(format!("parse report: {e}")))?;
-        Ok(Some(report))
     }
 
     async fn set_phase(

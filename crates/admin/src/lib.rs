@@ -9,9 +9,7 @@ use jiff::{SignedDuration, Timestamp};
 
 use crate::arrival::ArrivalTime;
 
-use wr_common::{
-    DemotionReport, IllegalControl, Phase, ProtectionRule, RuleFieldError, StoredControl,
-};
+use wr_common::{IllegalControl, Phase, ProtectionRule, RuleFieldError, StoredControl};
 
 pub mod arrival;
 pub mod dynamo;
@@ -163,14 +161,6 @@ pub trait Store {
         &self,
         event_id: &str,
     ) -> impl Future<Output = Result<Option<ControlState>, StoreError>> + Send;
-
-    /// Loads the open's demotion report (issue #145), or `None` when no open
-    /// with rules set has run. Its own item, so its own read: the dashboard
-    /// is the only reader, and the event item stays small for every poll.
-    fn load_demotion_report(
-        &self,
-        event_id: &str,
-    ) -> impl Future<Output = Result<Option<DemotionReport>, StoreError>> + Send;
 
     /// Transitions the phase with a guard on the expected current phase, so two
     /// operators cannot race a transition, and stamps the audit fields
@@ -1403,13 +1393,6 @@ mod tests {
                 }))
             };
             std::future::ready(result)
-        }
-
-        fn load_demotion_report(
-            &self,
-            _event_id: &str,
-        ) -> impl Future<Output = Result<Option<DemotionReport>, StoreError>> + Send {
-            std::future::ready(Ok(None))
         }
 
         fn set_phase(

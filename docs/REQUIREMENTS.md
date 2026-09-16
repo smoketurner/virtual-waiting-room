@@ -81,9 +81,7 @@ activation queues first-in, first-out (FIFO).
 
 ### 1.7 Abuse mitigation
 
-| ID | Requirement | Acceptance |
-|---|---|---|
-| F6.3 | Bot-blocking decisions SHOULD be enforceable at event start rather than during the pre-queue. | Built as open-time demotion ([ADR-0029](adr/0029-open-time-demotion.md)), off by default. Join-time telemetry (viewer address, ASN, country, JA4 fingerprint, user agent) is captured on every registration row; at the open, operator-set `signal:max` rules demote every group larger than its threshold behind the rest of the cohort, invisibly until T−0, and a report of what was demoted and why is on the dashboard. `observe` mode reports without demoting; the false-positive rate of a threshold is read off a real event before `enforce` is set. |
+No requirement in this section is currently met by a shipped mechanism.
 
 **No one-position-per-visitor control exists.** `request_id` is client-supplied, so nothing
 stops one visitor taking N places, and randomization converts volume into expected share of the
@@ -91,9 +89,9 @@ front of the queue linearly
 ([ADR-0001](adr/0001-randomize-pre-queue-assignment.md)). Every deployment is therefore a bare
 raffle. Bounding volume needs either an identity to bind a position to — which a public onsale
 open to anyone does not have — or a mechanism that costs the client something: proof of work, or
-behavioural classification over the telemetry F6.3 describes. The second now exists as open-time
-demotion (ADR-0029), disabled by default: it bounds a farm that shares an address, ASN, JA4 or
-user agent, and nothing else.
+behavioural classification over join-time telemetry. Open-time demotion was the
+second, and it was removed without ever being enabled ([ADR-0030](adr/0030-remove-open-time-demotion.md)), so nothing bounds
+volume today.
 
 ---
 
@@ -126,6 +124,20 @@ pre-event preparation in §4.
 | N8 | The API MUST be documented as an OpenAPI specification. | Spec published; client and admin surfaces generated from it. |
 | N9 | Concurrent events in one deployment MUST be isolated from each other. | One event driven to its throughput ceiling does not increase queue-join latency or error rate for another event in the same deployment. |
 | N10 | Client polling cost MUST scale with distance to the front, not with waiting visitors × a fixed interval. | Poll count is O(log) in the starting wait, and the harness client-request total under `--polling backoff` is materially below `--polling hold-position` at identical settings. |
+
+---
+
+### Retired requirements
+
+IDs are never reused and never renumbered, so a requirement that no longer holds is recorded
+here rather than deleted. A row names what it required, why it went, and which decision record
+carries the reasoning.
+
+| ID | Required | Retired because | Record |
+|---|---|---|---|
+| F6.1 | Gate queue entry on a client-issued signed entry ticket carrying an opaque per-identity subject, deriving `request_id` from it so one identity held one position. | Nothing could use it without customer-side work the product does not supply. | [ADR-0028](adr/0028-remove-entry-tickets.md) |
+| F6.2 | The entry ticket is signed by the client, not the waiting room, and its subject is opaque. | Retired with F6.1; it constrained a mechanism that no longer exists. | [ADR-0028](adr/0028-remove-entry-tickets.md) |
+| F6.3 | Bot-blocking decisions enforceable at event start rather than during the pre-queue. | Built as open-time demotion and never enabled; sixteen concepts, a `Scan` grant, and a room-wide refusal if one chunk item went unread. Structurally blind to a client that bypassed CloudFront, which is the traffic it was aimed at. | [ADR-0030](adr/0030-remove-open-time-demotion.md) |
 
 ---
 

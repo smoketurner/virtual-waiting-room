@@ -57,6 +57,10 @@ runtime wiring.
   Written for spec-driven agent work.
 - Requirement IDs (`F*`, `C*`, `N*`, `O*`) are the join key between the two layers. When a
   requirement changes, update both, keeping the ID stable.
+- A requirement that no longer holds is **retired, never deleted**: move it to the
+  `Retired requirements` table in both layers, naming what it required, why it went, and the ADR
+  carrying the reasoning. IDs are never reused and never renumbered — a gap in the numbering is a
+  record that something was dropped without one, which is how F6.1 and F6.2 vanished in #148.
 - ADRs are the shared rationale. Both layers link to `docs/adr/`; neither restates the "why".
 - `tasks.md` is the record of what is **built**. An item only partly delivered stays unchecked
   and carries a `Partial:` note saying what is missing. Neither design layer should describe an
