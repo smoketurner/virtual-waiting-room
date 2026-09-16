@@ -19,7 +19,7 @@ pub mod items;
 pub mod permutation;
 pub mod rules;
 
-pub use crypto::{Session, SigningKey, VerifyError};
+pub use crypto::{Session, SignError, SigningKey, VerifyError};
 pub use expr::{STARTS_AT_ATTR, STARTS_AT_TZ_ATTR};
 pub use ids::{
     AdmissionControl, EventId, IllegalControl, Phase, RequestId, ServingState, StoredControl,
@@ -27,7 +27,7 @@ pub use ids::{
 };
 pub use items::{
     Counters, OpenOutputs, PositionItem, PositionStatus, PreQueueItem, ResolveError,
-    ResolvedPosition, shard_count_of, shard_index_of,
+    ResolvedPosition, shard_count_of, shard_index_of, stored_control_of,
 };
 pub use permutation::{
     Assignment, CohortError, CohortOffsets, RandError, SHARDS, Seed, Shard, prp,

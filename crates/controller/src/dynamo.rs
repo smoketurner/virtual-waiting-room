@@ -69,16 +69,24 @@ impl Store for DynamoStore {
             .and_then(|s| s.parse::<Phase>().ok())
             .unwrap_or(Phase::Idle);
 
-        // A stored control that is absent or fails to parse (including a
-        // legacy "fail_open" string) resolves to Open, matching every other
-        // reader (`read`, `admin`, `generate_token`): "open" is the default an
-        // event is created in, and a garbage value must not silently hold
-        // admission for an event nobody paused.
-        let stored_control = item
-            .get("admission_control")
-            .and_then(|v| v.as_s().ok())
-            .and_then(|s| s.parse::<StoredControl>().ok())
-            .unwrap_or(StoredControl::Open);
+        // One rule, shared with every other reader: absent is normal
+        // admission, present-and-unreadable holds. This is the component that
+        // would act on a misread by releasing people into an origin an
+        // operator was trying to protect, so it says so under a stable event
+        // name -- a controller that silently stops releasing looks exactly
+        // like one with nothing to release.
+        let stored_control = wr_common::stored_control_of(item);
+        if stored_control == StoredControl::Paused
+            && item.get("admission_control").and_then(|v| v.as_s().ok())
+                != Some(&StoredControl::Paused.as_wire_str().to_owned())
+        {
+            tracing::error!(
+                event_id,
+                event = "admission_control_unreadable",
+                "stored admission control could not be parsed; holding admission"
+            );
+        }
+
         let fail_open_until = num(item, "fail_open_until");
 
         // target_rate absent (never set by the operator) means no admission

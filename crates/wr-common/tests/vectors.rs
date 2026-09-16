@@ -150,7 +150,7 @@ fn positives() -> Vec<PositiveVector> {
             issued_at,
             expires_at,
             now,
-            credential: session.sign(&key),
+            credential: session.sign(&key).unwrap(),
         }
     };
 

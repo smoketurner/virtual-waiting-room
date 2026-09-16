@@ -142,10 +142,22 @@ pub enum VerifyError {
     Expired,
 }
 
+/// Signing failed. `HS256` over a fixed claim set has no realistic failure
+/// path, but the type refuses to let a caller find out by shipping an empty
+/// cookie: an empty credential is not a well-formed JWS, so the gate refuses
+/// it and the visitor bounces between the origin and the waiting page while
+/// the response that sent them there said `admitted: true`.
+#[derive(Debug, thiserror::Error)]
+#[error("could not sign the session credential")]
+pub struct SignError;
+
 impl Session {
     /// Signs the session as a compact JWS (`HS256`).
-    #[must_use]
-    pub fn sign(&self, key: &SigningKey) -> String {
+    ///
+    /// # Errors
+    ///
+    /// [`SignError`] if the claims could not be encoded.
+    pub fn sign(&self, key: &SigningKey) -> Result<String, SignError> {
         sign_claims(
             key,
             Kind::Session,
@@ -181,13 +193,13 @@ impl Session {
 }
 
 /// Signs `kind || payload` and returns `base64url(payload).base64url(mac)`.
-fn sign_claims(key: &SigningKey, kind: Kind, claims: &Claims) -> String {
+fn sign_claims(key: &SigningKey, kind: Kind, claims: &Claims) -> Result<String, SignError> {
     jsonwebtoken::encode(
         &Header::new(Algorithm::HS256),
         claims,
         &EncodingKey::from_secret(key.for_kind(kind)),
     )
-    .unwrap_or_default()
+    .map_err(|_| SignError)
 }
 
 /// Verifies a compact JWS and returns its claims. Errors are collapsed to
@@ -231,14 +243,14 @@ mod tests {
 
     #[test]
     fn session_round_trips() {
-        let signed = session().sign(&key());
+        let signed = session().sign(&key()).unwrap();
         let back = Session::verify(&signed, &key(), 1_500_000_000).unwrap();
         assert_eq!(back, session());
     }
 
     #[test]
     fn expired_session_is_rejected() {
-        let signed = session().sign(&key());
+        let signed = session().sign(&key()).unwrap();
         assert_eq!(
             Session::verify(&signed, &key(), 2_000_000_001),
             Err(VerifyError::Expired)
@@ -263,7 +275,7 @@ mod tests {
                 out
             },
         };
-        let signed = session().sign(&underived);
+        let signed = session().sign(&underived).unwrap();
         assert_eq!(
             Session::verify(&signed, &derived, 1_500_000_000),
             Err(VerifyError::BadSignature),
@@ -273,7 +285,7 @@ mod tests {
 
     #[test]
     fn wrong_key_fails_signature() {
-        let signed = session().sign(&key());
+        let signed = session().sign(&key()).unwrap();
         let other = SigningKey::new(b"a-different-32-byte-signing-keyy");
         assert_eq!(
             Session::verify(&signed, &other, 1_500_000_000),
@@ -283,7 +295,7 @@ mod tests {
 
     #[test]
     fn tampered_payload_fails() {
-        let signed = session().sign(&key());
+        let signed = session().sign(&key()).unwrap();
         let parts: Vec<&str> = signed.split('.').collect();
         // Flip a character in the claims segment; the signature covers
         // "header.payload", so it no longer matches.
@@ -303,7 +315,7 @@ mod tests {
 
         // The point of the format: any JWT tool can read the claims. Decode
         // the payload segment and check the registered names are there.
-        let signed = session().sign(&key());
+        let signed = session().sign(&key()).unwrap();
         let parts: Vec<&str> = signed.split('.').collect();
         assert_eq!(parts.len(), 3, "compact serialization is three segments");
 
@@ -357,7 +369,7 @@ mod tests {
                 issued_at: expires_at - 1,
                 expires_at,
             };
-            let signed = t.sign(&k);
+            let signed = t.sign(&k).unwrap();
             let back = Session::verify(&signed, &k, expires_at - 1).unwrap();
             prop_assert_eq!(back, t);
         }
