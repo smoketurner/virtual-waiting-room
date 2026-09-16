@@ -143,7 +143,7 @@ Three of the four phases serve a static operator-authored page from content deli
 |---|---|
 | Phase state | Attribute on the `Counters` item; one conditional `UpdateItem` transitions a phase |
 | Scheduled transitions | EventBridge Scheduler invoking `open_event` at T−0 |
-| Manual transitions | `/admin/phase` on the admin Lambda, writing the same conditional `UpdateItem` |
+| Manual transitions | `/admin/phase` on the admin Lambda, writing the same conditional `UpdateItem`. Not `active`: the open owns that one, and `/admin/open_now` invokes it (ADR-0025) |
 | Phase pages | Client HTML in S3, served through CloudFront with a long time to live (TTL) |
 | Current phase for clients | `/status`, cached 5 s globally |
 | Maintenance mode | A phase override attribute checked before `phase` |
@@ -679,7 +679,8 @@ serves the previous value if the origin is slow.
 
 | Path | Purpose |
 |---|---|
-| `/admin/phase` | Transition phase; force or clear maintenance mode |
+| `/admin/phase` | Transition phase; force or clear maintenance mode. Refuses `active`, which only the open writes |
+| `/admin/open_now` | Open the event immediately, by invoking the function the schedule invokes |
 | `/admin/rate` | Set target admission rate |
 | `/admin/message` | Publish an operator message to waiting visitors |
 | `/admin/reset` | Reset event state |
@@ -846,7 +847,8 @@ the existing handlers rather than reimplementing them. The auth path is unchange
 | Route | Method | Purpose |
 |---|---|---|
 | `/admin` | GET | Dashboard |
-| `/admin/phase` | GET / POST | View / transition phase; force or clear maintenance mode |
+| `/admin/phase` | GET / POST | View / transition phase; force or clear maintenance mode. Refuses `active`, which only the open writes |
+| `/admin/open_now` | POST | Open the event immediately, by invoking the function the schedule invokes |
 | `/admin/rate` | GET / POST | View / set target admission rate |
 | `/admin/message` | GET / POST | View / publish operator message to waiting visitors |
 | `/admin/reset` | GET / POST | View / reset event state |

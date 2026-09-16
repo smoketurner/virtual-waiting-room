@@ -30,6 +30,11 @@ pub struct Dashboard {
     pub serving_counter: u64,
     pub queue_counter: u64,
     pub participant_count: String,
+    /// Whether the open has run. The open writes the seed, the offsets and the
+    /// cohort size in one conditional update, so a present `participant_count`
+    /// means all three landed — and an absent one means "not yet open" no
+    /// matter what the phase says.
+    pub opened: bool,
     pub target_rate: String,
     pub message: String,
     /// The raw broadcast message (empty string when unset), for pre-filling the
@@ -179,6 +184,7 @@ impl Dashboard {
             serving_counter: state.serving_counter,
             queue_counter: state.queue_counter,
             participant_count: dash(state.participant_count.map(|n| n.to_string())),
+            opened: state.participant_count.is_some(),
             target_rate: dash(state.target_rate.map(|n| n.to_string())),
             target_rate_raw: state.target_rate.map(|n| n.to_string()).unwrap_or_default(),
             message: dash(state.message.clone()),
@@ -300,6 +306,40 @@ mod tests {
         // Nothing to clear, so no clear button to mis-click.
         assert!(!html.contains("Clear start time"));
         assert!(html.contains(r#"<option value="UTC" selected>"#));
+    }
+
+    #[test]
+    fn a_pre_queue_event_offers_the_open_and_no_phase_transition() {
+        // The opening is not a phase an operator sets: it is one conditional
+        // update carrying the permutation seed. The phase card must say so
+        // rather than reuse the "event is over" text for its empty list, and
+        // the button that does perform it must be on the page.
+        let mut s = state();
+        s.phase = Phase::PreQueue;
+        s.participant_count = None;
+        let html = Dashboard::from_state(&s, 0).render().unwrap();
+
+        assert!(html.contains("Open now"));
+        assert!(html.contains("/admin/open_now"));
+        assert!(
+            !html.contains("The event is over"),
+            "a pre-queue event is not a finished one"
+        );
+        assert!(
+            !html.contains(r#"<select id="phase""#),
+            "no phase transition is offered from the pre-queue"
+        );
+    }
+
+    #[test]
+    fn an_opened_event_is_not_offered_the_open_again() {
+        // A cohort size on the item means the open already ran, whether the
+        // schedule fired it or an operator did. Pressing it again is a no-op
+        // the button should not invite.
+        let html = Dashboard::from_state(&state(), 0).render().unwrap();
+
+        assert!(!html.contains("/admin/open_now"));
+        assert!(html.contains("Already open"));
     }
 
     #[test]

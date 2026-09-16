@@ -142,6 +142,10 @@ resource "aws_lambda_function" "admin" {
       # Issue #128: the operator's start time is written here, which arms the
       # one-time open schedule Terraform created disabled.
       OPEN_SCHEDULE_NAME = aws_scheduler_schedule.open.name
+      # "Open now" invokes the same function the schedule invokes, rather than
+      # writing the open itself: the open is one conditional update carrying
+      # the permutation seed, and a second copy of that write could drift.
+      OPEN_EVENT_FUNCTION_NAME = aws_lambda_function.open_event.function_name
       # API Gateway prefixes the path with the stage (e.g. /dev/admin); this
       # makes the Rust runtime strip it so the Axum routes match unprefixed.
       AWS_LAMBDA_HTTP_IGNORE_STAGE_IN_PATH = "true"

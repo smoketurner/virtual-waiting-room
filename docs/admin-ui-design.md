@@ -44,7 +44,8 @@ from `wr-domain::Counters` / `Phase`.
 | Route | Method | Handler | Writes on `Counters` |
 |---|---|---|---|
 | `/admin` | GET | Render dashboard: current phase, serving/queue counters, N, message. Read the `Counters` item, render with askama. | — (read only) |
-| `/admin/phase` | POST | Transition phase (form field `phase` ∈ idle/pre_queue/active/post_event). One conditional `UpdateItem`. | `phase` |
+| `/admin/phase` | POST | Transition phase (form field `phase` ∈ idle/pre_queue/active/post_event). One conditional `UpdateItem`. Refuses `active` for an event the open has never run for. | `phase` |
+| `/admin/open_now` | POST | Open the event immediately instead of waiting for the scheduled start: invokes the `open_event` function the schedule invokes. | `shuffle_seed`, prefix offsets, `participant_count`, `phase = active` (written by `open_event`); audit fields here |
 | `/admin/rate` | POST | Set the admission target rate the outflow controller reads (form `rate`). | `target_rate` (new attribute; controller is future work but the knob is set here) |
 | `/admin/message` | POST | Set the operator broadcast message shown on phase pages / `/status` (form `message`). | `message` |
 | `/admin/reset` | POST | Force **maintenance** phase (the override that suppresses standby alarms), the safe operator stop. | `phase = maintenance` |
@@ -53,7 +54,8 @@ from `wr-domain::Counters` / `Phase`.
 ### MVP action set (implemented in Stages 3–5)
 
 `phase`, `rate`, `message`, `reset` (maintenance override), `pause`/`resume`,
-`fail_open`/`recover`, `start_time`, `rules`, and the read-only `/admin` render.
+`fail_open`/`recover`, `start_time`, `open_now`, `rules`, and the read-only
+`/admin` render.
 Nothing is wired as a route that answers "deferred": a control the operator
 cannot use is left out rather than shown as a dead panel.
 
@@ -65,6 +67,18 @@ phase (operator-forced). The handler validates the requested target against the
 current phase and rejects an illegal jump with a 4xx rather than writing it.
 The write is a conditional `UpdateItem` (guard on the current phase) so two
 concurrent operators cannot race a transition.
+
+**`active` is the one phase the operator cannot set.** It is not a phase change
+at all: `open_event` writes the permutation seed, the ten prefix offsets, the
+cohort size and `phase = active` in one conditional update guarded by
+`attribute_not_exists(shuffle_seed)`. A phase set to `active` on its own is an
+event that reports itself open while `/queue_num` answers "not yet open" to
+every pre-queue registrant, because nothing has written the seed their position
+is derived from. So the dropdown offers nothing from `pre_queue` — the schedule
+opens the event, or the operator presses **Open now** — and `/admin/phase`
+refuses `active` outright for an event with no `participant_count`, which also
+covers the recovery path out of `maintenance` for an event that was stopped
+before it ever opened.
 
 ## UI / styling (Stage 2)
 

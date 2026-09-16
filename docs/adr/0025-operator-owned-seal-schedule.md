@@ -112,3 +112,39 @@ worst available is re-pointing one existing schedule at a target that role canno
 - Dropping `count` moves the three open resources' addresses, so the first apply after this change
   replaces them. Harmless here — the schedule is disabled and holds no state — but it is a
   destroy-and-create in the plan, not an update.
+
+## Revision (2026-09-16): the operator can open the event now, and can no longer set `active`
+
+Scheduling was the only way to open an event, which left two holes. An event with no start time
+could never open at all, and an operator who needed to open early had one apparent alternative on
+the dashboard — the phase dropdown's `pre_queue → active` — which was not one.
+
+**Open now invokes `open_event`; it does not reimplement it.** The open is a single conditional
+`UpdateItem` guarded by `attribute_not_exists(shuffle_seed)`, writing the permutation seed, the ten
+prefix offsets, the cohort size and `phase = active` together. That guard is what makes a
+double-fire safe, so pressing the button after the schedule has already fired is a no-op rather
+than a second permutation, and the button and the schedule cannot drift apart because there is only
+one copy of the write. The invoke is `RequestResponse`, not `Event`: the operator pressed a button
+and is owed the answer, and a fire-and-forget invoke would report success for an open that failed
+reading its shard counts. `open_event` returns `{"opened": bool}` so the dashboard can tell "you
+opened it" from "it was already open" — the same success to the caller, a different thing to say to
+a person. The admin's audit stamp is written only in the first case, so the record never claims an
+open it did not perform; a stamp that fails is logged (`open_audit_failed`) rather than returned,
+because the event is open either way and reporting failure would invite a second press.
+
+**`active` is no longer a phase an operator can set.** `next_phases(pre_queue)` is now empty, and
+`/admin/phase` refuses `active` for any event with no `participant_count` — the cohort size being
+proof that the whole conditional update landed. Setting the phase alone produced an event that
+reported itself open while `/queue_num` answered "not yet open" to every pre-queue registrant,
+because nothing had written the seed their position derives from: a stack that looks healthy while
+doing nothing, which is this system's characteristic failure. The `participant_count` check rather
+than a change to `transition_allowed` also covers the `maintenance → active` recovery route for an
+event forced into maintenance before it was ever opened.
+
+The dashboard's phase card says this in place of its empty-list text, which previously read "the
+event is over".
+
+- `admin` gains `aws-sdk-lambda` and one IAM statement, `lambda:InvokeFunction` on `open_event` —
+  the same grant the scheduler's own role already holds on the same one function.
+- A start time set for later and then opened early leaves the schedule armed. It fires into the
+  seed guard and does nothing. Clearing it is tidiness, not correctness.

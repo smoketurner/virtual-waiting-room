@@ -286,6 +286,29 @@ impl Store for DynamoStore {
         send_guarded(req, "rules_audit").await
     }
 
+    async fn stamp_action(
+        &self,
+        event_id: &str,
+        action: crate::AdminAction,
+        actor: &str,
+        now: ArrivalTime,
+    ) -> Result<(), StoreError> {
+        // Audit fields only: the action's real effect landed elsewhere (the
+        // open's own conditional write), so there is nothing here to guard a
+        // race against -- only the record of it.
+        let mut req = self
+            .client
+            .update_item()
+            .table_name(&self.counters_table)
+            .set_key(Some(Key::Event { event_id }.build()))
+            .update_expression(
+                "SET last_action = :a, last_action_by = :by, last_action_at = :at, \
+                 last_action_epoch_ms = :ms",
+            );
+        req = apply_audit_values(req, action, actor, now);
+        send_guarded(req, "stamp_action").await
+    }
+
     async fn force_maintenance(
         &self,
         event_id: &str,

@@ -440,7 +440,8 @@ The admin Lambda serves an Axum router behind an API Gateway greedy proxy:
 | `/admin` | GET | Dashboard |
 | `/admin/state` | GET | JSON state |
 | `/admin/login`, `/admin/callback`, `/admin/logout` | GET | OIDC Authorization Code with PKCE |
-| `/admin/phase` | POST | Phase transition, guarded on the expected prior phase |
+| `/admin/phase` | POST | Phase transition, guarded on the expected prior phase. Refuses `active` for an event the open has never run for |
+| `/admin/open_now` | POST | Opens the event now, invoking `open_event` rather than writing the open a second time |
 | `/admin/rate` | POST | Target rate, guarded on the expected prior rate |
 | `/admin/message` | POST | Operator broadcast |
 | `/admin/reset` | POST | Reset event state |

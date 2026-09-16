@@ -114,7 +114,9 @@
         <p class="sub">Move the event to its next stage.</p>
       </div>
       <div class="card-body">
-        {% if allowed_transitions.is_empty() %}
+        {% if phase == "pre_queue" %}
+        <p class="deferred">Registration is open. The next step is the opening itself, which assigns everyone waiting their place — it is not a phase you set here. Use the scheduled start time, or <strong>Open now</strong>, under <strong>Start time</strong> below.</p>
+        {% elif allowed_transitions.is_empty() %}
         <p class="deferred">The event is over (<code>post_event</code>). There is no next phase. Start a new event to run again.</p>
         {% else %}
         <form method="post" action="/admin/phase">
@@ -189,6 +191,14 @@
           <input type="hidden" name="timezone" value="{{ starts_at_timezone }}">
           <button type="submit" class="normal" title="Unschedule the event.">Clear start time</button>
         </form>
+        {% endif %}
+        {% if !opened %}
+        <form method="post" action="/admin/open_now" data-confirm="Open the event now? The pre-queue closes, everyone waiting is assigned their place, and the event starts admitting. This cannot be undone." style="margin-top:12px;">
+          <button type="submit" class="danger" title="Close the pre-queue and open the event immediately, without waiting for a scheduled time.">Open now</button>
+          <span class="help">Closes the pre-queue and opens the event immediately. The same thing the schedule does, so a scheduled time that has not fired yet becomes a no-op rather than a second opening.</span>
+        </form>
+        {% else %}
+        <p class="help" style="margin-top:12px;">Already open — the pre-queue is closed and every waiting visitor has their place.</p>
         {% endif %}
       </div>
     </section>
