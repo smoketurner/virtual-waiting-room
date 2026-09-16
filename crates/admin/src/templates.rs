@@ -143,6 +143,10 @@ pub struct DemotionView {
     /// The seal ran without demoting anyone, and this is why: the rules did
     /// not parse, or the scan covered another event's rows.
     pub error: String,
+    /// The seal did demote, but on a cohort it could not verify was this
+    /// event's alone, and this is why. Qualifies the counts rather than
+    /// replacing them, so it never coincides with `error`.
+    pub caveat: String,
 }
 
 /// One row of the demotion card's group table.
@@ -169,6 +173,7 @@ impl Dashboard {
         self.demotion.demoted = report.demoted;
         self.demotion.groups_total = report.groups_total;
         self.demotion.error = report.error.clone().unwrap_or_default();
+        self.demotion.caveat = report.caveat.clone().unwrap_or_default();
         let mut groups = Vec::with_capacity(report.groups.len());
         for group in &report.groups {
             groups.push(DemotionGroupRow {
@@ -387,6 +392,7 @@ mod tests {
             }],
             sealed_at: 1,
             error: None,
+            caveat: None,
         };
         view.with_demotion_report(Some(&report));
         let html = view.render().unwrap();
@@ -414,19 +420,22 @@ mod tests {
             }],
             sealed_at: 1,
             error: None,
+            caveat: None,
         };
         view.with_demotion_report(Some(&report));
         let html = view.render().unwrap();
         assert!(html.contains("Would demote"));
         assert!(html.contains("(reported, not applied)"));
 
-        // A ruleset that failed to parse is said in so many words.
+        // A ruleset that failed to parse is said in so many words, as the
+        // reason the seal ran without demotion rather than as a generic fault.
         report.mode = "enforce".to_owned();
         report.error = Some("rule \"ja4\" is not of the form signal:max".to_owned());
         let mut view = Dashboard::from_state(&state(), 0);
         view.with_demotion_report(Some(&report));
         let html = view.render().unwrap();
-        assert!(html.contains("did not parse"));
+        assert!(html.contains("The seal ran without demotion:"));
+        assert!(html.contains("is not of the form signal:max"));
         assert!(html.contains("Largest 1 of 250 groups shown"));
         // The error path ran no classification, so the count is labelled
         // "Scanned", never "Demoted" (which implies a scan ran and won).
@@ -452,6 +461,7 @@ mod tests {
                 groups: vec![],
                 sealed_at: 1,
                 error: Some("rule \"address:lots\" is not of the form signal:max".to_owned()),
+                caveat: None,
             };
             view.with_demotion_report(Some(&report));
             let html = view.render().unwrap();
@@ -481,6 +491,7 @@ mod tests {
                  included another event's rows; nothing was demoted"
                     .to_owned(),
             ),
+            caveat: None,
         };
         view.with_demotion_report(Some(&report));
         let html = view.render().unwrap();
@@ -488,6 +499,53 @@ mod tests {
         assert!(!html.contains("198.51.100.1"));
         assert!(html.contains("another event"));
         assert!(html.contains("<strong>0</strong> of 8 registrations in 0 groups"));
+    }
+
+    #[test]
+    fn an_unverified_report_still_reads_as_a_demotion_that_happened() {
+        // The burned-index caveat qualifies the outcome; it does not replace
+        // one. Demotion ran, so the card must not tell the operator it did
+        // not, and the counts it ran on stay labelled as counts.
+        let report = |mode: &str| wr_common::DemotionReport {
+            mode: mode.to_owned(),
+            rules: "address:2".to_owned(),
+            cohort: 4,
+            demoted: 4,
+            groups_total: 1,
+            groups: vec![wr_common::ReportGroup {
+                signal: "address".to_owned(),
+                value: "198.51.100.1".to_owned(),
+                count: 4,
+                max: 2,
+            }],
+            sealed_at: 1,
+            error: None,
+            caveat: Some(
+                "the scan covered 4 cohort rows against 5 registrations for this event; burned \
+                 pre-queue indices make this read indistinguishable from one that folded in \
+                 another event's rows, so contamination cannot be ruled out"
+                    .to_owned(),
+            ),
+        };
+
+        let mut view = Dashboard::from_state(&state(), 0);
+        view.with_demotion_report(Some(&report("enforce")));
+        let html = view.render().unwrap();
+        assert!(!html.contains("The seal ran without demotion"));
+        assert!(html.contains("demoted on a cohort it could not verify"));
+        assert!(html.contains("contamination cannot be ruled out"));
+        // The count keeps its outcome label and the groups it acted on.
+        assert!(html.contains("Demoted"));
+        assert!(!html.contains("Scanned"));
+        assert!(html.contains("<strong>4</strong> of 4 registrations in 1 group<"));
+        assert!(html.contains("198.51.100.1"));
+
+        // Observe classified rather than demoted, and says so.
+        let mut view = Dashboard::from_state(&state(), 0);
+        view.with_demotion_report(Some(&report("observe")));
+        let html = view.render().unwrap();
+        assert!(html.contains("classified a cohort it could not verify"));
+        assert!(html.contains("Would demote"));
     }
 
     #[test]

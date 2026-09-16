@@ -360,17 +360,21 @@ pub async fn seal_event<S: Store>(
     );
 
     let mut report = DemotionReport::from_classification(config.mode, rules, &classification, now);
-    if contamination.contaminated {
+    match contamination.caveat(classification.cohort, distinct, values.participant_count) {
         // The classification is not this event's, so its per-group outputs are
         // suppressed: the report keeps the scan width and the reason, not the
-        // groups another event's rows would have produced. The burned-index
-        // regime keeps them — there demotion ran, on rows that are this
-        // event's as far as anything can tell.
-        report.demoted = 0;
-        report.groups.clear();
-        report.groups_total = 0;
+        // groups another event's rows would have produced.
+        Some(SealCaveat::Withheld(detail)) => {
+            report.demoted = 0;
+            report.groups.clear();
+            report.groups_total = 0;
+            report.error = Some(detail);
+        }
+        // Demotion ran, so the counts and groups stand and the report says
+        // only that the cohort they were drawn from could not be verified.
+        Some(SealCaveat::Unverified(detail)) => report.caveat = Some(detail),
+        None => {}
     }
-    report.error = contamination.caveat(classification.cohort, distinct, values.participant_count);
     if let Err(e) = store.write_report(event_id, &report).await {
         // The report is for the operator; the seal has landed, so this is
         // logged rather than fatal.
@@ -430,28 +434,41 @@ impl Contamination {
         }
     }
 
-    /// The operator-facing `DemotionReport::error` caveat for the run, or
-    /// `None` for a clean full turnout.
+    /// What the operator is told about the run, or `None` for a clean full
+    /// turnout.
     #[must_use]
-    fn caveat(self, cohort: u64, distinct: u64, participant_count: u64) -> Option<String> {
+    fn caveat(self, cohort: u64, distinct: u64, participant_count: u64) -> Option<SealCaveat> {
         if self.contaminated {
-            Some(format!(
+            Some(SealCaveat::Withheld(format!(
                 "the scan covered {cohort} cohort rows in {distinct} distinct pre-queue slots \
                  against {participant_count} registrations for this event; a single event issues \
-                 each (shard, local index) at most once, so this included another event's rows \
-                 and nothing was demoted"
-            ))
+                 each (shard, local index) at most once, so this included another event's rows"
+            )))
         } else if self.burned_regime {
-            Some(format!(
+            Some(SealCaveat::Unverified(format!(
                 "the scan covered {cohort} cohort rows against {participant_count} \
                  registrations for this event; burned pre-queue indices make this read \
                  indistinguishable from one that folded in another event's rows, so \
                  contamination cannot be ruled out"
-            ))
+            )))
         } else {
             None
         }
     }
+}
+
+/// What the seal has to tell the operator about a run it did not find clean.
+/// The two are different outcomes, not two shades of one: a withheld run
+/// demoted nobody, an unverified run demoted on rows it could not prove were
+/// this event's alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SealCaveat {
+    /// Demotion was withheld and the classification is another event's, so
+    /// the report carries the scan width and this reason in place of it.
+    Withheld(String),
+    /// Demotion ran, on a cohort the scan could not verify was this event's
+    /// alone. The counts stand; this qualifies them.
+    Unverified(String),
 }
 
 /// Scans the pre-queue and classifies every row the sealed offsets place in
@@ -1112,6 +1129,7 @@ mod tests {
         let report = store.report.lock().unwrap().clone().unwrap();
         // Contamination is surfaced, not hidden: the report carries an error.
         assert!(report.error.is_some(), "expected a contamination error");
+        assert!(report.caveat.is_none(), "{:?}", report.caveat);
         assert!(
             report.error.as_deref().unwrap().contains("another event"),
             "expected the error to name another event: {:?}",
@@ -1164,26 +1182,21 @@ mod tests {
             panic!("expected seal");
         };
         let report = store.report.lock().unwrap().clone().unwrap();
-        // cohort (4) < N (5): the run is flagged, not recorded as clean.
-        assert!(report.error.is_some());
+        // cohort (4) < N (5): the run is flagged, not recorded as clean. It is
+        // a caveat on the outcome, not the error that replaces one — demotion
+        // ran, so the report's counts stand.
+        assert!(report.error.is_none(), "{:?}", report.error);
         assert!(
             report
-                .error
+                .caveat
                 .as_deref()
                 .unwrap()
                 .contains("cannot be ruled out"),
             "expected the burned-index regime to be flagged: {:?}",
-            report.error
+            report.caveat
         );
-        assert!(
-            !report
-                .error
-                .as_deref()
-                .unwrap()
-                .contains("nothing was demoted"),
-            "the burned-index regime is not a no-demotion outcome: {:?}",
-            report.error
-        );
+        assert_eq!(report.demoted, 4);
+        assert!(!report.groups.is_empty());
         // Demotion is not withheld on the burned-index regime, so the tail is
         // in use and the (mixed) address group is demoted.
         assert!(values.demotion.is_some());
@@ -1221,10 +1234,10 @@ mod tests {
         };
         let report = store.report.lock().unwrap().clone().unwrap();
         assert_eq!(report.cohort, 3);
-        assert!(report.error.is_some());
+        assert!(report.error.is_none(), "{:?}", report.error);
         assert!(
             report
-                .error
+                .caveat
                 .as_deref()
                 .unwrap()
                 .contains("cannot be ruled out")
@@ -1259,10 +1272,10 @@ mod tests {
         };
         let report = store.report.lock().unwrap().clone().unwrap();
         assert_eq!(report.mode, "observe");
-        assert!(report.error.is_some());
+        assert!(report.error.is_none(), "{:?}", report.error);
         assert!(
             report
-                .error
+                .caveat
                 .as_deref()
                 .unwrap()
                 .contains("cannot be ruled out")
@@ -1307,6 +1320,7 @@ mod tests {
         assert_eq!(report.cohort, 5);
         // cohort == N and cohort == distinct: no flag, no residual caveat.
         assert!(report.error.is_none());
+        assert!(report.caveat.is_none());
         // A real demotion over a clean cohort still runs.
         assert!(values.demotion.is_some());
         assert_eq!(values.demoted_count, 5);
