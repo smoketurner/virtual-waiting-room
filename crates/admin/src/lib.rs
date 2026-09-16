@@ -654,7 +654,7 @@ pub fn next_phases(from: Phase) -> Vec<Phase> {
 /// `Maintenance`, which the phase dropdown routes through here.
 ///
 /// Entering `Maintenance` is rejected here even though `transition_allowed`
-/// permits it from any phase: the emergency stop must go through `/admin/reset`
+/// permits it from any phase: the emergency stop must go through `/admin/force_maintenance`
 /// (`force_maintenance`), so it is audited under its own label and a crafted
 /// `POST /admin/phase?phase=maintenance` cannot write `phase = maintenance`
 /// unaudited. The phase dropdown never offers `Maintenance` (`next_phases`
@@ -716,7 +716,7 @@ pub async fn apply_phase<S: Store>(
 /// # Errors
 ///
 /// [`ApplyError`] if the event is missing or the store write fails.
-pub async fn apply_reset<S: Store>(
+pub async fn apply_force_maintenance<S: Store>(
     store: &S,
     event_id: &str,
     actor: &str,
@@ -2130,7 +2130,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_phase_rejects_maintenance_target() {
-        // Entering maintenance must go through /admin/reset (force_maintenance)
+        // Entering maintenance must go through /admin/force_maintenance (force_maintenance)
         // so it is audited under its own label; a crafted POST to /admin/phase
         // with phase=maintenance is rejected here, before any write.
         for from in [
@@ -2174,7 +2174,9 @@ mod tests {
     #[tokio::test]
     async fn reset_forces_maintenance_from_any_phase() {
         let store = FakeStore::with_phase(Phase::Active);
-        apply_reset(&store, "evt", "op@x", ts(1000)).await.unwrap();
+        apply_force_maintenance(&store, "evt", "op@x", ts(1000))
+            .await
+            .unwrap();
         assert_eq!(*store.phase.lock().unwrap(), Phase::Maintenance);
         // The emergency stop stamps audit (ADR-0017 §6).
         let state = store.load("evt").await.unwrap().unwrap();
@@ -2192,7 +2194,9 @@ mod tests {
         let store = FakeStore::opened_with_phase(Phase::Active);
 
         // Audited emergency stop.
-        apply_reset(&store, "evt", "op@x", ts(5_000)).await.unwrap();
+        apply_force_maintenance(&store, "evt", "op@x", ts(5_000))
+            .await
+            .unwrap();
         assert_eq!(*store.phase.lock().unwrap(), Phase::Maintenance);
         let state = store.load("evt").await.unwrap().unwrap();
         assert_eq!(state.last_action.as_deref(), Some("force_maintenance"));
@@ -2624,7 +2628,9 @@ mod tests {
             .await
             .unwrap();
         // Force maintenance immediately after still applies (emergency stop).
-        apply_reset(&store, "evt", "op@x", ts(1100)).await.unwrap();
+        apply_force_maintenance(&store, "evt", "op@x", ts(1100))
+            .await
+            .unwrap();
         assert_eq!(*store.phase.lock().unwrap(), Phase::Maintenance);
     }
 

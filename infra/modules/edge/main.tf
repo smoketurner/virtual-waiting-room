@@ -167,6 +167,12 @@ resource "aws_cloudfront_distribution" "this" {
   comment             = "Virtual Waiting Room - ${var.name_prefix}"
   price_class         = var.price_class
 
+  # Empty deploys on the *.cloudfront.net name. A real event fronts the
+  # distribution with the customer's own hostname: the session cookie is set
+  # for the host the visitor is on, so a waiting room on one domain and an
+  # origin on another hands out a cookie the origin's requests never carry.
+  aliases = var.aliases
+
   # Origin 1: the core REST API (polled + write behaviours). origin_path is the
   # stage (= env), so a viewer request for /v1/status is forwarded to
   # /<env>/v1/status where the deployed, path-versioned methods live.
@@ -348,8 +354,17 @@ resource "aws_cloudfront_distribution" "this" {
     }
   }
 
+  # The certificate follows the alias. CloudFront rejects a custom domain
+  # served under its own default certificate, and the pair is validated
+  # together in variables.tf, so these branch on the one condition.
+  #
+  # minimum_protocol_version applies only to the ACM path: on the default
+  # certificate CloudFront picks the policy itself and rejects one set here.
   viewer_certificate {
-    cloudfront_default_certificate = true
+    cloudfront_default_certificate = local.use_custom_domain ? null : true
+    acm_certificate_arn            = local.use_custom_domain ? var.acm_certificate_arn : null
+    ssl_support_method             = local.use_custom_domain ? "sni-only" : null
+    minimum_protocol_version       = local.use_custom_domain ? "TLSv1.2_2021" : null
   }
 
   tags = var.tags

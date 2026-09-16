@@ -21,9 +21,9 @@ use admin::scheduler::SchedulerStore;
 use admin::sessions::{AdminSession, PendingLogin, SessionStore};
 use admin::templates::Dashboard;
 use admin::{
-    ApplyError, EdgeConfigStore, apply_fail_open, apply_message, apply_open_now, apply_pause,
-    apply_phase, apply_rate, apply_recover, apply_reset, apply_resume, apply_set_rules,
-    apply_start_time, format_rules, parse_rules,
+    ApplyError, EdgeConfigStore, apply_fail_open, apply_force_maintenance, apply_message,
+    apply_open_now, apply_pause, apply_phase, apply_rate, apply_recover, apply_resume,
+    apply_set_rules, apply_start_time, format_rules, parse_rules,
 };
 use askama::Template;
 use axum::Form;
@@ -156,7 +156,7 @@ async fn main() -> Result<(), Error> {
         .route("/admin/message", post(set_message))
         .route("/admin/start_time", post(set_start_time))
         .route("/admin/open_now", post(open_now))
-        .route("/admin/reset", post(reset))
+        .route("/admin/force_maintenance", post(force_maintenance))
         .route("/admin/pause", post(pause))
         .route("/admin/resume", post(resume))
         .route("/admin/fail_open", post(fail_open))
@@ -566,11 +566,18 @@ async fn set_start_time(
     )
 }
 
-async fn reset(State(state): State<Shared>, headers: HeaderMap, now: ArrivalTime) -> Response {
+/// The emergency full-stop: takes the whole event into maintenance, so waiting
+/// visitors see an outage page rather than a queue. Not a reset — it clears
+/// nothing and is reversed from the phase control.
+async fn force_maintenance(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    now: ArrivalTime,
+) -> Response {
     let Some(session) = authed(&state, &headers, now).await else {
         return Redirect::to("/admin/login").into_response();
     };
-    finish(apply_reset(&state.store, &state.event_id, &session.email, now).await)
+    finish(apply_force_maintenance(&state.store, &state.event_id, &session.email, now).await)
 }
 
 /// Holds admission while the queue keeps forming. Reversible, no confirmation.

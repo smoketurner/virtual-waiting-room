@@ -99,7 +99,7 @@
         <p class="deferred">The event is in maintenance. Waiting visitors see an "event is temporarily down" page. Recover from the Phase control: return to <code>active</code> to resume, or <code>idle</code> to reset.</p>
         {% else %}
         <p class="help"><strong>Force maintenance takes the whole event down.</strong> Waiting visitors see an "event is temporarily down" page, not a queue. Use it for an outage, not a routine hold. Recover from the Phase control (return to <code>active</code> or <code>idle</code>). Pause only holds admission; this stops everything.</p>
-        <form method="post" action="/admin/reset" data-confirm="Force maintenance takes the whole event down. Waiting visitors see an 'event is temporarily down' page. Continue?">
+        <form method="post" action="/admin/force_maintenance" data-confirm="Force maintenance takes the whole event down. Waiting visitors see an 'event is temporarily down' page. Continue?">
           <button class="danger" type="submit" title="Take the event down. Waiting visitors see an 'event is temporarily down' page. Requires confirmation. Reversible from the Phase control.">Force maintenance</button>
         </form>
         {% endif %}

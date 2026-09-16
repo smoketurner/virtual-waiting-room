@@ -683,7 +683,7 @@ serves the previous value if the origin is slow.
 | `/admin/open_now` | Open the event immediately, by invoking the function the schedule invokes |
 | `/admin/rate` | Set target admission rate |
 | `/admin/message` | Publish an operator message to waiting visitors |
-| `/admin/reset` | Reset event state |
+| `/admin/force_maintenance` | The emergency full-stop: forces the maintenance phase |
 | `/admin/fail_open` | Engage the fail-open break-glass epoch for a given duration (issue #71) |
 | `/admin/recover` | Clear the fail-open epoch — not "resume": a queued pause still applies once it clears |
 | `/admin/rules` | Update protection rules — **not built**: the edge gate's ruleset and `enforce_from` are written directly to the KeyValueStore today |
@@ -851,7 +851,7 @@ the existing handlers rather than reimplementing them. The auth path is unchange
 | `/admin/open_now` | POST | Open the event immediately, by invoking the function the schedule invokes |
 | `/admin/rate` | GET / POST | View / set target admission rate |
 | `/admin/message` | GET / POST | View / publish operator message to waiting visitors |
-| `/admin/reset` | GET / POST | View / reset event state |
+| `/admin/force_maintenance` | POST | The emergency full-stop: forces the maintenance phase from any phase |
 | `/admin/rules` | GET / POST | View / update protection rules |
 | `/admin/metrics` | GET | Metrics rendered as HTML over the existing `/metrics` JSON |
 

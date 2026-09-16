@@ -452,7 +452,7 @@ The admin Lambda serves an Axum router behind an API Gateway greedy proxy:
 | `/admin/open_now` | POST | Opens the event now, invoking `open_event` rather than writing the open a second time |
 | `/admin/rate` | POST | Target rate, guarded on the expected prior rate |
 | `/admin/message` | POST | Operator broadcast |
-| `/admin/reset` | POST | Reset event state |
+| `/admin/force_maintenance` | POST | The emergency full-stop: forces the maintenance phase from any phase, undebounced |
 | `/admin/pause`, `/admin/resume` | POST | Admission control transitions |
 | `/admin/fail_open`, `/admin/recover` | POST | Sets and clears the break-glass epoch |
 | `/admin/rules` | POST | Writes the edge gate's ruleset to the KeyValueStore |
@@ -546,8 +546,9 @@ invoked, and as wired it forwarded every request. N4 now says commercial regions
 and GovCloud is out of scope until a gate exists for it.
 
 **The edge does not extend sessions.** `generate_token` mints one session for
-`SESSION_TTL_SECS` and nothing re-issues it, so a visitor still on the origin when it expires
-returns to the queue mid-checkout. The sliding alternative lived in the origin authorizer and
+`session_ttl_seconds` and nothing re-issues it, so a visitor still on the origin when it expires
+returns to the queue mid-checkout. The value is settable per deployment, which is the only control
+there is over this: set it longer than the worst realistic time on the origin. The sliding alternative lived in the origin authorizer and
 went with it (ADR-0032); F3.7 is retired rather than left as a `MUST` with no mechanism. A
 viewer-response function that re-signs a near-expiry cookie under a hard cap is the design that
 would fix it.

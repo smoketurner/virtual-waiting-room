@@ -142,3 +142,29 @@ variable "starts_at_timezone" {
   type        = string
   default     = "UTC"
 }
+
+# --- Custom domain ------------------------------------------------------------
+# A real event fronts the distribution with the customer's own hostname. The
+# *.cloudfront.net default works and is the fallback, but the session cookie is
+# set for the host the visitor is on, so the waiting room and the origin it
+# protects belong on the same domain.
+
+variable "aliases" {
+  description = "Alternate domain names for the distribution, e.g. [\"waiting.example.com\"]. Empty deploys on the default *.cloudfront.net name."
+  type        = list(string)
+  default     = []
+}
+
+variable "acm_certificate_arn" {
+  description = "ARN of an ACM certificate in us-east-1 covering every name in aliases. Required together with aliases; the edge module validates the pair."
+  type        = string
+  default     = ""
+}
+
+# --- Sessions -----------------------------------------------------------------
+
+variable "session_ttl_seconds" {
+  description = "How long an admitted visitor's session cookie is valid. Set it comfortably longer than the worst realistic time on the origin: when it lapses the visitor is returned to the queue, and nothing renews it at the edge."
+  type        = number
+  default     = 3600
+}

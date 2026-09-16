@@ -102,6 +102,9 @@ override the file, so the file stays the single source of truth. Copy
 | `gate_rules`                | *(empty)*   | Which requests the gate covers, one rule per line — same grammar as the dashboard's Set rules form. Empty is dormant: every request passes through. |
 | `starts_at`                 | *(empty)*   | When the event opens, local date-time with no zone. Empty leaves the schedule disabled — the event then opens when an operator presses **Open now** on the dashboard, or never. |
 | `starts_at_timezone`        | `UTC`       | IANA zone `starts_at` is evaluated in. |
+| `aliases`                   | `[]`        | The hostnames viewers actually use, e.g. `["waiting.example.com"]`. Empty deploys on the distribution's own `*.cloudfront.net` name. |
+| `acm_certificate_arn`       | *(empty)*   | ACM certificate in **us-east-1** covering every name in `aliases`. Set with `aliases` or not at all — the pair is validated together. |
+| `session_ttl_seconds`       | `3600`      | How long an admitted visitor's session cookie lasts. See *Choosing the session lifetime* below. |
 | `oidc_client_id`, `oidc_redirect_uri`, `oidc_allowed_emails` | *(empty)* | **Required — the apply fails without them.** See the two-pass note below. The client secret is not here; it goes in an SSM SecureString out of band. |
 
 The one `make`-level override is the build target:
@@ -138,12 +141,17 @@ make apply
 
 ### The one sequencing step: OIDC
 
-`oidc_redirect_uri` is a path on the CloudFront distribution, and the
-distribution does not exist until the first apply. `core` cannot derive it
-either: `edge` consumes `core`'s KeyValueStore ARN, so `core` depending on
-`edge` would be a module cycle.
+`oidc_redirect_uri` is a path on the host the dashboard is served from, and
+`core` cannot derive it: `edge` consumes `core`'s KeyValueStore ARN, so `core`
+depending on `edge` would be a module cycle.
 
-So the first apply of a brand-new deployment is a two-pass operation:
+**With a custom domain there is no sequencing step.** You already know the
+hostname, so set `aliases`, `acm_certificate_arn` and
+`oidc_redirect_uri = "https://waiting.example.com/admin/callback"` together and
+apply once. Point the DNS record at the distribution afterwards.
+
+Without one, the `*.cloudfront.net` name does not exist until the first apply,
+so a brand-new deployment is a two-pass operation:
 
 ```bash
 make apply                              # fails: the admin Lambda has no OIDC config
@@ -190,10 +198,10 @@ visitors with `x-wr-reason=signature` and redirects them to the waiting page. Vi
 positions cannot rejoin. The deployment accepts one key at a time, so
 there is no overlap period. Regenerate only before an event opens.
 
-### Choosing `SESSION_TTL_SECS`
+### Choosing the session lifetime
 
 The CloudFront-path session has a fixed lifetime, not a sliding one: `generate_token` mints a
-session valid for `SESSION_TTL_SECS` (`modules/core`'s `session_ttl_seconds`, default 3600) and
+session valid for `session_ttl_seconds` (default 3600, set in `terraform.tfvars`) and
 nothing re-issues it — a visitor still on the protected origin when it expires is logged out and
 has to rejoin the queue, checkout included (ADR-0021 §5.3). There is no sliding alternative: the
 one that existed lived in the origin authorizer, which was removed (ADR-0032), so this value is

@@ -40,6 +40,10 @@ module "core" {
   # Function cannot drift onto different cookie names (issue #71).
   session_cookie_name = var.session_cookie_name
 
+  # How long an admitted visitor's session lasts. Long enough to finish what
+  # they queued for, or they are returned to the queue mid-checkout.
+  session_ttl_seconds = var.session_ttl_seconds
+
   # Seeded at apply so the stack serves without an operator driving a script or
   # the dashboard first.
   admission_rate     = var.admission_rate
@@ -83,4 +87,8 @@ module "edge" {
   gate_kvs_arn        = module.core.gate_kvs_arn
   event_id            = var.event_id
   session_cookie_name = var.session_cookie_name
+
+  # The customer's own hostname, or empty for the *.cloudfront.net default.
+  aliases             = var.aliases
+  acm_certificate_arn = var.acm_certificate_arn
 }

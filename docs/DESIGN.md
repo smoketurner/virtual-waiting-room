@@ -587,7 +587,7 @@ serves the previous value if the origin is slow.
 | `/admin/open_now` | Open the event immediately, by invoking the function the schedule invokes |
 | `/admin/rate` | Set target admission rate |
 | `/admin/message` | Publish an operator message to waiting visitors |
-| `/admin/reset` | Reset event state |
+| `/admin/force_maintenance` | The emergency full-stop: forces the maintenance phase |
 | `/admin/pause` | Pause admissions (reversible; queue and configured rate preserved) |
 | `/admin/resume` | Resume admissions, restoring the configured rate |
 | `/admin/fail_open` | Engage the fail-open break-glass epoch for a given duration (issue #71) |
