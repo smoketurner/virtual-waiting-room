@@ -547,10 +547,10 @@ The two striped counters — the pre-queue registration index and the arrivals c
 back under that item's single 1,000-write/s ceiling and distribute nothing.
 | `operator_message` | S | Delivered in `/status` |
 
-**`PreQueue`** — partition key `r`. Attributes `s` (shard), `l` (local index), `t`, `v`
-(join-time telemetry). Short attribute names because the table is scanned during audit. The
-global registration index `i = offset[s] + l` is derived on read, never stored. Read by
-`/queue_num` as a single `GetItem`; never scanned on the hot path.
+**`PreQueue`** — partition key `r`. Attributes `s` (shard), `l` (local index) and `t`
+(registration time). Short attribute names because `DynamoDB` bills them on every write and
+there is one row per visitor. The global registration index `i = offset[s] + l` is derived on
+read, never stored. Read by `/queue_num` as a single `GetItem`; never scanned on the hot path.
 
 **`Positions`** — partition key `request_id`. Attributes `event_id`, `queue_position`,
 `entry_time`, `status`, `expires_at`, `ttl`. Written with
@@ -736,7 +736,7 @@ subject. It was removed: it required the customer to build and host a signing en
 login they already ran, so no deployment could use it without that upstream work, and it bounded
 identifier minting rather than volume — a farm with N legitimate accounts still took N
 positions. Bounding volume needs a mechanism that costs the client something: proof of work, or
-behavioural classification over the join telemetry described below. Neither is built.
+behavioural classification over signals the join path would have to collect. Neither is built.
 
 ### Deferred bot enforcement
 

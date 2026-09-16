@@ -10,7 +10,7 @@ use wr_common::expr::{
     Condition, Key, POSITIONS_KEY_ATTR, SHARD_COUNT_ATTR, SHARD_INDEX_ATTR, STATUS_ATTR,
     STATUS_EXPIRED, Update,
 };
-use wr_common::{Counters, PositionItem, PositionStatus, PreQueueItem, Shard, Telemetry};
+use wr_common::{Counters, PositionItem, PositionStatus, PreQueueItem, Shard};
 
 use crate::{PositionWrite, PreQueueWrite, Store, StoreError, WriteOutcome};
 
@@ -46,12 +46,6 @@ impl DynamoStore {
             positions_table,
         }
     }
-}
-
-/// `Some(telemetry)` unless every field is absent, in which case the `v`
-/// attribute is omitted entirely rather than writing an empty map.
-fn telemetry_or_none(telemetry: Telemetry) -> Option<Telemetry> {
-    (telemetry != Telemetry::default()).then_some(telemetry)
 }
 
 impl Store for DynamoStore {
@@ -91,7 +85,6 @@ impl Store for DynamoStore {
             entry_time: now,
             status: PositionStatus::Issued,
             ttl: now.saturating_add(POSITION_TTL_SECS),
-            v: telemetry_or_none(write.telemetry.clone()),
         };
         let attrs: HashMap<String, AttributeValue> =
             serde_dynamo::to_item(&item).map_err(|e| StoreError(format!("serialize: {e}")))?;
@@ -190,7 +183,6 @@ impl Store for DynamoStore {
             s: shard,
             l: write.local_index,
             t: now_epoch_secs(),
-            v: telemetry_or_none(write.telemetry.clone()),
         };
         let attrs: HashMap<String, AttributeValue> =
             serde_dynamo::to_item(&item).map_err(|e| StoreError(format!("serialize: {e}")))?;
@@ -313,15 +305,5 @@ mod tests {
         // value cannot be trusted to reconstruct a first index, so this must
         // be a StoreError, never a saturated (and silently wrong) 0.
         assert!(first_local_index(3, 2, 5).is_err());
-    }
-
-    #[test]
-    fn telemetry_or_none_omits_an_entirely_empty_value() {
-        assert_eq!(telemetry_or_none(Telemetry::default()), None);
-        let present = Telemetry {
-            c: Some("US".to_owned()),
-            ..Telemetry::default()
-        };
-        assert_eq!(telemetry_or_none(present.clone()), Some(present));
     }
 }

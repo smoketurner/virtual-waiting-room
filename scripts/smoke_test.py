@@ -93,14 +93,6 @@ def uuid_v7() -> str:
     return f"{h[0:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
 
 
-def telemetry_of(item: dict) -> dict:
-    """The `v` map a row carries from join-time viewer headers (issue #59), as
-    plain strings. Empty when the attribute is absent."""
-    return {
-        k: next(iter(v.values())) for k, v in item.get("v", {}).get("M", {}).items()
-    }
-
-
 def api_get(api_url: str, path: str) -> dict:
     with urllib.request.urlopen(f"{api_url}{path}") as r:
         return json.load(r)
@@ -214,31 +206,6 @@ def main() -> int:
         f"registered {len(ids)} pre-queue visitors; {len(slots)} distinct (shard, index) slots"
     )
 
-    # Join-time telemetry rides as SQS message attributes and lands on the row.
-    # A row with no `v` means the API Gateway stage is serving a mapping
-    # template older than the one in this checkout — the failure is otherwise
-    # completely silent, since nothing reads the telemetry yet.
-    with_telemetry = [rid for rid, item in rows.items() if telemetry_of(item)]
-    if not with_telemetry:
-        print(
-            "ERROR: no PreQueue row carried a `v` attribute. The deployed stage is "
-            "probably serving a stale mapping template — check whether "
-            "aws_api_gateway_deployment is pending replacement in `make plan`.",
-            file=sys.stderr,
-        )
-        return 1
-    sample = telemetry_of(rows[with_telemetry[0]])
-    print(
-        f"telemetry present on {len(with_telemetry)}/{len(rows)} rows; "
-        f"sample keys={sorted(sample)}"
-    )
-    if "a" not in sample:
-        print(
-            "WARNING: no viewer address (`a`) on the sample row. Expected when "
-            "posting directly to the API; via CloudFront it should be set.",
-            file=sys.stderr,
-        )
-
     shard_total = 0
     for s in range(SHARDS):
         shard_item = ddb.get_item(
@@ -285,12 +252,11 @@ def main() -> int:
         print("ERROR: no Positions row for the live join after 30s", file=sys.stderr)
         return 1
 
-    say("7. Join through CloudFront; confirm the viewer headers reach the row")
-    # Steps 3 and 6 post straight at API Gateway, which never sees a
-    # CloudFront-Viewer-* header — only the request id and user agent survive
-    # that path. Proving the telemetry works end to end needs the CDN, because
-    # the headers are generated there and forwarded by the /v1/join origin
-    # request policy.
+    say("7. Join through CloudFront; confirm the row lands")
+    # Steps 3 and 6 post straight at API Gateway. This is the only step that
+    # exercises the path a real visitor takes — the /v1/join cache behaviour,
+    # its origin request policy, and the SQS integration behind them — so a
+    # misrouted or uncached join surfaces here and nowhere else.
     cdn_rid = uuid_v7()
     api_post(
         f"https://{cf_host}", "/v1/join", {"request_id": cdn_rid, "event_id": event_id}
@@ -309,19 +275,7 @@ def main() -> int:
         )
         return 1
 
-    viewer = telemetry_of(cdn_item)
-    print(f"row telemetry: {json.dumps(viewer, sort_keys=True)}")
-    missing = [k for k in ("a", "c", "j") if k not in viewer]
-    if missing:
-        print(
-            f"ERROR: viewer telemetry missing {missing} (a=address, c=country, "
-            "j=JA4). Either the /v1/join origin request policy is not forwarding "
-            "the CloudFront-Viewer-* headers, or the stage is serving a stale "
-            "mapping template.",
-            file=sys.stderr,
-        )
-        return 1
-    print("viewer telemetry present: address, country and JA4 fingerprint all landed")
+    print(f"joined through CloudFront; position {cdn_item['queue_position']['N']}")
 
     say("SMOKE TEST PASSED")
     return 0

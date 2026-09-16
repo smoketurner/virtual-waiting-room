@@ -28,39 +28,6 @@ pub enum PositionStatus {
     Expired,
 }
 
-/// Join-time signals `assign_position` lifts out of `CloudFront`'s viewer
-/// headers, carried as SQS message attributes rather than in the request body
-/// (issue #59). Reported, not attested: the regional API Gateway endpoint has
-/// no resource policy restricting it to `CloudFront`, so a caller that bypasses
-/// the edge can set these values itself. Nothing reads them yet — they exist so
-/// a farm is analysable after the fact and so a future mitigation has
-/// something to act on.
-///
-/// Single-letter field names for the same reason the striped counters use
-/// them: this rides inside `v` on every `PreQueue` and `Positions` row, and
-/// `DynamoDB` bills attribute names on every write.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct Telemetry {
-    /// `CloudFront-Viewer-Address`, verbatim (port included).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub a: Option<String>,
-    /// `CloudFront-Viewer-ASN`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub n: Option<String>,
-    /// `CloudFront-Viewer-Country`, ISO-3166-1 alpha-2.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub c: Option<String>,
-    /// `CloudFront-Viewer-JA4-Fingerprint`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub j: Option<String>,
-    /// `User-Agent`, truncated to 256 bytes.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub u: Option<String>,
-    /// The API Gateway request id, for correlating a row back to access logs.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub q: Option<String>,
-}
-
 /// A `PreQueue` row: shard `s` and local index `l` for a request, written at
 /// registration. The global index is derived on read, never stored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,10 +40,6 @@ pub struct PreQueueItem {
     pub l: u64,
     /// Registration timestamp, epoch seconds.
     pub t: u64,
-    /// Join-time telemetry, absent on a row written before issue #59 or on an
-    /// open (untelemetered) deployment.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub v: Option<Telemetry>,
 }
 
 /// A `Positions` row, written lazily when a visitor is admitted.
@@ -99,10 +62,6 @@ pub struct PositionItem {
     /// deadline, because a deadline set when the position is issued expires
     /// people for waiting the length of the queue they are waiting in.
     pub ttl: u64,
-    /// Join-time telemetry, absent on a row written before issue #59 or on an
-    /// open (untelemetered) deployment.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub v: Option<Telemetry>,
 }
 
 /// The single `Counters` item for an event: all sequences, the sharded
@@ -385,61 +344,11 @@ mod tests {
             s: 7,
             l: 42,
             t: 1_788_000_000,
-            v: None,
         };
         let av: std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue> =
             serde_dynamo::to_item(&item).unwrap();
         let back: PreQueueItem = serde_dynamo::from_item(av).unwrap();
         assert_eq!(item, back);
-    }
-
-    #[test]
-    fn prequeue_item_round_trips_with_telemetry() {
-        let item = PreQueueItem {
-            r: "018f3a2b-7c9d-7e1f-abcd-0123456789ab".to_owned(),
-            s: 7,
-            l: 42,
-            t: 1_788_000_000,
-            v: Some(Telemetry {
-                a: Some("203.0.113.1:443".to_owned()),
-                n: Some("64500".to_owned()),
-                c: Some("US".to_owned()),
-                j: Some("t13d1516h2_8daaf6152771_02713d6af862".to_owned()),
-                u: Some("Mozilla/5.0".to_owned()),
-                q: Some("req-abc-123".to_owned()),
-            }),
-        };
-        let av: std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue> =
-            serde_dynamo::to_item(&item).unwrap();
-        let back: PreQueueItem = serde_dynamo::from_item(av).unwrap();
-        assert_eq!(item, back);
-    }
-
-    #[test]
-    fn a_row_written_before_telemetry_existed_still_deserializes() {
-        // A PreQueue row with no `v` attribute at all (written before issue
-        // #59, or by an untelemetered join) must still deserialize, with `v`
-        // defaulting to `None` rather than failing to parse.
-        let av = std::collections::HashMap::from([
-            (
-                "r".to_owned(),
-                aws_sdk_dynamodb::types::AttributeValue::S("req-1".to_owned()),
-            ),
-            (
-                "s".to_owned(),
-                aws_sdk_dynamodb::types::AttributeValue::N("3".to_owned()),
-            ),
-            (
-                "l".to_owned(),
-                aws_sdk_dynamodb::types::AttributeValue::N("1".to_owned()),
-            ),
-            (
-                "t".to_owned(),
-                aws_sdk_dynamodb::types::AttributeValue::N("1788000000".to_owned()),
-            ),
-        ]);
-        let item: PreQueueItem = serde_dynamo::from_item(av).unwrap();
-        assert!(item.v.is_none());
     }
 
     #[test]
@@ -450,7 +359,6 @@ mod tests {
             entry_time: 1_788_000_000,
             status: PositionStatus::Issued,
             ttl: 1_900_000_000,
-            v: None,
         };
         let av: std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue> =
             serde_dynamo::to_item(&item).unwrap();
@@ -476,7 +384,6 @@ mod tests {
             entry_time: 1_788_000_000,
             status: PositionStatus::Issued,
             ttl: 1_900_000_000,
-            v: None,
         };
         let av: std::collections::HashMap<String, AttributeValue> =
             serde_dynamo::to_item(&item).unwrap();
@@ -547,20 +454,12 @@ mod tests {
         counters
     }
 
-    fn prequeue_row(s: u8, l: u64, asn: Option<&str>) -> PreQueueItem {
+    fn prequeue_row(s: u8, l: u64) -> PreQueueItem {
         PreQueueItem {
             r: format!("r-{s}-{l}"),
             s,
             l,
             t: 0,
-            v: asn.map(|asn| Telemetry {
-                a: None,
-                n: Some(asn.to_owned()),
-                c: None,
-                j: None,
-                u: None,
-                q: None,
-            }),
         }
     }
 
@@ -582,7 +481,7 @@ mod tests {
         let mut positions = std::collections::HashSet::new();
         for s in 0..2u8 {
             for l in 0..10u64 {
-                let p = position_of(&counters, &prequeue_row(s, l, None));
+                let p = position_of(&counters, &prequeue_row(s, l));
                 assert!(p < n, "position {p} outside the cohort's [0, {n})");
                 assert!(positions.insert(p), "duplicate position {p}");
             }
@@ -597,9 +496,7 @@ mod tests {
         // `Positions` lookup.
         let counters = opened_counters([10, 10, 0, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(
-            counters
-                .resolve_prequeue(&prequeue_row(0, 10, Some("64500")))
-                .unwrap(),
+            counters.resolve_prequeue(&prequeue_row(0, 10)).unwrap(),
             ResolvedPosition::LiveJoin
         );
     }

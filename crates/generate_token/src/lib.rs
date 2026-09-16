@@ -298,7 +298,6 @@ mod tests {
             s: 3,
             l: 1,
             t: 1_788_000_000,
-            v: None,
         };
         let grant = decide(&c, Some(&row), None, 0).unwrap();
         // Inside the cohort.
@@ -316,7 +315,6 @@ mod tests {
             s: 0,
             l: 0,
             t: 1_788_000_000,
-            v: None,
         };
         assert_eq!(
             decide(&c, Some(&row), None, 0).unwrap_err(),
@@ -332,7 +330,6 @@ mod tests {
             s: 0,
             l: 0,
             t: 1_788_000_000,
-            v: None,
         };
         let grant = decide(
             &counters(100),

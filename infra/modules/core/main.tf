@@ -369,13 +369,8 @@ resource "aws_api_gateway_integration" "join_sqs" {
     "integration.request.header.Content-Type" = "'application/x-www-form-urlencoded'"
   }
 
-  # SendMessage numbers MessageAttribute.N as a contiguous 1-based sequence and
-  # silently truncates at the first gap, so $n increments only when a value is
-  # present. An absent header must be skipped rather than sent empty: SQS
-  # rejects an empty StringValue, failing the whole send and dropping the join
-  # (issue #59).
   request_templates = {
-    "application/json" = "Action=SendMessage&MessageBody=$util.urlEncode($input.body)#set($n=0)#if($input.params('CloudFront-Viewer-Address') != \"\")#set($n=$n+1)&MessageAttribute.$${n}.Name=va&MessageAttribute.$${n}.Value.DataType=String&MessageAttribute.$${n}.Value.StringValue=$util.urlEncode($input.params('CloudFront-Viewer-Address'))#end#if($input.params('CloudFront-Viewer-ASN') != \"\")#set($n=$n+1)&MessageAttribute.$${n}.Name=vn&MessageAttribute.$${n}.Value.DataType=String&MessageAttribute.$${n}.Value.StringValue=$util.urlEncode($input.params('CloudFront-Viewer-ASN'))#end#if($input.params('CloudFront-Viewer-Country') != \"\")#set($n=$n+1)&MessageAttribute.$${n}.Name=vc&MessageAttribute.$${n}.Value.DataType=String&MessageAttribute.$${n}.Value.StringValue=$util.urlEncode($input.params('CloudFront-Viewer-Country'))#end#if($input.params('CloudFront-Viewer-JA4-Fingerprint') != \"\")#set($n=$n+1)&MessageAttribute.$${n}.Name=vj&MessageAttribute.$${n}.Value.DataType=String&MessageAttribute.$${n}.Value.StringValue=$util.urlEncode($input.params('CloudFront-Viewer-JA4-Fingerprint'))#end#if($context.identity.userAgent != \"\")#set($n=$n+1)&MessageAttribute.$${n}.Name=vu&MessageAttribute.$${n}.Value.DataType=String&MessageAttribute.$${n}.Value.StringValue=$util.urlEncode($context.identity.userAgent)#end#if($context.requestId != \"\")#set($n=$n+1)&MessageAttribute.$${n}.Name=vq&MessageAttribute.$${n}.Value.DataType=String&MessageAttribute.$${n}.Value.StringValue=$util.urlEncode($context.requestId)#end"
+    "application/json" = "Action=SendMessage&MessageBody=$util.urlEncode($input.body)"
   }
 }
 
