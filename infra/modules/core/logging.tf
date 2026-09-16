@@ -71,6 +71,18 @@ locals {
       value     = "1"
     }
 
+    # The stored admission control could not be parsed, so the controller is
+    # holding admission rather than resuming it. Holding is the safe direction
+    # (the only writer of that attribute is the operator's pause, so an
+    # unreadable value is a pause that did not land), but it is silent from the
+    # outside: a controller that stops releasing looks exactly like one with
+    # nothing to release, and the queue simply stops moving.
+    admission_control_unreadable = {
+      log_group = local.controller_name
+      pattern   = "{ $.event = \"admission_control_unreadable\" }"
+      value     = "1"
+    }
+
     # The ruleset reached the edge but the audit stamp did not, so the
     # dashboard shows a stale "last changed by" for a gate that has already
     # changed. The KeyValueStore data plane is not covered by CloudTrail
