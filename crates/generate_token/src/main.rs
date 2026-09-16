@@ -128,8 +128,8 @@ async fn handle<S: Store>(state: &AppState<S>, req: Request) -> Result<Response<
                 // name because the damage is cumulative and silent — every
                 // uncounted arrival inflates the measured no-show rate, and
                 // the controller answers that by releasing more people than
-                // the origin agreed to serve. Attach a metric filter to
-                // `arrival_record_failed` to alarm on it.
+                // the origin agreed to serve. The metric filter and alarm on
+                // `arrival_record_failed` live in modules/core/logging.tf.
                 error!(error = %e, event = "arrival_record_failed", "failed to record arrival; admitting anyway");
             }
         }

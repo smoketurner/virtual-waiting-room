@@ -279,7 +279,7 @@ resource "aws_lambda_function" "assign_position" {
 
   # Terraform must own the log group before Lambda writes to it, or Lambda
   # auto-creates an untagged, never-expiring one first.
-  depends_on = [aws_cloudwatch_log_group.assign_position]
+  depends_on = [aws_cloudwatch_log_group.lambda]
 
   tags = var.tags
 }

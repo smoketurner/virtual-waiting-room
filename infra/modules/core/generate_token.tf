@@ -41,6 +41,11 @@ resource "aws_lambda_function" "generate_token" {
   }
 
   tags = var.tags
+
+  # Terraform's log group must exist before the function can be invoked, or
+  # Lambda auto-creates one that never expires and Terraform's create collides
+  # with it.
+  depends_on = [aws_cloudwatch_log_group.lambda]
 }
 
 resource "aws_lambda_permission" "generate_token_apigw" {
