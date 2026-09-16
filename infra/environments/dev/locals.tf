@@ -11,7 +11,6 @@ locals {
       "admin",
       "controller",
       "generate_token",
-      "authorizer",
     ] : crate => "${path.module}/../../../.artifacts/${crate}/bootstrap/bootstrap.zip"
   }
 
@@ -21,8 +20,7 @@ locals {
     ManagedBy   = "terraform"
   }
 
-  # Where the authorizer sends an un-admitted visitor. The CloudFront
-  # distribution created here is the waiting room, so derive the URL rather than
-  # configuring it twice and letting the two drift apart.
+  # The waiting room's own URL. Derived from the distribution created here
+  # rather than configured twice and left to drift.
   waiting_room_url = "https://${module.edge.distribution_domain_name}/"
 }

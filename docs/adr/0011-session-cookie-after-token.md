@@ -2,6 +2,8 @@
 
 **Status:** Accepted
 
+> **Amended by [0032](0032-remove-the-origin-authorizer.md).** The origin authorizer was removed, and with it the admission token this record describes. `generate_token` mints the session directly; the CloudFront Function gate verifies it.
+
 ## Context
 
 The admission token proves a visitor reached the front of the queue. It travels as a URL

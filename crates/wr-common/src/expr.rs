@@ -121,8 +121,6 @@ pub enum Key<'a> {
     /// One arrivals shard, incremented when a visitor claims their admission
     /// and summed by the controller to measure the no-show rate.
     ArrivalsShard { event_id: &'a str, shard: Shard },
-    /// A single-use admission token reservation.
-    AdmissionToken { request_id: &'a str },
     /// An operator's OIDC session.
     OidcSession { session_id: &'a str },
     /// A pending OIDC login, keyed by its CSRF state.
@@ -139,9 +137,7 @@ impl Key<'_> {
     pub fn attr(self) -> &'static str {
         match self {
             Key::Event { .. } | Key::PrequeueShard { .. } | Key::ArrivalsShard { .. } => KEY_ATTR,
-            Key::AdmissionToken { .. } | Key::OidcSession { .. } | Key::PkceTransaction { .. } => {
-                TOKENS_KEY_ATTR
-            }
+            Key::OidcSession { .. } | Key::PkceTransaction { .. } => TOKENS_KEY_ATTR,
             Key::Prequeue { .. } => PREQUEUE_KEY_ATTR,
             Key::Position { .. } => POSITIONS_KEY_ATTR,
         }
@@ -158,7 +154,6 @@ impl Key<'_> {
             Key::ArrivalsShard { event_id, shard } => {
                 format!("EVT#{event_id}#AR#{}", shard.index())
             }
-            Key::AdmissionToken { request_id } => format!("TKN#{request_id}"),
             Key::OidcSession { session_id } => format!("SESS#{session_id}"),
             Key::PkceTransaction { state } => format!("PKCE#{state}"),
             // Untagged: one kind of item per table, so a tag would
@@ -371,7 +366,6 @@ mod tests {
             .value(),
             "EVT#evt#AR#3"
         );
-        assert_eq!(Key::AdmissionToken { request_id: "abc" }.value(), "TKN#abc");
         assert_eq!(Key::OidcSession { session_id: "abc" }.value(), "SESS#abc");
         assert_eq!(Key::PkceTransaction { state: "abc" }.value(), "PKCE#abc");
         // One kind per table, so no tag: the bytes would be paid per visitor.
@@ -415,16 +409,15 @@ mod tests {
 
     #[test]
     fn the_tokens_table_key_space_does_not_collide_across_kinds() {
-        // Three kinds of item share this table's key. Without the tags an
-        // operator session id and an admission token reservation for the same
-        // string would be the same row.
+        // Two kinds of item share this table's key. Without the tags an
+        // operator session id and a pending login for the same string would be
+        // the same row.
         let keys = [
-            Key::AdmissionToken { request_id: "abc" }.value(),
             Key::OidcSession { session_id: "abc" }.value(),
             Key::PkceTransaction { state: "abc" }.value(),
         ];
         let distinct: BTreeSet<&String> = keys.iter().collect();
-        assert_eq!(distinct.len(), 3, "two kinds share a key: {keys:?}");
+        assert_eq!(distinct.len(), 2, "two kinds share a key: {keys:?}");
     }
 
     #[test]

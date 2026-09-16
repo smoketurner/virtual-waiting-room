@@ -50,13 +50,10 @@ activation queues first-in, first-out (FIFO).
 |---|---|---|
 | F3.1 | A visitor MUST be able to read their own position and the current serving position. | `GET /queue_num` and `GET /status` return correct values. |
 | F3.2 | The operator MUST be able to control admission rate during the event. | `POST /admin/rate` changes the target rate; effect visible within the cache time to live (TTL). |
-| F3.3 | Admitted visitors MUST receive a cryptographically verifiable token. | Token is signed; signature verifies at the authorizer without a backend call. |
-| F3.4 | The origin MUST reject requests without a valid token or session. | A request with no credential, an expired one, or one for another event is denied. |
-| F3.5 | After validating an admission token once, the system MUST establish a **session** so the visitor is not re-checked against a single-use token on every subsequent request. | A visitor navigates to a second page without re-presenting the admission token and is not re-queued. |
-| F3.6 | The session MUST be separately signed from the admission token, over different inputs. | A captured admission token cannot be replayed as a session credential, or vice versa. |
-| F3.7 | Session lifetime MUST support both a sliding window (extended on activity) and a hard cap from issue time. | Both modes configurable per event; hard cap does not extend regardless of activity. |
+| F3.3 | Admitted visitors MUST receive a cryptographically verifiable credential. | The session cookie is signed; the edge gate verifies the signature locally, with no backend call. |
+| F3.4 | The protected origin MUST be unreachable without a valid session. | A request with no credential, an expired one, or one for another event is refused at the edge. |
+| F3.5 | Once a visitor's position is reached, the system MUST establish a **session** so they are not re-checked on every subsequent request. | A visitor navigates to a second page without re-presenting anything and is not re-queued. |
 | F3.8 | Admission rate control MUST compensate for **no-shows** — admitted visitors who never arrive at the origin. | With a 30% no-show rate and a target of 500/min, actual origin arrivals converge on 500/min, not 350. |
-| F3.10 | Sessions MUST be markable as completed or abandoned. | `POST /update_session` updates the completion and abandonment counters. |
 
 ### 1.5 Failure behaviour
 
@@ -116,7 +113,7 @@ pre-event preparation in §4.
 | N1 | Idle cost MUST approach zero. No always-on compute or cache tier. | Monthly bill for an idle deployment is under $5 excluding pre-warming. |
 | N2 | The system MUST deploy into the client's own AWS account. | `terraform apply` from a clean account produces a working deployment. |
 | N3 | The system MUST NOT require us to operate shared infrastructure on clients' behalf. | No component runs in a Smoke Turner account. |
-| N4 | The system MUST support commercial AWS regions and AWS GovCloud (US). | Both variants deploy and pass functional tests. |
+| N4 | The system MUST support commercial AWS regions. GovCloud (US) is out of scope until a gate exists for it. | The commercial variant deploys and passes functional tests. GovCloud has no shipped gate: the edge gate is a CloudFront Function, which the partition does not offer, and the origin authorizer that filled that role was removed ([ADR-0032](adr/0032-remove-the-origin-authorizer.md)). |
 | N5 | Infrastructure MUST be expressed as Terraform. | No manual console steps in the deployment path. |
 | N6 | A full deployment SHOULD be small enough to read and reason about in one sitting. | Target ≤ 80 Terraform-managed resources for the core module. |
 | N7 | Bot and abuse mitigation MUST be present at the edge. | A Web Application Firewall (WAF) with Bot Control and Autonomous System Number (ASN) matching is deployed by default. |
@@ -137,6 +134,9 @@ carries the reasoning.
 | F6.1 | Gate queue entry on a client-issued signed entry ticket carrying an opaque per-identity subject, deriving `request_id` from it so one identity held one position. | Nothing could use it without customer-side work the product does not supply. | [ADR-0028](adr/0028-remove-entry-tickets.md) |
 | F6.2 | The entry ticket is signed by the client, not the waiting room, and its subject is opaque. | Retired with F6.1; it constrained a mechanism that no longer exists. | [ADR-0028](adr/0028-remove-entry-tickets.md) |
 | F3.9 | Queue positions expire if unused within an operator-configured period. | Implemented as a controller `Scan` of `Positions` six times a minute: unbounded, blind to the pre-queue cohort (which has no `Positions` row), advancing an attribute nothing read, and applying a grace expressed in seconds as a distance in positions — so a hidden tab lost its place (#97). The no-show correction already compensates for absentees. | [ADR-0031](adr/0031-remove-controller-driven-expiry.md) |
+| F3.6 | The session is separately signed from the admission token, over different inputs. | There is no admission token. `Kind` keeps its enum shape so a future second credential kind must carry its own derivation label, but one kind cannot be confused with another that does not exist. | [ADR-0032](adr/0032-remove-the-origin-authorizer.md) |
+| F3.7 | Session lifetime supports both a sliding window and a hard cap from issue time. | `SessionMode::Sliding` lived only in the origin authorizer. The edge does not re-issue a cookie, so a visitor still on the origin when `SESSION_TTL_SECS` lapses returns to the queue. Retired rather than left as a `MUST` with no mechanism; renewing at viewer-response would re-raise it. | [ADR-0032](adr/0032-remove-the-origin-authorizer.md) |
+| F3.10 | Sessions are markable as completed or abandoned. | `POST /update_session` returned 501 and nothing ever wrote `Completed` or `Abandoned`. Deferred "with the authorizer" by ADR-0016, and removed with it. | [ADR-0032](adr/0032-remove-the-origin-authorizer.md) |
 | F6.3 | Bot-blocking decisions enforceable at event start rather than during the pre-queue. | Built as open-time demotion and never enabled; sixteen concepts, a `Scan` grant, and a room-wide refusal if one chunk item went unread. Structurally blind to a client that bypassed CloudFront, which is the traffic it was aimed at. | [ADR-0030](adr/0030-remove-open-time-demotion.md) |
 
 ---
@@ -163,7 +163,7 @@ Not required for the current release. Rationale in [`adr/README.md`](./adr/READM
 - Invite-only waiting rooms with multi-factor authentication (MFA) gating.
 - Proof-of-Work challenges and CAPTCHA softblock before queue entry.
 - Native application software development kits (SDKs) for iOS, Android and React Native.
-- Platform connector breadth beyond the CloudFront/origin authorizer.
+- Platform connector breadth beyond the CloudFront gate.
 
 ## 6. Explicit non-goals
 

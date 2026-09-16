@@ -48,16 +48,14 @@ from `wr-domain::Counters` / `Phase`.
 | `/admin/rate` | POST | Set the admission target rate the outflow controller reads (form `rate`). | `target_rate` (new attribute; controller is future work but the knob is set here) |
 | `/admin/message` | POST | Set the operator broadcast message shown on phase pages / `/status` (form `message`). | `message` |
 | `/admin/reset` | POST | Force **maintenance** phase (the override that suppresses standby alarms), the safe operator stop. | `phase = maintenance` |
-| `/admin/rules` | POST | Set protection rules (path/header/cookie match) the authorizer reads. **Deferred** — authorizer is out of MVP scope; route renders "not yet available". | — (deferred) |
-| `/admin/metrics` · `/metrics` | GET | Read-only metrics view (counters + phase). MVP renders current `Counters` values; EMF/CloudWatch wiring is future work. | — (read only) |
-| `/update_session` | POST | Session admin (bound to the token/session plane). **Deferred** with the authorizer. | — (deferred) |
+| `/admin/rules` | POST | Replace the edge gate's whole ruleset (path/header/cookie/user-agent match), written to the CloudFront KeyValueStore. | KeyValueStore `rules`; audited on `Counters` |
 
 ### MVP action set (implemented in Stages 3–5)
 
-`phase`, `rate`, `message`, `reset` (maintenance override), and the read-only
-`/admin` + `/metrics` render. `rules` and `update_session` are wired as routes
-that return a clear "deferred" response, so the surface is complete and honest
-without pretending the authorizer/session plane exists (no phantom features).
+`phase`, `rate`, `message`, `reset` (maintenance override), `pause`/`resume`,
+`fail_open`/`recover`, `start_time`, `rules`, and the read-only `/admin` render.
+Nothing is wired as a route that answers "deferred": a control the operator
+cannot use is left out rather than shown as a dead panel.
 
 ## Phase transition rules
 
@@ -79,7 +77,7 @@ disabled** (verified in Stage 5).
 
 ## Out of scope (explicitly, this build)
 
-Outflow controller loop, `generate_token`/authorizer/session admission,
+Outflow controller loop, `generate_token` admission,
 standby alarms, protection-rule evaluation. The admin plane sets the knobs
 (`target_rate`, `phase`, `message`) those systems will later read; it does not
 implement them.

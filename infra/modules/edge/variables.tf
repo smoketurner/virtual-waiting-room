@@ -57,7 +57,7 @@ variable "polled_min_ttl_seconds" {
 }
 
 variable "session_cookie_name" {
-  description = "Name of the session cookie the authorizer sets. Forwarded to the protected origin on the default behaviour; never forwarded on polled or write behaviours (ADR-0013)."
+  description = "Name of the session cookie generate_token mints. Forwarded to the protected origin on the default behaviour; never forwarded on polled or write behaviours (ADR-0013)."
   type        = string
   default     = "vwr_session"
 

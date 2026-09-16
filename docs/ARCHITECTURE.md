@@ -54,10 +54,6 @@ Every function runs `provided.al2023` at 256 MB on the architecture named in
 `terraform.tfvars`. Every function deploys a real build. There is no placeholder artifact and no
 fallback path.
 
-`authorizer` is a seventh crate with its own Terraform module. It is an origin-side gate for a
-customer who controls their origin. It is built and deployable. Nothing in the CloudFront path
-invokes it.
-
 ---
 
 ## 3. Ingest
@@ -370,10 +366,9 @@ understates the no-show rate. One admitted but not counted makes the controller 
 every later interval. A failed arrival write is logged at error under the stable event name
 `arrival_record_failed` and the visitor is admitted anyway.
 
-The credential is an HMAC-SHA256 `wr_common::crypto::Session` — the same wire format the
-authorizer's session cookie already used (ADR-0011), domain-separated from an admission token by
-a leading kind byte so neither validates as the other — set directly as a cookie, defaulting to a
-one-hour lifetime:
+The credential is an HMAC-SHA256 `wr_common::crypto::Session`, signed under a key derived from
+the deployment secret rather than the secret itself (ADR-0024) — set directly as a cookie,
+defaulting to a one-hour lifetime:
 
 ```
 <session_cookie_name>=<base64url(payload)>.<base64url(mac)>; Path=/; Max-Age=3600; Secure; HttpOnly; SameSite=Lax
@@ -452,8 +447,6 @@ The admin Lambda serves an Axum router behind an API Gateway greedy proxy:
 | `/admin/pause`, `/admin/resume` | POST | Admission control transitions |
 | `/admin/fail_open`, `/admin/recover` | POST | Sets and clears the break-glass epoch |
 | `/admin/rules` | POST | Writes the edge gate's ruleset to the KeyValueStore |
-| `/update_session` | POST | 501 Not Implemented |
-| `/metrics` | GET | Routed by API Gateway, **no handler in the router** |
 
 API Gateway authorization is `NONE` on every admin route. The Lambda enforces access with an OIDC
 login session in DynamoDB and an email allowlist from `OIDC_ALLOWED_EMAILS`. An unset allowlist
@@ -538,20 +531,22 @@ no-show rate, so the controller under-releases — the safe direction, but the m
 `enforce_from` switches every edge to enforcing at one instant. Nothing triggers either. There is
 no inflow alarm and no automatic phase transition.
 
-**GovCloud matches on path prefixes only.** The CloudFront path evaluates all four rule kinds:
-path, header, cookie, and user agent. `authorizer` is the only gate available where CloudFront
-Functions do not exist, and it wires just `PathPrefix` from `PROTECTED_PATH_PREFIXES`. The two
-gates share the rule type but not the configuration path, so a commercial deployment and a
-GovCloud deployment protect different requests.
+**GovCloud has no gate.** The gate is a CloudFront Function and that partition does not offer
+them. The origin authorizer that filled the role was removed (ADR-0032) — it had never been
+invoked, and as wired it forwarded every request. N4 now says commercial regions are supported
+and GovCloud is out of scope until a gate exists for it.
 
 **Sessions cannot be completed or abandoned.** `PositionStatus` has `Completed` and `Abandoned`
-variants. Only the controller's expiry path and `generate_token`'s refusal read them.
-`/update_session` returns 501, so nothing writes them.
+variants that `generate_token` refuses on, and no writer sets either. `/update_session` was the
+endpoint that would have, and it went with the authorizer (ADR-0032), so `Issued` is the only
+reachable variant.
 
 **The edge does not extend sessions.** `generate_token` mints one session for
-`SESSION_TTL_SECS` and nothing re-issues it. A visitor still on the origin when it expires returns
-to the queue. `authorizer` offers `SessionMode::Sliding`, which extends on activity. The two gates
-never run in the same deployment, so an operator chooses between them.
+`SESSION_TTL_SECS` and nothing re-issues it, so a visitor still on the origin when it expires
+returns to the queue mid-checkout. The sliding alternative lived in the origin authorizer and
+went with it (ADR-0032); F3.7 is retired rather than left as a `MUST` with no mechanism. A
+viewer-response function that re-signs a near-expiry cookie under a hard cap is the design that
+would fix it.
 
 **Two properties are unmeasured against a real deployment:** the function's compute utilization
 per request, and how long a KeyValueStore write takes to reach every edge.
@@ -592,9 +587,8 @@ cause — an `event_id` containing `#` — but nothing else in the deployment is
 event.
 
 **What happens when the signing key is compromised?**
-Everything. One per-deployment key signs the session cookies the edge gate verifies, and
-`authorizer` uses the same key for its admission tokens and sessions with a kind-byte domain
-separation. Holding it mints admission for the whole event. Terraform generates it, so changing it
+Everything. One per-deployment key signs every session cookie the edge gate verifies, so holding
+it mints admission for the whole event. Terraform generates it, so changing it
 means forcing `random_bytes.signing_key` to regenerate — which invalidates every live session, so
 it is a between-events operation rather than a routine one.
 

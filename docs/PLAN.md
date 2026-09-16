@@ -40,7 +40,7 @@ Throwaway code. Measures what documentation cannot settle.
       [F0.1, F0.8]
 - [ ] Operator-authored static page per phase, CDN-cached [F0.2]
 - [ ] Protection rules (path, header, cookie, user agent), evaluated locally at the
-      authorizer [F0.6]
+      the edge gate [F0.6]
 - [ ] Standby mode: CloudWatch alarm on `AWS/CloudFront` `Requests` (60 s period,
       `us-east-1`) → EventBridge → phase transition. Activation latency ~125 s worst case
       [F0.4, F0.7]
@@ -79,7 +79,8 @@ Throwaway code. Measures what documentation cannot settle.
 ### 1f. Admission, session, and outflow control
 - [ ] Deploy-time signing key into an SSM Parameter Store SecureString
 - [ ] `/generate_token` — single-use admission token, short expiry [F3.3]
-- [ ] Authorizer decision tree: session → token → protection match → 302 [F3.4]
+- Gate decision tree: session cookie → protection match → 302. Built as a CloudFront
+      Function (ADR-0021); the origin authorizer that also implemented it was removed (ADR-0032) [F3.4]
 - [ ] Session cookie set after token validation (ADR-0011), signed over different inputs
       from the token, scoped per event, token stripped from the URL [F3.5, F3.6]
 - [x] Sliding and fixed session validity modes [F3.7]
@@ -107,14 +108,15 @@ Throwaway code. Measures what documentation cannot settle.
 
 ### 1i. Control plane
 - [ ] Admin API: `/admin/phase`, `/admin/rate`, `/admin/message`, `/admin/reset`,
-      `/admin/rules`, `/metrics`, `/update_session` [F3.10, F5.5]
+      `/admin/rules` [F5.5]
 - [ ] `modules/core` — DynamoDB, SQS, Lambdas, IAM, regional REST API + validator [N5]
 - [ ] `modules/edge` — CloudFront with three cache behaviours per ADR-0013: polled
       endpoints (Min TTL 1 s, no cookie forwarding), write endpoints (uncached), protected
       origin (uncached, session cookie forwarded). Web Application Firewall (WAF) with Bot
       Control, Autonomous System Number (ASN) match and anti-DDoS in Count mode
       [N7, O5, C4]
-- [ ] `modules/authorizer` — origin authorizer plus optional CloudFront VPC origin.
+- `modules/authorizer` — removed (ADR-0032): nothing invoked it, and as wired it
+      forwarded every request.
       Note VPC origins require an internet gateway present but unused, forbid Lambda@Edge
       origin triggers, and are unavailable in GovCloud (DESIGN §12)
 - [ ] `var.enable_vpc` for ATO-constrained clients — design the seam now, do not retrofit
@@ -186,7 +188,7 @@ What makes this a service rather than a repository.
 
 Ships second, priced separately. No CloudFront, no edge compute, no VPC origins.
 
-- [ ] Internal Application Load Balancer (ALB) gating with the token authorizer; origin
+- [ ] Internal Application Load Balancer (ALB) gating with a gate that does not exist yet; origin
       access via security groups and Identity and Access Management (IAM) [N4]
 - [ ] Replace CDN cache collapse for `/status` — the read-scaling story differs
       materially inside the boundary
@@ -203,7 +205,7 @@ Out of scope for this release; see REQUIREMENTS §5.
 - Invite-only waiting rooms with multi-factor authentication (MFA) gating
 - Proof-of-Work challenges and CAPTCHA softblock
 - Native application SDKs (iOS, Android, React Native)
-- Platform connector breadth beyond the CloudFront/origin authorizer
+- Platform connector breadth beyond the CloudFront gate
 - OpenID identity-provider adapter
 - Multi-region and global tables
 - CloudFront SaaS Manager variant for a client with many branded domains
@@ -219,4 +221,4 @@ Out of scope for this release; see REQUIREMENTS §5.
 | Load harness cannot generate 1M participants from one source | Distributed harness; budget for it in Phase 3 |
 | GovCloud variant larger than estimated — no CloudFront, no virtual private cloud (VPC) origins | Phase 5, priced separately; no date until commercial ships |
 | On-call burden during a live event | Price as incident-critical infrastructure; cap concurrent engagements |
-| Connector breadth | Product scope decision; one authorizer covers content delivery network (CDN) fronted origins |
+| Connector breadth | Product scope decision; the CloudFront gate covers content delivery network (CDN) fronted origins |

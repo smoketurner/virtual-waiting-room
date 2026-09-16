@@ -29,7 +29,7 @@ Throwaway code. Measures what documentation cannot settle.
 
 - [x] Phase state machine: idle → pre-queue → active → post-event, plus maintenance [F0.1, F0.8]
 - [ ] Operator-authored static page per phase, CDN-cached [F0.2]
-- [ ] Protection rules (path, header, cookie, user agent), evaluated locally at the authorizer [F0.6] — Partial: path-prefix matching only (`PROTECTED_PATH_PREFIXES`); header, cookie, and user-agent matching outstanding.
+- [x] Protection rules (path, header, cookie, user agent), evaluated locally at the edge gate [F0.6] — all four kinds are evaluated by the CloudFront Function and frozen by the conformance vectors. The path-prefix-only origin authorizer was removed (ADR-0032).
 - [ ] Standby mode: CloudWatch alarm on `AWS/CloudFront` `Requests` (60 s period, `us-east-1`) → EventBridge → phase Lambda. Activation latency ~125 s worst case [F0.4, F0.7]
 - [ ] Scheduled and standby coexisting on one origin [F0.3, F0.5]
 
@@ -64,14 +64,13 @@ Throwaway code. Measures what documentation cannot settle.
 - [x] **The gate is a CloudFront Function** (issue #71, supersedes the trusted-key-group gate, ADR-0020): `infra/modules/edge/functions/gate.js.tftpl`, associated at viewer-request with the protected behaviour only, reads its ruleset and the signing secret from one CloudFront KeyValueStore (`modules/core`'s `gate_kvs_arn`, consumed by `modules/edge`). `event_id` and the session cookie name are templated into the function's own source [F3.4, ADR-0021]
 - [x] Gate scope and lifetime: the session credential is scoped by `event_id` — the gate refuses a credential minted for another event — closing [#61](https://github.com/smoketurner/virtual-waiting-room/issues/61) on the CloudFront path. [#63](https://github.com/smoketurner/virtual-waiting-room/issues/63) (revocation) remains open; no design chosen (ADR-0021 §5.2)
 - [x] Cross-language credential and rule conformance: `crates/wr-common/tests/vectors.rs` generates vectors (positives minted by the real `Session::sign`, negatives hand-encoded independently, `(rule, request) → bool` cases); `infra/modules/edge/tests/gate.conformance.test.js` checks the **shipped** function against them under `node:vm` [ADR-0021 §6]
-- [x] HMAC admission-token minting also exists in the authorizer crate (`token.rs`) for the authorizer gate; it is not what the CloudFront path uses
-- [x] Authorizer decision tree: session → token → protection match → 302, sharing `wr_common::rules::ProtectionRule` with the edge gate's config writer [F3.4]
+- Origin authorizer decision tree — removed (ADR-0032). The edge gate implements session cookie → protection match → 302, sharing `wr_common::rules::ProtectionRule` with the config writer [F3.4]
 - [x] Session cookie set after token validation (ADR-0011), signed over different inputs from the token, scoped per event, token stripped from the URL [F3.5, F3.6]
 - [x] Sliding and fixed session validity modes [F3.7]
 - [x] `StoredControl` (`Open`/`Paused`) + `Counters.fail_open_until` epoch (issue #71) replace the three-valued stored `AdmissionControl`: `wr_common::resolve(stored, fail_open_until, now)` is the only thing that produces the resolved `FailOpen`, so the string `"fail_open"` can no longer be written to storage. `/admin/fail_open` and `/admin/recover` engage/clear the epoch, mirrored to the edge gate's KeyValueStore (admin-writer-first entering, DynamoDB-first leaving) [ADR-0009, ADR-0019]
 - [ ] Fail open with a time-limited epoch (ADR-0009) [F4.1, F4.2, F4.3] — Partial: the *mechanism* is built (`fail_open_until`, evaluated by the CloudFront Function against its own clock) and an operator can engage it via `/admin/fail_open`, but nothing trips it **automatically** on a backend outage — engaging fail-open still depends on a human, or a watchdog that does not exist yet, noticing DynamoDB is down ([#58](https://github.com/smoketurner/virtual-waiting-room/issues/58))
 - [x] No-show compensating outflow controller: measure arrivals against releases, smooth, bound the correction, adjust `serving_counter` on a 10 s interval (`rate(1 minute)` × six passes, the scheduler's floor being one minute; the gaps are durable waits, so the controller is not billed for them — ADR-0022). Arrival counter sharded ×10 (`arrivals#0..9`) [F3.2, F3.8]
-- [ ] Concurrency term in the control law: `/update_session` is a stub, so completions and abandonments never close the loop and origin concurrency drifts with session duration ([#65](https://github.com/smoketurner/virtual-waiting-room/issues/65))
+- [ ] Concurrency term in the control law: nothing reports completion or abandonment, so origin concurrency drifts with session duration. `/update_session` was the route that would have; it returned 501 and was removed with the authorizer (ADR-0032), so closing this loop needs a new design ([#65](https://github.com/smoketurner/virtual-waiting-room/issues/65))
 - [x] Signing-key generation: `random_bytes.signing_key` generates the secret at apply and Terraform writes it to both the SSM SecureString the Lambdas read and the edge gate's KeyValueStore `k`. One value from one source, so the two copies cannot diverge and there is no bootstrap step whose absence has to be detected (issue #71)
 
 ### 1g. Entry gating and abuse mitigation
@@ -99,7 +98,7 @@ Throwaway code. Measures what documentation cannot settle.
 
 ### 1i. Control plane
 
-- [ ] Admin API: `/admin/phase`, `/admin/rate`, `/admin/message`, `/admin/reset`, `/admin/rules`, `/metrics`, `/update_session` [F3.10, F5.5] — Partial: phase, rate, message, reset, pause, resume, fail_open, recover, and rules are live; `/metrics` and `/update_session` return the deferred stub. `/admin/rules` (issue #71) replaces the edge gate's whole ruleset from a one-rule-per-line form, validated and encoded through `wr_common::rules::validate_rule_fields` + `encode_gate_config`, written to the KeyValueStore (the sole store for `rules`) and then audited on `Counters` (`rules_digest`, `rules_count`, `AdminAction::SetRules`) — a failed audit write is logged and swallowed, not surfaced to the operator, since the KeyValueStore write already landed by then. `enforce_from` is still Terraform-only; no admin route sets it. A rejected ruleset is reported as a
+- [ ] Admin API: `/admin/phase`, `/admin/rate`, `/admin/message`, `/admin/reset`, `/admin/rules` [F5.5] — Partial: phase, rate, message, reset, pause, resume, fail_open, recover, and rules are live. `/metrics` and `/update_session` were removed (ADR-0032): the first was routed by API Gateway with no handler behind it, the second returned 501. `/admin/rules` (issue #71) replaces the edge gate's whole ruleset from a one-rule-per-line form, validated and encoded through `wr_common::rules::validate_rule_fields` + `encode_gate_config`, written to the KeyValueStore (the sole store for `rules`) and then audited on `Counters` (`rules_digest`, `rules_count`, `AdminAction::SetRules`) — a failed audit write is logged and swallowed, not surfaced to the operator, since the KeyValueStore write already landed by then. `enforce_from` is still Terraform-only; no admin route sets it. A rejected ruleset is reported as a
 plain-text 400 naming the offending line and reason (works with JavaScript disabled, the
 requirement that mattered); it is not re-rendered inline on the form beside the offending field.
 - Position expiry in the controller — **F3.9 retired** (ADR-0031). An unbounded `Scan` of
@@ -114,7 +113,7 @@ requirement that mattered); it is not re-rendered inline on the form beside the 
 - [ ] Admin dashboard view: live metrics (inflow, outflow, queue depth, admitted, no-show rate, expiry rate) as an HTML view over `/metrics` JSON + CloudWatch EMF [F7.6, F5.1]
 - [x] askama template unit tests + rendered-HTML snapshot/accessibility check; verify no React/SPA bundle emitted
 
-**Exit:** all endpoints correct; every lifecycle phase serves its page; pre-queue assigns fairly and reproducibly; a visitor browses multiple pages on one session; standby activates on threshold; entry gating rejects unsigned identifiers; operator can see and steer a live event via both API and the web interface; authorizer fails open.
+**Exit:** all endpoints correct; every lifecycle phase serves its page; pre-queue assigns fairly and reproducibly; a visitor browses multiple pages on one session; standby activates on threshold; entry gating rejects unsigned identifiers; operator can see and steer a live event via both API and the web interface; an operator can engage fail-open and the edge honours it.
 
 ---
 
@@ -122,7 +121,7 @@ requirement that mattered); it is not re-rendered inline on the form beside the 
 
 - [x] `modules/core` — DynamoDB, SQS, Lambdas, IAM, regional REST API + validator [N5]
 - [ ] `modules/edge` — CloudFront with three cache behaviours per ADR-0013: polled endpoints (Min TTL 1 s, no cookie forwarding), write endpoints (uncached), protected origin (uncached, session cookie forwarded, gated by the CloudFront Function — issue #71, ADR-0021). Web Application Firewall (WAF) with Bot Control, Autonomous System Number (ASN) match and anti-DDoS in Count mode [N7, O5, C4] — Partial: the three cache behaviours and the gate are built; the WAF web ACL is not.
-- [x] `modules/authorizer` — origin authorizer plus optional CloudFront VPC origin. Note VPC origins require an internet gateway present but unused, forbid Lambda@Edge origin triggers, and are unavailable in GovCloud (DESIGN §12)
+- `modules/authorizer` — removed (ADR-0032): nothing invoked it, and as wired it forwarded every request
 - [x] `var.enable_vpc` for ATO-constrained clients — design the seam now, do not retrofit
 - [ ] Flat-rate plan subscription as a variable [O6]
 - [x] Add the admin-UI Lambda + its route/cache behaviour to the module; confirm it stays within the ~80-resource budget [N6] — Note: the resource-count confirmation is the separate item below.
@@ -172,7 +171,7 @@ What makes this a service rather than a repository.
 
 Ships second, priced separately. No CloudFront, no edge compute, no VPC origins.
 
-- [ ] Internal Application Load Balancer (ALB) gating with the token authorizer; origin access via security groups and Identity and Access Management (IAM) [N4]
+- [ ] Internal Application Load Balancer (ALB) gating with a gate that does not exist yet; origin access via security groups and Identity and Access Management (IAM) [N4]
 - [ ] Replace CDN cache collapse for `/status` — the read-scaling story differs materially inside the boundary
 - [ ] Document the commercial-CloudFront-fronting-GovCloud-origin data-boundary question for the client's Authorizing Official (AO)
 - [ ] Validate deploy in a real GovCloud account
@@ -219,7 +218,7 @@ Out of scope for this release; see REQUIREMENTS §5.
 - Invite-only waiting rooms with multi-factor authentication (MFA) gating
 - Proof-of-Work challenges and CAPTCHA softblock
 - Native application SDKs (iOS, Android, React Native)
-- Platform connector breadth beyond the CloudFront/origin authorizer
+- Platform connector breadth beyond the CloudFront gate
 - OpenID identity-provider adapter
 - Multi-region and global tables
 - CloudFront SaaS Manager variant for a client with many branded domains
@@ -235,4 +234,4 @@ Out of scope for this release; see REQUIREMENTS §5.
 | Load harness cannot generate 1M participants from one source | Distributed harness; budget for it in Phase 3 |
 | GovCloud variant larger than estimated — no CloudFront, no virtual private cloud (VPC) origins | Phase 5, priced separately; no date until commercial ships |
 | On-call burden during a live event | Price as incident-critical infrastructure; cap concurrent engagements |
-| Connector breadth | Product scope decision; one authorizer covers content delivery network (CDN) fronted origins |
+| Connector breadth | Product scope decision; the CloudFront gate covers content delivery network (CDN) fronted origins |

@@ -122,8 +122,6 @@ the expiry write both bind `#s` to `status`.
 | `controller` | `Counters` | `UpdateItem` cursor, guarded | — | 1 per pass |
 | `controller` | `Positions` | `Scan` with a filter | Eventual | 1 per pass, when the cutoff is above zero |
 | `controller` | `Positions` | `UpdateItem status`, guarded | — | 1 per expired position, serially |
-| `authorizer` | `Counters` | `UpdateItem SET s ADD n` on an arrival shard | — | 1 per admission |
-| `authorizer` | `Tokens` | `PutItem` if `attribute_not_exists(request_id)` | — | 1 per admission |
 | `admin` | `Counters` | `GetItem`, five `UpdateItem` forms | Eventual | Operator actions |
 | `admin` | `Tokens` | `PutItem`, `GetItem`, `DeleteItem` | Eventual | Operator logins |
 
@@ -531,8 +529,8 @@ waiting to be reclaimed.
 
 **The `Tokens` table's TTL attribute does not match what the code writes.** Terraform declares
 `ttl { attribute_name = "ttl" }`. Every writer to that table writes `expires_at` instead —
-`authorizer::reserve_token`, `admin`'s `put_pending` (600-second lifetime), and `admin`'s
-`create_session` (8-hour lifetime). No row in `Tokens` is ever deleted by TTL.
+`admin`'s `put_pending` (600-second lifetime) and `admin`'s `create_session` (8-hour
+lifetime). No row in `Tokens` is ever deleted by TTL.
 
 Behaviour is correct, because the session loader checks expiry on read and the reservation guard
 is `attribute_not_exists`, so nothing serves an expired row. The cost is that the table grows
@@ -549,9 +547,10 @@ who calls it twice records two arrivals against one release. That over-counts ar
 understates the no-show rate, and makes the controller release less than the target — the safe
 direction, but the measurement is wrong. Nothing in the data model prevents the replay.
 
-**Nothing writes `PositionStatus::Completed` or `Abandoned`.** Both variants exist, `generate_token`
-refuses on them, and the expiry guard checks against them. The endpoint that would set them,
-`/update_session`, returns 501.
+**Nothing writes `PositionStatus::Completed` or `Abandoned`.** Both variants exist and
+`generate_token` refuses on them, but no writer sets either. `/update_session` was the endpoint
+that would have, and it was removed with the origin authorizer (ADR-0032), so the enum's only
+reachable variant is `Issued`.
 
 **The `Tokens` partition key is named `request_id`.** It now holds operator session ids and PKCE
 states, neither of which is a request id. Renaming it changes the table's hash key, which replaces

@@ -40,21 +40,23 @@ struct Claims {
     iat: Option<u64>,
 }
 
-/// A credential kind. Each signs under its own derived key, so the two are
+/// A credential kind. Each signs under its own derived key, so kinds are
 /// separated by the signature rather than by a claim.
+///
+/// One variant today. It stays an enum rather than collapsing into a constant
+/// so that adding a second kind forces a label of its own — two kinds sharing a
+/// derived key is exactly the confusion this exists to prevent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
-    Token,
     Session,
 }
 
 impl Kind {
-    /// The derivation label for this kind's key. Distinct constant strings, so
+    /// The derivation label for this kind's key. A constant string, so
     /// the two derived keys cannot coincide. Versioned because changing a
     /// label changes every credential it signs.
     const fn label(self) -> &'static [u8] {
         match self {
-            Self::Token => b"vwr/jws/token/v1",
             Self::Session => b"vwr/jws/session/v1",
         }
     }
@@ -63,13 +65,14 @@ impl Kind {
 /// The per-deployment signing key, read from SSM at Lambda init. A newtype so
 /// a raw byte slice is never mistaken for the key at a call site.
 ///
-/// The deployment secret is never used to sign directly. Each credential kind
-/// signs under `HMAC-SHA256(secret, label)`, so a credential of one kind cannot
-/// validate as the other. The edge derives the session key the same way from
-/// the same secret; it holds the secret, not a reduced key, because Terraform
-/// has no HMAC function to derive one with at apply time.
+/// The deployment secret is never used to sign directly: a credential signs
+/// under `HMAC-SHA256(secret, label)`. [`Kind`] has one variant today, and it
+/// stays an enum so a second credential kind cannot be added without a label of
+/// its own — two kinds sharing a derived key is the failure this guards. The
+/// edge derives the session key the same way from the same secret; it holds the
+/// secret, not a reduced key, because Terraform has no HMAC function to derive
+/// one with at apply time.
 pub struct SigningKey {
-    token: [u8; 32],
     session: [u8; 32],
 }
 
@@ -78,14 +81,12 @@ impl SigningKey {
     #[must_use]
     pub fn new(secret: &[u8]) -> Self {
         Self {
-            token: derive(secret, Kind::Token),
             session: derive(secret, Kind::Session),
         }
     }
 
     const fn for_kind(&self, kind: Kind) -> &[u8; 32] {
         match kind {
-            Kind::Token => &self.token,
             Kind::Session => &self.session,
         }
     }
@@ -112,18 +113,8 @@ fn validation() -> Validation {
     v
 }
 
-/// A single-use admission token: proof a visitor reached the front of the
-/// queue, carried on the URL and validated once by the authorizer.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdmissionToken {
-    pub event_id: String,
-    pub request_id: String,
-    /// Epoch-seconds hard expiry.
-    pub expires_at: u64,
-}
-
-/// A per-event session credential set after the token validates. Signed over
-/// different inputs (and a different kind tag) from the token.
+/// A per-event session credential, minted once a visitor's position is
+/// reached. The only credential the edge gate checks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Session {
     pub event_id: String,
@@ -148,43 +139,6 @@ pub enum VerifyError {
     /// The signature is valid but the credential has expired.
     #[error("expired")]
     Expired,
-}
-
-impl AdmissionToken {
-    /// Signs the token as a compact JWS (`HS256`).
-    #[must_use]
-    pub fn sign(&self, key: &SigningKey) -> String {
-        sign_claims(
-            key,
-            Kind::Token,
-            &Claims {
-                aud: self.event_id.clone(),
-                sub: self.request_id.clone(),
-                exp: self.expires_at,
-                iat: None,
-            },
-        )
-    }
-
-    /// Verifies a signed token against `key` and checks it has not expired at
-    /// `now` (epoch seconds).
-    ///
-    /// # Errors
-    ///
-    /// [`VerifyError::Malformed`] if the string is not well-formed;
-    /// [`VerifyError::BadSignature`] if the MAC does not match under this kind;
-    /// [`VerifyError::Expired`] if `now >= expires_at`.
-    pub fn verify(token: &str, key: &SigningKey, now: u64) -> Result<Self, VerifyError> {
-        let claims = verify_claims(key, Kind::Token, token)?;
-        if now >= claims.exp {
-            return Err(VerifyError::Expired);
-        }
-        Ok(Self {
-            event_id: claims.aud,
-            request_id: claims.sub,
-            expires_at: claims.exp,
-        })
-    }
 }
 
 impl Session {
@@ -265,14 +219,6 @@ mod tests {
         SigningKey::new(b"a-32-byte-test-signing-key-value")
     }
 
-    fn token() -> AdmissionToken {
-        AdmissionToken {
-            event_id: "smoke".to_owned(),
-            request_id: "018f3a2b-7c9d-7e1f-abcd-0123456789ab".to_owned(),
-            expires_at: 2_000_000_000,
-        }
-    }
-
     fn session() -> Session {
         Session {
             event_id: "smoke".to_owned(),
@@ -283,28 +229,10 @@ mod tests {
     }
 
     #[test]
-    fn token_round_trips() {
-        let signed = token().sign(&key());
-        let back = AdmissionToken::verify(&signed, &key(), 1_500_000_000).unwrap();
-        assert_eq!(back, token());
-    }
-
-    #[test]
     fn session_round_trips() {
         let signed = session().sign(&key());
         let back = Session::verify(&signed, &key(), 1_500_000_000).unwrap();
         assert_eq!(back, session());
-    }
-
-    #[test]
-    fn expired_token_is_rejected() {
-        let signed = token().sign(&key());
-        assert_eq!(
-            AdmissionToken::verify(&signed, &key(), 2_000_000_000),
-            Err(VerifyError::Expired)
-        );
-        // One second before expiry is still valid.
-        assert!(AdmissionToken::verify(&signed, &key(), 1_999_999_999).is_ok());
     }
 
     #[test]
@@ -317,38 +245,44 @@ mod tests {
     }
 
     #[test]
+    fn the_raw_secret_is_never_the_signing_key() {
+        // What survives of the token/session separation now that one kind is
+        // left: a credential is signed under HMAC(secret, label), never under
+        // the secret itself. If the derivation were skipped, anything holding
+        // the deployment secret could mint a session directly -- and the edge
+        // gate holds exactly that, because Terraform cannot derive a key at
+        // apply time.
+        const SECRET: &[u8] = b"a-32-byte-signing-key-for-tests!";
+        let derived = SigningKey::new(SECRET);
+        // A "key" whose session bytes are the raw secret rather than the HMAC.
+        let underived = SigningKey {
+            session: {
+                let mut out = [0u8; 32];
+                out.copy_from_slice(SECRET);
+                out
+            },
+        };
+        let signed = session().sign(&underived);
+        assert_eq!(
+            Session::verify(&signed, &derived, 1_500_000_000),
+            Err(VerifyError::BadSignature),
+            "a session signed under the raw secret must not verify"
+        );
+    }
+
+    #[test]
     fn wrong_key_fails_signature() {
-        let signed = token().sign(&key());
+        let signed = session().sign(&key());
         let other = SigningKey::new(b"a-different-32-byte-signing-keyy");
         assert_eq!(
-            AdmissionToken::verify(&signed, &other, 1_500_000_000),
-            Err(VerifyError::BadSignature)
-        );
-    }
-
-    #[test]
-    fn a_token_does_not_verify_as_a_session() {
-        // Same fields, but the kind tag differs, so the MACs differ: a captured
-        // admission token cannot be replayed as a session.
-        let signed = token().sign(&key());
-        assert_eq!(
-            Session::verify(&signed, &key(), 1_500_000_000),
-            Err(VerifyError::BadSignature)
-        );
-    }
-
-    #[test]
-    fn a_session_does_not_verify_as_a_token() {
-        let signed = session().sign(&key());
-        assert_eq!(
-            AdmissionToken::verify(&signed, &key(), 1_500_000_000),
+            Session::verify(&signed, &other, 1_500_000_000),
             Err(VerifyError::BadSignature)
         );
     }
 
     #[test]
     fn tampered_payload_fails() {
-        let signed = token().sign(&key());
+        let signed = session().sign(&key());
         let parts: Vec<&str> = signed.split('.').collect();
         // Flip a character in the claims segment; the signature covers
         // "header.payload", so it no longer matches.
@@ -357,7 +291,7 @@ mod tests {
         let tampered: String = chars.into_iter().collect();
         let forged = format!("{}.{tampered}.{}", parts[0], parts[2]);
         assert_eq!(
-            AdmissionToken::verify(&forged, &key(), 1_500_000_000),
+            Session::verify(&forged, &key(), 1_500_000_000),
             Err(VerifyError::BadSignature)
         );
     }
@@ -398,30 +332,32 @@ mod tests {
     fn malformed_strings_are_rejected() {
         let k = key();
         assert_eq!(
-            AdmissionToken::verify("no-dot-here", &k, 0),
+            Session::verify("no-dot-here", &k, 0),
             Err(VerifyError::Malformed)
         );
         assert_eq!(
-            AdmissionToken::verify("bad*.chars", &k, 0),
+            Session::verify("bad*.chars", &k, 0),
             Err(VerifyError::Malformed)
         );
-        assert_eq!(
-            AdmissionToken::verify("", &k, 0),
-            Err(VerifyError::Malformed)
-        );
+        assert_eq!(Session::verify("", &k, 0), Err(VerifyError::Malformed));
     }
 
     proptest! {
         #[test]
-        fn any_token_round_trips(
+        fn any_session_round_trips(
             event_id in "[a-z0-9-]{1,40}",
             request_id in "[a-z0-9-]{1,40}",
-            expires_at in 1u64..u64::MAX,
+            expires_at in 2u64..u64::MAX,
         ) {
             let k = key();
-            let t = AdmissionToken { event_id, request_id, expires_at };
+            let t = Session {
+                event_id,
+                request_id,
+                issued_at: expires_at - 1,
+                expires_at,
+            };
             let signed = t.sign(&k);
-            let back = AdmissionToken::verify(&signed, &k, expires_at - 1).unwrap();
+            let back = Session::verify(&signed, &k, expires_at - 1).unwrap();
             prop_assert_eq!(back, t);
         }
 
@@ -431,7 +367,7 @@ mod tests {
         fn verify_never_panics_on_arbitrary_input(s in ".{0,120}") {
             let k = key();
             prop_assert!(Session::verify(&s, &k, 0).is_err());
-            prop_assert!(AdmissionToken::verify(&s, &k, 0).is_err());
+            prop_assert!(Session::verify(&s, &k, 0).is_err());
         }
     }
 }

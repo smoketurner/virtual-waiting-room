@@ -36,13 +36,10 @@ locals {
     #
     # /admin (the dashboard GET) is explicit because a {proxy+} resource does not
     # match the bare parent path. Every /admin/* action (login, callback, logout,
-    # phase, rate, message, reset, rules, metrics) is served by the
-    # /admin/{proxy+} greedy resource below → the same admin Lambda, whose axum
-    # router does the real routing. /metrics and /update_session are top-level
-    # paths (outside /admin/*) that also front the admin Lambda.
-    admin          = { parent = "root", path_part = "admin", method = "GET", auth = "NONE" }
-    metrics        = { parent = "root", path_part = "metrics", method = "GET", auth = "NONE" }
-    update_session = { parent = "root", path_part = "update_session", method = "POST", auth = "NONE" }
+    # phase, rate, message, reset, rules) is served by the /admin/{proxy+}
+    # greedy resource below → the same admin Lambda, whose axum router does the
+    # real routing.
+    admin = { parent = "root", path_part = "admin", method = "GET", auth = "NONE" }
   }
 
   # Split by parent so each container resource is created before its children.
@@ -52,7 +49,7 @@ locals {
   # Endpoints that front the admin Lambda (all top-level here; the /admin/*
   # children are handled by the greedy proxy, not this map).
   is_admin_endpoint = {
-    for k, v in local.api_endpoints : k => contains(["admin", "metrics", "update_session"], k)
+    for k, v in local.api_endpoints : k => k == "admin"
   }
 }
 
@@ -75,7 +72,7 @@ resource "aws_api_gateway_resource" "root" {
 }
 
 # Every /admin/* action (login, callback, logout, phase, rate, message, reset,
-# rules, metrics) is a greedy proxy to the admin Lambda; its axum router does the
+# rules) is a greedy proxy to the admin Lambda; its axum router does the
 # routing. ANY covers the GET login flow and the POST actions in one resource.
 # The bare /admin path is the explicit "admin" endpoint above ({proxy+} does not
 # match the parent). Auth is NONE — the Lambda enforces the OIDC session.

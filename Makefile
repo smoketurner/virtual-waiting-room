@@ -42,17 +42,13 @@ endif
 # Each crate is built separately (every bin is named `bootstrap`, so a single
 # --output-format zip invocation would collide them under one dir). Each
 # per-crate build writes $(ARTIFACTS)/<crate>/bootstrap/bootstrap.zip.
-#
-# The authorizer is built and deployed like the rest, but nothing in this
-# account invokes it: it attaches at the customer's own origin.
-LAMBDA_CRATES := assign_position open_event read admin controller authorizer generate_token
+LAMBDA_CRATES := assign_position open_event read admin controller generate_token
 
 ASSIGN_ARTIFACT     := $(ARTIFACTS)/assign_position/bootstrap/bootstrap.zip
 OPEN_ARTIFACT       := $(ARTIFACTS)/open_event/bootstrap/bootstrap.zip
 READ_ARTIFACT       := $(ARTIFACTS)/read/bootstrap/bootstrap.zip
 ADMIN_ARTIFACT      := $(ARTIFACTS)/admin/bootstrap/bootstrap.zip
 CONTROLLER_ARTIFACT := $(ARTIFACTS)/controller/bootstrap/bootstrap.zip
-AUTHORIZER_ARTIFACT := $(ARTIFACTS)/authorizer/bootstrap/bootstrap.zip
 TOKEN_ARTIFACT      := $(ARTIFACTS)/generate_token/bootstrap/bootstrap.zip
 
 # Local load generation. `harness` is a development tool, not a Lambda, so it is
@@ -74,7 +70,7 @@ build: ## Cross-compile every Lambda to a zip under .artifacts/<crate>/.
 			--lambda-dir $(ARTIFACTS)/$$crate \
 			-p $$crate --manifest-path $(MANIFEST); \
 	done
-	@echo "built: $(ASSIGN_ARTIFACT) $(OPEN_ARTIFACT) $(READ_ARTIFACT) $(ADMIN_ARTIFACT) $(CONTROLLER_ARTIFACT) $(AUTHORIZER_ARTIFACT) $(TOKEN_ARTIFACT)"
+	@echo "built: $(ASSIGN_ARTIFACT) $(OPEN_ARTIFACT) $(READ_ARTIFACT) $(ADMIN_ARTIFACT) $(CONTROLLER_ARTIFACT) $(TOKEN_ARTIFACT)"
 
 init: ## terraform init (safe, idempotent).
 	terraform -chdir=$(ENV_DIR) init -input=false

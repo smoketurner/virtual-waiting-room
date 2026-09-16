@@ -45,18 +45,8 @@ output "controller_function_name" {
 }
 
 
-output "authorizer_function_arn" {
-  description = "ARN of the origin authorizer Lambda. Attach it at a protected origin you control: it is invoked with the ALB / API Gateway request shape and answers 200 to serve or 302 to send the visitor to wait."
-  value       = module.authorizer.authorizer_function_arn
-}
-
-output "authorizer_role_arn" {
-  description = "ARN of the authorizer execution role."
-  value       = module.authorizer.authorizer_role_arn
-}
-
 output "waiting_room_url" {
-  description = "The URL the authorizer redirects un-admitted visitors to."
+  description = "The waiting room's own URL: the CloudFront distribution created here."
   value       = local.waiting_room_url
 }
 

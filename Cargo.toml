@@ -3,7 +3,6 @@ resolver = "3"
 members = [
     "crates/admin",
     "crates/assign_position",
-    "crates/authorizer",
     "crates/controller",
     "crates/generate_token",
     "crates/harness",

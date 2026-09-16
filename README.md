@@ -67,11 +67,12 @@ origin never calls the waiting room on the hot path.
   touches a function, so there are no cold starts and no concurrency ceiling at the door.
 - **Closed-loop admission.** Some admitted visitors never arrive. The controller measures
   the no-show rate and compensates, so your origin runs at the capacity you paid for.
-- **Fails open** — the intent, not yet the behaviour. A waiting room that fails closed turns
-  its own outage into yours. The authorizer gate does this; the CloudFront gate does not, and
-  an outage of the token path currently refuses every visitor
-  ([#58](https://github.com/smoketurner/virtual-waiting-room/issues/58)). Read that issue
-  before running an event on this.
+- **Fails open** — the mechanism, not yet the trigger. A waiting room that fails closed turns
+  its own outage into yours. An operator can engage fail-open from the dashboard and the edge
+  honours it immediately, but nothing trips it automatically: the gate makes no network calls,
+  so it cannot notice the backend is down. Read
+  [#58](https://github.com/smoketurner/virtual-waiting-room/issues/58) before running an event
+  on this.
 - **Near-zero idle cost.** No always-on compute or cache tier. Tables are pre-warmed before
   an event and cost nothing between them.
 - **Your account, your data.** Commercial regions or GovCloud. Nothing runs anywhere else.

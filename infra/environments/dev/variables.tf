@@ -51,16 +51,6 @@ variable "lambda_architecture" {
   default     = "arm64"
 }
 
-# --- Origin authorizer --------------------------------------------------------
-# The authorizer runs at the customer's protected origin, not at the edge: it is
-# invoked with the ALB / API Gateway request shape and answers 200 to serve the
-# request or 302 to send the visitor to wait. This root creates the function, its
-# role, and its policy, and exports the ARN; attaching it to the origin happens
-# where the origin lives, which this configuration does not own.
-#
-# The whole origin is protected. Narrowing that is a per-deployment decision made
-# at the origin, and defaulting to "gate everything" fails safe.
-
 variable "event_id" {
   description = "The single event id this MVP deployment serves."
   type        = string
