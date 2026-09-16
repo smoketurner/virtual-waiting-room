@@ -183,3 +183,11 @@ event identifier on `PreQueue` rows (or per-event isolation), since the scan car
 tag and no proxy built from `cohort`, `N`, or distinct slots can separate the two in that
 shape. This is a design change the ADR has not made; until it is, the burned-index regime is
 *surfaced* rather than *detected*.
+
+The two outcomes are separate fields on the report, because they are separate outcomes. `error`
+keeps its original meaning — the seal ran with no demotion rather than not at all — and the
+dashboard reads it as the reason nobody was demoted, labelling the counts a scan. The
+burned-index regime is a `caveat`: demotion ran, the counts and groups stand, and what is
+qualified is the confidence that the cohort they were drawn from was this event's alone.
+Carrying it in `error` would have had the dashboard tell the operator that nothing was demoted
+on every run with a burned index, which at any real turnout is most of them.

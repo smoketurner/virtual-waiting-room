@@ -592,8 +592,16 @@ pub struct DemotionReport {
     /// Set when the seal ran with no demotion rather than not at all, and says
     /// which of the two reasons applied: the rules did not parse, or the scan
     /// covered another event's rows and the classification is not this event's.
+    /// Its presence is what makes the counts above a scan rather than an
+    /// outcome — nobody was demoted.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub error: Option<String>,
+    /// Set when the seal demoted (or classified, under observe) on a cohort it
+    /// could not verify was this event's alone. Unlike `error` this qualifies
+    /// the outcome rather than replacing it: the counts above stand and the
+    /// groups were acted on.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub caveat: Option<String>,
 }
 
 impl DemotionReport {
@@ -623,6 +631,7 @@ impl DemotionReport {
             groups,
             sealed_at,
             error: None,
+            caveat: None,
         }
     }
 
@@ -647,6 +656,7 @@ impl DemotionReport {
             groups: Vec::new(),
             sealed_at,
             error: Some(error.to_string()),
+            caveat: None,
         }
     }
 }
@@ -948,12 +958,43 @@ mod tests {
             }],
             sealed_at: 1_788_000_000,
             error: None,
+            caveat: None,
         };
         let av: HashMap<String, aws_sdk_dynamodb::types::AttributeValue> =
             serde_dynamo::to_item(&report).unwrap();
         assert!(!av.contains_key("error"));
+        assert!(!av.contains_key("caveat"));
         let back: DemotionReport = serde_dynamo::from_item(av).unwrap();
         assert_eq!(report, back);
+    }
+
+    #[test]
+    fn a_caveat_round_trips_and_leaves_the_error_absent() {
+        // A qualified outcome is not a failed one: the caveat is written, the
+        // error stays off the item, and the counts it qualifies survive.
+        let report = DemotionReport {
+            mode: "enforce".to_owned(),
+            rules: "address:25".to_owned(),
+            cohort: 10,
+            demoted: 3,
+            groups_total: 1,
+            groups: vec![ReportGroup {
+                signal: "address".to_owned(),
+                value: "198.51.100.1".to_owned(),
+                count: 3,
+                max: 25,
+            }],
+            sealed_at: 1_788_000_000,
+            error: None,
+            caveat: Some("contamination cannot be ruled out".to_owned()),
+        };
+        let av: HashMap<String, aws_sdk_dynamodb::types::AttributeValue> =
+            serde_dynamo::to_item(&report).unwrap();
+        assert!(!av.contains_key("error"));
+        assert!(av.contains_key("caveat"));
+        let back: DemotionReport = serde_dynamo::from_item(av).unwrap();
+        assert_eq!(report, back);
+        assert_eq!(back.demoted, 3);
     }
 
     #[test]
