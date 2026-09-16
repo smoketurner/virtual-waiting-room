@@ -127,7 +127,6 @@ fn position_from_item(item: &HashMap<String, AttributeValue>) -> Option<(u64, Po
             "issued" => Some(PositionStatus::Issued),
             "completed" => Some(PositionStatus::Completed),
             "abandoned" => Some(PositionStatus::Abandoned),
-            "expired" => Some(PositionStatus::Expired),
             _ => None,
         })?;
     Some((position, status))
@@ -154,7 +153,6 @@ mod tests {
             ("issued", PositionStatus::Issued),
             ("completed", PositionStatus::Completed),
             ("abandoned", PositionStatus::Abandoned),
-            ("expired", PositionStatus::Expired),
         ] {
             assert_eq!(
                 position_from_item(&position_item("7", wire)),

@@ -21,7 +21,7 @@ costs the most, because it is loaded into every session.
 | `open_event` | EventBridge Scheduler, one-time `at()` set by the operator on the dashboard (issue #128) | One conditional `UpdateItem` at T−0: seed, offsets, count, phase |
 | `read` | API Gateway | `GET /v1/status`, `GET /v1/queue_num` |
 | `generate_token` | API Gateway | Checks the position against `serving_counter`, records the arrival, mints a signed session cookie the edge gate's CloudFront Function verifies (issue #71) |
-| `controller` | EventBridge Scheduler, `rate(1 minute)` | Durable function: six 10-second passes per execution — no-show correction, `serving_counter`, position expiry. Waits between passes suspend the execution rather than being billed |
+| `controller` | EventBridge Scheduler, `rate(1 minute)` | Durable function: six 10-second passes per execution — no-show correction and `serving_counter`. Waits between passes suspend the execution rather than being billed |
 | `admin` | API Gateway | Axum app: operator UI and `/admin/*` actions, OIDC-authenticated |
 | `authorizer` | ALB / API Gateway at the operator's origin | The alternative gate, for an origin the operator controls. Deployed by `modules/authorizer`, not in the CloudFront path |
 

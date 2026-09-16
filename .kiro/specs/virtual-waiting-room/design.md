@@ -80,7 +80,6 @@ authorizer without a call to the waiting-room backend.
         2. no_show_rate = 1 − (arrivals / released)
         3. release = target_rate / (1 − smoothed_no_show_rate), bounded
         4. UpdateItem serving_counter
-        5. expire positions past expires_at, advance max_expired_position
         │
         ▼
   Visitor polls /status → serving_counter ≥ own position
@@ -532,7 +531,6 @@ skipped number.
 | `queue_counter` | N | Live-join position sequence |
 | `prequeue_offsets` | L | Per-shard prefix offsets, written at T−0 to assemble `[0, N)` |
 | `serving_counter` | N | Admission high-water mark |
-| `max_expired_position` | N | Highest expired position |
 | `phase` | S | `idle` / `pre_queue` / `active` / `post_event` / `maintenance` |
 | `admission_control` | S | The *stored* control (ADR-0019, ADR-0021 issue #71): `open` / `paused` only — never `fail_open`. Combined with `fail_open_until` by `wr_common::resolve(stored, fail_open_until, now)` into the three-valued resolved control that, with `phase`, derives the visitor-facing `ServingState` |
 | `fail_open_until` | N | Epoch-seconds fail-open deadline (issue #71); `0` = no window in force. Mirrored to the edge gate's KeyValueStore |
@@ -650,11 +648,10 @@ rate that is 1,000 writes/s, the single-item ceiling, so the counter is sharded 
 items chosen by `hash(request_id) % 10`. Cost: 10 reads per interval, independent of event
 size.
 
-**Position expiry.** Each interval the controller queries positions whose `expires_at` has
-passed with `status = issued`, marks them expired, and advances `max_expired_position`.
-DynamoDB TTL is enabled on `Positions` for post-event storage reclamation only, never as the
-expiry mechanism ([ADR-0006](../../../docs/adr/0006-controller-driven-expiry-not-ttl.md)). Reads that could
-observe a TTL-pending item apply a `FilterExpression` on `expires_at`.
+**No position expiry.** A position lives until DynamoDB TTL reclaims its row a day after it
+was written (ADR-0031). The controller does not expire anything and performs no `Scan`: the
+no-show correction is what compensates for people who never arrive, measuring arrivals against
+releases and releasing more to cover the gap.
 
 ---
 
@@ -987,7 +984,6 @@ Which section implements which requirement from the Kiro spec's `requirements.md
 | F3.2, F3.8 — admission rate control, no-show compensation | §7 |
 | F3.3, F3.4, F3.6, F3.7 — token, origin rejection, distinct signing, session lifetime | §8 |
 | F3.5 — session established after token validation | §2.3, §8 |
-| F3.9 — position expiry | §7 |
 | F3.10 — session completion and abandonment | §8 |
 | F4.1, F4.2, F4.3 — fail open, bounded bypass, configurable | §10 |
 | F4.4 — recovery from a lost join | §6 |

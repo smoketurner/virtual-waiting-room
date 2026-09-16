@@ -44,7 +44,6 @@ The event item carries, by writer:
 |---|---|---|
 | `queue_counter` | `open_event`, `assign_position` | Live-join position sequence; set to `N` at the open |
 | `serving_counter` | `controller` | Admission cursor, exclusive |
-| `max_expired_position` | `controller` | Highest position expired |
 | `last_serving_counter`, `last_arrivals_total`, `no_show_rate` | `controller` | Measurement state carried across passes |
 | `phase` | `open_event`, `admin` | `idle` / `pre_queue` / `active` / `post_event` / `maintenance` |
 | `admission_control` | `admin` | `open` / `paused` |
@@ -123,7 +122,6 @@ the expiry write both bind `#s` to `status`.
 | `controller` | `Counters` | `UpdateItem` cursor, guarded | — | 1 per pass |
 | `controller` | `Positions` | `Scan` with a filter | Eventual | 1 per pass, when the cutoff is above zero |
 | `controller` | `Positions` | `UpdateItem status`, guarded | — | 1 per expired position, serially |
-| `controller` | `Counters` | `UpdateItem max_expired_position`, guarded | — | ≤1 per pass |
 | `authorizer` | `Counters` | `UpdateItem SET s ADD n` on an arrival shard | — | 1 per admission |
 | `authorizer` | `Tokens` | `PutItem` if `attribute_not_exists(request_id)` | — | 1 per admission |
 | `admin` | `Counters` | `GetItem`, five `UpdateItem` forms | Eventual | Operator actions |
@@ -247,7 +245,6 @@ test seam.
 | `Positions` row | `attribute_not_exists(request_id)` | A duplicate join consumes no position |
 | Open | `attribute_not_exists(shuffle_seed)` | A double-fire opens exactly once |
 | Cursor advance | `attribute_not_exists(serving_counter) OR serving_counter = :expected` | Overlapping controller executions cannot double-advance |
-| `max_expired_position` | `attribute_not_exists(...) OR max_expired_position < :m` | The cursor only moves forward |
 | Position expiry | `#s = :issued` | A position completed since the scan is not overwritten |
 | Admission reservation | `attribute_not_exists(request_id)` | A reservation is taken once |
 | Phase change | `phase = :from` | A transition another operator applied is a 409 |

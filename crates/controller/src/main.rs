@@ -39,14 +39,8 @@ async fn main() -> Result<(), lambda_runtime::Error> {
     let config = aws_config::load_from_env().await;
     let client = aws_sdk_dynamodb::Client::new(&config);
     let counters_table = std::env::var("COUNTERS_TABLE")?;
-    let positions_table = std::env::var("POSITIONS_TABLE")?;
     let event_id = std::env::var("EVENT_ID")?;
-    let store = Arc::new(DynamoStore::new(
-        client,
-        counters_table,
-        positions_table,
-        event_id,
-    ));
+    let store = Arc::new(DynamoStore::new(client, counters_table, event_id));
 
     // Force one real read in the Init phase so the aws-lc-rs jitter-entropy seed
     // and the TLS handshake land on boosted Init CPU rather than the first

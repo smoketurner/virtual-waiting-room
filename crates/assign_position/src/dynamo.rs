@@ -7,8 +7,7 @@ use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::put_item::PutItemError;
 use aws_sdk_dynamodb::types::{AttributeValue, KeysAndAttributes, ReturnValue};
 use wr_common::expr::{
-    Condition, Key, POSITIONS_KEY_ATTR, SHARD_COUNT_ATTR, SHARD_INDEX_ATTR, STATUS_ATTR,
-    STATUS_EXPIRED, Update,
+    Condition, Key, POSITIONS_KEY_ATTR, SHARD_COUNT_ATTR, SHARD_INDEX_ATTR, Update,
 };
 use wr_common::{Counters, PositionItem, PositionStatus, PreQueueItem, Shard};
 
@@ -94,15 +93,7 @@ impl Store for DynamoStore {
             .put_item()
             .table_name(&self.positions_table)
             .set_item(Some(attrs));
-        // Widened so a re-join can reclaim a row the controller expired;
-        // `completed` and `abandoned` stay terminal.
-        let guard = Condition::attribute_not_exists(POSITIONS_KEY_ATTR);
-        let guard = if write.allow_expired_overwrite {
-            guard.or_equals(STATUS_ATTR, AttributeValue::S(STATUS_EXPIRED.to_owned()))
-        } else {
-            guard
-        }
-        .build();
+        let guard = Condition::attribute_not_exists(POSITIONS_KEY_ATTR).build();
         request = request
             .condition_expression(guard.expression.clone())
             .set_expression_attribute_names(guard.names_or_none())

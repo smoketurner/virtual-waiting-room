@@ -142,12 +142,10 @@ fn resolve_position(
     if let Some((position, status)) = position_row {
         return match status {
             PositionStatus::Issued => Ok(position),
-            // Expired by the controller, already used, or given up: none of the
-            // three is a live claim on a position, and all three are permanent,
-            // so the visitor is told to stop rather than to keep polling.
-            PositionStatus::Expired | PositionStatus::Completed | PositionStatus::Abandoned => {
-                Err(Denied::Spent)
-            }
+            // Already used or given up: neither is a live claim on a position,
+            // and both are permanent, so the visitor is told to stop rather
+            // than to keep polling.
+            PositionStatus::Completed | PositionStatus::Abandoned => Err(Denied::Spent),
         };
     }
 
@@ -269,12 +267,8 @@ mod tests {
     }
 
     #[test]
-    fn an_expired_or_spent_position_is_refused() {
-        for status in [
-            PositionStatus::Expired,
-            PositionStatus::Completed,
-            PositionStatus::Abandoned,
-        ] {
+    fn a_spent_position_is_refused() {
+        for status in [PositionStatus::Completed, PositionStatus::Abandoned] {
             assert_eq!(
                 decide(&counters(10), None, Some((3, status)), 0).unwrap_err(),
                 Denied::Spent

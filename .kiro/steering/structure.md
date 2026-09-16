@@ -36,7 +36,7 @@ crates/                       Rust workspace — one crate per Lambda + shared l
   open_event/                 T−0 conditional open
   read/                       /v1/status, /v1/queue_num
   generate_token/             Admission check + signed session cookie minting (issue #71)
-  controller/                 Outflow control and position expiry
+  controller/                 Outflow control
   admin/                      Axum operator UI and /admin/* actions, including the edge gate's
                               KeyValueStore writer (edge.rs)
   authorizer/                 The alternative origin gate
@@ -72,7 +72,7 @@ runtime wiring.
 |---|---|---|
 | `Counters` | `event_id` | The event item `EVT#{id}`, plus its striped shard items `EVT#{id}#PQ#{n}` and `EVT#{id}#AR#{n}` |
 | `PreQueue` | `r` (request_id) | Shard `s` + local index `l` (+ time `t`); global index `i=offset[s]+l` assembled at T−0; scanned only at audit |
-| `Positions` | `request_id` | Written lazily at admission; carries expiry for the controller |
+| `Positions` | `request_id` | Written lazily at admission; reclaimed by DynamoDB TTL |
 | `Tokens` | `request_id` | Three tagged kinds: admission-token reservations `TKN#`, operator OIDC sessions `SESS#`, pending PKCE logins `PKCE#` |
 
 Keys are tagged only where a table holds more than one kind of item; `Positions` and `PreQueue`

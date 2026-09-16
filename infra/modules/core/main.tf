@@ -80,10 +80,11 @@ resource "aws_dynamodb_table" "positions" {
     enabled = true
   }
 
-  # TTL is post-event storage reclamation ONLY, never the expiry mechanism
-  # (ADR-0006): the controller expires positions on a schedule, scanning on
-  # status rather than on a deadline, so a row still present past its ttl is
-  # never mistaken for a live position. The name matches PositionItem::ttl.
+  # TTL is now the only expiry mechanism (ADR-0031): a row is reclaimed a day
+  # after it was written, and until then it is a live position. Deletion is
+  # asynchronous, so a row may outlive its ttl by hours; nothing reads the
+  # attribute, so that is storage lag, not a stale admission. The name matches
+  # PositionItem::ttl.
   ttl {
     attribute_name = "ttl"
     enabled        = true

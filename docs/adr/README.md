@@ -10,7 +10,7 @@ One record per decision. Each states the context, the decision, and its conseque
 | [0003](0003-dynamodb-counters-not-elasticache.md) | Use DynamoDB atomic counters, not a cache tier |
 | [0004](0004-putitem-not-batchwriteitem.md) | Write positions with `PutItem`, not `BatchWriteItem` |
 | [0005](0005-rest-api-not-http-api.md) | Use a REST API, not an HTTP API |
-| [0006](0006-controller-driven-expiry-not-ttl.md) | Drive position expiry from the controller, not DynamoDB TTL |
+| [0006](0006-controller-driven-expiry-not-ttl.md) | Drive position expiry from the controller, not DynamoDB TTL (superseded by 0031) |
 | [0007](0007-single-tenant-deployment.md) | Deploy single-tenant into the client's account |
 | [0008](0008-partition-isolation-not-shuffle-sharding.md) | Isolate concurrent events by partition, not shuffle sharding |
 | [0009](0009-fail-open.md) | Fail open when the waiting room is unavailable |
@@ -34,6 +34,7 @@ One record per decision. Each states the context, the decision, and its conseque
 | [0028](0028-remove-entry-tickets.md) | Remove entry tickets: nothing could use them without customer-side work we do not supply |
 | [0029](0029-seal-time-demotion.md) | Demote telemetry groups to the tail at the open, matching on read (superseded by 0030) |
 | [0030](0030-remove-open-time-demotion.md) | Remove open-time demotion: never enabled, sixteen concepts, and a room-wide refusal if one chunk item went unread |
+| [0031](0031-remove-controller-driven-expiry.md) | Remove controller-driven expiry: an unbounded Scan six times a minute that could not see the pre-queue cohort |
 
 ## Open
 

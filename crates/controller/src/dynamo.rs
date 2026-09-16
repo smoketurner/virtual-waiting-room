@@ -15,34 +15,26 @@ use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
 use aws_sdk_dynamodb::types::AttributeValue;
 use wr_common::expr::Key;
-use wr_common::{Phase, PositionStatus, SHARDS, StoredControl};
+use wr_common::{Phase, SHARDS, StoredControl};
 use wr_common::{Shard, shard_count_of, shard_index_of};
 
 use crate::{
-    ControllerState, ExpiredPosition, NoShowState, ReleaseDecision, ReleaseInputs, ReleaseOutcome,
-    Store, StoreError,
+    ControllerState, NoShowState, ReleaseDecision, ReleaseInputs, ReleaseOutcome, Store, StoreError,
 };
 
 /// A live `DynamoDB` store bound to the counters and positions tables.
 pub struct DynamoStore {
     client: Client,
     counters_table: String,
-    positions_table: String,
     event_id: String,
 }
 
 impl DynamoStore {
     #[must_use]
-    pub fn new(
-        client: Client,
-        counters_table: String,
-        positions_table: String,
-        event_id: String,
-    ) -> Self {
+    pub fn new(client: Client, counters_table: String, event_id: String) -> Self {
         Self {
             client,
             counters_table,
-            positions_table,
             event_id,
         }
     }
@@ -120,7 +112,6 @@ impl Store for DynamoStore {
                 participant_count: num(item, "participant_count"),
             },
             prev_no_show,
-            max_expired_position: num(item, "max_expired_position"),
         })
     }
 
@@ -189,113 +180,6 @@ impl Store for DynamoStore {
                 Ok(ReleaseOutcome::LostRace)
             }
             Err(e) => Err(StoreError(format!("update_item release: {e}"))),
-        }
-    }
-
-    async fn query_expired(
-        &self,
-        cutoff_position: u64,
-    ) -> Result<Vec<ExpiredPosition>, StoreError> {
-        let mut expired = Vec::new();
-        let mut pages = self
-            .client
-            .scan()
-            .table_name(&self.positions_table)
-            .filter_expression("queue_position < :cutoff AND #s = :issued")
-            .expression_attribute_names("#s", "status")
-            .expression_attribute_values(":cutoff", AttributeValue::N(cutoff_position.to_string()))
-            .expression_attribute_values(
-                ":issued",
-                AttributeValue::S(status_wire(PositionStatus::Issued).to_owned()),
-            )
-            .projection_expression("request_id, queue_position")
-            .into_paginator()
-            .items()
-            .send();
-
-        while let Some(item) = pages.next().await {
-            let item = item.map_err(|e| StoreError(format!("scan positions: {e}")))?;
-            let request_id = item.get("request_id").and_then(|v| v.as_s().ok());
-            let position = item
-                .get("queue_position")
-                .and_then(|v| v.as_n().ok())
-                .and_then(|n| n.parse::<u64>().ok());
-            if let (Some(request_id), Some(position)) = (request_id, position) {
-                expired.push(ExpiredPosition {
-                    request_id: request_id.clone(),
-                    position,
-                });
-            }
-        }
-        Ok(expired)
-    }
-
-    async fn mark_expired(&self, request_id: &str) -> Result<(), StoreError> {
-        let result = self
-            .client
-            .update_item()
-            .table_name(&self.positions_table)
-            .key("request_id", AttributeValue::S(request_id.to_owned()))
-            .update_expression("SET #s = :expired")
-            .condition_expression("#s = :issued")
-            .expression_attribute_names("#s", "status")
-            .expression_attribute_values(
-                ":expired",
-                AttributeValue::S(status_wire(PositionStatus::Expired).to_owned()),
-            )
-            .expression_attribute_values(
-                ":issued",
-                AttributeValue::S(status_wire(PositionStatus::Issued).to_owned()),
-            )
-            .send()
-            .await;
-
-        match result {
-            Ok(_) => Ok(()),
-            Err(SdkError::ServiceError(se))
-                if matches!(
-                    se.err(),
-                    UpdateItemError::ConditionalCheckFailedException(_)
-                ) =>
-            {
-                // The position was completed/abandoned/already-expired between the
-                // scan and this write; leave it as it is.
-                Ok(())
-            }
-            Err(e) => Err(StoreError(format!("update_item mark_expired: {e}"))),
-        }
-    }
-
-    async fn advance_max_expired(
-        &self,
-        event_id: &str,
-        max_expired_position: u64,
-    ) -> Result<(), StoreError> {
-        let result = self
-            .client
-            .update_item()
-            .table_name(&self.counters_table)
-            .set_key(Some(Key::Event { event_id }.build()))
-            .update_expression("SET max_expired_position = :m")
-            // Only ever move the cursor forward.
-            .condition_expression(
-                "attribute_not_exists(max_expired_position) OR max_expired_position < :m",
-            )
-            .expression_attribute_values(":m", AttributeValue::N(max_expired_position.to_string()))
-            .send()
-            .await;
-
-        match result {
-            Ok(_) => Ok(()),
-            Err(SdkError::ServiceError(se))
-                if matches!(
-                    se.err(),
-                    UpdateItemError::ConditionalCheckFailedException(_)
-                ) =>
-            {
-                Ok(())
-            }
-            Err(e) => Err(StoreError(format!("update_item max_expired: {e}"))),
         }
     }
 }
@@ -369,18 +253,6 @@ fn arrivals_from_shard_items(
             .ok_or_else(|| StoreError("arrivals item has an unreadable count".to_owned()))?;
     }
     Ok(arrivals)
-}
-
-/// The stored wire string for a [`PositionStatus`], matching its `serde`
-/// `snake_case` representation. Single source so no filter or write hand-writes
-/// "issued"/"expired".
-fn status_wire(status: PositionStatus) -> &'static str {
-    match status {
-        PositionStatus::Issued => "issued",
-        PositionStatus::Completed => "completed",
-        PositionStatus::Abandoned => "abandoned",
-        PositionStatus::Expired => "expired",
-    }
 }
 
 /// The `event_id` this store is bound to, for the handler's logging.

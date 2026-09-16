@@ -21,7 +21,7 @@ Throwaway code. Measures what documentation cannot settle.
 ### 1a. Data and counter
 
 - [x] Four tables — `Counters`, `PreQueue`, `Positions`, `Tokens` — on-demand, PITR, `warm_throughput_*` and optional `max_throughput_*` as variables (DESIGN §6.7) [O1] — Note: no `max_throughput_*` variables yet.
-- [x] `Counters` attributes: `queue_counter`, `serving_counter`, `max_expired_position`, `arrivals#0..9`, `phase`, `phase_override`, `target_rate`, `shuffle_seed`, `operator_message` — Note: `phase_override` is instead the `Phase::Maintenance` variant, and `admission_control` (ADR-0019) replaces the `admission_paused`/`fail_open` pair.
+- [x] `Counters` attributes: `queue_counter`, `serving_counter`, `arrivals#0..9`, `phase`, `phase_override`, `target_rate`, `shuffle_seed`, `operator_message` — Note: `phase_override` is instead the `Phase::Maintenance` variant, and `admission_control` (ADR-0019) replaces the `admission_paused`/`fail_open` pair.
 - [x] Batch range allocation via `UpdateItem ADD` / `ALL_NEW`; increment by **valid** count only [F2.2, F2.6]
 - [x] `PutItem` with `attribute_not_exists(request_id)` on every position write [F2.5]
 
@@ -102,10 +102,10 @@ Throwaway code. Measures what documentation cannot settle.
 - [ ] Admin API: `/admin/phase`, `/admin/rate`, `/admin/message`, `/admin/reset`, `/admin/rules`, `/metrics`, `/update_session` [F3.10, F5.5] — Partial: phase, rate, message, reset, pause, resume, fail_open, recover, and rules are live; `/metrics` and `/update_session` return the deferred stub. `/admin/rules` (issue #71) replaces the edge gate's whole ruleset from a one-rule-per-line form, validated and encoded through `wr_common::rules::validate_rule_fields` + `encode_gate_config`, written to the KeyValueStore (the sole store for `rules`) and then audited on `Counters` (`rules_digest`, `rules_count`, `AdminAction::SetRules`) — a failed audit write is logged and swallowed, not surfaced to the operator, since the KeyValueStore write already landed by then. `enforce_from` is still Terraform-only; no admin route sets it. A rejected ruleset is reported as a
 plain-text 400 naming the offending line and reason (works with JavaScript disabled, the
 requirement that mattered); it is not re-rendered inline on the form beside the offending field.
-- [x] Position expiry in the controller (ADR-0006): query `expires_at` past due with `status = issued`, mark expired, advance `max_expired_position`. Time to live (TTL) enabled only for post-event storage reclamation, with `FilterExpression` on reads that could see a pending-delete item [F3.9]
-
-### 1j. Operator web interface (Axum Lambda, Vouch design language per ADR-0018)
-
+- Position expiry in the controller — **F3.9 retired** (ADR-0031). An unbounded `Scan` of
+  `Positions` six times a minute that could not see the pre-queue cohort and advanced an
+  attribute nothing read. DynamoDB TTL now reclaims the row and the no-show correction
+  compensates for absentees.
 - [x] Vendor one plain-CSS stylesheet into the admin Lambda — NO runtime npm dependency, NO React [F7.2, F7.5]. ADR-0018 replaced the Cloudscape design tokens with the Vouch design language, so the vendored `tokens.css` and its `extract_tokens.py` build step are deleted and the stylesheet is self-contained
 - [x] Single Axum Lambda (Rust, arm64, `provided.al2023`) serving the admin UI via askama compile-time templates; semantic HTML laid out to the ADR-0018 conventions (top bar, content header, stat tiles, status pills, card grid, forms, a dominant emergency card for the andon cord) [F7.1, F7.2]
 - [x] Reuse existing admin Lambda logic — UI is a thin server-rendered client over the SAME `/admin/*` actions; add no capability the API lacks [F7.3, F5.5]

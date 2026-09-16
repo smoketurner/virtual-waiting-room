@@ -272,16 +272,6 @@ data "aws_iam_policy_document" "controller" {
   }
 
   statement {
-    sid    = "ExpirePositions"
-    effect = "Allow"
-    actions = [
-      "dynamodb:Scan",
-      "dynamodb:UpdateItem",
-    ]
-    resources = [aws_dynamodb_table.positions.arn]
-  }
-
-  statement {
     sid    = "DurableExecution"
     effect = "Allow"
     actions = [
