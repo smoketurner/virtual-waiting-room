@@ -12,7 +12,7 @@
 use std::env;
 
 use generate_token::dynamo::DynamoStore;
-use generate_token::{DEFAULT_SESSION_TTL_SECS, Denied, Store, decide};
+use generate_token::{AdmissionClaim, DEFAULT_SESSION_TTL_SECS, Denied, Store, decide};
 use lambda_http::{Body, Error, Request, RequestExt, Response, run, service_fn};
 use tracing::{error, info};
 use wr_common::{Session, SigningKey};
@@ -119,33 +119,58 @@ async fn handle<S: Store>(state: &AppState<S>, req: Request) -> Result<Response<
         Err(denied) => return refusal(&denied),
     };
 
-    // Recorded before the cookie is handed out: a visitor counted but not
-    // admitted only understates the no-show rate, whereas one admitted but not
-    // counted makes the controller over-release for every later interval.
+    // Claim the visitor's one admission, so their arrival is counted once
+    // however many times they call (issue #62). `request_id` travels in a URL
+    // and the waiting page polls, so a reload, a second tab or a retried
+    // request all arrive here again; `record_arrival` is an unconditional
+    // `ADD`, and a second one tells the controller more people showed up than
+    // it released, understating the no-show rate and under-releasing for the
+    // rest of the event.
     //
-    // The shard is drawn at random per admission (issue #59) rather than
-    // hashed from `request_id`, so it is drawn here rather than by `decide`,
-    // which stays a pure function of the queue state. A draw failure is
-    // logged and swallowed for the same reason a record failure is: the
-    // controller tolerates a missed arrival better than the visitor tolerates
-    // being refused at their turn.
-    match wr_common::Shard::random() {
-        Ok(shard) => {
-            if let Err(e) = state.store.record_arrival(&state.event_id, shard).await {
-                // Non-fatal for this visitor: the controller tolerates a
-                // missed arrival better than the visitor tolerates being
-                // refused at their turn. Logged at error with a stable event
-                // name because the damage is cumulative and silent — every
-                // uncounted arrival inflates the measured no-show rate, and
-                // the controller answers that by releasing more people than
-                // the origin agreed to serve. The metric filter and alarm on
-                // `arrival_record_failed` live in modules/core/logging.tf.
-                error!(error = %e, event = "arrival_record_failed", "failed to record arrival; admitting anyway");
-            }
-        }
+    // A failed claim leaves it unknown whether the arrival has been counted, so
+    // it is counted: over-counting understates the no-show rate and releases
+    // fewer people, while missing it releases more than the origin agreed to
+    // serve. Neither refuses the visitor -- the claim governs the count, not
+    // admission.
+    let claim = match state
+        .store
+        .claim_admission(&request_id, grant.position, now)
+        .await
+    {
+        Ok(claim) => claim,
         Err(e) => {
-            error!(error = %e, event = "arrival_shard_draw_failed", "failed to draw a random shard; admitting without recording arrival");
+            error!(error = %e, event = "admission_claim_failed", "could not claim the admission; counting the arrival and admitting anyway");
+            AdmissionClaim::First
         }
+    };
+
+    match claim {
+        // The shard is drawn at random per admission (issue #59) rather than
+        // hashed from `request_id`, so it is drawn here rather than by
+        // `decide`, which stays a pure function of the queue state. A draw
+        // failure is logged and swallowed for the same reason a record failure
+        // is: the controller tolerates a missed arrival better than the visitor
+        // tolerates being refused at their turn.
+        AdmissionClaim::First => match wr_common::Shard::random() {
+            Ok(shard) => {
+                if let Err(e) = state.store.record_arrival(&state.event_id, shard).await {
+                    // Non-fatal for this visitor: the controller tolerates a
+                    // missed arrival better than the visitor tolerates being
+                    // refused at their turn. Logged at error with a stable event
+                    // name because the damage is cumulative and silent — every
+                    // uncounted arrival inflates the measured no-show rate, and
+                    // the controller answers that by releasing more people than
+                    // the origin agreed to serve. The metric filter and alarm on
+                    // `arrival_record_failed` live in modules/core/logging.tf.
+                    error!(error = %e, event = "arrival_record_failed", "failed to record arrival; admitting anyway");
+                }
+            }
+            Err(e) => {
+                error!(error = %e, event = "arrival_shard_draw_failed", "failed to draw a random shard; admitting without recording arrival");
+            }
+        },
+        // Already counted. The visitor still gets their session below.
+        AdmissionClaim::Repeat => {}
     }
 
     let expires_at = now.saturating_add(state.session_ttl_secs);
@@ -162,7 +187,7 @@ async fn handle<S: Store>(state: &AppState<S>, req: Request) -> Result<Response<
     // it is retryable: the position is still theirs, and the next poll tries
     // again.
     //
-    // The arrival was already recorded above, which is the right order for the
+    // The arrival was already counted above, which is the right order for the
     // reason given there: a visitor counted but not admitted understates the
     // no-show rate, which under-releases. The opposite mistake over-releases.
     let Ok(credential) = session.sign(&state.key) else {
@@ -218,7 +243,6 @@ fn refusal(denied: &Denied) -> Result<Response<Body>, Error> {
         Denied::StillQueued { .. } => 425,
         Denied::NotAdmitting | Denied::NotOpen => 409,
         Denied::NotRegistered => 404,
-        Denied::Spent => 410,
         Denied::Corrupt => 500,
     };
     let mut payload = serde_json::json!({
@@ -239,4 +263,188 @@ fn json<T: serde::Serialize>(status: u16, body: &T) -> Result<Response<Body>, Er
         .header("content-type", "application/json")
         .header("cache-control", "no-store")
         .body(Body::from(payload))?)
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
+
+    use std::sync::Mutex;
+
+    use generate_token::{AdmissionClaim, StoreError};
+    use wr_common::{Counters, Phase, PositionStatus, PreQueueItem, SHARDS, Shard};
+
+    use super::*;
+
+    /// An in-memory store that counts what the handler did, so a test can tell
+    /// "admitted and counted" from "admitted without counting".
+    struct FakeStore {
+        counters: Counters,
+        position: Option<(u64, PositionStatus)>,
+        prequeue: Option<PreQueueItem>,
+        /// How many times the admission has already been claimed. The first
+        /// claim wins, mirroring the conditional write.
+        claims: Mutex<u32>,
+        /// How many arrivals were recorded — the number that must not exceed
+        /// one release.
+        arrivals: Mutex<u32>,
+        /// When set, every claim fails as a store error rather than answering.
+        claim_fails: bool,
+    }
+
+    impl FakeStore {
+        fn admitting() -> Self {
+            Self {
+                counters: Counters {
+                    event_id: "evt".to_owned(),
+                    phase: Phase::Active,
+                    queue_counter: 100,
+                    serving_counter: 50,
+                    shuffle_seed: Some([7u8; 32]),
+                    participant_count: Some(100),
+                    prequeue_offsets: Some([0u64; SHARDS]),
+                    target_rate: Some(10),
+                    message: None,
+                    stored_control: wr_common::StoredControl::Open,
+                    fail_open_until: 0,
+                    starts_at: None,
+                },
+                position: Some((3, PositionStatus::Issued)),
+                prequeue: None,
+                claims: Mutex::new(0),
+                arrivals: Mutex::new(0),
+                claim_fails: false,
+            }
+        }
+
+        fn arrivals(&self) -> u32 {
+            *self.arrivals.lock().unwrap()
+        }
+    }
+
+    impl Store for FakeStore {
+        fn load_counters(
+            &self,
+            _event_id: &str,
+        ) -> impl std::future::Future<Output = Result<Option<Counters>, StoreError>> + Send
+        {
+            std::future::ready(Ok(Some(self.counters.clone())))
+        }
+
+        fn load_prequeue(
+            &self,
+            _request_id: &str,
+        ) -> impl std::future::Future<Output = Result<Option<PreQueueItem>, StoreError>> + Send
+        {
+            std::future::ready(Ok(self.prequeue.clone()))
+        }
+
+        fn load_position(
+            &self,
+            _request_id: &str,
+        ) -> impl std::future::Future<Output = Result<Option<(u64, PositionStatus)>, StoreError>> + Send
+        {
+            std::future::ready(Ok(self.position))
+        }
+
+        fn claim_admission(
+            &self,
+            _request_id: &str,
+            _position: u64,
+            _now: u64,
+        ) -> impl std::future::Future<Output = Result<AdmissionClaim, StoreError>> + Send {
+            let result = if self.claim_fails {
+                Err(StoreError("claim unavailable".to_owned()))
+            } else {
+                let mut claims = self.claims.lock().unwrap();
+                *claims = claims.saturating_add(1);
+                Ok(if *claims == 1 {
+                    AdmissionClaim::First
+                } else {
+                    AdmissionClaim::Repeat
+                })
+            };
+            std::future::ready(result)
+        }
+
+        fn record_arrival(
+            &self,
+            _event_id: &str,
+            _shard: Shard,
+        ) -> impl std::future::Future<Output = Result<(), StoreError>> + Send {
+            let mut arrivals = self.arrivals.lock().unwrap();
+            *arrivals = arrivals.saturating_add(1);
+            std::future::ready(Ok(()))
+        }
+    }
+
+    fn state(store: FakeStore) -> AppState<FakeStore> {
+        AppState {
+            store,
+            key: SigningKey::new(b"a-test-signing-key"),
+            event_id: "evt".to_owned(),
+            session_cookie_name: "vwr_session".to_owned(),
+            session_ttl_secs: 3600,
+        }
+    }
+
+    /// The request id travels in the body here; the query-string form needs the
+    /// Lambda request context the runtime attaches.
+    fn request() -> Request {
+        Request::new(Body::from(r#"{"request_id":"r1"}"#))
+    }
+
+    #[tokio::test]
+    async fn a_reloaded_page_is_admitted_again_but_counted_once() {
+        // request_id travels in a URL and the waiting page polls, so the second
+        // call is the normal case, not the exceptional one. Both calls must
+        // hand out a working session; only the first may reach the counter the
+        // controller measures no-shows against.
+        let state = state(FakeStore::admitting());
+
+        for _ in 0..3u8 {
+            let response = handle(&state, request()).await.unwrap();
+            assert_eq!(response.status(), 200);
+            assert!(response.headers().contains_key("set-cookie"));
+        }
+
+        assert_eq!(
+            state.store.arrivals(),
+            1,
+            "three admissions of one visitor counted more than one arrival"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_claim_counts_the_arrival_rather_than_losing_it() {
+        // The claim failed, so whether this arrival is already counted is
+        // unknown. Counting it understates the no-show rate and releases fewer
+        // people; missing it releases more than the origin agreed to serve.
+        let store = FakeStore {
+            claim_fails: true,
+            ..FakeStore::admitting()
+        };
+        let state = state(store);
+
+        let response = handle(&state, request()).await.unwrap();
+
+        assert_eq!(response.status(), 200);
+        assert_eq!(state.store.arrivals(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_visitor_whose_turn_has_not_come_claims_nothing() {
+        // The claim is made only after `decide` admits, so a visitor still in
+        // the queue leaves no row behind and no arrival counted -- otherwise
+        // polling would count an arrival for everyone waiting.
+        let mut store = FakeStore::admitting();
+        store.position = Some((70, PositionStatus::Issued));
+        let state = state(store);
+
+        let response = handle(&state, request()).await.unwrap();
+
+        assert_eq!(response.status(), 425);
+        assert_eq!(*state.store.claims.lock().unwrap(), 0);
+        assert_eq!(state.store.arrivals(), 0);
+    }
 }

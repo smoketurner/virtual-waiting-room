@@ -127,7 +127,8 @@ activation queues first-in, first-out (FIFO).
 
 **F3.8** — As an operator, I want no-show compensation so that actual origin arrivals hit the target.
 - THE SYSTEM SHALL compensate admission rate control for **no-shows** — admitted visitors who never arrive at the origin.
-- Acceptance: With a 30% no-show rate and a target of 500/min, actual origin arrivals converge on 500/min, not 350.
+- THE SYSTEM SHALL count each admitted visitor as one arrival however many times they call `/v1/generate_token`.
+- Acceptance: With a 30% no-show rate and a target of 500/min, actual origin arrivals converge on 500/min, not 350. A visitor who reloads the waiting page three times adds one to the arrivals count, not three.
 
 ### 1.5 Failure behaviour
 
@@ -197,7 +198,7 @@ here rather than deleted.
 | F3.9 | Queue positions expire if unused within an operator-configured period. | Implemented as a controller `Scan` of `Positions` six times a minute: unbounded, blind to the pre-queue cohort (which has no `Positions` row), advancing an attribute nothing read, and applying a grace expressed in seconds as a distance in positions — so a hidden tab lost its place (#97). The no-show correction already compensates for absentees. | ADR-0031 |
 | F3.6 | The session is separately signed from the admission token. | There is no admission token. `Kind` keeps its enum shape so a future second kind must carry its own label. | ADR-0032 |
 | F3.7 | Session lifetime supports a sliding window and a hard cap. | `SessionMode::Sliding` lived only in the origin authorizer; the edge does not re-issue a cookie. Retired rather than left as a `MUST` with no mechanism. | ADR-0032 |
-| F3.10 | Sessions are markable as completed or abandoned. | `POST /update_session` returned 501 and nothing wrote `Completed` or `Abandoned`. | ADR-0032 |
+| F3.10 | Sessions are markable as completed or abandoned. | `POST /update_session` returned 501 and nothing wrote `Completed` or `Abandoned`; both variants were deleted by ADR-0033. | ADR-0032 |
 | N6 | A full deployment is small enough to read and reason about in one sitting, targeting ≤ 80 Terraform-managed resources in `core`. | The intent was sound; the acceptance criterion never measured it. "Resources" was never defined as blocks or instances, and the two had drifted — 69 blocks, 8 of which expand through `for_each`. Worse, it was satisfiable by rewriting the same infrastructure: thirteen alarms as thirteen blocks breached the ceiling, the identical thirteen as three `for_each` blocks did not. A number that changes with formatting is not measuring comprehensibility. **N1 is the constraint that survives** — idle cost, which is what a resource count was standing in for. | — |
 | F6.3 | Bot-blocking decisions enforceable at event start rather than during the pre-queue. | Built as open-time demotion and never enabled; structurally blind to a client that bypassed CloudFront. | ADR-0030 |
 

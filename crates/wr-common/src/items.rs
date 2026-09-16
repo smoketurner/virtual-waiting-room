@@ -18,13 +18,23 @@ use crate::expr::STARTS_AT_ATTR;
 use crate::ids::{Phase, StoredControl};
 use crate::permutation::{Assignment, CohortOffsets, SHARDS, Seed};
 
-/// The admission status of a written [`Position`].
+/// What has happened to a `Positions` row.
+///
+/// Two states, and the transition between them is a conditional write: it is
+/// what makes admission happen once per visitor (issue #62). Neither is a
+/// refusal — a visitor whose row says `Admitted` is admitted again, with a
+/// freshly signed session, because the first response may simply not have
+/// reached them. What the transition decides is whether their arrival is
+/// counted, and the controller's no-show correction is only meaningful if it is
+/// counted once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PositionStatus {
+    /// A position claimed from `queue_counter`, not yet exchanged for a
+    /// session.
     Issued,
-    Completed,
-    Abandoned,
+    /// The position has been exchanged for a session and the arrival counted.
+    Admitted,
 }
 
 /// A `PreQueue` row: shard `s` and local index `l` for a request, written at
@@ -41,13 +51,18 @@ pub struct PreQueueItem {
     pub t: u64,
 }
 
-/// A `Positions` row, written lazily when a visitor is admitted.
+/// A `Positions` row.
+///
+/// A live joiner gets one at registration, carrying the position claimed from
+/// `queue_counter`. A pre-queue member has none — their position is derived
+/// from the seed on read — until they are admitted, when the admission claim
+/// creates one to record that their arrival has been counted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PositionItem {
     pub request_id: String,
-    /// The queue position this request holds. For a live joiner it is the value
-    /// claimed from `queue_counter`; a pre-queue member's position is derived
-    /// from the seed on read and never written here.
+    /// The queue position this request holds: claimed from `queue_counter` for
+    /// a live joiner, or the seed-derived one stamped at admission for a
+    /// pre-queue member.
     pub queue_position: u64,
     /// Server-stamped arrival time in epoch seconds. Authoritative: a
     /// client-supplied request id may also carry a timestamp (a `UUIDv7`
@@ -55,11 +70,11 @@ pub struct PositionItem {
     /// guaranteed to be present.
     pub entry_time: u64,
     pub status: PositionStatus,
-    /// Post-event storage reclamation only, never the expiry mechanism. A
-    /// position is expired by the controller when the admission cursor has
-    /// passed it and it was not claimed; there is deliberately no per-row
-    /// deadline, because a deadline set when the position is issued expires
-    /// people for waiting the length of the queue they are waiting in.
+    /// Post-event storage reclamation only, never an admission deadline
+    /// (ADR-0031). A deadline set when the position is issued would expire
+    /// people for waiting the length of the queue they are waiting in, so
+    /// nothing reads this to decide whether a visitor may be admitted; the
+    /// controller's no-show correction is what compensates for absentees.
     pub ttl: u64,
 }
 

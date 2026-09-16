@@ -87,6 +87,28 @@ pub const STARTS_AT_TZ_ATTR: &str = "starts_at_tz";
 /// know which words are reserved.
 pub const STATUS_ATTR: &str = "status";
 
+/// The position a `Positions` row holds.
+pub const QUEUE_POSITION_ATTR: &str = "queue_position";
+
+/// The server-stamped time a `Positions` row was created, epoch seconds.
+pub const ENTRY_TIME_ATTR: &str = "entry_time";
+
+/// The expiry attribute of a `Positions` row.
+///
+/// The `Positions` table's `ttl { attribute_name }` in
+/// `infra/modules/core/main.tf`, for the same reason [`TOKENS_TTL_ATTR`] is
+/// named here: `DynamoDB` reclaims a row only when the attribute it was told to
+/// watch is the one the writers set, and the two sides are one name in two
+/// layers that nothing checks against each other. A row written with a
+/// different spelling is never reclaimed, and nothing reports it.
+pub const POSITIONS_TTL_ATTR: &str = "ttl";
+
+/// How long a `Positions` row lives before `DynamoDB` reclaims it.
+///
+/// Storage reclamation only, never an admission deadline: it is far longer than
+/// any event, and nothing reads it to decide whether a visitor may be admitted.
+pub const POSITION_TTL_SECS: u64 = 86_400;
+
 /// Which item a key addresses.
 ///
 /// One type rather than a constructor per item kind, so the tag prefixes and
@@ -238,6 +260,21 @@ impl Update {
     pub fn set(mut self, attr: &str, value: AttributeValue) -> Self {
         let (name, placeholder) = self.bind(attr, value);
         self.set.push(format!("{name} = {placeholder}"));
+        self
+    }
+
+    /// `SET <attr> = if_not_exists(<attr>, <value>)` — writes the value only
+    /// when the attribute is absent.
+    ///
+    /// For an `UpdateItem` that has to serve both a row that already exists and
+    /// one it is creating: the fields that belong to the row's creation keep
+    /// the values they were created with, while the rest of the same update
+    /// overwrites normally.
+    #[must_use]
+    pub fn set_if_not_exists(mut self, attr: &str, value: AttributeValue) -> Self {
+        let (name, placeholder) = self.bind(attr, value);
+        self.set
+            .push(format!("{name} = if_not_exists({name}, {placeholder})"));
         self
     }
 
@@ -540,6 +577,45 @@ mod tests {
             .set("queue_counter", AttributeValue::N("9".to_owned()))
             .build();
         assert_eq!(built.values.len(), 2);
+        assert_self_consistent(&built);
+    }
+
+    #[test]
+    fn if_not_exists_names_the_attribute_on_both_sides() {
+        // `#u0 = if_not_exists(#u0, :u0)`. Naming a different attribute inside
+        // the call would read someone else's value and write it here, and the
+        // expression would still be valid -- so the shape is asserted, not just
+        // that it parses. The admission claim depends on it: the clause is what
+        // keeps a live joiner's entry_time from being overwritten with the
+        // moment they were admitted.
+        let built = Update::new()
+            .set_if_not_exists(ENTRY_TIME_ATTR, AttributeValue::N("100".to_owned()))
+            .build();
+
+        assert_eq!(built.names.len(), 1);
+        assert_eq!(built.values.len(), 1);
+        let name = built.names.keys().next().unwrap();
+        let placeholder = built.values.keys().next().unwrap();
+        assert_eq!(
+            built.expression,
+            format!("SET {name} = if_not_exists({name}, {placeholder})")
+        );
+        assert_self_consistent(&built);
+    }
+
+    #[test]
+    fn if_not_exists_mixes_with_a_plain_set_in_one_expression() {
+        // The claim writes both kinds at once: the status and position
+        // overwrite, the creation stamp does not.
+        let built = Update::new()
+            .set(STATUS_ATTR, AttributeValue::S("admitted".to_owned()))
+            .set_if_not_exists(ENTRY_TIME_ATTR, AttributeValue::N("100".to_owned()))
+            .build();
+
+        assert!(built.expression.starts_with("SET "));
+        assert!(built.expression.contains(", "));
+        assert_eq!(built.expression.matches("if_not_exists(").count(), 1);
+        assert_eq!(built.names.len(), 2);
         assert_self_consistent(&built);
     }
 

@@ -354,12 +354,20 @@ answers.
 
 `decide` refuses in this order: resolved admission control (`wr_common::resolve(stored_control,
 fail_open_until, now)`, issue #71) not `Open`, phase not `Active`, no registration, position not
-yet reached. A `Positions` row whose status is `completed`, `abandoned` or `expired` is `Spent` —
-permanent, so the client stops rather than keeps polling. The cursor is exclusive:
-`position >= serving_counter` means still queued.
+yet reached. The cursor is exclusive: `position >= serving_counter` means still queued. A row
+whose status is already `admitted` is not a refusal — see below.
 
 Refusals map to statuses the waiting page acts on: 425 still queued, 409 not admitting or not
-opened, 404 not registered, 410 spent, 500 corrupt.
+opened, 404 not registered, 500 corrupt.
+
+**The admission is then claimed** (ADR-0033): one `UpdateItem` setting `status = admitted`,
+guarded by `attribute_not_exists(request_id) OR status = "issued"`. One expression covers both
+populations — it claims a live joiner's existing row and creates the row a pre-queue member does
+not have. Only the call that wins the guard records an arrival. A call that loses it is still
+admitted with a freshly signed session, because `request_id` travels in a URL and a reload, a
+second tab or a lost response must not strand a visitor holding a position that is still theirs.
+A claim that fails with a store error counts the arrival anyway and logs `admission_claim_failed`:
+over-counting under-releases, missing one over-releases.
 
 The arrival is recorded before the cookie is signed. A visitor counted but not admitted
 understates the no-show rate. One admitted but not counted makes the controller over-release for
@@ -536,11 +544,6 @@ no inflow alarm and no automatic phase transition.
 them. The origin authorizer that filled the role was removed (ADR-0032) — it had never been
 invoked, and as wired it forwarded every request. N4 now says commercial regions are supported
 and GovCloud is out of scope until a gate exists for it.
-
-**Sessions cannot be completed or abandoned.** `PositionStatus` has `Completed` and `Abandoned`
-variants that `generate_token` refuses on, and no writer sets either. `/update_session` was the
-endpoint that would have, and it went with the authorizer (ADR-0032), so `Issued` is the only
-reachable variant.
 
 **The edge does not extend sessions.** `generate_token` mints one session for
 `SESSION_TTL_SECS` and nothing re-issues it, so a visitor still on the origin when it expires

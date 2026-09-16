@@ -319,9 +319,8 @@ data "aws_iam_policy_document" "scheduler_assume_role" {
   }
 }
 
-# generate_token: read the counters and the visitor's position, count the
-# arrival, and read the signing key. It writes only the arrivals counter, so an
-# UpdateItem on Counters is the whole write surface.
+# generate_token: read the counters and the visitor's position, claim the
+# admission, count the arrival, and read the signing key.
 data "aws_iam_policy_document" "generate_token" {
   statement {
     sid     = "ReadQueueState"
@@ -339,6 +338,17 @@ data "aws_iam_policy_document" "generate_token" {
     effect    = "Allow"
     actions   = ["dynamodb:UpdateItem"]
     resources = [aws_dynamodb_table.counters.arn]
+  }
+
+  # Issue #62: one conditional write per visitor marks their admission claimed,
+  # so a reloaded page does not count a second arrival against one release. It
+  # creates the row for a pre-queue member, who has none until then, which is
+  # why this is UpdateItem on Positions rather than a narrower grant.
+  statement {
+    sid       = "ClaimAdmission"
+    effect    = "Allow"
+    actions   = ["dynamodb:UpdateItem"]
+    resources = [aws_dynamodb_table.positions.arn]
   }
 
   statement {
