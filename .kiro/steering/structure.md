@@ -71,7 +71,7 @@ runtime wiring.
 | `Counters` | `event_id` | The event item `EVT#{id}`, plus its striped shard items `EVT#{id}#PQ#{n}` and `EVT#{id}#AR#{n}` |
 | `PreQueue` | `r` (request_id) | Shard `s` + local index `l` (+ time `t`); global index `i=offset[s]+l` assembled at T−0; scanned only at audit |
 | `Positions` | `request_id` | Written lazily at admission; reclaimed by DynamoDB TTL |
-| `Tokens` | `request_id` | Three tagged kinds: admission-token reservations `TKN#`, operator OIDC sessions `SESS#`, pending PKCE logins `PKCE#` |
+| `Tokens` | `request_id` | Two tagged kinds: operator OIDC sessions `SESS#`, pending PKCE logins `PKCE#`. The key's name is a misnomer inherited from the admission tokens it was built for (ADR-0032) |
 
 Keys are tagged only where a table holds more than one kind of item; `Positions` and `PreQueue`
 take bare ids because a tag there disambiguates nothing and costs bytes in every row. Every key

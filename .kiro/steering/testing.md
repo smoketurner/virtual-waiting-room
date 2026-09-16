@@ -40,8 +40,9 @@ visible fairness failure at 1,000,000 people. Tests are the primary evidence.
   **zero duplicates**; gaps are permitted and their rate is measured, not eliminated.
 - **Idempotent join** — repeating a join with the same `request_id` consumes no extra
   position; malformed joins consume none.
-- **Admission / session** — a captured admission token cannot be replayed as a session, or
-  vice versa; a session survives a second page view without re-queueing.
+- **Session** — a session is signed under a key *derived* from the deployment secret, never the
+  secret itself, so a future second credential kind cannot validate as a session; a session
+  survives a second page view without re-queueing.
 - **Cross-language credential and rule conformance (ADR-0021, issue #71)** — a frozen wire
   contract with the edge, proven by generated vectors rather than hand-written assertions on
   either side. `crates/wr-common/tests/vectors.rs` generates
