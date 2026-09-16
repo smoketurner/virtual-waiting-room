@@ -20,7 +20,11 @@
 //!
 //! 1. Read the shard counts, so the cohort is fixed.
 //! 2. Scan the pre-queue and classify it. Nothing is written yet, so a
-//!    double-fire at this point costs a duplicate scan and nothing else.
+//!    double-fire at this point costs a duplicate scan and nothing else. The
+//!    scan is the one store boundary that cannot be scoped to the event — the
+//!    pre-queue table is shared and its rows carry no event id — so a
+//!    classification covering more rows than the event registered is another
+//!    event's, and is reported rather than enforced.
 //! 3. Write the demoted group set — the [`wr_common::DemotionSet`] every
 //!    resolver will match rows against — as chunk items under a per-run
 //!    nonce. Written *before* the election so the winning seal never names a
@@ -272,7 +276,31 @@ pub async fn seal_event<S: Store>(
     }
 
     let classification = classify_cohort(store, &values, rules.clone()).await?;
-    let enforcing = config.mode == DemotionMode::Enforce && classification.demoted > 0;
+
+    // A cohort wider than the event's own participant count means the scan
+    // read rows this event never wrote. Every registration holds a local index
+    // below its shard's sealed count, so all of them land in the cohort, and
+    // request_id reuse or a straggler can only take rows out of it — nothing
+    // in a single-event run puts the count above N. The excess is therefore
+    // another event's registrations left in the shared table, and the groups
+    // built from them are not this event's to demote.
+    //
+    // The seal itself is unharmed: its values come from the shard counts, not
+    // the scan. So the event opens on time with the control switched off, and
+    // the report carries both numbers and the reason — the same trade the
+    // unparsable-rules path makes, for the same reason.
+    let contaminated = classification.cohort > values.participant_count;
+    if contaminated {
+        tracing::error!(
+            event_id,
+            participant_count = values.participant_count,
+            cohort = classification.cohort,
+            "pre-queue scan covered more rows than this event registered; sealing without demotion"
+        );
+    }
+
+    let enforcing =
+        !contaminated && config.mode == DemotionMode::Enforce && classification.demoted > 0;
     if enforcing {
         let set = DemotionSet::from_groups(&classification.groups);
         let chunks = set.to_chunks(MAX_CHUNK_BYTES);
@@ -312,11 +340,19 @@ pub async fn seal_event<S: Store>(
         demoted_groups = classification.groups.len(),
         demoted = classification.demoted,
         enforced = enforcing,
+        contaminated,
         mode = config.mode.as_wire_str(),
         "event sealed"
     );
 
-    let report = DemotionReport::from_classification(config.mode, rules, &classification, now);
+    let mut report = DemotionReport::from_classification(config.mode, rules, &classification, now);
+    if contaminated {
+        report.error = Some(format!(
+            "the scan covered {} cohort rows against {} registrations for this event, so it \
+             included another event's rows; nothing was demoted",
+            classification.cohort, values.participant_count
+        ));
+    }
     if let Err(e) = store.write_report(event_id, &report).await {
         // The report is for the operator; the seal has landed, so this is
         // logged rather than fatal.
@@ -691,6 +727,119 @@ mod tests {
         assert_eq!(report.cohort, 5);
         assert_eq!(report.demoted, 0);
         assert!(store.chunks.lock().unwrap().is_empty());
+    }
+
+    /// Eight rows on shard 0 sharing one address, for an event that issued
+    /// five indices: five are this event's and three were left in the shared
+    /// pre-queue table by a previous one. The scan cannot tell them apart, so
+    /// the cohort comes back at 8 against a participant count of 5.
+    fn another_events_rows_mixed_in() -> Vec<ScannedRow> {
+        (0..8).map(|l| row(0, l % 5, "198.51.100.1")).collect()
+    }
+
+    #[tokio::test]
+    async fn a_scan_wider_than_the_event_seals_on_time_without_demoting() {
+        // The groups are built from another event's rows, so they are not this
+        // event's to demote — but the seal's own values come from the shard
+        // counts, so the event still opens, with the tail unused.
+        let store = FakeStore::new([5, 0, 0, 0, 0, 0, 0, 0, 0, 0], false)
+            .with_rows(another_events_rows_mixed_in());
+        let result = seal_event(
+            &store,
+            "evt-1",
+            [1u8; 32],
+            NONCE,
+            &config("address:4", DemotionMode::Enforce),
+            1,
+        )
+        .await
+        .unwrap();
+        let SealResult::Sealed(values) = result else {
+            panic!("expected a first seal");
+        };
+        assert_eq!(values.participant_count, 5);
+        assert_eq!(values.demoted_count, 0);
+        assert!(values.demotion.is_none());
+        // No tail, so live joins start at N rather than 2N.
+        assert_eq!(values.queue_counter_start().unwrap(), 5);
+        assert!(store.chunks.lock().unwrap().is_empty());
+        assert!(store.written.lock().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_scan_wider_than_the_event_says_why_in_the_report() {
+        // The operator's only record of a control that did not apply: both
+        // counts, so the mismatch is visible, and the reason beside them.
+        let store = FakeStore::new([5, 0, 0, 0, 0, 0, 0, 0, 0, 0], false)
+            .with_rows(another_events_rows_mixed_in());
+        seal_event(
+            &store,
+            "evt-1",
+            [1u8; 32],
+            NONCE,
+            &config("address:4", DemotionMode::Enforce),
+            1,
+        )
+        .await
+        .unwrap();
+        let report = store.report.lock().unwrap().clone().unwrap();
+        assert_eq!(report.cohort, 8);
+        assert_eq!(report.mode, "enforce");
+        let error = report.error.unwrap();
+        assert!(error.contains('8'), "names the cohort: {error}");
+        assert!(error.contains('5'), "names the registrations: {error}");
+        assert!(error.contains("another event"), "names the cause: {error}");
+    }
+
+    #[tokio::test]
+    async fn a_scan_wider_than_the_event_is_reported_under_observe_too() {
+        // Observe demotes nobody either way; what the guard adds here is that
+        // the report does not present another event's rows as a classification
+        // this event's thresholds can be tuned against.
+        let store = FakeStore::new([5, 0, 0, 0, 0, 0, 0, 0, 0, 0], false)
+            .with_rows(another_events_rows_mixed_in());
+        seal_event(
+            &store,
+            "evt-1",
+            [1u8; 32],
+            NONCE,
+            &config("address:4", DemotionMode::Observe),
+            1,
+        )
+        .await
+        .unwrap();
+        let report = store.report.lock().unwrap().clone().unwrap();
+        assert_eq!(report.mode, "observe");
+        assert!(report.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_clean_scan_reports_no_error() {
+        // The boundary — a cohort exactly filling the event — is a full
+        // turnout, not contamination, and is pinned to enforce by
+        // `enforce_mode_writes_the_set_before_the_seal_and_names_it_in_the_seal`.
+        // This is the other half: nothing is flagged on the clean path.
+        let store = FakeStore::new([10, 0, 0, 0, 0, 0, 0, 0, 0, 0], false).with_rows(farmed_rows());
+        seal_event(
+            &store,
+            "evt-1",
+            [1u8; 32],
+            NONCE,
+            &config("address:5", DemotionMode::Enforce),
+            1,
+        )
+        .await
+        .unwrap();
+        assert!(
+            store
+                .report
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap()
+                .error
+                .is_none()
+        );
     }
 
     #[tokio::test]

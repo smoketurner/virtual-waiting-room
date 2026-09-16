@@ -589,8 +589,9 @@ pub struct DemotionReport {
     pub groups: Vec<ReportGroup>,
     /// When the seal ran, epoch seconds.
     pub sealed_at: u64,
-    /// Set when the rules could not be parsed at all: the seal then ran with no
-    /// demotion rather than not at all, and this says so.
+    /// Set when the seal ran with no demotion rather than not at all, and says
+    /// which of the two reasons applied: the rules did not parse, or the scan
+    /// covered another event's rows and the classification is not this event's.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub error: Option<String>,
 }
