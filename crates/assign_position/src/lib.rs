@@ -51,7 +51,7 @@ use std::collections::HashSet;
 use std::future::Future;
 
 use serde::Deserialize;
-use wr_common::{Assignment, Counters, Phase, Shard, Telemetry};
+use wr_common::{Assignment, Counters, Phase, Shard};
 
 pub mod dynamo;
 
@@ -69,7 +69,6 @@ pub struct JoinMessage {
 pub struct BatchRecord {
     pub message_id: String,
     pub body: String,
-    pub telemetry: Telemetry,
 }
 
 /// A position write to attempt: the request, the queue position it claimed,
@@ -78,7 +77,6 @@ pub struct BatchRecord {
 pub struct PositionWrite {
     pub request_id: String,
     pub position: u64,
-    pub telemetry: Telemetry,
     /// Whether the write may overwrite an existing row whose `status` is
     /// `expired`. A re-join keeps its `request_id`, so without this it could
     /// never reclaim the id a controller-expired live join left behind,
@@ -97,7 +95,6 @@ pub struct PreQueueWrite {
     pub request_id: String,
     pub shard: Shard,
     pub local_index: u64,
-    pub telemetry: Telemetry,
 }
 
 /// The persistence port the batch logic drives.
@@ -278,7 +275,7 @@ pub async fn process_batch<S: Store>(
     for record in records {
         match classify_record(&record.body, event_id) {
             RecordVerdict::Accept(msg) => {
-                valid.push((record.message_id.clone(), msg, record.telemetry.clone()));
+                valid.push((record.message_id.clone(), msg));
             }
             RecordVerdict::Reject(reason) => drops.record(reason),
         }
@@ -315,14 +312,14 @@ pub async fn process_batch<S: Store>(
                 valid = valid.len(),
                 "no Counters item; failing batch until the event is set up"
             );
-            for (message_id, _, _) in &valid {
+            for (message_id, _) in &valid {
                 outcome.failures.push(message_id.clone());
             }
             return outcome;
         }
         Err(err) => {
             tracing::error!(error = %err, "counters read failed; retrying batch");
-            for (message_id, _, _) in &valid {
+            for (message_id, _) in &valid {
                 outcome.failures.push(message_id.clone());
             }
             return outcome;
@@ -372,12 +369,12 @@ async fn registered_ids_or_unknown<S: Store>(store: &S, request_ids: &[String]) 
 async fn process_live_batch<S: Store>(
     store: &S,
     event_id: &str,
-    valid: Vec<(String, JoinMessage, Telemetry)>,
+    valid: Vec<(String, JoinMessage)>,
     outcome: &mut BatchOutcome,
 ) {
     let ids: Vec<String> = valid
         .iter()
-        .map(|(_, msg, _)| msg.request_id.clone())
+        .map(|(_, msg)| msg.request_id.clone())
         .collect();
     let has_prequeue_row = registered_ids_or_unknown(store, &ids).await;
 
@@ -386,7 +383,7 @@ async fn process_live_batch<S: Store>(
         Ok(end) => end,
         Err(err) => {
             tracing::error!(error = %err, "queue_counter claim failed; retrying batch");
-            for (message_id, _, _) in &valid {
+            for (message_id, _) in &valid {
                 outcome.failures.push(message_id.clone());
             }
             return;
@@ -398,7 +395,7 @@ async fn process_live_batch<S: Store>(
     // is a guard against a counter that was reset, never normal arithmetic.
     let start = end.saturating_sub(n).saturating_add(1);
 
-    for (offset, (message_id, msg, telemetry)) in valid.into_iter().enumerate() {
+    for (offset, (message_id, msg)) in valid.into_iter().enumerate() {
         let write = PositionWrite {
             allow_expired_overwrite: !has_prequeue_row.contains(&msg.request_id),
             request_id: msg.request_id,
@@ -406,7 +403,6 @@ async fn process_live_batch<S: Store>(
             // position is indistinguishable from a valid low one, never a
             // harmless gap.
             position: start.saturating_add(offset as u64),
-            telemetry,
         };
         if let Err(err) = store.put_position(&write).await {
             tracing::error!(error = %err, message_id = %message_id, "position write failed");
@@ -425,7 +421,7 @@ async fn process_prequeue_batch<S: Store>(
     store: &S,
     event_id: &str,
     shard: Shard,
-    valid: Vec<(String, JoinMessage, Telemetry)>,
+    valid: Vec<(String, JoinMessage)>,
     outcome: &mut BatchOutcome,
 ) {
     // In-batch dedupe: a browser that denies every storage tier re-sends the
@@ -435,9 +431,9 @@ async fn process_prequeue_batch<S: Store>(
     // them rather than one each.
     let mut seen_in_batch = HashSet::new();
     let mut deduped = Vec::with_capacity(valid.len());
-    for (message_id, msg, telemetry) in valid {
+    for (message_id, msg) in valid {
         if seen_in_batch.insert(msg.request_id.clone()) {
-            deduped.push((message_id, msg, telemetry));
+            deduped.push((message_id, msg));
         }
     }
 
@@ -447,12 +443,12 @@ async fn process_prequeue_batch<S: Store>(
     // authoritative guard; this only avoids paying for the claim.
     let ids: Vec<String> = deduped
         .iter()
-        .map(|(_, msg, _)| msg.request_id.clone())
+        .map(|(_, msg)| msg.request_id.clone())
         .collect();
     let already_registered = registered_ids_or_unknown(store, &ids).await;
-    let group: Vec<(String, JoinMessage, Telemetry)> = deduped
+    let group: Vec<(String, JoinMessage)> = deduped
         .into_iter()
-        .filter(|(_, msg, _)| !already_registered.contains(&msg.request_id))
+        .filter(|(_, msg)| !already_registered.contains(&msg.request_id))
         .collect();
 
     if group.is_empty() {
@@ -464,7 +460,7 @@ async fn process_prequeue_batch<S: Store>(
         Ok(start) => start,
         Err(err) => {
             tracing::error!(error = %err, shard = shard.index(), "prequeue shard claim failed; retrying batch");
-            for (message_id, _, _) in &group {
+            for (message_id, _) in &group {
                 outcome.failures.push(message_id.clone());
             }
             return;
@@ -475,7 +471,7 @@ async fn process_prequeue_batch<S: Store>(
     // docs), carried into the fix-up below.
     let mut written = Vec::new();
 
-    for (offset, (message_id, msg, telemetry)) in group.into_iter().enumerate() {
+    for (offset, (message_id, msg)) in group.into_iter().enumerate() {
         let write = PreQueueWrite {
             request_id: msg.request_id,
             shard,
@@ -485,7 +481,6 @@ async fn process_prequeue_batch<S: Store>(
             // small relative to `u64::MAX` here, so this is defensive, not
             // reachable in practice.
             local_index: start.saturating_add(offset as u64),
-            telemetry,
         };
         match store.put_prequeue(&write).await {
             Ok(WriteOutcome::Written) => written.push(write),
@@ -575,7 +570,6 @@ async fn fixup_stragglers<S: Store>(store: &S, event_id: &str, written: Vec<PreQ
         let position_write = PositionWrite {
             request_id: write.request_id,
             position: start.saturating_add(offset as u64),
-            telemetry: write.telemetry,
             // A straggler fix-up is the first live write for this id; there
             // is no row yet to collide with an expired one.
             allow_expired_overwrite: true,
@@ -780,7 +774,6 @@ mod tests {
         BatchRecord {
             message_id: message_id.to_owned(),
             body: format!(r#"{{"request_id":"{request_id}","event_id":"evt-1"}}"#),
-            telemetry: Telemetry::default(),
         }
     }
 
@@ -871,7 +864,6 @@ mod tests {
             BatchRecord {
                 message_id: "m2".to_owned(),
                 body: "not json".to_owned(),
-                telemetry: Telemetry::default(),
             },
             rec("m3", BAD_SHAPE_ID),
         ];
@@ -889,7 +881,6 @@ mod tests {
         let records = vec![BatchRecord {
             message_id: "m1".to_owned(),
             body: "garbage".to_owned(),
-            telemetry: Telemetry::default(),
         }];
         let outcome = run_open(&store, &records).await;
         assert!(outcome.failures.is_empty());

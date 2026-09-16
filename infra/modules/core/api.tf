@@ -194,7 +194,7 @@ resource "aws_api_gateway_deployment" "this" {
       # in-place update, so hash their mutable config too — the same hazard the
       # endpoint methods below carry. Without this, editing the SQS mapping
       # template or the request schema leaves the stage serving the previous
-      # one, and join-time telemetry silently never arrives.
+      # one, and a join is accepted into a queue nobody is reading.
       jsonencode(aws_api_gateway_integration.join_sqs.request_templates),
       jsonencode(aws_api_gateway_integration.join_sqs.request_parameters),
       aws_api_gateway_model.join.schema,

@@ -197,9 +197,9 @@ Reliability — the waiting room must not be the reason the site is down:
 Fairness and abuse — nothing bounds how many places one visitor takes:
 
 - [ ] [#59](https://github.com/smoketurner/virtual-waiting-room/issues/59) No one-position-per-visitor control [F6.3]
-      `Partial:` server-drawn shards, the reload dedupe and join telemetry are built. The entry
-      tickets are not — they were removed (ADR-0028). Nothing bounds volume; see the unchecked
-      items in §1g.
+      `Partial:` server-drawn shards and the reload dedupe are built. Entry tickets were
+      removed (ADR-0028) and the join telemetry with open-time demotion (ADR-0030). Nothing
+      bounds volume; see the unchecked items in §1g.
 - [ ] [#61](https://github.com/smoketurner/virtual-waiting-room/issues/61) Admission cookies wildcard-scoped and transferable
 - [ ] [#62](https://github.com/smoketurner/virtual-waiting-room/issues/62) `request_id` is both a public cache key and the bearer credential
 - [ ] [#63](https://github.com/smoketurner/virtual-waiting-room/issues/63) No way to revoke an admission

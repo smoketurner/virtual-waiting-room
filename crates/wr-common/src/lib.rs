@@ -27,7 +27,7 @@ pub use ids::{
 };
 pub use items::{
     Counters, OpenOutputs, PositionItem, PositionStatus, PreQueueItem, ResolveError,
-    ResolvedPosition, Telemetry, shard_count_of, shard_index_of,
+    ResolvedPosition, shard_count_of, shard_index_of,
 };
 pub use permutation::{
     Assignment, CohortError, CohortOffsets, RandError, SHARDS, Seed, Shard, prp,
