@@ -201,8 +201,10 @@ needs SigV4A, which the Rust SDK signs with RustCrypto (`p256`/`hmac`/`sha2`, th
 `aws-sdk-cloudfrontkeyvaluestore` crate's `sigv4a` feature). That path is control-plane only. The
 admission path mints and verifies with `aws-lc-rs`.
 
-Keep the `core` module at or under 80 Terraform resources (requirement N6); justify additions.
-Currently 69: the event-item seed is the one addition, and it is what makes an applied stack serve.
+There is no resource-count ceiling: N6 was retired because the number never measured what it
+was standing in for and moved when the same infrastructure was written differently. The
+constraint that matters is **N1 — idle cost under $5/month when no event is running**. Judge an
+addition by what it bills between events, not by how many blocks it takes.
 
 ## Conventions specific to this repo
 

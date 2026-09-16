@@ -1043,8 +1043,8 @@ pub async fn apply_set_rules<S: Store, E: EdgeConfigStore>(
         // gate reads. A missed audit stamp costs the dashboard's "last
         // changed by X at T" line, not correctness. cloudfront-keyvaluestore
         // writes are data-plane and outside CloudTrail management events, so
-        // this log line — under a stable event name a metric filter can
-        // alarm on — is the only trail a failed stamp leaves.
+        // this log line is the only trail a failed stamp leaves. The metric
+        // filter and alarm on `rules_audit_failed` are in core's logging.tf.
         tracing::error!(
             error = %e,
             event = "rules_audit_failed",

@@ -198,6 +198,7 @@ here rather than deleted.
 | F3.6 | The session is separately signed from the admission token. | There is no admission token. `Kind` keeps its enum shape so a future second kind must carry its own label. | ADR-0032 |
 | F3.7 | Session lifetime supports a sliding window and a hard cap. | `SessionMode::Sliding` lived only in the origin authorizer; the edge does not re-issue a cookie. Retired rather than left as a `MUST` with no mechanism. | ADR-0032 |
 | F3.10 | Sessions are markable as completed or abandoned. | `POST /update_session` returned 501 and nothing wrote `Completed` or `Abandoned`. | ADR-0032 |
+| N6 | A full deployment is small enough to read and reason about in one sitting, targeting ≤ 80 Terraform-managed resources in `core`. | The intent was sound; the acceptance criterion never measured it. "Resources" was never defined as blocks or instances, and the two had drifted — 69 blocks, 8 of which expand through `for_each`. Worse, it was satisfiable by rewriting the same infrastructure: thirteen alarms as thirteen blocks breached the ceiling, the identical thirteen as three `for_each` blocks did not. A number that changes with formatting is not measuring comprehensibility. **N1 is the constraint that survives** — idle cost, which is what a resource count was standing in for. | — |
 | F6.3 | Bot-blocking decisions enforceable at event start rather than during the pre-queue. | Built as open-time demotion and never enabled; structurally blind to a client that bypassed CloudFront. | ADR-0030 |
 
 ### 1.8 Operator web interface
@@ -279,10 +280,6 @@ pre-event preparation in the Operational section.
 **N5** — As an operator, I want everything in Terraform so that deployment has no manual steps.
 - THE SYSTEM SHALL express infrastructure as Terraform.
 - Acceptance: No manual console steps in the deployment path.
-
-**N6** — As a maintainer, I want a small deployment so that it can be reasoned about in one sitting.
-- THE SYSTEM SHOULD keep a full deployment small enough to read and reason about in one sitting.
-- Acceptance: Target ≤ 80 Terraform-managed resources for the core module.
 
 **N7** — As an operator, I want edge abuse mitigation so that bots are handled before the origin.
 - THE SYSTEM SHALL provide bot and abuse mitigation at the edge.

@@ -43,6 +43,11 @@ resource "aws_lambda_function" "open_event" {
   }
 
   tags = var.tags
+
+  # Terraform's log group must exist before the function can be invoked, or
+  # Lambda auto-creates one that never expires and Terraform's create collides
+  # with it.
+  depends_on = [aws_cloudwatch_log_group.lambda]
 }
 
 # --- read ---------------------------------------------------------------------
@@ -85,6 +90,11 @@ resource "aws_lambda_function" "read" {
   }
 
   tags = var.tags
+
+  # Terraform's log group must exist before the function can be invoked, or
+  # Lambda auto-creates one that never expires and Terraform's create collides
+  # with it.
+  depends_on = [aws_cloudwatch_log_group.lambda]
 }
 
 # API Gateway invokes the read Lambda for the status / queue_num routes.
@@ -173,6 +183,11 @@ resource "aws_lambda_function" "admin" {
       error_message = "oidc_allowed_emails must list at least one operator, or every login is denied and the event has no control plane."
     }
   }
+
+  # Terraform's log group must exist before the function can be invoked, or
+  # Lambda auto-creates one that never expires and Terraform's create collides
+  # with it.
+  depends_on = [aws_cloudwatch_log_group.lambda]
 }
 
 # API Gateway invokes the admin Lambda for the SigV4 /admin, /metrics, and
@@ -316,6 +331,11 @@ resource "aws_lambda_function" "controller" {
   }
 
   tags = var.tags
+
+  # Terraform's log group must exist before the function can be invoked, or
+  # Lambda auto-creates one that never expires and Terraform's create collides
+  # with it.
+  depends_on = [aws_cloudwatch_log_group.lambda]
 }
 
 # --- controller schedule (EventBridge Scheduler) ------------------------------

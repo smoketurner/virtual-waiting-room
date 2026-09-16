@@ -179,7 +179,7 @@ pub struct BatchOutcome {
 /// Why a record was permanently rejected: never retried, never
 /// dead-lettered, since no redelivery makes attacker-chosen or malformed
 /// input valid. Counted by [`DropCounts`] and logged once per batch under the
-/// fixed field names a metric filter keys on.
+/// fixed field names the `join_dropped` metric filter keys on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DropReason {
     /// The body did not parse as JSON, or a required field was missing or the
@@ -189,8 +189,8 @@ pub enum DropReason {
     WrongEvent,
 }
 
-/// Per-reason drop counts for one batch, logged under fixed field names so a
-/// `CloudWatch` metric filter can extract `total` mechanically.
+/// Per-reason drop counts for one batch, logged under fixed field names so the
+/// `join_dropped` metric filter can extract `total` mechanically.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct DropCounts {
     bad_shape: u64,
