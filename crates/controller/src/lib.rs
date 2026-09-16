@@ -102,16 +102,16 @@ pub struct ReleaseInputs {
     /// The current `serving_counter`.
     pub serving_counter: u64,
     /// The highest position ever issued. The live-join sequence ends here, and
-    /// after a seal it starts at the cohort size, so this is the end of the
+    /// after an open it starts at the cohort size, so this is the end of the
     /// line however the positions were assigned.
     pub queue_counter: u64,
     /// Operator target rate in visitors per second (the `/admin/rate` value).
     pub target_rate: u32,
-    /// `N`, the sealed pre-queue cohort size; `0` before a seal or for a
+    /// `N`, the opened pre-queue cohort size; `0` before an open or for a
     /// live-join-only event. With `demoted_count` it lays out the position
     /// space ([`Tiers`]) the cursor walks.
     pub participant_count: u64,
-    /// `D`, how many cohort rows the seal demoted into the tail `[N, 2N)`
+    /// `D`, how many cohort rows the open demoted into the tail `[N, 2N)`
     /// (issue #145); `0` when none.
     pub demoted_count: u64,
 }
@@ -237,7 +237,7 @@ pub fn compute_release(inputs: ReleaseInputs, prev: Option<NoShowState>) -> Rele
 
     // `release` is people; the cursor moves in positions. Inside a demotion
     // tail one person is many positions, and the conversion is exact for the
-    // density the seal recorded rather than a correction the EWMA has to
+    // density the open recorded rather than a correction the EWMA has to
     // discover — which it could not, bounded at twice the target.
     let positions = tiers.positions_for_people(inputs.serving_counter, release);
 
@@ -602,15 +602,15 @@ async fn expire_due<S: Store>(store: &S, event_id: &str, cutoff: u64) -> Result<
     Ok(due.len())
 }
 
-/// The position space as the seal laid it out, and the conversions between
+/// The position space as the open laid it out, and the conversions between
 /// positions and people the controller needs to walk it.
 mod tiers {
     /// How positions map to people (issue #145).
     ///
     /// Without a demotion tail every position is a person and this is the
-    /// identity. With one, the seal's `[0, N)` holds `N − D` people, its
+    /// identity. With one, the open's `[0, N)` holds `N − D` people, its
     /// second copy `[N, 2N)` holds the `D` demoted, and live joins from `2N`
-    /// are dense again. The densities are exact — the seal counted them — so
+    /// are dense again. The densities are exact — the open counted them — so
     /// the controller converts rather than corrects: it releases a target
     /// number of *people* per interval, measures no-shows against people, and
     /// keeps the expiry grace a duration rather than a distance.
@@ -629,9 +629,9 @@ mod tiers {
     }
 
     impl Tiers {
-        /// The layout for a sealed cohort of `participant_count` with
+        /// The layout for a fixed cohort of `participant_count` with
         /// `demoted_count` demoted. `D` is clamped to `N`: more demoted than
-        /// sealed is a corrupt item, and a clamp keeps every density in
+        /// opened is a corrupt item, and a clamp keeps every density in
         /// `[0, 1]` rather than letting one wrap.
         #[must_use]
         pub fn new(participant_count: u64, demoted_count: u64) -> Self {

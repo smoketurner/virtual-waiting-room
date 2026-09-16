@@ -33,7 +33,7 @@ crates/                       Rust workspace — one crate per Lambda + shared l
                               tests/vectors.rs generates the cross-language conformance vectors
                               infra/modules/edge/tests/*.conformance.test.js consume
   assign_position/            SQS consumer: position range claim + Positions writes
-  seal_event/                 T−0 conditional seal
+  open_event/                 T−0 conditional open
   read/                       /v1/status, /v1/queue_num
   generate_token/             Admission check + signed session cookie minting (issue #71)
   controller/                 Outflow control and position expiry

@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::demotion::{DemotionRef, DemotionSet};
 use crate::expr::{DEMOTED_COUNT_ATTR, DEMOTION_CHUNKS_ATTR, DEMOTION_NONCE_ATTR, STARTS_AT_ATTR};
 use crate::ids::{Phase, StoredControl};
-use crate::permutation::{Assignment, SHARDS, SealedOffsets, Seed};
+use crate::permutation::{Assignment, CohortOffsets, SHARDS, Seed};
 
 /// The admission status of a written [`Position`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,29 +107,29 @@ pub struct PositionItem {
 }
 
 /// The single `Counters` item for an event: all sequences, the sharded
-/// pre-queue counter, phase, and the seal outputs.
+/// pre-queue counter, phase, and the open outputs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Counters {
     pub event_id: String,
     pub phase: Phase,
-    /// Live-join sequence; starts at `participant_count` after the seal so live
+    /// Live-join sequence; starts at `participant_count` after the open so live
     /// joiners are numbered behind the whole pre-queue cohort.
     pub queue_counter: u64,
     /// Admission cursor advanced by the controller.
     pub serving_counter: u64,
-    /// Set only at the seal, absent before: the 256-bit permutation seed.
+    /// Set only at the open, absent before: the 256-bit permutation seed.
     pub shuffle_seed: Option<[u8; 32]>,
-    /// Set at the seal: cohort size `N`, the sum of the pre-queue shards.
+    /// Set at the open: cohort size `N`, the sum of the pre-queue shards.
     pub participant_count: Option<u64>,
-    /// Set at the seal: prefix offsets `offset[s] = Σ counts[0..s)`.
+    /// Set at the open: prefix offsets `offset[s] = Σ counts[0..s)`.
     pub prequeue_offsets: Option<[u64; SHARDS]>,
-    /// Set at the seal when demotion is enforced (issue #145): `D`, how many
+    /// Set at the open when demotion is enforced (issue #145): `D`, how many
     /// cohort rows the stored demotion set matches. They resolve into the
     /// tail `[N, 2N)`, a second copy of the index space behind the whole
     /// cohort, and `queue_counter` starts at `2N` to keep live joiners behind
     /// it. `0` when nothing was demoted.
     pub demoted_count: u64,
-    /// Where the demotion set the seal wrote lives, when `demoted_count > 0`:
+    /// Where the demotion set the open wrote lives, when `demoted_count > 0`:
     /// the nonce its chunk items are keyed under and how many there are. A
     /// resolver loads it once per execution environment and matches every
     /// pre-queue row against it.
@@ -154,7 +154,7 @@ pub struct Counters {
     pub fail_open_until: u64,
     /// The scheduled event start, epoch seconds; absent when no start time is
     /// set. Written by the admin, which arms the `EventBridge` schedule in the
-    /// same action: the schedule is what fires the seal, this is what the
+    /// same action: the schedule is what fires the open, this is what the
     /// waiting page counts down to.
     ///
     /// Absent rather than `0`, unlike `fail_open_until`: there, a zero and a
@@ -166,35 +166,35 @@ pub struct Counters {
     pub starts_at: Option<u64>,
 }
 
-/// The sealed pre-queue index space and permutation seed, once the seal has
-/// written them.
+/// The fixed pre-queue index space and permutation seed, once the event has
+/// opened and written them.
 ///
 /// No `Debug`/`PartialEq`: [`Seed`] carries the permutation key and
 /// deliberately implements neither, so it cannot end up in a log line or a
 /// careless equality check at a call site.
 #[derive(Clone, Copy)]
-pub struct Sealed {
-    pub offsets: SealedOffsets,
+pub struct OpenOutputs {
+    pub offsets: CohortOffsets,
     pub seed: Seed,
     /// The tail's size `D` (issue #145); `0` when nothing was demoted.
     pub demoted: u64,
 }
 
 impl Counters {
-    /// `Some` once the seal has written the seed, cohort size, and offsets;
+    /// `Some` once the open has written the seed, cohort size, and offsets;
     /// `None` before.
     ///
     /// Callers branch on this rather than on [`Phase`]: an operator can walk
-    /// the phase back through `Maintenance` to `PreQueue` after a seal
-    /// (recovering from an operator error) without unsealing the index
-    /// space, so `phase == PreQueue` alone does not mean unsealed.
+    /// the phase back through `Maintenance` to `PreQueue` after an open
+    /// (recovering from an operator error) without undoing the index
+    /// space, so `phase == PreQueue` alone does not mean unopened.
     #[must_use]
-    pub fn sealed(&self) -> Option<Sealed> {
+    pub fn open_outputs(&self) -> Option<OpenOutputs> {
         let seed_bytes = self.shuffle_seed?;
         let offsets = self.prequeue_offsets?;
         let participant_count = self.participant_count?;
-        Some(Sealed {
-            offsets: SealedOffsets::from_parts(offsets, participant_count),
+        Some(OpenOutputs {
+            offsets: CohortOffsets::from_parts(offsets, participant_count),
             seed: Seed(seed_bytes),
             demoted: self.demoted_count,
         })
@@ -202,13 +202,13 @@ impl Counters {
 
     /// Resolves a pre-queue registration to its queue position.
     ///
-    /// Reconstructs the global index `i = offset[s] + l` from the sealed offsets
+    /// Reconstructs the global index `i = offset[s] + l` from the fixed offsets
     /// and the row, then derives the position with the permutation. A row whose
-    /// local index is at or past its shard's own issued count raced the seal
+    /// local index is at or past its shard's own issued count raced the open
     /// and belongs to the live-join sequence instead, so the permutation is
     /// never evaluated outside its domain.
     ///
-    /// A row the seal demoted (issue #145) — one the stored [`DemotionSet`]
+    /// A row the open demoted (issue #145) — one the stored [`DemotionSet`]
     /// matches — resolves to `N + PRP(seed, i, N)` instead: the same slot in a
     /// second copy of the index space behind the whole cohort, so every
     /// position stays unique (primary slots are `< N`, tail slots are in
@@ -217,17 +217,17 @@ impl Counters {
     /// controller walks it at its known density.
     ///
     /// `demotion` is the set the event item names. It may be `None` when the
-    /// seal demoted nobody, or for a row that raced the seal: such a row
+    /// open demoted nobody, or for a row that raced the open: such a row
     /// resolves to [`ResolvedPosition::LiveJoin`] without consulting the set —
     /// the permutation is never evaluated for it, so there is no primary slot
-    /// to answer from and no demoted row to un-demote. A cohort row on a sealed
+    /// to answer from and no demoted row to un-demote. A cohort row on an open
     /// event with `demoted_count > 0` and no set to match against cannot be
     /// resolved, because answering from the primary slot alone would silently
     /// un-demote every demoted row.
     ///
     /// # Errors
     ///
-    /// [`ResolveError::NotSealed`] before the seal has written the seed, cohort
+    /// [`ResolveError::NotOpen`] before the open has written the seed, cohort
     /// size, and offsets; [`ResolveError::BadShard`] if the row's shard is
     /// outside `0..SHARDS`; [`ResolveError::DemotionUnavailable`] when a cohort
     /// row's event demoted rows and the caller could not supply the set — a
@@ -237,11 +237,11 @@ impl Counters {
         row: &PreQueueItem,
         demotion: Option<&DemotionSet>,
     ) -> Result<ResolvedPosition, ResolveError> {
-        let Sealed {
+        let OpenOutputs {
             offsets,
             seed,
             demoted,
-        } = self.sealed().ok_or(ResolveError::NotSealed)?;
+        } = self.open_outputs().ok_or(ResolveError::NotOpen)?;
 
         let shard = usize::from(row.s);
         if shard >= SHARDS {
@@ -258,8 +258,8 @@ impl Counters {
                 let primary = crate::permutation::prp(&seed, index, participant_count);
                 let position = match demotion {
                     Some(set) if set.matches(row.v.as_ref()) => {
-                        // `2N` was checked to fit at the seal; a saturated
-                        // add here cannot happen for any cohort that sealed.
+                        // `2N` was checked to fit at the open; a saturated
+                        // add here cannot happen for any cohort the event opened with.
                         participant_count.saturating_add(primary)
                     }
                     Some(_) | None => primary,
@@ -353,9 +353,9 @@ impl Counters {
 /// Where a pre-queue registration resolves to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResolvedPosition {
-    /// A position inside the sealed cohort's `[0, N)`, derived from the seed.
+    /// A position inside the cohort's `[0, N)`, derived from the seed.
     PreQueue(u64),
-    /// The registration raced the seal; it has no pre-queue position and is
+    /// The registration raced the open; it has no pre-queue position and is
     /// instead a live joiner, whose actual position lives in `Positions`.
     LiveJoin,
 }
@@ -363,13 +363,13 @@ pub enum ResolvedPosition {
 /// Why a pre-queue registration cannot be resolved to a position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ResolveError {
-    /// The event has not been sealed, so no pre-queue position exists yet.
-    #[error("event not yet sealed")]
-    NotSealed,
+    /// The event has not opened yet, so no pre-queue position exists.
+    #[error("event not yet open")]
+    NotOpen,
     /// The stored shard is outside `0..SHARDS` (a corrupt row).
     #[error("shard index out of range")]
     BadShard,
-    /// The seal demoted rows but the caller had no demotion set to match
+    /// The open demoted rows but the caller had no demotion set to match
     /// against, so no position can be answered without risking un-demoting.
     #[error("demotion set unavailable")]
     DemotionUnavailable,
@@ -564,7 +564,7 @@ mod tests {
         );
     }
 
-    fn unsealed_counters(phase: Phase) -> Counters {
+    fn unopened_counters(phase: Phase) -> Counters {
         Counters {
             event_id: "evt-1".to_owned(),
             phase,
@@ -584,46 +584,46 @@ mod tests {
     }
 
     #[test]
-    fn sealed_is_none_before_every_seal_output_is_present() {
-        assert!(unsealed_counters(Phase::PreQueue).sealed().is_none());
+    fn open_outputs_is_none_until_every_output_is_present() {
+        assert!(unopened_counters(Phase::PreQueue).open_outputs().is_none());
 
         // Missing just the seed, or just the offsets, or just the count: still
-        // not sealed. Every field must be present.
-        let mut partial = unsealed_counters(Phase::Active);
+        // not opened. Every field must be present.
+        let mut partial = unopened_counters(Phase::Active);
         partial.shuffle_seed = Some([1u8; 32]);
-        assert!(partial.sealed().is_none());
+        assert!(partial.open_outputs().is_none());
         partial.participant_count = Some(10);
-        assert!(partial.sealed().is_none());
+        assert!(partial.open_outputs().is_none());
     }
 
     #[test]
-    fn sealed_is_some_once_every_seal_output_is_present_regardless_of_phase() {
-        // The operator can walk the phase back to PreQueue after a seal
-        // (Active -> Maintenance -> Idle -> PreQueue) without unsealing the
-        // index space, so `sealed()` must not gate on phase.
-        let mut counters = unsealed_counters(Phase::PreQueue);
+    fn open_outputs_is_some_once_every_output_is_present_regardless_of_phase() {
+        // The operator can walk the phase back to PreQueue after an open
+        // (Active -> Maintenance -> Idle -> PreQueue) without undoing the
+        // index space, so `opened()` must not gate on phase.
+        let mut counters = unopened_counters(Phase::PreQueue);
         counters.shuffle_seed = Some([9u8; 32]);
         counters.participant_count = Some(3);
         counters.prequeue_offsets = Some([0, 0, 0, 1, 1, 1, 2, 2, 2, 2]);
-        let sealed = counters.sealed().unwrap();
-        assert_eq!(sealed.offsets.participant_count(), 3);
+        let opened = counters.open_outputs().unwrap();
+        assert_eq!(opened.offsets.participant_count(), 3);
     }
 
-    fn sealed_counters(counts: [u64; SHARDS], demoted: u64) -> Counters {
-        let sealed = SealedOffsets::seal(counts).unwrap();
+    fn opened_counters(counts: [u64; SHARDS], demoted: u64) -> Counters {
+        let opened = CohortOffsets::from_counts(counts).unwrap();
         let mut offsets = [0u64; SHARDS];
         for (s, slot) in offsets.iter_mut().enumerate() {
-            *slot = sealed.offset(s);
+            *slot = opened.offset(s);
         }
-        let mut counters = unsealed_counters(Phase::Active);
+        let mut counters = unopened_counters(Phase::Active);
         counters.shuffle_seed = Some([3u8; 32]);
-        counters.participant_count = Some(sealed.participant_count());
+        counters.participant_count = Some(opened.participant_count());
         counters.prequeue_offsets = Some(offsets);
         counters.demoted_count = demoted;
         counters.queue_counter = if demoted > 0 {
-            sealed.participant_count().saturating_mul(2)
+            opened.participant_count().saturating_mul(2)
         } else {
-            sealed.participant_count()
+            opened.participant_count()
         };
         counters
     }
@@ -668,7 +668,7 @@ mod tests {
         // ASN. Matched rows must land in [N, 2N) at their own slot, unmatched
         // rows in [0, N), and no two rows may share a position — a duplicate
         // position is a visible fairness failure.
-        let counters = sealed_counters([10, 10, 0, 0, 0, 0, 0, 0, 0, 0], 5);
+        let counters = opened_counters([10, 10, 0, 0, 0, 0, 0, 0, 0, 0], 5);
         let set = farm_set();
         let n = 20;
         let mut positions = std::collections::HashSet::new();
@@ -693,7 +693,7 @@ mod tests {
 
     #[test]
     fn an_untelemetered_row_is_never_demoted() {
-        let counters = sealed_counters([10, 10, 0, 0, 0, 0, 0, 0, 0, 0], 5);
+        let counters = opened_counters([10, 10, 0, 0, 0, 0, 0, 0, 0, 0], 5);
         let p = position_of(&counters, &prequeue_row(0, 3, None), Some(&farm_set()));
         assert!(p < 20);
     }
@@ -702,13 +702,13 @@ mod tests {
     fn a_demoting_event_refuses_to_resolve_without_its_set() {
         // Answering from the primary slot alone would silently un-demote
         // every demoted row, so no answer is the only safe answer.
-        let counters = sealed_counters([10, 10, 0, 0, 0, 0, 0, 0, 0, 0], 5);
+        let counters = opened_counters([10, 10, 0, 0, 0, 0, 0, 0, 0, 0], 5);
         assert_eq!(
             counters.resolve_prequeue(&prequeue_row(0, 3, Some("64500")), None),
             Err(ResolveError::DemotionUnavailable)
         );
         // An event that demoted nobody needs no set, and ignores one.
-        let plain = sealed_counters([10, 10, 0, 0, 0, 0, 0, 0, 0, 0], 0);
+        let plain = opened_counters([10, 10, 0, 0, 0, 0, 0, 0, 0, 0], 0);
         let without = position_of(&plain, &prequeue_row(0, 3, Some("64500")), None);
         let with = position_of(
             &plain,
@@ -722,8 +722,8 @@ mod tests {
     #[test]
     fn a_straggler_is_a_live_join_even_when_the_set_matches_it() {
         // The straggler rule runs first: a row past its shard's issued count
-        // was never in the cohort the seal classified.
-        let counters = sealed_counters([10, 10, 0, 0, 0, 0, 0, 0, 0, 0], 5);
+        // was never in the cohort the open classified.
+        let counters = opened_counters([10, 10, 0, 0, 0, 0, 0, 0, 0, 0], 5);
         assert_eq!(
             counters
                 .resolve_prequeue(&prequeue_row(0, 10, Some("64500")), Some(&farm_set()))
@@ -735,12 +735,12 @@ mod tests {
     #[test]
     fn a_straggler_is_a_live_join_even_when_the_set_is_unavailable() {
         // The straggler rule runs before the demotion-availability gate: a row
-        // past its shard's issued count was never in the cohort the seal
+        // past its shard's issued count was never in the cohort the open
         // classified, so it has no primary slot to un-demote from and falls
         // through to a `Positions` lookup even when the set could not be loaded
         // (cold-start / transient-failure window, where `demoted_count > 0`
         // and the set is `None`). The symmetric cohort row still refuses.
-        let counters = sealed_counters([10, 10, 0, 0, 0, 0, 0, 0, 0, 0], 5);
+        let counters = opened_counters([10, 10, 0, 0, 0, 0, 0, 0, 0, 0], 5);
         assert_eq!(
             counters.resolve_prequeue(&prequeue_row(0, 10, Some("64500")), None),
             Ok(ResolvedPosition::LiveJoin)
@@ -789,7 +789,7 @@ mod tests {
 
     #[test]
     fn from_item_defaults_a_fresh_event_to_idle_and_open() {
-        // An item with nothing set must not read as a sealed, admitting event.
+        // An item with nothing set must not read as an opened, admitting event.
         let counters = Counters::from_item("evt-1", &HashMap::new());
         assert_eq!(counters.phase, Phase::Idle);
         assert_eq!(counters.queue_counter, 0);
@@ -875,7 +875,7 @@ mod tests {
     }
 
     #[test]
-    fn from_item_round_trips_the_seal_outputs() {
+    fn from_item_round_trips_the_open_outputs() {
         let mut item = HashMap::new();
         item.insert("phase".to_owned(), AttributeValue::S("active".to_owned()));
         item.insert(
@@ -909,6 +909,6 @@ mod tests {
             counters.prequeue_offsets,
             Some([0, 3, 3, 8, 9, 9, 9, 11, 11, 11])
         );
-        assert!(counters.sealed().is_some());
+        assert!(counters.open_outputs().is_some());
     }
 }

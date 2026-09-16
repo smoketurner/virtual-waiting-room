@@ -18,7 +18,7 @@ costs the most, because it is loaded into every session.
 | Function | Trigger | Job |
 |---|---|---|
 | `assign_position` | SQS event source mapping | Claims a contiguous position range per batch, writes `Positions` rows |
-| `seal_event` | EventBridge Scheduler, one-time `at()` set by the operator on the dashboard (issue #128) | One conditional `UpdateItem` at T−0: seed, offsets, count, phase |
+| `open_event` | EventBridge Scheduler, one-time `at()` set by the operator on the dashboard (issue #128) | One conditional `UpdateItem` at T−0: seed, offsets, count, phase |
 | `read` | API Gateway | `GET /v1/status`, `GET /v1/queue_num` |
 | `generate_token` | API Gateway | Checks the position against `serving_counter`, records the arrival, mints a signed session cookie the edge gate's CloudFront Function verifies (issue #71) |
 | `controller` | EventBridge Scheduler, `rate(1 minute)` | Durable function: six 10-second passes per execution — no-show correction, `serving_counter`, position expiry. Waits between passes suspend the execution rather than being billed |
@@ -38,7 +38,7 @@ only in the member crate that uses them):
 | Lambda runtime | `lambda_runtime`, `lambda_http`, `aws_lambda_events` |
 | Web framework (admin UI) | `axum`, `tower`, `tower-http` |
 | Async runtime | `tokio` |
-| AWS SDK | `aws-config`, `aws-sdk-dynamodb`, `aws-sdk-ssm`, `aws-smithy-types`, `aws-sdk-cloudfrontkeyvaluestore` (admin only — writes the edge gate's config, issue #71), `aws-sdk-scheduler` (admin only — sets the seal schedule's time, issue #128) |
+| AWS SDK | `aws-config`, `aws-sdk-dynamodb`, `aws-sdk-ssm`, `aws-smithy-types`, `aws-sdk-cloudfrontkeyvaluestore` (admin only — writes the edge gate's config, issue #71), `aws-sdk-scheduler` (admin only — sets the open schedule's time, issue #128) |
 | Templating + static assets (admin UI) | `askama`, `rust-embed`, `mime_guess` |
 | Admin OIDC login (ADR-0016) | `openidconnect`, `jsonwebtoken`, `reqwest`, `rustls`, `cookie` |
 | Serialization | `serde`, `serde_json`, `serde_dynamo`, `base64` |
@@ -51,7 +51,7 @@ the batch as a Lambda event. There is no Secrets Manager SDK dependency either �
 from SSM.
 
 Terraform creates every schedule and owns its target, retry policy and role. The one schedule
-whose *time* is not Terraform's is the seal (issue #128): the operator sets it on the dashboard,
+whose *time* is not Terraform's is the open (issue #128): the operator sets it on the dashboard,
 so `admin` carries `aws-sdk-scheduler` to rewrite the expression and state, and those two fields
 alone sit under `ignore_changes`. `UpdateSchedule` replaces rather than patches, so that writer
 reads the schedule and resends the whole definition.
@@ -134,12 +134,12 @@ spike.
 |---|---|
 | Edge / CDN / request collapsing | CloudFront — polled, write, waiting-page and protected behaviours (ADR-0013) |
 | **The admission gate** | CloudFront Function (`cloudfront-js-2.0`) at viewer-request on the protected behaviour only, deciding locally from a KeyValueStore (ADR-0021, issue #71); `generate_token` signs an HMAC-SHA256 session cookie the function verifies. Sub-millisecond compute at the edge, not zero, but no round trip to the origin |
-| Bot & abuse mitigation | Seal-time demotion over the join telemetry (ADR-0029, #145): operator `signal:max` rules, demoted groups stored once and matched on read, density-aware controller, `observe` by default. WAF: Bot Control, ASN matching, anti-DDoS in Count mode — **not built** (N7, #59, #70) |
+| Bot & abuse mitigation | Open-time demotion over the join telemetry (ADR-0029, #145): operator `signal:max` rules, demoted groups stored once and matched on read, density-aware controller, `observe` by default. WAF: Bot Control, ASN matching, anti-DDoS in Count mode — **not built** (N7, #59, #70) |
 | Ingest | API Gateway **REST** (regional) with request validator → SQS |
 | Buffer | SQS standard queue + DLQ (`maxReceiveCount` 5), ESM `ReportBatchItemFailures` |
 | Compute | Lambda (Rust, arm64) — the seven functions above |
 | State | DynamoDB on-demand + PITR: `Counters`, `PreQueue`, `Positions`, `Tokens` |
-| Scheduling | EventBridge Scheduler (T−0 seal, controller every minute × six passes via durable waits) |
+| Scheduling | EventBridge Scheduler (T−0 open, controller every minute × six passes via durable waits) |
 | Secrets | **SSM Parameter Store SecureString** — the per-deployment HMAC signing key (Terraform generates it and writes the same value to the edge gate's CloudFront KeyValueStore, issue #71) and the OIDC client secret. Not Secrets Manager: a SecureString is free where a secret is $0.40/mo, which N1 does not allow |
 | Metrics | CloudWatch. EMF emission and the shipped dashboard are **not built** (F5.1) |
 

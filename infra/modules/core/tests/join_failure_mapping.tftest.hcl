@@ -33,7 +33,7 @@ variables {
   name_prefix                   = "test"
   env                           = "test"
   assign_position_artifact_path = "tests/fixtures/bootstrap.zip"
-  seal_event_artifact_path      = "tests/fixtures/bootstrap.zip"
+  open_event_artifact_path      = "tests/fixtures/bootstrap.zip"
   read_artifact_path            = "tests/fixtures/bootstrap.zip"
   admin_artifact_path           = "tests/fixtures/bootstrap.zip"
   controller_artifact_path      = "tests/fixtures/bootstrap.zip"

@@ -37,7 +37,7 @@ authorizer without a call to the waiting-room backend.
                                     ▼
                               DynamoDB PreQueue
 
-  T−0   EventBridge Scheduler → seal_event (Rust, arm64)
+  T−0   EventBridge Scheduler → open_event (Rust, arm64)
           ONE UpdateItem on Counters:
             SET shuffle_seed = :seed, participant_count = :n, phase = :active
             ConditionExpression: attribute_not_exists(shuffle_seed)
@@ -150,7 +150,7 @@ Three of the four phases serve a static operator-authored page from content deli
 | Concern | Mechanism |
 |---|---|
 | Phase state | Attribute on the `Counters` item; one conditional `UpdateItem` transitions a phase |
-| Scheduled transitions | EventBridge Scheduler invoking `seal_event` at T−0 |
+| Scheduled transitions | EventBridge Scheduler invoking `open_event` at T−0 |
 | Manual transitions | `/admin/phase` on the admin Lambda, writing the same conditional `UpdateItem` |
 | Phase pages | Client HTML in S3, served through CloudFront with a long time to live (TTL) |
 | Current phase for clients | `/status`, cached 5 s globally |
@@ -200,7 +200,7 @@ under two minutes; scheduled mode exists for events with a known start time.
 A visitor arriving during the pre-queue calls `POST /join` — the same ingest path as a live
 join (§6): API Gateway writes the request straight to SQS, and `assign_position` consumes the
 batch. It reads the event's `Counters` item once per batch to decide which path the whole batch
-takes: sealed, or any phase but pre-queue, takes the live-join path below (§4.5); otherwise it
+takes: opened, or any phase but pre-queue, takes the live-join path below (§4.5); otherwise it
 groups the batch's valid records by shard and claims one contiguous block of local indices per
 shard, then writes one `PreQueue` item per record
 ([ADR-0015](../../../docs/adr/0015-stripe-prequeue-counter.md)):
@@ -223,10 +223,10 @@ the contiguous global index `i` is assembled at T−0 (§4.2), not at registrati
 writes spread across the pre-queue window — minutes to hours — rather than concentrating at
 T−0.
 
-A registration that lands after `seal_event` has already read that shard's count is a
-straggler: it is invisible to the seal, so nothing assigns it a pre-queue position. The batch
+A registration that lands after `open_event` has already read that shard's count is a
+straggler: it is invisible to the open, so nothing assigns it a pre-queue position. The batch
 that wrote it checks for this once its writes land (one more consistent read of `Counters`) and,
-if the event sealed underneath it, gives it a real live-join position instead. `/queue_num` (§4.2)
+if the event opened underneath it, gives it a real live-join position instead. `/queue_num` (§4.2)
 falls back to the same live-join lookup for any straggler that step missed, so a visitor is
 never stuck polling a row that will never resolve.
 
@@ -242,7 +242,7 @@ Queue order is a bijection from registration index to queue position, realised a
 **pseudorandom permutation (PRP)** rather than stored rows
 ([ADR-0002](../../../docs/adr/0002-seeded-permutation-not-materialised-shuffle.md)).
 
-At T−0 `seal_event` performs one `UpdateItem` on `Counters`. It reads the 10 shard count items
+At T−0 `open_event` performs one `UpdateItem` on `Counters`. It reads the 10 shard count items
 (`EVT#{event_id}#PQ#0`–`#9`), computes the prefix offsets `offset[s] = Σ counts[0..s)` and the
 cohort size `N = Σ counts`, and writes them alongside the seed, phase, and the live-join
 sequence's starting value in the same conditional write
@@ -255,7 +255,7 @@ ConditionExpression: attribute_not_exists(shuffle_seed)
 ```
 
 `queue_counter = :n` is in the same write for a reason, not an afterthought: the live-join
-sequence has to start at the cohort size, or the first post-seal live joiner collides with
+sequence has to start at the cohort size, or the first post-open live joiner collides with
 position 0 of the pre-queue cohort. Nothing else is written. Assignment is complete when this
 single conditional write succeeds, so there is no interval during which some participants hold
 positions and others do not.
@@ -271,22 +271,22 @@ Position is derived on read:
 queue_position = PRP(shuffle_seed, i, participant_count)     // i = offset[s] + l
 ```
 
-**Seal-time demotion ([ADR-0029](../../../docs/adr/0029-seal-time-demotion.md), issue #145).** When the
-operator has set demotion rules, the seal also scans the pre-queue between reading the shard
+**Open-time demotion ([ADR-0029](../../../docs/adr/0029-open-time-demotion.md), issue #145).** When the
+operator has set demotion rules, the open also scans the pre-queue between reading the shard
 counts and the write above, groups the cohort by each ruled signal (viewer address, ASN, JA4
 fingerprint, user agent) and demotes every group larger than its threshold. Nothing is written
-per row: the seal stores the demoted group set once, as chunk items keyed by a per-run nonce,
-and the seal write then also carries `demoted_count = D`, the nonce and the chunk count, and
+per row: the open stores the demoted group set once, as chunk items keyed by a per-run nonce,
+and the open write then also carries `demoted_count = D`, the nonce and the chunk count, and
 starts `queue_counter` at `2N`. Every resolver loads the set once per execution environment and
 matches a row's telemetry against it; a match resolves to `N + PRP(shuffle_seed, i, N)` — the
 same slot in a second copy of the index space behind the whole cohort — so primary slots, demoted
 slots and live joins occupy three disjoint ranges. The tail is sparse, and the controller (§7)
-walks it at the density the seal recorded. Under the default `observe` mode the seal classifies
+walks it at the density the open recorded. Under the default `observe` mode the open classifies
 and reports but demotes nobody; with no rules it never scans.
 
 `/queue_num` reads the visitor's `PreQueue` item for `(s, l)` and the seed, count, and offsets
 from `/status`; it reconstructs `i` with one addition. All three are already being fetched. A
-join that raced the seal is a **straggler**, but that is a per-shard fact, not a global one:
+join that raced the open is a **straggler**, but that is a per-shard fact, not a global one:
 `l` is checked against shard `s`'s own issued count (`offset[s+1] - offset[s]`, or `N -
 offset[s]` for the last shard), and only a local index at or past that count is a straggler.
 Testing the reconstructed `i ≥ N` instead would miss it — an over-count on an interior shard can
@@ -553,7 +553,7 @@ skipped number.
 | `target_rate` | N | Operator-set admissions per minute |
 | `shuffle_seed` | B | 256-bit permutation key, written once at T−0 |
 | `participant_count` | N | Pre-queue cohort size, the permutation domain |
-| `demoted_count` | N | `D`, how many cohort rows the seal-time demotion set matches (ADR-0029); absent or `0` when nothing was demoted. Positive means the tail `[N, 2N)` is in use and `queue_counter` started at `2N` |
+| `demoted_count` | N | `D`, how many cohort rows the open-time demotion set matches (ADR-0029); absent or `0` when nothing was demoted. Positive means the tail `[N, 2N)` is in use and `queue_counter` started at `2N` |
 | `demotion_nonce`, `demotion_chunks` | S, N | Where the demotion set lives: its chunk items are `EVT#{event_id}#DG#{nonce}#{k}` for `k` below the chunk count. Present exactly when `demoted_count > 0` |
 
 The two striped counters — the pre-queue registration index and the arrivals count — are
@@ -565,14 +565,14 @@ back under that item's single 1,000-write/s ceiling and distribute nothing.
 
 **`PreQueue`** — partition key `r`. Attributes `s` (shard), `l` (local index), `t`, `v`
 (join-time telemetry). Short attribute names because the table is scanned during audit and,
-when demotion rules are set, once by the seal — which reads it and writes nothing back. The
+when demotion rules are set, once by the open — which reads it and writes nothing back. The
 global registration index `i = offset[s] + l` is derived on read, never stored, and so is a
 demotion (ADR-0029): the row is matched against the stored set on every read. Read by
 `/queue_num` as a single `GetItem`; never scanned on the hot path.
 
-The seal's demotion set and report are further items in `Counters`. The set is one or more
+The open's demotion set and report are further items in `Counters`. The set is one or more
 chunks `EVT#{event_id}#DG#{nonce}#{k}`, each a list `g` of `signal:value` strings, written before
-the seal and named by it. The report, `EVT#{event_id}#DM`, holds the mode, rules, cohort size,
+the open and named by it. The report, `EVT#{event_id}#DM`, holds the mode, rules, cohort size,
 demoted count and the largest demoted groups with their thresholds. Their own items so the event
 item every poll reads stays small; resolvers read the set once per execution environment, and the
 dashboard is the report's only reader.
@@ -656,7 +656,7 @@ release_next          = target_rate / (1 − smoothed_no_show_rate)
 
 **Positions versus people (ADR-0029).** With a demotion tail the position space has three
 tiers: `[0, N)` holding `N − D` people, `[N, 2N)` holding the `D` demoted, and live joins from
-`2N`, dense. The seal counted both densities, so the controller converts rather than corrects:
+`2N`, dense. The open counted both densities, so the controller converts rather than corrects:
 the interval's target is a number of people, turned into positions at the density of the tier
 the cursor is in; no-shows are measured as arrivals against people released; and the expiry
 grace is walked back as a count of people, so it stays a duration inside the tail. With nothing
@@ -772,7 +772,7 @@ behavioural classification over the join telemetry described below. Neither is b
 
 ### Deferred bot enforcement
 
-**Built as seal-time demotion ([ADR-0029](../../../docs/adr/0029-seal-time-demotion.md), issue #145), off by
+**Built as open-time demotion ([ADR-0029](../../../docs/adr/0029-open-time-demotion.md), issue #145), off by
 default.** Where an operator can identify likely bots during the pre-queue, the decision is
 deferred to randomization rather than applied on arrival, so detection is not revealed while
 there is still time to modify a client and rejoin.
@@ -780,11 +780,11 @@ there is still time to modify a client and rejoin.
 The input is the join-time telemetry every registration row carries — viewer address, ASN,
 country, JA4 fingerprint and user agent — captured as SQS message attributes on the compute-free
 join path. The operator sets rules of the form `signal:max` (`address:25,asn:5000`) in
-`terraform.tfvars`. At the seal, every group of registrations sharing one value of a ruled signal
+`terraform.tfvars`. At the open, every group of registrations sharing one value of a ruled signal
 and larger than its threshold is demoted whole: served behind the rest of the cohort (§4.2),
 never blocked, because a rule that catches a farm also catches an office NAT and a demoted office
 still gets in. Nothing is written per row; the demoted groups are stored once and every position
-lookup matches against them. The seal writes a report — mode, rules, cohort, demoted count,
+lookup matches against them. The open writes a report — mode, rules, cohort, demoted count,
 largest groups — that the dashboard renders, so what was mitigated and on what basis is visible.
 
 The default mode is `observe`: the classification runs and the report is written, nobody is
@@ -796,7 +796,7 @@ are the operator's and the mode starts at observe.
 
 WAF Bot Control's labels, and the anonymous-IP and hosting-provider reputation lists, are a
 later input to the same mechanism: another attribute on the row, another signal in the rules,
-acted on at the same seal. They are not enabled on cost grounds (§8, §12).
+acted on at the same open. They are not enabled on cost grounds (§8, §12).
 
 ### Web Application Firewall (WAF)
 

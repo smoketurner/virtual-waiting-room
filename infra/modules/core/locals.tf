@@ -35,7 +35,7 @@ locals {
   }
 
   assign_position_name = "${var.name_prefix}-assign-position"
-  seal_event_name      = "${var.name_prefix}-seal-event"
+  open_event_name      = "${var.name_prefix}-open-event"
   read_name            = "${var.name_prefix}-read"
   admin_name           = "${var.name_prefix}-admin"
   controller_name      = "${var.name_prefix}-controller"
@@ -51,7 +51,7 @@ locals {
   # and every crate is built by `make build` before plan or apply runs.
   lambda_zip = {
     assign_position = var.assign_position_artifact_path
-    seal_event      = var.seal_event_artifact_path
+    open_event      = var.open_event_artifact_path
     read            = var.read_artifact_path
     admin           = var.admin_artifact_path
     controller      = var.controller_artifact_path

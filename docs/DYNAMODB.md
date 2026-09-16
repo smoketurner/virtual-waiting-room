@@ -37,26 +37,26 @@ EVT#{event_id}            the event
 EVT#{event_id}#PQ#{0..9}  pre-queue registration shards
 EVT#{event_id}#AR#{0..9}  arrival shards
 EVT#{event_id}#DM         demotion report, when demotion rules are set
-EVT#{event_id}#DG#{nonce}#{k}  demotion-set chunks, when the seal demoted
+EVT#{event_id}#DG#{nonce}#{k}  demotion-set chunks, when the open demoted
 ```
 
 The event item carries, by writer:
 
 | Attribute | Written by | Meaning |
 |---|---|---|
-| `queue_counter` | `seal_event`, `assign_position` | Live-join position sequence; set to `N` at the seal |
+| `queue_counter` | `open_event`, `assign_position` | Live-join position sequence; set to `N` at the open |
 | `serving_counter` | `controller` | Admission cursor, exclusive |
 | `max_expired_position` | `controller` | Highest position expired |
 | `last_serving_counter`, `last_arrivals_total`, `no_show_rate` | `controller` | Measurement state carried across passes |
-| `phase` | `seal_event`, `admin` | `idle` / `pre_queue` / `active` / `post_event` / `maintenance` |
+| `phase` | `open_event`, `admin` | `idle` / `pre_queue` / `active` / `post_event` / `maintenance` |
 | `admission_control` | `admin` | `open` / `paused` |
 | `fail_open_until` | `admin` | Epoch-seconds break-glass deadline; absent or `0` means not engaged |
 | `target_rate` | `admin` | Visitors **per second** |
-| `shuffle_seed` | `seal_event` | 256-bit permutation key (B), written once |
-| `participant_count` | `seal_event` | Cohort size `N` |
-| `prequeue_offsets` | `seal_event` | Ten prefix offsets (L) |
-| `demoted_count` | `seal_event` | `D`, cohort rows the demotion set matches; absent or `0` when nothing was demoted |
-| `demotion_nonce`, `demotion_chunks` | `seal_event` | Locate the demotion set's chunk items; present when `demoted_count > 0` |
+| `shuffle_seed` | `open_event` | 256-bit permutation key (B), written once |
+| `participant_count` | `open_event` | Cohort size `N` |
+| `prequeue_offsets` | `open_event` | Ten prefix offsets (L) |
+| `demoted_count` | `open_event` | `D`, cohort rows the demotion set matches; absent or `0` when nothing was demoted |
+| `demotion_nonce`, `demotion_chunks` | `open_event` | Locate the demotion set's chunk items; present when `demoted_count > 0` |
 | `message` | `admin` | Operator broadcast |
 | `last_action`, `last_action_by`, `last_action_at`, `last_action_epoch_ms` | `admin` | Audit trail and debounce guard |
 
@@ -113,9 +113,9 @@ the expiry write both bind `#s` to `status`.
 | `assign_position` | `Counters` | `UpdateItem ADD queue_counter`, `ALL_NEW` | — | 1 per batch, +1 per straggler fix-up |
 | `assign_position` | `Counters` | `GetItem` event item (fix-up re-read) | **Strong** | 1 per pre-queue batch |
 | `assign_position` | `Positions` | `PutItem` if `attribute_not_exists(request_id)` | — | 1 per live joiner |
-| `seal_event` | `Counters` | `BatchGetItem` of ten pre-queue shards | **Strong** | Once per event |
-| `seal_event` | `PreQueue` | `Scan` of the cohort, parallel | **Strong** | Once per event, when demotion rules are set |
-| `seal_event` | `Counters` | `UpdateItem` if `attribute_not_exists(shuffle_seed)` | — | Once per event |
+| `open_event` | `Counters` | `BatchGetItem` of ten pre-queue shards | **Strong** | Once per event |
+| `open_event` | `PreQueue` | `Scan` of the cohort, parallel | **Strong** | Once per event, when demotion rules are set |
+| `open_event` | `Counters` | `UpdateItem` if `attribute_not_exists(shuffle_seed)` | — | Once per event |
 | `read` | `Counters` | `GetItem` event item | Eventual, 1 s in-process cache | ≤1/s per execution environment |
 | `read` | `PreQueue` | `GetItem` by `r` | Eventual | 1 per `/v1/queue_num` |
 | `read` | `Positions` | `GetItem` by `request_id` | Eventual | 1 per `/v1/queue_num` with no `PreQueue` row |
@@ -134,7 +134,7 @@ the expiry write both bind `#s` to `status`.
 | `admin` | `Counters` | `GetItem`, five `UpdateItem` forms | Eventual | Operator actions |
 | `admin` | `Tokens` | `PutItem`, `GetItem`, `DeleteItem` | Eventual | Operator logins |
 
-There are two `Scan`s in the codebase — `controller`'s expiry scan (§11) and `seal_event`'s scan of the pre-queue when demotion rules are set — and no `Query`. Everything else is a key lookup.
+There are two `Scan`s in the codebase — `controller`'s expiry scan (§11) and `open_event`'s scan of the pre-queue when demotion rules are set — and no `Query`. Everything else is a key lookup.
 
 ---
 
@@ -194,7 +194,7 @@ also cannot be written into an expression at all (§1.4).
 | `arrivals` | Statistic | Yes, ×10 | Runs at the admission rate; order carries no information |
 
 Striping a sequence is forbidden. Striping the pre-queue counter is safe because `PRP(seed, i, N)`
-needs `i` to be unique and in range and nothing else. The prefix offsets written at the seal
+needs `i` to be unique and in range and nothing else. The prefix offsets written at the open
 reassemble ten shards into exactly `[0, N)`, so the permutation domain is unchanged.
 
 `SHARDS` is `pub const SHARDS: usize = 10` and is not configurable. An unused configuration
@@ -250,7 +250,7 @@ test seam.
 |---|---|---|
 | `PreQueue` row | `attribute_not_exists(r)` | A duplicate registration consumes no index |
 | `Positions` row | `attribute_not_exists(request_id)` | A duplicate join consumes no position |
-| Seal | `attribute_not_exists(shuffle_seed)` | A double-fire seals exactly once |
+| Open | `attribute_not_exists(shuffle_seed)` | A double-fire opens exactly once |
 | Cursor advance | `attribute_not_exists(serving_counter) OR serving_counter = :expected` | Overlapping controller executions cannot double-advance |
 | `max_expired_position` | `attribute_not_exists(...) OR max_expired_position < :m` | The cursor only moves forward |
 | Position expiry | `#s = :issued` | A position completed since the scan is not overwritten |
@@ -268,7 +268,7 @@ instant. A stored value no instant can hold reads as no stamp at all, so it cann
 debounce window open against every later action.
 
 Every guarded write handles `ConditionalCheckFailedException` by name, and none treats it as an
-error. `assign_position` reports a duplicate, `seal_event` returns `AlreadySealed`, the controller
+error. `assign_position` reports a duplicate, `open_event` returns `AlreadyOpen`, the controller
 logs the lost race and continues, and `admin` maps it to a conflict for the operator.
 
 These guards are what let ingest run on an SQS standard queue, which delivers at least once with
@@ -283,10 +283,10 @@ A materialised shuffle for a million participants is a million row writes, and t
 not atomic. There would be an interval in which some participants hold positions and others do
 not.
 
-The seal writes five values in one conditional `UpdateItem`. A reader sees the unsealed state or
-all five together; a torn read is impossible because it is one item. `Counters::sealed()` returns
+The open writes five values in one conditional `UpdateItem`. A reader sees the unopened state or
+all five together; a torn read is impossible because it is one item. `Counters::opened()` returns
 `Some` only when the seed, the cohort size, and the offsets are all present, and
-`sealed_is_none_before_every_seal_output_is_present` pins that.
+`opened_is_none_before_every_open_output_is_present` pins that.
 
 Position is then computed on read. The savings compound: a million fewer writes at the scheduled
 start, no rows to fall out of sync with the offsets, no storage to reclaim afterwards, and no
@@ -338,7 +338,7 @@ There are exactly five `consistent_read(true)` call sites.
 
 - `assign_position` reading `Counters`. The whole batch's routing decision — pre-queue or live —
   turns on this read, and so does the straggler fix-up.
-- `seal_event` reading the ten pre-queue shards. The seal folds these into the cohort size. A
+- `open_event` reading the ten pre-queue shards. The open folds these into the cohort size. A
   registration missed here is a visitor with no position at all.
 - `generate_token` reading `Counters`. A visitor at their turn must not be told to keep waiting
   because a replica lagged behind the controller.
@@ -396,7 +396,7 @@ that they are not maximum limits.
 |---|---|---|---|
 | Pre-queue | `PreQueue` rows | 1,000,000 | 1,000,000 |
 | Pre-queue | Shard block claims, batch 100 over 10 shards | ≤100,000 | ≤100,000 |
-| Seal | The conditional update | 1 | 1 |
+| Open | The conditional update | 1 | 1 |
 | Admission | Arrival shard increments | 1 per admitted visitor | 1 each |
 | Admission | Cursor advance | 6 per minute | 6 per minute |
 

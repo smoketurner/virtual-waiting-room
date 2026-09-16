@@ -7,7 +7,7 @@ and a first-deploy walkthrough.
 
 ## The build → package → deploy chain
 
-The four Rust functions `make build` produces (`assign_position`, `seal_event`,
+The four Rust functions `make build` produces (`assign_position`, `open_event`,
 `read`, `admin`) are **`provided.al2023` custom-runtime** Lambdas — plain zipped
 binaries, not container images. There are no Dockerfiles by design. Two distinct
 steps take source to a running function:
@@ -29,7 +29,7 @@ steps take source to a running function:
    automatically. No Terraform re-zip step.
 
 The seam between build and deploy is a **path variable per function**
-(`assign_position_artifact_path`, `seal_event_artifact_path`,
+(`assign_position_artifact_path`, `open_event_artifact_path`,
 `read_artifact_path`, `admin_artifact_path`). You build the zips out-of-band,
 point the variables at them in `terraform.tfvars`, and Terraform deploys them
 directly.
@@ -100,7 +100,7 @@ override the file, so the file stays the single source of truth. Copy
 | `client_origin_domain_name` | *(none)*    | **Required.** Bare domain of the protected origin CloudFront fronts. Host only — no scheme, no path. |
 | `*_artifact_path`           | *(empty)*   | The four built zips. Empty = that function stays on the placeholder.     |
 | `oidc_*`                    | *(varies)*  | Admin login (ADR-0016). The client secret is not here — it goes in an SSM SecureString out of band. |
-| `demotion_rules`            | *(empty)*   | Seal-time demotion (ADR-0029): `signal:max` entries over `address`, `asn`, `ja4`, `ua`. Empty = the seal never scans. |
+| `demotion_rules`            | *(empty)*   | Open-time demotion (ADR-0029): `signal:max` entries over `address`, `asn`, `ja4`, `ua`. Empty = the open never scans. |
 | `demotion_mode`             | `observe`   | `observe` reports what the rules would demote; `enforce` demotes. Read a real event's report before enforcing. |
 
 The one `make`-level override is the build target:
@@ -138,9 +138,9 @@ make apply
 ```
 
 `make apply` prints the stack outputs, including the API invoke URL and the
-table names. To exercise the deployed stack end to end — register, seal, and
+table names. To exercise the deployed stack end to end — register, open, and
 verify no two visitors get the same position — run the smoke test. It reads the
-API URL, table names, seal function, and event id from `terraform output` and
+API URL, table names, open function, and event id from `terraform output` and
 never touches Terraform state, so it needs nothing but credentials. `uv`
 provisions boto3 from the script's inline metadata on first run:
 

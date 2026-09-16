@@ -69,7 +69,7 @@ one write, read back on the same polled document). The real reasons:
    route and its supporting `Store` method would.
 3. **Criterion 4 of #69 (operator-configurable and published) is satisfied without it.** Deploy-time
    Terraform published on `/status` is exactly that, served on the same document as `target_rate`.
-   (The `seal_start_time` variable this originally cited as the precedent for deploy-time operator
+   (The `open_start_time` variable this originally cited as the precedent for deploy-time operator
    configuration is gone: issue #128 moved the start time to the dashboard. The decision below
    stands on its own — the poll policy is not a per-event dial the way the start time is.)
 

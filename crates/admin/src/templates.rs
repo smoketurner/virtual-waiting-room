@@ -112,22 +112,22 @@ pub struct Dashboard {
     /// outside it can still be posted and is still validated.
     #[serde(skip)]
     pub timezones: Vec<&'static str>,
-    /// Seal-time demotion (issue #145), for the operator's card: the report
+    /// Demotion at open (issue #145), for the operator's card: the report
     /// item, read separately by the handler like the ruleset. Render-only.
     #[serde(skip)]
     pub demotion: DemotionView,
 }
 
-/// What the dashboard shows about the seal's demotion (issue #145): a
+/// What the dashboard shows about the open's demotion (issue #145): a
 /// fairness control that acts invisibly is hard to defend after the event, so
 /// what was demoted, and on what basis, is on the dashboard.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DemotionView {
-    /// A report exists: a seal ran with rules set.
+    /// A report exists: an open ran with rules set.
     pub reported: bool,
     /// `observe` or `enforce`, from the report.
     pub mode: String,
-    /// The rules the seal ran with, canonical form.
+    /// The rules the open ran with, canonical form.
     pub rules: String,
     /// Cohort rows classified.
     pub cohort: u64,
@@ -140,7 +140,7 @@ pub struct DemotionView {
     /// `groups.len()`, as the same width as `groups_total` for the template's
     /// "largest X of Y" line.
     pub groups_shown: u64,
-    /// The rules did not parse, and this is why. The seal ran without them.
+    /// The rules did not parse, and this is why. The open ran without them.
     pub error: String,
 }
 
@@ -154,7 +154,7 @@ pub struct DemotionGroupRow {
 }
 
 impl Dashboard {
-    /// Attaches the seal's demotion report (issue #145) to the view, or marks
+    /// Attaches the open's demotion report (issue #145) to the view, or marks
     /// its absence. Called by the handler after [`Dashboard::from_state`], the
     /// way the ruleset is, because the report is a separate item.
     pub fn with_demotion_report(&mut self, report: Option<&wr_common::DemotionReport>) {
@@ -363,7 +363,7 @@ mod tests {
     #[test]
     fn without_a_report_the_demotion_card_says_so() {
         let html = Dashboard::from_state(&state(), 0).render().unwrap();
-        assert!(html.contains("Seal-time demotion"));
+        assert!(html.contains("Demotion at open"));
         assert!(html.contains("No report yet"));
     }
 
@@ -384,7 +384,7 @@ mod tests {
                 count: 7,
                 max: 5,
             }],
-            sealed_at: 1,
+            opened_at: 1,
             error: None,
         };
         view.with_demotion_report(Some(&report));
@@ -411,7 +411,7 @@ mod tests {
                 count: 3,
                 max: 100,
             }],
-            sealed_at: 1,
+            opened_at: 1,
             error: None,
         };
         view.with_demotion_report(Some(&report));
@@ -438,7 +438,7 @@ mod tests {
     fn a_parse_error_report_does_not_pretend_a_scan_ran_whatever_the_mode() {
         // The real error path zeroes cohort/groups and carries the parse error.
         // For both configured modes the count label reads "Scanned", so the
-        // operator is not told the seal scanned an empty cohort it never
+        // operator is not told the open scanned an empty cohort it never
         // classified.
         for mode in ["enforce", "observe"] {
             let mut view = Dashboard::from_state(&state(), 0);
@@ -449,7 +449,7 @@ mod tests {
                 demoted: 0,
                 groups_total: 0,
                 groups: vec![],
-                sealed_at: 1,
+                opened_at: 1,
                 error: Some("rule \"address:lots\" is not of the form signal:max".to_owned()),
             };
             view.with_demotion_report(Some(&report));

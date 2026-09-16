@@ -44,7 +44,7 @@ API, one CloudFront distribution.
 | Function | Trigger | Timeout | What it does |
 |---|---|---|---|
 | `assign_position` | SQS event source mapping | 30 s | Consumes join batches; claims indices or positions; writes rows |
-| `seal_event` | EventBridge Scheduler, one-shot | 10 s | Folds shard counts into offsets; writes the seal |
+| `open_event` | EventBridge Scheduler, one-shot | 10 s | Folds shard counts into offsets; writes the open |
 | `read` | API Gateway | 10 s | Serves `GET /v1/status` and `GET /v1/queue_num` |
 | `controller` | EventBridge Scheduler, `rate(1 minute)` | 30 s | Meters admission; expires positions |
 | `generate_token` | API Gateway | 10 s | Checks the position; records the arrival; signs the session cookie the edge gate verifies |
@@ -112,15 +112,15 @@ quiet queue. A lone join during testing can take about 20 seconds to get a posit
 `GetItem`. Every valid record in that batch then takes the same path:
 
 ```rust
-let live_path = counters.sealed().is_some() || counters.phase != Phase::PreQueue;
+let live_path = counters.opened().is_some() || counters.phase != Phase::PreQueue;
 ```
 
-The branch is on the seal outputs, never on the phase alone. An operator can walk the phase back to
-`pre_queue` after a seal without unsealing the index space, and a record arriving then is
+The branch is on the open outputs, never on the phase alone. An operator can walk the phase back to
+`pre_queue` after an open without undoing the index space, and a record arriving then is
 still a live join. A missing `Counters` item fails every valid record: the event has not been
-set up, and processing a join before setup would let a pre-seal live join increment
-`queue_counter` ahead of the seal, which the seal's unconditional `SET queue_counter = :n`
-would then overwrite — handing a cohort member (or a post-seal joiner) the same numeric
+set up, and processing a join before setup would let a pre-open live join increment
+`queue_counter` ahead of the open, which the open's unconditional `SET queue_counter = :n`
+would then overwrite — handing a cohort member (or a post-open joiner) the same numeric
 position.
 
 ### 4.2 Pre-queue registration claims an index, not a position
@@ -139,7 +139,7 @@ The block's first local index is `checked_sub`, not saturating. A saturated pre-
 would be a duplicate global index that hands two visitors the same position, where a saturated
 live-join position would only be a gap.
 
-### 4.3 The seal writes five values in one guarded update
+### 4.3 The open writes five values in one guarded update
 
 ```
 SET shuffle_seed = :seed, participant_count = :n, queue_counter = :n,
@@ -147,18 +147,18 @@ SET shuffle_seed = :seed, participant_count = :n, queue_counter = :n,
 ConditionExpression: attribute_not_exists(shuffle_seed)
 ```
 
-`seal_event` first gathers the ten shard counts with one strongly consistent `BatchGetItem`, then
+`open_event` first gathers the ten shard counts with one strongly consistent `BatchGetItem`, then
 folds them: `offset[s]` is the sum of counts `0..s`, and `N` is the total. An unprocessed key
-aborts the seal rather than under-counting the cohort. A shard with no registrations has no item
+aborts the open rather than under-counting the cohort. A shard with no registrations has no item
 at all, and `BatchGetItem` returns nothing for it, so the fold counts it as zero. A shard item
 that exists but whose index cannot be read raises an error, because zeroing it silently would
 unadmit every registrant in it.
 
-A double-fire or a retry finds the seed present, fails the condition, and returns `AlreadySealed`
+A double-fire or a retry finds the seed present, fails the condition, and returns `AlreadyOpen`
 without changing anything.
 
 `queue_counter = :n` rides in the same update because a separate write could be lost between the
-seal and the first live join.
+open and the first live join.
 
 ### 4.4 Position is computed on read
 
@@ -180,8 +180,8 @@ the network around it. The vectors were computed from a separate implementation 
 encoding, not captured from this code.
 
 Four rounds is fewer than the ten that NIST Special Publication 800-38G specifies for FF1. The
-seed is not a long-term secret here. It does not exist before the seal, so nobody can predict
-their position; after the seal it is published so a third party can recompute the ordering. The
+seed is not a long-term secret here. It does not exist before the open, so nobody can predict
+their position; after the open it is published so a third party can recompute the ordering. The
 construction has to be bijective and uniform, and both are tested directly.
 
 `prp` returns `i` unchanged when `i >= n` or `n <= 1`. It is never evaluated outside its domain.
@@ -192,15 +192,15 @@ One `ADD queue_counter :n` with `ALL_NEW` claims a block for the whole valid set
 `[end - n + 1, end]`, computed with saturating arithmetic because the release profile has no
 overflow checks. Each row is then written with `attribute_not_exists(request_id)`.
 
-Because the block starts at `end - n + 1` and the seal leaves `queue_counter` at `N`, the first
-live joiner after a seal receives position `N + 1`. Position `N` is never issued. The pre-queue
+Because the block starts at `end - n + 1` and the open leaves `queue_counter` at `N`, the first
+live joiner after an open receives position `N + 1`. Position `N` is never issued. The pre-queue
 cohort holds `[0, N)`, live joins hold `[N + 1, …)`, and the single position between them is a
 permitted gap.
 
-### 4.6 A join that races the seal
+### 4.6 A join that races the open
 
-A shard claim can land after `seal_event` read that shard's count. The row is then invisible to
-the seal, and `SealedOffsets::assign` resolves it to `Assignment::LiveJoin`.
+A shard claim can land after `open_event` read that shard's count. The row is then invisible to
+the open, and `CohortOffsets::assign` resolves it to `Assignment::LiveJoin`.
 
 The test is per shard, against `offset[s+1] - offset[s]`, never against a global `i >= N`. A
 global test would let an over-count on an interior shard reconstruct into an index range a later
@@ -215,7 +215,7 @@ visitor already counted into the cohort.
 
 One case is left open. A pre-queue write that times out on the caller side but actually lands is
 indistinguishable from one that failed. It is reported as a batch failure, redelivery finds the
-event sealed, and the visitor ends up with a `Positions` row as well as a counted `PreQueue` row.
+event opened, and the visitor ends up with a `Positions` row as well as a counted `PreQueue` row.
 Closing it costs a `PreQueue` `GetItem` on every live join.
 
 ---
@@ -245,7 +245,7 @@ Closing it costs a `PreQueue` `GetItem` on every live join.
 ADR-0023) is a Terraform-set deploy-time value, not something an operator changes mid-event
 through the admin surface.
 
-`shuffle_seed` is the 256-bit permutation key as lowercase hex, present only once the seal has
+`shuffle_seed` is the 256-bit permutation key as lowercase hex, present only once the open has
 written it — it does not exist earlier, so no registrant can pick a registration index that lands
 at the front. Publishing it with `participant_count` and `prequeue_offsets` is what lets an
 outside party recompute the whole ordering and check it.
@@ -262,7 +262,7 @@ and ceiling both default to 5,000 ms with a divisor of 1, reproducing the fixed 
 interval every client used before #69. Each tick fetches `/v1/status`. It fetches `/v1/queue_num`
 only while it does not yet know its position.
 
-A position never changes once known. A pre-queue registrant's comes from the sealed permutation
+A position never changes once known. A pre-queue registrant's comes from the opened permutation
 and a live joiner's from a claimed row. Only the cursor moves, and `/v1/status` carries it.
 
 `/v1/status` is cached with a path-only key and no cookies forwarded, so CloudFront collapses
@@ -364,7 +364,7 @@ permanent, so the client stops rather than keeps polling. The cursor is exclusiv
 `position >= serving_counter` means still queued.
 
 Refusals map to statuses the waiting page acts on: 425 still queued, 409 not admitting or not
-sealed, 404 not registered, 410 spent, 500 corrupt.
+opened, 404 not registered, 410 spent, 500 corrupt.
 
 The arrival is recorded before the cookie is signed. A visitor counted but not admitted
 understates the no-show rate. One admitted but not counted makes the controller over-release for
@@ -488,7 +488,7 @@ Read from the test bodies.
 | Shards are distinct keys | `shard_keys_are_distinct_partition_keys` | Ten distinct partition keys; pre-queue and arrival families disjoint |
 | No expression inlines a `#` | `no_expression_inlines_an_attribute_name_containing_a_hash` | Pins the bug that broke every arrival write |
 | Token kinds do not collide | `the_tokens_table_key_space_does_not_collide_across_kinds` | `TKN#`, `SESS#`, `PKCE#` are three rows |
-| Seal starts the live sequence | `seal_starts_the_live_join_sequence_at_the_cohort_size` | `queue_counter = :n` is in the seal update |
+| Open starts the live sequence | `open_starts_the_live_join_sequence_at_the_cohort_size` | `queue_counter = :n` is in the open update |
 | Release is bounded | `near_total_no_show_is_bounded_at_cap`, `zero_arrivals_is_bounded_at_cap_not_infinite` | A no-show rate at 1.0 yields the cap, not a division by zero |
 
 Two figures that appear in `DESIGN.md` have no test behind them: a 200,000-sample bijectivity run
@@ -563,8 +563,8 @@ per request, and how long a KeyValueStore write takes to reach every edge.
 
 **Why not store the shuffled order?**
 Writing a million rows at the scheduled start is not atomic. There would be an interval in which
-some participants hold positions and others do not. The seal is one conditional `UpdateItem`, so a
-reader sees either the unsealed state or all five values together.
+some participants hold positions and others do not. The open is one conditional `UpdateItem`, so a
+reader sees either the unopened state or all five values together.
 
 **Why DynamoDB rather than a cache tier?**
 A cache tier is always-on compute, and idle cost is the constraint the whole design is built
@@ -579,7 +579,7 @@ the burst path. HTTP APIs support neither.
 **Why is `queue_counter` not sharded when the pre-queue counter is?**
 A sequence must yield a unique ordered value, and summing shards cannot produce one. The
 permutation needs registration indices to be unique and inside `[0, N)`; it does not need them
-ordered. The prefix offsets written at the seal reassemble ten shards into that exact range.
+ordered. The prefix offsets written at the open reassemble ten shards into that exact range.
 
 **Why is the straggler check per shard rather than against `N`?**
 An over-count on an interior shard can reconstruct into an index that still falls inside `[0, N)`,
@@ -623,8 +623,8 @@ protected: CloudFront [/*, CloudFront Function at viewer-request]
              ├─ valid session cookie → customer origin (or the demo fixture)
              └─ missing/expired       → 302/403 → /_wr/waiting.html
 
-seal:      EventBridge Scheduler at(operator's time)   [always; disabled until set]
-             → seal_event → BatchGetItem ×10 → one guarded UpdateItem
+open:      EventBridge Scheduler at(operator's time)   [always; disabled until set]
+             → open_event → BatchGetItem ×10 → one guarded UpdateItem
 
 meter:     EventBridge Scheduler rate(1 minute)        [always]
              → controller, six durable passes at 10 s

@@ -38,7 +38,7 @@ New workspace member `crates/admin`:
 ## Routes → handler → state
 
 All admin actions are one **conditional `UpdateItem`** on the single `Counters`
-item (`event_id` PK), mirroring how `seal_event` writes. Attribute names come
+item (`event_id` PK), mirroring how `open_event` writes. Attribute names come
 from `wr-domain::Counters` / `Phase`.
 
 | Route | Method | Handler | Writes on `Counters` |

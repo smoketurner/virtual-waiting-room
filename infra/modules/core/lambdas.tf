@@ -1,7 +1,7 @@
-# modules/core - the seal and read Lambdas.
+# modules/core - the open and read Lambdas.
 #
-#   seal_event  fired once at the event start by an EventBridge schedule; reads
-#               the shard counts and writes the seal (seed + offsets + count +
+#   open_event  fired once at the event start by an EventBridge schedule; reads
+#               the shard counts and writes the open (seed + offsets + count +
 #               phase) in one conditional UpdateItem. With demotion rules set
 #               (issue #145) it first scans the pre-queue, classifies it, and
 #               stores the demoted groups once for every resolver to match on.
@@ -10,27 +10,27 @@
 #
 # Every function deploys its own build; there is no stub fallback.
 
-# --- seal_event ---------------------------------------------------------------
+# --- open_event ---------------------------------------------------------------
 
-resource "aws_iam_role" "seal_event" {
-  name               = "${local.seal_event_name}-role"
+resource "aws_iam_role" "open_event" {
+  name               = "${local.open_event_name}-role"
   assume_role_policy = data.aws_iam_policy_document.lambda_assume_role.json
   tags               = var.tags
 }
 
-resource "aws_iam_role_policy" "seal_event" {
-  name   = "${local.seal_event_name}-policy"
-  role   = aws_iam_role.seal_event.id
-  policy = data.aws_iam_policy_document.seal_event.json
+resource "aws_iam_role_policy" "open_event" {
+  name   = "${local.open_event_name}-policy"
+  role   = aws_iam_role.open_event.id
+  policy = data.aws_iam_policy_document.open_event.json
 }
 
-resource "aws_lambda_function" "seal_event" {
-  function_name = local.seal_event_name
-  role          = aws_iam_role.seal_event.arn
+resource "aws_lambda_function" "open_event" {
+  function_name = local.open_event_name
+  role          = aws_iam_role.open_event.arn
   runtime       = "provided.al2023"
   architectures = [local.lambda_runtime_arch]
   handler       = "bootstrap"
-  # Sized for the demotion scan (issue #145), not the seal write: with rules
+  # Sized for the demotion scan (issue #145), not the open write: with rules
   # set the function reads every pre-queue row and holds a few words per row
   # plus the interned signal values in memory — tens of megabytes at a million
   # registrations — and writes nothing per row. With no rules it is the same
@@ -39,14 +39,14 @@ resource "aws_lambda_function" "seal_event" {
   timeout     = 300
   memory_size = 1024
 
-  filename         = local.lambda_zip["seal_event"]
-  source_code_hash = local.lambda_hash["seal_event"]
+  filename         = local.lambda_zip["open_event"]
+  source_code_hash = local.lambda_hash["open_event"]
 
   environment {
     variables = merge(local.dynamo_lambda_env, {
       COUNTERS_TABLE = aws_dynamodb_table.counters.name
       PREQUEUE_TABLE = aws_dynamodb_table.prequeue.name
-      # Seal-time demotion (issue #145). Empty rules = no scan at all.
+      # Open-time demotion (issue #145). Empty rules = no scan at all.
       DEMOTION_RULES = var.demotion_rules
       DEMOTION_MODE  = var.demotion_mode
     })
@@ -140,8 +140,8 @@ resource "aws_lambda_function" "admin" {
       # Issue #71: mirrors fail_open_until to the edge gate's KeyValueStore.
       EDGE_KVS_ARN = aws_cloudfront_key_value_store.gate.arn
       # Issue #128: the operator's start time is written here, which arms the
-      # one-time seal schedule Terraform created disabled.
-      SEAL_SCHEDULE_NAME = aws_scheduler_schedule.seal.name
+      # one-time open schedule Terraform created disabled.
+      OPEN_SCHEDULE_NAME = aws_scheduler_schedule.open.name
       # API Gateway prefixes the path with the stage (e.g. /dev/admin); this
       # makes the Rust runtime strip it so the Axum routes match unprefixed.
       AWS_LAMBDA_HTTP_IGNORE_STAGE_IN_PATH = "true"
@@ -170,7 +170,7 @@ resource "aws_lambda_permission" "admin_apigw" {
   source_arn    = "${aws_api_gateway_rest_api.this.execution_arn}/*/*"
 }
 
-# --- seal schedule (EventBridge Scheduler) ------------------------------------
+# --- open schedule (EventBridge Scheduler) ------------------------------------
 # One-time trigger at the event start (issue #128). The schedule always exists
 # so that destroying the stack destroys it too; the operator sets the time from
 # the admin dashboard, which is the only thing that ever writes the expression.
@@ -181,10 +181,10 @@ resource "aws_lambda_permission" "admin_apigw" {
 # the same shape as aws_ssm_parameter.oidc_client_secret: required by the API,
 # overwritten out of band, and excluded from drift by ignore_changes. It is set
 # far in the future rather than near, so that even an accidental enable of the
-# placeholder cannot fire a seal.
+# placeholder cannot fire an open.
 
-resource "aws_scheduler_schedule" "seal" {
-  name = "${var.name_prefix}-seal"
+resource "aws_scheduler_schedule" "open" {
+  name = "${var.name_prefix}-open"
 
   flexible_time_window {
     mode = "OFF"
@@ -195,12 +195,12 @@ resource "aws_scheduler_schedule" "seal" {
   state                        = "DISABLED"
 
   target {
-    arn      = aws_lambda_function.seal_event.arn
-    role_arn = aws_iam_role.seal_scheduler.arn
+    arn      = aws_lambda_function.open_event.arn
+    role_arn = aws_iam_role.open_scheduler.arn
     input    = jsonencode({ event_id = var.event_id })
 
     # Deliberately not the AWS defaults (86400 seconds / 185 attempts). Two
-    # reasons. A seal that could not be delivered for 24 hours would open the
+    # reasons. An open that could not be delivered for 24 hours would open the
     # event a day late, which is worse than not opening it at all, so the
     # attempt is bounded to minutes. And because the provider's defaults are
     # also the service's, an UpdateSchedule that dropped this block would be
@@ -221,21 +221,21 @@ resource "aws_scheduler_schedule" "seal" {
   }
 }
 
-resource "aws_iam_role" "seal_scheduler" {
-  name               = "${var.name_prefix}-seal-scheduler-role"
+resource "aws_iam_role" "open_scheduler" {
+  name               = "${var.name_prefix}-open-scheduler-role"
   assume_role_policy = data.aws_iam_policy_document.scheduler_assume_role.json
   tags               = var.tags
 }
 
-resource "aws_iam_role_policy" "seal_scheduler" {
-  name = "${var.name_prefix}-seal-scheduler-policy"
-  role = aws_iam_role.seal_scheduler.id
+resource "aws_iam_role_policy" "open_scheduler" {
+  name = "${var.name_prefix}-open-scheduler-policy"
+  role = aws_iam_role.open_scheduler.id
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
       Effect   = "Allow"
       Action   = "lambda:InvokeFunction"
-      Resource = aws_lambda_function.seal_event.arn
+      Resource = aws_lambda_function.open_event.arn
     }]
   })
 }

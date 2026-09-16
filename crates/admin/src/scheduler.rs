@@ -1,12 +1,12 @@
-//! The `aws-sdk-scheduler`-backed [`SealSchedule`] implementation (issue
-//! #128): arms or disables the one-time schedule that fires `seal_event` at
+//! The `aws-sdk-scheduler`-backed [`OpenSchedule`] implementation (issue
+//! #128): arms or disables the one-time schedule that fires `open_event` at
 //! the operator's start time.
 //!
 //! `UpdateSchedule` **replaces** a schedule rather than patching it — every
 //! field left unset reverts to its service default — so a write here is
 //! get-then-resend, in the same shape as `edge`'s describe-then-put. Getting
 //! that wrong does not fail loudly: it silently drops the target's `input`,
-//! which carries the event id the seal needs, and its retry policy.
+//! which carries the event id the open needs, and its retry policy.
 //!
 //! Terraform owns the schedule's existence, target and role; only the
 //! expression and the state are ever changed here.
@@ -16,9 +16,9 @@ use aws_sdk_scheduler::operation::get_schedule::GetScheduleOutput;
 use aws_sdk_scheduler::operation::update_schedule::builders::UpdateScheduleInputBuilder;
 use aws_sdk_scheduler::types::ScheduleState;
 
-use crate::{ScheduleError, SealSchedule};
+use crate::{OpenSchedule, ScheduleError};
 
-/// A live `EventBridge` Scheduler-backed [`SealSchedule`] bound to one
+/// A live `EventBridge` Scheduler-backed [`OpenSchedule`] bound to one
 /// schedule.
 pub struct SchedulerStore {
     client: Client,
@@ -100,7 +100,7 @@ fn rewrite(
 /// when disabling a schedule whose own expression is no longer usable.
 const DISABLED_PLACEHOLDER: &str = "at(2099-12-31T23:59:59)";
 
-impl SealSchedule for SchedulerStore {
+impl OpenSchedule for SchedulerStore {
     async fn set_start_time(&self, at: Option<(&str, &str)>) -> Result<(), ScheduleError> {
         let current = self
             .client
@@ -130,7 +130,7 @@ mod tests {
 
     use super::*;
 
-    const NAME: &str = "wr-dev-seal";
+    const NAME: &str = "wr-dev-open";
     const INPUT: &str = r#"{"event_id":"evt-1"}"#;
 
     /// A schedule shaped like the one Terraform creates: a target carrying the
@@ -143,7 +143,7 @@ mod tests {
             .schedule_expression("at(2099-12-31T23:59:59)")
             .schedule_expression_timezone("UTC")
             .state(ScheduleState::Disabled)
-            .description("seal the event at T-0")
+            .description("open the event at T-0")
             .flexible_time_window(
                 FlexibleTimeWindow::builder()
                     .mode(FlexibleTimeWindowMode::Off)
@@ -152,8 +152,8 @@ mod tests {
             )
             .target(
                 Target::builder()
-                    .arn("arn:aws:lambda:us-east-1:111122223333:function:wr-dev-seal-event")
-                    .role_arn("arn:aws:iam::111122223333:role/wr-dev-seal-scheduler-role")
+                    .arn("arn:aws:lambda:us-east-1:111122223333:function:wr-dev-open-event")
+                    .role_arn("arn:aws:iam::111122223333:role/wr-dev-open-scheduler-role")
                     .input(INPUT)
                     .retry_policy(
                         RetryPolicy::builder()
@@ -176,7 +176,7 @@ mod tests {
     fn arming_preserves_the_target_input_and_retry_policy() {
         // The acceptance criterion for issue #128. UpdateSchedule replaces the
         // schedule, so a writer that sent only the expression would blank the
-        // event id the seal reads and revert the retry policy to the service
+        // event id the open reads and revert the retry policy to the service
         // default — and because that default equals the provider's, the
         // regression would be invisible without asserting it here.
         let current = deployed_schedule();

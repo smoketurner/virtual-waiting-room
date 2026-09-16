@@ -132,7 +132,7 @@ async fn main() -> Result<()> {
                         if elapsed_secs < countdown_secs {
                             // Countdown still running: no cursor yet, matching
                             // the real server's `closed` serving_state before
-                            // the seal. Without this row --polling backoff's
+                            // the open. Without this row --polling backoff's
                             // ceiling-during-closed branch never fires and the
                             // measured saving is 2.6x smaller than the
                             // client's actual countdown-phase behaviour.
@@ -309,10 +309,10 @@ fn histogram(timeline: &[u64], countdown_s: u64) {
         // reported as comfortable.
         let worst = chunk.iter().copied().max().unwrap_or(0);
         let width = (worst * 50 / peak) as usize;
-        let seal = if seconds == countdown_s.saturating_sub(countdown_s % per_bucket as u64)
+        let open = if seconds == countdown_s.saturating_sub(countdown_s % per_bucket as u64)
             && countdown_s > 0
         {
-            " <- seal"
+            " <- open"
         } else {
             ""
         };
@@ -320,7 +320,7 @@ fn histogram(timeline: &[u64], countdown_s: u64) {
             "  t={seconds:>4}s {:>9} {}{}",
             worst,
             "#".repeat(width),
-            seal
+            open
         );
     }
 }

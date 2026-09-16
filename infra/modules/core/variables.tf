@@ -52,8 +52,8 @@ variable "assign_position_artifact_path" {
   type        = string
 }
 
-variable "seal_event_artifact_path" {
-  description = "Path to the seal_event Lambda bootstrap zip."
+variable "open_event_artifact_path" {
+  description = "Path to the open_event Lambda bootstrap zip."
   type        = string
 }
 
@@ -155,7 +155,7 @@ variable "assign_position_reserved_concurrency" {
     sequential DynamoDB calls, so the per-call latency sets the drain rate, and
     it is not measured. Headroom is free — this is a ceiling, not a
     reservation that bills when idle — and running short is not merely slow: a
-    registrant still queued when the event seals is demoted to the back of the
+    registrant still queued when the event opens is demoted to the back of the
     live-join queue.
 
     Raising this alone does not raise the ceiling on `PreQueue` writes. Set
@@ -238,14 +238,14 @@ variable "poll_divisor" {
   }
 }
 
-# --- Seal-time demotion (issue #145) ------------------------------------------
-# Read by seal_event only. Both are deploy-time settings rather than admin
+# --- Open-time demotion (issue #145) ------------------------------------------
+# Read by open_event only. Both are deploy-time settings rather than admin
 # levers for the same reason the poll policy is: a fairness control that can be
 # flipped mid-event from a dashboard is one that can be flipped by mistake at
-# the moment it matters most, and the seal fires once.
+# the moment it matters most, and the open fires once.
 
 variable "demotion_rules" {
-  description = "Seal-time demotion rules (issue #145), comma-separated `signal:max` entries where signal is one of address, asn, ja4, ua. At the seal, every group of registrations sharing one value of that signal and numbering more than `max` is moved whole to a tail behind the rest of the cohort (or only reported, under demotion_mode = observe). Empty disables the scan entirely. Choose thresholds against a real event's report before enforcing: an office NAT or campus network shares one address, and every user of one browser release shares one JA4."
+  description = "Open-time demotion rules (issue #145), comma-separated `signal:max` entries where signal is one of address, asn, ja4, ua. At the open, every group of registrations sharing one value of that signal and numbering more than `max` is moved whole to a tail behind the rest of the cohort (or only reported, under demotion_mode = observe). Empty disables the scan entirely. Choose thresholds against a real event's report before enforcing: an office NAT or campus network shares one address, and every user of one browser release shares one JA4."
   type        = string
   default     = ""
 
@@ -256,7 +256,7 @@ variable "demotion_rules" {
 }
 
 variable "demotion_mode" {
-  description = "What the seal does with a demotion classification (issue #145): `observe` writes the report and demotes nobody; `enforce` also moves every registration in a demoted group to the tail. Observe is the default, and the count-then-block discipline (O5) applies — run a real event in observe and read the report before enforcing."
+  description = "What the open does with a demotion classification (issue #145): `observe` writes the report and demotes nobody; `enforce` also moves every registration in a demoted group to the tail. Observe is the default, and the count-then-block discipline (O5) applies — run a real event in observe and read the report before enforcing."
   type        = string
   default     = "observe"
 

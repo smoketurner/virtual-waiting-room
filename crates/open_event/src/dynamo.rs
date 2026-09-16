@@ -1,4 +1,4 @@
-//! The `aws-sdk-dynamodb`-backed [`Store`] for the seal.
+//! The `aws-sdk-dynamodb`-backed [`Store`] for the open.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,7 +16,7 @@ use wr_common::{
     DemotionReport, Phase, PreQueueItem, SHARDS, Shard, shard_count_of, shard_index_of,
 };
 
-use crate::{ScannedRow, SealValues, Store, StoreError};
+use crate::{OpenValues, ScannedRow, Store, StoreError};
 
 /// Parallel scan segments. The scan is bounded by page round trips, not CPU:
 /// at a million rows and 1 MB pages, eight segments finish in seconds.
@@ -44,7 +44,7 @@ impl Store for DynamoStore {
     async fn read_shard_counts(&self, event_id: &str) -> Result<[u64; SHARDS], StoreError> {
         // One BatchGetItem across the ten shard items rather than one GetItem
         // on a shared one. The shards are separate partition keys precisely so
-        // registration writes do not contend, which means the seal has to
+        // registration writes do not contend, which means the open has to
         // gather them.
         let keys: Vec<_> = (0..SHARDS)
             .filter_map(Shard::new)
@@ -53,7 +53,7 @@ impl Store for DynamoStore {
 
         let request = aws_sdk_dynamodb::types::KeysAndAttributes::builder()
             .set_keys(Some(keys))
-            // Consistent: the seal folds these into the cohort size, and a
+            // Consistent: the open folds these into the cohort size, and a
             // registration missed here is a visitor with no position at all.
             .consistent_read(true)
             .build()
@@ -71,7 +71,7 @@ impl Store for DynamoStore {
             .unprocessed_keys()
             .is_some_and(|u| u.contains_key(&self.counters_table))
         {
-            // Sealing on a partial read would under-count the cohort and strand
+            // Opening on a partial read would under-count the cohort and strand
             // every registration in the shards that were dropped.
             return Err(StoreError("shard read incomplete; retry".to_owned()));
         }
@@ -103,7 +103,7 @@ impl Store for DynamoStore {
         Ok(scanned)
     }
 
-    async fn write_seal(&self, event_id: &str, values: &SealValues) -> Result<bool, StoreError> {
+    async fn write_open(&self, event_id: &str, values: &OpenValues) -> Result<bool, StoreError> {
         let offsets_list: Vec<AttributeValue> = values
             .offsets
             .iter()
@@ -112,12 +112,12 @@ impl Store for DynamoStore {
 
         let count = AttributeValue::N(values.participant_count.to_string());
         // queue_counter starts behind the cohort *and its tail*: the live-join
-        // sequence must not hand a post-seal joiner a position already owned
+        // sequence must not hand a post-open joiner a position already owned
         // inside `[0, N)` or inside the tail `[N, 2N)`.
         let live_join_start = values
             .queue_counter_start()
             .map_err(|e| StoreError(format!("live-join start: {e}")))?;
-        let mut seal = Update::new()
+        let mut open = Update::new()
             .set(
                 "shuffle_seed",
                 AttributeValue::B(aws_sdk_dynamodb::primitives::Blob::new(values.seed)),
@@ -133,7 +133,7 @@ impl Store for DynamoStore {
                 AttributeValue::S(Phase::Active.as_wire_str().to_owned()),
             );
         if let Some(demotion) = &values.demotion {
-            seal = seal
+            open = open
                 .set(
                     DEMOTED_COUNT_ATTR,
                     AttributeValue::N(values.demoted_count.to_string()),
@@ -147,14 +147,14 @@ impl Store for DynamoStore {
                     AttributeValue::N(demotion.chunks.to_string()),
                 );
         }
-        let seal = seal.build();
+        let open = open.build();
 
-        // The seed is written by the seal and nothing else, so its absence
-        // means "not yet sealed" and a double-fire is rejected rather than
+        // The seed is written by the open and nothing else, so its absence
+        // means "not yet open" and a double-fire is rejected rather than
         // reseeding.
         let guard = Condition::attribute_not_exists("shuffle_seed").build();
 
-        let mut names = seal.names;
+        let mut names = open.names;
         names.extend(guard.names);
 
         let result = self
@@ -162,10 +162,10 @@ impl Store for DynamoStore {
             .update_item()
             .table_name(&self.counters_table)
             .set_key(Some(Key::Event { event_id }.build()))
-            .update_expression(seal.expression)
+            .update_expression(open.expression)
             .condition_expression(guard.expression)
             .set_expression_attribute_names(Some(names))
-            .set_expression_attribute_values(Some(seal.values))
+            .set_expression_attribute_values(Some(open.values))
             .send()
             .await;
 
@@ -209,7 +209,7 @@ impl Store for DynamoStore {
         chunks: &[Vec<String>],
     ) -> Result<(), StoreError> {
         // A handful of items at most (a chunk is 300 KB of entries), written
-        // in order so a partial failure leaves a prefix; the seal that would
+        // in order so a partial failure leaves a prefix; the open that would
         // name them is never written after a failure here.
         for (index, chunk) in chunks.iter().enumerate() {
             let chunk_index = u32::try_from(index)
@@ -273,7 +273,7 @@ async fn scan_segment(
         .segment(segment)
         .total_segments(SCAN_SEGMENTS)
         // Consistent, like the shard-count read: the cohort is every row
-        // written before the seal, and an eventually consistent scan could
+        // written before the open, and an eventually consistent scan could
         // miss the last seconds of registrations — exactly the ones a farm
         // times for T−0.
         .consistent_read(true)
@@ -286,7 +286,7 @@ async fn scan_segment(
             Ok(row) => row,
             Err(e) => {
                 // A row this crate cannot read is a row it cannot classify;
-                // it keeps its primary slot, and the seal goes on.
+                // it keeps its primary slot, and the open goes on.
                 tracing::warn!(error = %e, "skipping an unreadable pre-queue row");
                 continue;
             }

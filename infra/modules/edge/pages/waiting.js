@@ -400,7 +400,7 @@
   var MAX_MISSES = 8;
   var misses = 0;
 
-  // A place in line, once known, never changes: it is derived from a sealed
+  // A place in line, once known, never changes: it is derived from an opened
   // permutation for a pre-queue registrant and from a claimed row for a live
   // joiner. Only the serving cursor moves, and /status carries that. So the
   // number is fetched once and held, and every later poll reads /status alone —
@@ -821,7 +821,7 @@
           // still watching rather than dead.
           // A closed event has not dealt this visitor a number, and if one was
           // held from an earlier run of the same page it belongs to a cohort
-          // that no longer exists — an operator who resets an event seals a new
+          // that no longer exists — an operator who resets an event opens a new
           // one with a different permutation.
           forgetPosition();
           nextIntervalMs = policy.ceilingMs;
@@ -840,7 +840,7 @@
               "This page updates on its own when it opens."
             );
           } else {
-            // The start has passed but the seal has not landed yet. Saying
+            // The start has passed but the open has not landed yet. Saying
             // "opens in under a minute" forever would read as stuck.
             say("Opening now", "This page updates on its own when it opens.");
           }
@@ -848,7 +848,7 @@
             // Registration during the countdown is a single direct write
             // (join() no-ops on reload via JOINED_KEY), not a poll: the
             // /queue_num call below stays skipped, since that endpoint
-            // answers 409 until the seal and a poll against it would only
+            // answers 409 until the open and a poll against it would only
             // churn the catch handler. Must return the promise chain, or a
             // rejected join never reaches tick()'s catch and schedule()
             // never runs again.

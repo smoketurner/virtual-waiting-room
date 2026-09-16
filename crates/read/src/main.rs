@@ -25,9 +25,9 @@ struct Ctx {
     positions_table: String,
     event_id: String,
     counters_cache: CountersCache,
-    /// The sealed event's demotion set (issue #145), loaded once per
+    /// The opened event's demotion set (issue #145), loaded once per
     /// execution environment and keyed by the nonce the event item names.
-    /// Immutable once sealed, so it never expires; a new event's nonce
+    /// Immutable once opened, so it never expires; a new event's nonce
     /// replaces it.
     demotion_cache: DemotionCache,
     /// The adaptive poll policy (#69), parsed once at cold start
@@ -129,19 +129,19 @@ async fn handle_queue_num(ctx: &Ctx, req: &Request) -> Result<Response<Body>, Er
     let demotion = load_demotion(ctx, &counters).await?;
     match queue_num(&counters, &row, demotion.as_deref()) {
         Ok(ResolvedQueueNum::PreQueue(resp)) => json(200, &resp),
-        // The row raced the seal: it holds no real position, so fall through
+        // The row raced the open: it holds no real position, so fall through
         // to the same Positions lookup a live joiner uses. A row there means
         // this visitor re-joined and already holds a live position; no row
         // means "not registered yet" — a 404 the straggler's client treats as
         // a miss and eventually recovers from by re-joining.
         Ok(ResolvedQueueNum::Straggler) => respond_from_position(ctx, request_id).await,
-        Err(QueueNumError::NotSealed) => {
+        Err(QueueNumError::NotOpen) => {
             json(409, &serde_json::json!({ "error": "event not yet open" }))
         }
         Err(QueueNumError::BadShard) => {
             json(500, &serde_json::json!({ "error": "corrupt registration" }))
         }
-        // Retryable: the set exists (the seal named it) and the next poll
+        // Retryable: the set exists (the open named it) and the next poll
         // gets another chance to load it. Answering from the primary slot
         // would silently un-demote every demoted row.
         Err(QueueNumError::DemotionUnavailable) => {
@@ -151,7 +151,7 @@ async fn handle_queue_num(ctx: &Ctx, req: &Request) -> Result<Response<Body>, Er
 }
 
 /// The demotion set the event item names, from the per-environment cache or
-/// one read of its chunk items. `None` when the seal demoted nobody. A read
+/// one read of its chunk items. `None` when the open demoted nobody. A read
 /// or parse failure is `None` too — the resolver then refuses rather than
 /// answering from half a set — and is logged, since a set that stays
 /// unreadable stalls every demoting event's position lookups.
@@ -355,7 +355,7 @@ mod tests {
 
     #[test]
     fn a_straggler_with_no_positions_row_answers_404_not_registered() {
-        // A PreQueue row that raced the seal falls through to this lookup; no
+        // A PreQueue row that raced the open falls through to this lookup; no
         // Positions row means the re-join hasn't landed yet, not an error.
         assert_eq!(
             position_response(None),

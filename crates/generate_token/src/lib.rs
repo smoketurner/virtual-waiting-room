@@ -78,9 +78,9 @@ pub enum Denied {
     /// The event is not admitting: not active, or held by the operator.
     #[error("event is not admitting")]
     NotAdmitting,
-    /// The event has not been sealed, so no position exists yet.
+    /// The event has not been opened, so no position exists yet.
     #[error("event not yet open")]
-    NotSealed,
+    NotOpen,
     /// The visitor's turn has not arrived.
     #[error("still queued at {position}, now serving {serving}")]
     StillQueued { position: u64, serving: u64 },
@@ -91,7 +91,7 @@ pub enum Denied {
     /// The stored registration is corrupt.
     #[error("corrupt registration")]
     Corrupt,
-    /// The seal demoted rows (issue #145) and the demotion set could not be
+    /// The open demoted rows (issue #145) and the demotion set could not be
     /// read, so the position cannot be resolved right now. Retryable.
     #[error("queue state temporarily unavailable")]
     Unavailable,
@@ -147,7 +147,7 @@ pub fn decide(
 
 /// The visitor's position, from whichever path registered them. A live-join
 /// row wins over a pre-queue row: it is the position actually claimed from the
-/// counter, whereas a pre-queue row that raced the seal only reports the base
+/// counter, whereas a pre-queue row that raced the open only reports the base
 /// the live sequence counts from.
 fn resolve_position(
     counters: &Counters,
@@ -173,10 +173,10 @@ fn resolve_position(
 
     match counters.resolve_prequeue(row, demotion) {
         Ok(ResolvedPosition::PreQueue(position)) => Ok(position),
-        // Raced the seal, so a live-join row should exist; without one there is
+        // Raced the open, so a live-join row should exist; without one there is
         // no claimed position to admit against.
         Ok(ResolvedPosition::LiveJoin) => Err(Denied::NotRegistered),
-        Err(ResolveError::NotSealed) => Err(Denied::NotSealed),
+        Err(ResolveError::NotOpen) => Err(Denied::NotOpen),
         Err(ResolveError::BadShard) => Err(Denied::Corrupt),
         Err(ResolveError::DemotionUnavailable) => Err(Denied::Unavailable),
     }
@@ -186,24 +186,24 @@ fn resolve_position(
 mod tests {
     #![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
 
-    use wr_common::{SHARDS, SealedOffsets, StoredControl};
+    use wr_common::{CohortOffsets, SHARDS, StoredControl};
 
     use super::*;
 
     fn counters(serving: u64) -> Counters {
         let counts = [2u64; SHARDS];
-        let sealed = SealedOffsets::seal(counts).unwrap();
+        let opened = CohortOffsets::from_counts(counts).unwrap();
         let mut offsets = [0u64; SHARDS];
         for (s, slot) in offsets.iter_mut().enumerate() {
-            *slot = sealed.offset(s);
+            *slot = opened.offset(s);
         }
         Counters {
             event_id: "evt".to_owned(),
             phase: Phase::Active,
-            queue_counter: sealed.participant_count(),
+            queue_counter: opened.participant_count(),
             serving_counter: serving,
             shuffle_seed: Some([9u8; 32]),
-            participant_count: Some(sealed.participant_count()),
+            participant_count: Some(opened.participant_count()),
             prequeue_offsets: Some(offsets),
             demoted_count: 0,
             demotion: None,
@@ -352,7 +352,7 @@ mod tests {
             v: None,
         };
         let grant = decide(&c, Some(&row), None, 0, None).unwrap();
-        // Inside the sealed cohort.
+        // Inside the cohort.
         assert!(grant.position < c.participant_count.unwrap());
     }
 
@@ -414,7 +414,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unsealed_event_has_no_pre_queue_position() {
+    fn an_unopened_event_has_no_pre_queue_position() {
         let mut c = counters(10);
         c.shuffle_seed = None;
         c.participant_count = None;
@@ -428,7 +428,7 @@ mod tests {
         };
         assert_eq!(
             decide(&c, Some(&row), None, 0, None).unwrap_err(),
-            Denied::NotSealed
+            Denied::NotOpen
         );
     }
 

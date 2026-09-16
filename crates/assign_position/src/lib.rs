@@ -15,33 +15,33 @@
 //! - **Rejected (unconfigured event)** — no `Counters` item exists, so the
 //!   event has not been set up. Every accepted record is failed and claims
 //!   nothing, surfacing the state as a hard failure rather than letting a
-//!   pre-seal live join increment `queue_counter` before the seal `SET`s it
+//!   pre-open live join increment `queue_counter` before the open `SET`s it
 //!   to the cohort size (an unconditional `SET` that would discard the
-//!   increment and let a later cohort member or post-seal joiner collide on
+//!   increment and let a later cohort member or post-open joiner collide on
 //!   the same numeric position).
-//! - **Live join** — the event is sealed, or its phase is anything but
+//! - **Live join** — the event is open, or its phase is anything but
 //!   `PreQueue`. Allocates one contiguous block of queue positions with one
 //!   counter increment and writes one `Positions` row per accepted record.
-//! - **Pre-queue** — the event is not sealed and its phase is `PreQueue`.
+//! - **Pre-queue** — the event is not open and its phase is `PreQueue`.
 //!   Deduplicates by `request_id` (within the batch, and against any row a
 //!   prior invocation already wrote) and claims one contiguous block of local
 //!   indices on one randomly drawn shard for whatever remains.
 //!
-//! The branch is decided on the seal outputs ([`wr_common::Counters::sealed`]),
+//! The branch is decided on the open outputs ([`wr_common::Counters::opened`]),
 //! never on phase alone: an operator can walk the phase back to `PreQueue`
-//! after a seal without unsealing the index space, and a record arriving in
+//! after an open without undoing the index space, and a record arriving in
 //! that state is still a live join.
 //!
-//! A pre-queue write can race `seal_event`'s `BatchGetItem` — the shard claim
-//! landing after the seal read that shard's count, but the row write landing
+//! A pre-queue write can race `open_event`'s `BatchGetItem` — the shard claim
+//! landing after the open read that shard's count, but the row write landing
 //! before the batch finishes. Left alone this is a silent dead end: the row
 //! resolves to a live join on read, but nothing ever gave it a live position.
 //! So after the pre-queue writes land, one more consistent read of `Counters`
-//! checks whether the event sealed mid-batch; every row this invocation
+//! checks whether the event opened mid-batch; every row this invocation
 //! actually wrote (never a `Duplicate` — its burned index belongs to an
 //! earlier invocation with a different local index) that now resolves past
-//! its shard's sealed count gets a real live position, claimed from the same
-//! `queue_counter` the live path uses. This is safe because the seal sets
+//! its shard's opened count gets a real live position, claimed from the same
+//! `queue_counter` the live path uses. This is safe because the open sets
 //! `queue_counter = N` in the same atomic write that publishes the offsets.
 //!
 //! The batch logic is generic over the [`Store`] port so it runs without AWS;
@@ -302,10 +302,10 @@ pub async fn process_batch<S: Store>(
         Ok(Some(c)) => c,
         Ok(None) => {
             // No `Counters` item: the event has not been set up yet. Failing
-            // every accepted record prevents a pre-seal live join from
-            // incrementing `queue_counter` before the seal `SET`s it to the
+            // every accepted record prevents a pre-open live join from
+            // incrementing `queue_counter` before the open `SET`s it to the
             // cohort size — an unconditional `SET` that would discard the
-            // increment and let a later cohort member (or post-seal live
+            // increment and let a later cohort member (or post-open live
             // joiner) collide on the same numeric position. The message
             // retries until setup, then dead-letters after `maxReceiveCount`:
             // a misconfiguration surfaced as a hard failure rather than
@@ -329,11 +329,11 @@ pub async fn process_batch<S: Store>(
         }
     };
 
-    // Branch on the seal outputs, never on phase alone: an operator can walk
-    // the phase back to PreQueue after a seal (Active -> Maintenance -> Idle
-    // -> PreQueue) without unsealing the index space, and a record arriving
+    // Branch on the open outputs, never on phase alone: an operator can walk
+    // the phase back to PreQueue after an open (Active -> Maintenance -> Idle
+    // -> PreQueue) without undoing the index space, and a record arriving
     // in that state is still a live join.
-    let live_path = counters.sealed().is_some() || counters.phase != Phase::PreQueue;
+    let live_path = counters.open_outputs().is_some() || counters.phase != Phase::PreQueue;
 
     if live_path {
         process_live_batch(store, event_id, valid, &mut outcome).await;
@@ -418,7 +418,7 @@ async fn process_live_batch<S: Store>(
 /// Deduplicates the valid set by `request_id` (within the batch, and against
 /// any row a prior invocation already wrote), then claims one contiguous
 /// block of local indices on `shard` for whatever remains and writes one
-/// `PreQueue` row per record. Then checks whether the event sealed mid-batch
+/// `PreQueue` row per record. Then checks whether the event opened mid-batch
 /// and gives every row this invocation actually wrote that now resolves past
 /// the shard's count a real live position.
 async fn process_prequeue_batch<S: Store>(
@@ -500,7 +500,7 @@ async fn process_prequeue_batch<S: Store>(
                 // side but actually landed is indistinguishable here from one
                 // that truly failed, so it is classified as "no row" and
                 // reported as a batch failure. Redelivery finds the event
-                // sealed by then and takes the live path, which can mint a
+                // opened by then and takes the live path, which can mint a
                 // second Positions row for a request id that already holds a
                 // counted PreQueue row, demoting a visitor who was counted
                 // into the cohort. The fix-up below cannot catch it, because
@@ -521,14 +521,14 @@ async fn process_prequeue_batch<S: Store>(
     fixup_stragglers(store, event_id, written).await;
 }
 
-/// Checks whether the event sealed while the pre-queue writes above were
+/// Checks whether the event opened while the pre-queue writes above were
 /// landing, and gives every row this invocation wrote that now resolves past
-/// its shard's sealed count a real live position.
+/// its shard's opened count a real live position.
 ///
 /// A failure anywhere in this fix-up — the read, the block claim, or a
 /// position write — is deliberately never a batch failure. A record whose
 /// `PreQueue` row this invocation already wrote must never be redelivered:
-/// redelivery would find the event sealed and take the live path directly,
+/// redelivery would find the event opened and take the live path directly,
 /// minting a second position for a row that (if it turns out to be within its
 /// shard's count) is already correctly counted in the pre-queue cohort — the
 /// same demotion by a different route. Left alone, an uncorrected straggler
@@ -542,15 +542,15 @@ async fn fixup_stragglers<S: Store>(store: &S, event_id: &str, written: Vec<PreQ
             return;
         }
     };
-    let Some(sealed) = counters.and_then(|c| c.sealed()) else {
-        return; // Still not sealed; nothing raced the seal.
+    let Some(opened) = counters.and_then(|c| c.open_outputs()) else {
+        return; // Still not open; nothing raced the open.
     };
 
     let stragglers: Vec<PreQueueWrite> = written
         .into_iter()
         .filter(|write| {
             matches!(
-                sealed
+                opened
                     .offsets
                     .assign(write.shard.index(), write.local_index),
                 Assignment::LiveJoin
@@ -593,7 +593,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
-    use wr_common::{SHARDS, SealedOffsets, StoredControl};
+    use wr_common::{CohortOffsets, SHARDS, StoredControl};
 
     use super::*;
 
@@ -803,22 +803,22 @@ mod tests {
         }
     }
 
-    /// A sealed `Counters` built from real per-shard counts via
-    /// [`SealedOffsets::seal`], so the offsets are exactly what `seal_event`
+    /// An opened `Counters` built from real per-shard counts via
+    /// [`CohortOffsets::open`], so the offsets are exactly what `open_event`
     /// would have produced rather than hand-picked to fit a scenario.
-    fn sealed_counters(counts: [u64; SHARDS], phase: Phase) -> Counters {
-        let sealed = SealedOffsets::seal(counts).unwrap();
+    fn opened_counters(counts: [u64; SHARDS], phase: Phase) -> Counters {
+        let opened = CohortOffsets::from_counts(counts).unwrap();
         let mut offsets = [0u64; SHARDS];
         for (s, slot) in offsets.iter_mut().enumerate() {
-            *slot = sealed.offset(s);
+            *slot = opened.offset(s);
         }
         Counters {
             event_id: "evt-1".to_owned(),
             phase,
-            queue_counter: sealed.participant_count(),
+            queue_counter: opened.participant_count(),
             serving_counter: 0,
             shuffle_seed: Some([7u8; 32]),
-            participant_count: Some(sealed.participant_count()),
+            participant_count: Some(opened.participant_count()),
             prequeue_offsets: Some(offsets),
             demoted_count: 0,
             demotion: None,
@@ -929,8 +929,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_joins_after_a_seal_land_above_the_pre_queue_cohort() {
-        // The seal starts queue_counter at the cohort size N. A live join
+    async fn live_joins_after_an_open_land_above_the_pre_queue_cohort() {
+        // The open starts queue_counter at the cohort size N. A live join
         // arriving afterwards must be numbered outside the pre-queue cohort's
         // [0, N), or two visitors hold the same position.
         const COHORT: u64 = 1_000;
@@ -1032,15 +1032,15 @@ mod tests {
         assert_eq!(store.writes.lock().unwrap().len(), 1);
     }
 
-    // --- routing: seal outputs, not phase -----------------------------------
+    // --- routing: open outputs, not phase -----------------------------------
 
     #[tokio::test]
-    async fn sealed_event_with_prequeue_phase_takes_live_path() {
-        // An operator can walk the phase back to PreQueue after a seal without
-        // unsealing the index space; a sealed event always takes the live path
+    async fn opened_event_with_prequeue_phase_takes_live_path() {
+        // An operator can walk the phase back to PreQueue after an open without
+        // undoing the index space; an opened event always takes the live path
         // regardless of what phase says.
         let store = FakeStore::default();
-        let counters = sealed_counters([1, 0, 0, 0, 0, 0, 0, 0, 0, 0], Phase::PreQueue);
+        let counters = opened_counters([1, 0, 0, 0, 0, 0, 0, 0, 0, 0], Phase::PreQueue);
         *store.counters_sequence.lock().unwrap() = VecDeque::from([Some(counters)]);
         let records = vec![rec("m1", VALID_ID)];
         let outcome = run_open(&store, &records).await;
@@ -1096,8 +1096,8 @@ mod tests {
     async fn missing_counters_item_fails_every_valid_record_and_claims_nothing() {
         // The contract change: with no `Counters` item the event is
         // unconfigured, so a join is never processed. Failing every valid
-        // record (rather than taking the live path) prevents a pre-seal live
-        // join from incrementing `queue_counter` before the seal `SET`s it to
+        // record (rather than taking the live path) prevents a pre-open live
+        // join from incrementing `queue_counter` before the open `SET`s it to
         // the cohort size, which would discard the increment and cause a
         // position collision.
         let store = FakeStore {
@@ -1184,7 +1184,7 @@ mod tests {
     }
 
     /// The handler-level burned-slot test: unlike the property test over
-    /// `SealedOffsets` alone, this drives the actual batch-processing code
+    /// `CohortOffsets` alone, this drives the actual batch-processing code
     /// through the `Store` port with a real write failure, and proves the
     /// gap it leaves does not collide with a neighbour's index.
     #[tokio::test]
@@ -1220,7 +1220,7 @@ mod tests {
         );
 
         // The shard's claimed count still advanced past the burned index —
-        // the fold that decides pre-queue vs. live-join at the seal reads it
+        // the fold that decides pre-queue vs. live-join at the open reads it
         // from there, not from how many rows actually landed.
         assert_eq!(store.shard_counters.lock().unwrap()[0], 3);
     }
@@ -1239,7 +1239,7 @@ mod tests {
             .counters_sequence
             .lock()
             .unwrap()
-            .push_back(Some(sealed_counters(counts, Phase::Active)));
+            .push_back(Some(opened_counters(counts, Phase::Active)));
 
         let outcome = run_open(&store, &records).await;
         assert!(outcome.failures.is_empty());
@@ -1294,7 +1294,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seal_landing_mid_batch_splits_stragglers_from_counted_rows() {
+    async fn open_landing_mid_batch_splits_stragglers_from_counted_rows() {
         let store = FakeStore::default();
         *store.counters_sequence.lock().unwrap() =
             VecDeque::from([Some(counters_with_phase(Phase::PreQueue))]);
@@ -1303,7 +1303,7 @@ mod tests {
         let straggler_id = "018f3a2b-7c9d-7e1f-8001-0123456789ab".to_owned();
         let records = vec![rec("m1", &counted_id), rec("m2", &straggler_id)];
 
-        // Sealed at fix-up time: the drawn shard's issued count is 1, so local
+        // Opened at fix-up time: the drawn shard's issued count is 1, so local
         // index 0 (the first write) is in range and local index 1 (the
         // second) is already past it.
         let mut counts = [0u64; SHARDS];
@@ -1312,7 +1312,7 @@ mod tests {
             .counters_sequence
             .lock()
             .unwrap()
-            .push_back(Some(sealed_counters(counts, Phase::Active)));
+            .push_back(Some(opened_counters(counts, Phase::Active)));
 
         let outcome = run_open(&store, &records).await;
         assert!(outcome.failures.is_empty());

@@ -57,7 +57,7 @@ struct StaticAssets;
 struct AppState {
     store: DynamoStore,
     edge: KvsStore,
-    /// The one-time seal schedule the operator's start time writes (issue
+    /// The one-time open schedule the operator's start time writes (issue
     /// #128).
     schedule: SchedulerStore,
     sessions: SessionStore,
@@ -119,7 +119,7 @@ async fn main() -> Result<(), Error> {
     let state = Arc::new(AppState {
         store: DynamoStore::new(dynamo.clone(), std::env::var("COUNTERS_TABLE")?),
         edge: KvsStore::new(kvs, std::env::var("EDGE_KVS_ARN")?),
-        schedule: SchedulerStore::new(scheduler, std::env::var("SEAL_SCHEDULE_NAME")?),
+        schedule: SchedulerStore::new(scheduler, std::env::var("OPEN_SCHEDULE_NAME")?),
         sessions: SessionStore::new(dynamo, std::env::var("TOKENS_TABLE")?),
         oidc,
         http,
@@ -391,7 +391,7 @@ async fn dashboard(State(state): State<Shared>, headers: HeaderMap, now: Arrival
                     view.rules_load_failed = true;
                 }
             }
-            // The seal's demotion report (issue #145) is its own item, so a
+            // The open's demotion report (issue #145) is its own item, so a
             // third read; like the ruleset, a failure hides the card's detail
             // rather than the dashboard.
             {

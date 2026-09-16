@@ -30,20 +30,20 @@ visible fairness failure at 1,000,000 people. Tests are the primary evidence.
   - **Burned slot** — with an injected registration-write failure (counter incremented, no
     `PreQueue` row), the space stays contiguous, `PRP` stays bijective, and the burned index
     resolves to a position that maps to no one (absorbed like a live-join gap, F2.3).
-  - **Straggler race** — a join that raced the seal claims a local index at or past its own
+  - **Straggler race** — a join that raced the open claims a local index at or past its own
     shard's issued count (a **per-shard** test, not a global `i ≥ participant_count`: an
     over-count on a shard that is not the last one can still reconstruct to an `i` inside
     `[0, N)`, because that index belongs to a later shard); `/queue_num` never calls `PRP` out
     of domain for it, falling through to the `Positions` row instead (a live-join position if
     one has landed, 404 — recoverable by re-join — if not).
-- **Seal-time demotion (ADR-0029, issue #145).** A group over its rule's threshold is demoted
+- **Open-time demotion (ADR-0029, issue #145).** A group over its rule's threshold is demoted
   whole and a group under it is not; a row in two demoted groups is counted once; a straggler is
   never classified; every row the set matches resolves into `[N, 2N)` at `N + p` and every other
   into `[0, N)` with no position held twice; an untelemetered row is never demoted; a demoting
   event refuses to resolve without its set rather than answering from the primary slot; the set
   round-trips through chunks and a garbled entry fails the whole read; `observe` writes the
   report and no set; the set is written before the election and a lost election deletes its own
-  chunks; rules that do not parse seal without demotion and say so in the report. Controller
+  chunks; rules that do not parse open without demotion and say so in the report. Controller
   `Tiers`: the identity without a tail; inside the tail one person is `N / D` positions; a
   release crossing a tier boundary is exact per tier; a tier holding nobody is skipped whole;
   by property, the people released per interval never fall short of the target and never exceed
