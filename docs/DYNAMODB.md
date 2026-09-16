@@ -62,7 +62,7 @@ taking the key apart.
 ### 1.2 Keys are tagged only where a table holds more than one kind of item
 
 `Counters` holds the event plus its shards, so every key is tagged. `Tokens` holds three kinds —
-`TKN#` for admission reservations, `SESS#` for operator sessions, `PKCE#` for pending logins — so
+`SESS#` for operator sessions and `PKCE#` for pending logins — so
 every key there is tagged too. Without the tag, a session id and an admission reservation for the
 same string would be one row. A test pins that all three are distinct.
 
@@ -93,8 +93,8 @@ literally. `ADD arrivals#4 :one` parses as the attribute `arrivals` plus an unde
 `no_expression_inlines_an_attribute_name_containing_a_hash` asserts the rule across every
 expression fragment. Key values are unaffected, because a key is a value and not expression text.
 
-Where a reserved word is unavoidable, the code uses a placeholder properly: the expiry scan and
-the expiry write both bind `#s` to `status`.
+Where a reserved word is unavoidable, the code uses a placeholder properly: `status` is bound to
+`#s` wherever a condition names it.
 
 ---
 
@@ -120,12 +120,10 @@ the expiry write both bind `#s` to `status`.
 | `controller` | `Counters` | `GetItem` event item | **Strong** | 1 per pass |
 | `controller` | `Counters` | `BatchGetItem` of ten arrival shards | Eventual | 1 per pass |
 | `controller` | `Counters` | `UpdateItem` cursor, guarded | — | 1 per pass |
-| `controller` | `Positions` | `Scan` with a filter | Eventual | 1 per pass, when the cutoff is above zero |
-| `controller` | `Positions` | `UpdateItem status`, guarded | — | 1 per expired position, serially |
 | `admin` | `Counters` | `GetItem`, five `UpdateItem` forms | Eventual | Operator actions |
 | `admin` | `Tokens` | `PutItem`, `GetItem`, `DeleteItem` | Eventual | Operator logins |
 
-There is one `Scan` in the codebase — `controller`'s expiry scan (§11) — and no `Query`. Everything else is a key lookup.
+There is no `Scan` in the codebase and no `Query` (§11). Every access is a key lookup.
 
 ---
 
@@ -243,7 +241,6 @@ test seam.
 | `Positions` row | `attribute_not_exists(request_id)` | A duplicate join consumes no position |
 | Open | `attribute_not_exists(shuffle_seed)` | A double-fire opens exactly once |
 | Cursor advance | `attribute_not_exists(serving_counter) OR serving_counter = :expected` | Overlapping controller executions cannot double-advance |
-| Position expiry | `#s = :issued` | A position completed since the scan is not overwritten |
 | Admission reservation | `attribute_not_exists(request_id)` | A reservation is taken once |
 | Phase change | `phase = :from` | A transition another operator applied is a 409 |
 | Rate change | `target_rate = :exp`, or `attribute_not_exists(target_rate)` | Same, for the rate |
@@ -459,65 +456,22 @@ PreQueue GetItem  = 174,000 × 0.5 RRU       ≈  87,000 RRU/s   (2.2× the defa
 
 ---
 
-## 11. The expiry `Scan`
+## 11. No scan, and time to live is the only reclamation
 
-`Positions` is keyed only by `request_id` and has no secondary index, so finding the positions the
-cursor left behind unclaimed is a `Scan`:
-
-```rust
-.filter_expression("queue_position < :cutoff AND #s = :issued")
-.expression_attribute_names("#s", "status")
-.projection_expression("request_id, queue_position")
-```
-
-A filter is applied after items are read, so the scan consumes capacity for every item in the
-table, not for the items it returns. The projection reduces bytes transferred, not capacity
-consumed.
-
-It runs once per controller pass — six per minute — whenever the cutoff is above zero. The cutoff
-is `serving_counter − target_rate × 120` and returns zero when `target_rate` is zero, so an event
-with no rate set scans nothing.
-
-For a `Positions` table holding 1,000,000 rows at about 110 bytes each:
-
-```
-table size   ≈ 110 MB
-per pass     = 110 MB / 4 KB × 0.5   ≈ 14,080 RCU
-sustained    = 14,080 × 6 / 60       ≈  1,408 RCU/s
-pages        = 110 MB / 1 MB         ≈    110 sequential pages per pass
-```
-
-`Positions` holds live joiners only — a pure pre-queue cohort writes no rows there at all — so a
-scheduled event with few live joins scans a nearly empty table. The reads spread across every
-partition, so the scan consumes table quota rather than hitting a partition ceiling.
-
-`mark_expired` then issues one guarded `UpdateItem` per expired position, sequentially:
-
-```rust
-for position in &due {
-    store.mark_expired(&position.request_id).await?;
-}
-```
-
-A pass expiring 5,000 positions makes 5,000 sequential round trips. At 5 ms each that is 25
-seconds, which exceeds the 10-second pass interval and the 30-second function timeout is not far
-beyond it. Neither the scan cost nor the serial expiry has been measured against a real event.
-
----
-
-## 12. Time to live is reclamation, not expiry
+There is no `Scan` anywhere in the codebase. The controller once ran an unbounded one over
+`Positions` six times a minute to expire positions the admission cursor had passed; that
+mechanism was removed ([ADR-0031](adr/0031-remove-controller-driven-expiry.md)) and with it the
+only `dynamodb:Scan` grant in the deployment. Every access is now a key lookup.
 
 DynamoDB deletes expired items within a few days, and expired items stay readable until the
-deletion runs. That makes TTL unusable as the expiry mechanism for a queue position: an operator
-cannot reason about a deadline AWS does not commit to.
+deletion runs. That was the original objection to TTL as an expiry mechanism, and it still holds
+— which is why nothing treats it as one. **A position is live until its row is gone.** TTL on
+`Positions` is reclamation, set 86,400 seconds after the row is written by
+`const POSITION_TTL_SECS: u64 = 86_400`, and nothing reads the attribute.
 
-Position expiry is driven by the controller against the admission cursor. TTL on `Positions` is
-storage hygiene, set 86,400 seconds after the row is written by
-`const POSITION_TTL_SECS: u64 = 86_400`.
-
-No per-row deadline is stamped at issue time. A deadline set when the position is issued expires
-people for waiting the length of the queue they are waiting in. The controller expires a position
-once the cursor has passed it by more than the 120-second grace window.
+What compensates for people who never arrive is the controller's no-show correction: it measures
+arrivals against releases and releases more to cover the gap. Expiry was a second control acting
+on the same quantity, and the two were never reconciled.
 
 `load_session` applies the same caution in the other direction: it checks `expires_at` on read
 rather than trusting deletion, so an expired session is never served while its row is still
@@ -525,7 +479,7 @@ waiting to be reclaimed.
 
 ---
 
-## 13. Known gaps
+## 12. Known gaps
 
 **The `Tokens` table's TTL attribute does not match what the code writes.** Terraform declares
 `ttl { attribute_name = "ttl" }`. Every writer to that table writes `expires_at` instead —
@@ -537,10 +491,6 @@ is `attribute_not_exists`, so nothing serves an expired row. The cost is that th
 without bound: every operator login leaves a session row and a PKCE row behind forever. The fix is
 to point the Terraform TTL at `expires_at`, which is a table setting change and not a table
 replacement.
-
-**The controller's scan and serial expiry are unmeasured.** §11 gives the arithmetic. Neither
-figure has been observed against a real event, and the serial loop can exceed the pass interval
-at a few thousand expiries.
 
 **`generate_token` records an arrival on every call and never marks a position spent.** A visitor
 who calls it twice records two arrivals against one release. That over-counts arrivals,
@@ -575,7 +525,6 @@ the scan filter would need to use it.
 | Warm throughput minimum | 4,000 write units, 12,000 read units | No | The Terraform variable validation |
 | Item size | 400 KB | No | Not binding; the largest item is under 1 KB |
 | `BatchGetItem` | 100 items, 16 MB | No | Not binding; both call sites fetch 10 |
-| `Scan` page | 1 MB | No | §11 |
 | API Gateway account throttle | 10,000 requests/s | Yes | The first-ask spike, before DynamoDB (§10.2) |
 
 ## Appendix B — Sources

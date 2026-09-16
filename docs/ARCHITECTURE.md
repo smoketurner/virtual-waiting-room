@@ -46,7 +46,7 @@ API, one CloudFront distribution.
 | `assign_position` | SQS event source mapping | 30 s | Consumes join batches; claims indices or positions; writes rows |
 | `open_event` | EventBridge Scheduler, one-shot | 10 s | Folds shard counts into offsets; writes the open |
 | `read` | API Gateway | 10 s | Serves `GET /v1/status` and `GET /v1/queue_num` |
-| `controller` | EventBridge Scheduler, `rate(1 minute)` | 30 s | Meters admission; expires positions |
+| `controller` | EventBridge Scheduler, `rate(1 minute)` | 30 s | Meters admission |
 | `generate_token` | API Gateway | 10 s | Checks the position; records the arrival; signs the session cookie the edge gate verifies |
 | `admin` | API Gateway | 10 s | Axum operator UI and control plane |
 
@@ -479,7 +479,7 @@ Read from the test bodies.
 | Uniform | `prop_uniform_by_decile` | At `n = 10,000`, χ² across 10 deciles stays below 27.88 — the p = 0.001 critical value at 9 degrees of freedom |
 | Shards are distinct keys | `shard_keys_are_distinct_partition_keys` | Ten distinct partition keys; pre-queue and arrival families disjoint |
 | No expression inlines a `#` | `no_expression_inlines_an_attribute_name_containing_a_hash` | Pins the bug that broke every arrival write |
-| Token kinds do not collide | `the_tokens_table_key_space_does_not_collide_across_kinds` | `TKN#`, `SESS#`, `PKCE#` are three rows |
+| Token kinds do not collide | `the_tokens_table_key_space_does_not_collide_across_kinds` | `SESS#` and `PKCE#` are two rows |
 | Open starts the live sequence | `open_starts_the_live_join_sequence_at_the_cohort_size` | `queue_counter = :n` is in the open update |
 | Release is bounded | `near_total_no_show_is_bounded_at_cap`, `zero_arrivals_is_bounded_at_cap_not_infinite` | A no-show rate at 1.0 yields the cap, not a division by zero |
 

@@ -136,11 +136,10 @@ pub trait Store {
     ) -> impl Future<Output = Result<WriteOutcome, StoreError>> + Send;
 
     /// Reads which of `request_ids` already have a `PreQueue` row, via one
-    /// consistent `BatchGetItem` (issue #59). Used two ways: to skip a
-    /// pre-queue claim for an id that already registered (a browser that
-    /// denies every storage tier re-sends the join on each reload, and
-    /// without this check each reload burned a fresh index), and to keep a
-    /// live-join expired-row overwrite from resurrecting a straggler who also
+    /// consistent `BatchGetItem` (issue #59). It skips a pre-queue claim for an
+    /// id that already registered: a browser that denies every storage tier
+    /// re-sends the join on each reload, and without this check each reload
+    /// burned a fresh index.
     ///
     /// This is an optimization over the authoritative `attribute_not_exists`
     /// guard, never a substitute for it: a store error, or an id
@@ -158,9 +157,9 @@ pub trait Store {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteOutcome {
     Written,
-    /// The write's condition rejected it: a duplicate request id, or (for a
-    /// live-join write) a row already claiming the id whose status is not
-    /// `expired`.
+    /// The write's condition rejected it: a row already claims this request
+    /// id. The position that was claimed for it is abandoned, which is a
+    /// permitted gap.
     Duplicate,
 }
 
@@ -332,8 +331,8 @@ pub async fn process_batch<S: Store>(
 /// Degrades a [`Store::registered_ids`] failure to "unknown" — an empty set,
 /// so every caller falls through to attempting its claim exactly as it would
 /// with no dedupe at all. This is the "unknown, claim anyway" degrade path:
-/// the authoritative `attribute_not_exists` guard (or, for a live-join
-/// overwrite, the widened status check) still catches an actual duplicate.
+/// the authoritative `attribute_not_exists` guard on the write still catches
+/// an actual duplicate.
 async fn registered_ids_or_unknown<S: Store>(store: &S, request_ids: &[String]) -> HashSet<String> {
     match store.registered_ids(request_ids).await {
         Ok(ids) => ids,
@@ -345,15 +344,13 @@ async fn registered_ids_or_unknown<S: Store>(store: &S, request_ids: &[String]) 
 }
 
 /// Claims one contiguous block of queue positions for the whole valid set and
-/// writes one `Positions` row per record.
+/// writes one `Positions` row per record, each guarded by
+/// `attribute_not_exists(request_id)`.
 ///
-/// Before writing, checks which request ids also hold a `PreQueue` row
-/// (issue #59, R4): those are excluded from the expired-row overwrite, so a
-/// fixed-up straggler's controller-expired live position cannot be
-/// resurrected out from under `/queue_num`, which prefers the `PreQueue` row
-/// and would otherwise keep answering with the stale, already-passed
-/// position while `generate_token` polls forever without ever reaching a
-/// terminal 410.
+/// A row exists means this id already holds its one permanent position, so the
+/// write is refused and the claimed position abandoned. Nothing reclaims a row
+/// now that positions never expire, so the guard needs no widening and this
+/// path needs no read to decide whether to widen it.
 async fn process_live_batch<S: Store>(
     store: &S,
     event_id: &str,
@@ -551,8 +548,6 @@ async fn fixup_stragglers<S: Store>(store: &S, event_id: &str, written: Vec<PreQ
         let position_write = PositionWrite {
             request_id: write.request_id,
             position: start.saturating_add(offset as u64),
-            // A straggler fix-up is the first live write for this id; there
-            // is no row yet to collide with an expired one.
         };
         if let Err(err) = store.put_position(&position_write).await {
             tracing::error!(error = %err, "straggler position write failed; leaving to self-heal");

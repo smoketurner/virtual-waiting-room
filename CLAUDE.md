@@ -156,9 +156,9 @@ destroys ordering — and both are low-rate: one claim per ingest batch, one adv
 pass.
 
 Keys are tagged only where a table holds more than one kind of item. `Counters` holds the
-event plus its shards, and `Tokens` holds admission-token reservations (`TKN#`), operator OIDC
-sessions (`SESS#`) and pending PKCE logins (`PKCE#`) — without the tag a session id and a
-pending login for the same string would be one row. `Positions` and `PreQueue` hold one kind each and
+event plus its shards, and `Tokens` holds operator OIDC sessions (`SESS#`) and pending PKCE
+logins (`PKCE#`) — without the tag a session id and a pending login for the same string would be
+one row. `Positions` and `PreQueue` hold one kind each and
 take bare ids: a tag there disambiguates nothing and costs bytes in the partition key of every
 row, of which there is one per visitor.
 

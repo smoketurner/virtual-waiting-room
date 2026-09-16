@@ -1,4 +1,4 @@
-//! Signed admission tokens and session cookies.
+//! Signed session cookies.
 //!
 //! Both are JSON Web Signatures in compact serialization — a JWT — signed
 //! `HS256` under a per-deployment key. An origin, a proxy or an operator can
@@ -12,25 +12,26 @@
 //!
 //! # Claims
 //!
-//! `aud` the event id, `sub` the request id, `exp` the hard expiry, and for a
-//! session `iat` as well. All three are registered claims, so the payload reads
-//! the same to any JWT tool.
+//! `aud` the event id, `sub` the request id, `exp` the hard expiry, and `iat`
+//! the issue time. All are registered claims, so the payload reads the same to
+//! any JWT tool.
 //!
 //! # Domain separation
 //!
-//! A token must never validate as a session. That is enforced at the signature
-//! rather than by a claim: each kind signs under its own key, derived from the
-//! deployment secret by [`SigningKey`]. Presenting one kind as the other fails
-//! `BadSignature`, so there is no check a caller can forget to make. A `typ`
-//! claim would have to be read *after* verifying, and skipping it would admit
-//! the wrong credential.
+//! [`Kind`] has one variant today, and a credential still signs under a key
+//! *derived* from the deployment secret rather than the secret itself. That is
+//! what keeps the separation available: a second kind must carry a label of its
+//! own, and presenting one kind as another fails `BadSignature` — a check no
+//! caller can forget to make, unlike a `typ` claim that would have to be read
+//! after verifying. The admission token this once separated a session from was
+//! removed with the origin authorizer
+//! ([`ADR-0032`](../../../docs/adr/0032-remove-the-origin-authorizer.md)).
 
 use aws_lc_rs::hmac;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 
-/// The registered claims carried by both credentials. `iat` is absent on an
-/// admission token, which has no issue time to record.
+/// The registered claims a credential carries.
 #[derive(Debug, Serialize, Deserialize)]
 struct Claims {
     aud: String,

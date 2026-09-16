@@ -539,8 +539,8 @@ waiting ([ADR-0022](adr/0022-durable-controller-cadence.md)). Each pass is a dur
 checkpointed so replay returns its result
 rather than advancing `serving_counter` a second time.
 
-**Counting arrivals.** `generate_token` increments an arrival counter when it converts an
-admission token into a session — one write per admitted visitor. At a 60,000/minute admission
+**Counting arrivals.** `generate_token` increments an arrival counter when it mints a session —
+one write per admitted visitor. At a 60,000/minute admission
 rate that is 1,000 writes/s, the single-item ceiling, so the counter is sharded across 10
 items chosen by `hash(request_id) % 10`. Cost: 10 reads per interval, independent of event
 size.

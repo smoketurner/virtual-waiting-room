@@ -26,10 +26,10 @@ const KEY_ATTR: &str = "event_id";
 
 /// The partition key attribute of the `Tokens` table.
 ///
-/// Named `request_id` for the admission tokens it was built for, which is a
-/// misnomer for the other two things it now holds — an OIDC session id is not a
-/// request id, and neither is a PKCE state. Renaming it changes the table's hash
-/// key, which replaces the table.
+/// Named `request_id` for the admission tokens it was built for. Those are
+/// gone (ADR-0032) and the name is now a misnomer for both things it holds: an
+/// OIDC session id is not a request id, and neither is a PKCE state. Renaming
+/// it changes the table's hash key, which replaces the table, so it stays.
 const TOKENS_KEY_ATTR: &str = "request_id";
 
 /// The partition key attribute of the `PreQueue` table.
@@ -38,8 +38,8 @@ const PREQUEUE_KEY_ATTR: &str = "r";
 /// The partition key attribute of the `Positions` table.
 pub const POSITIONS_KEY_ATTR: &str = "request_id";
 
-/// The expiry attribute of every `Tokens` row — admission-token reservations,
-/// operator OIDC sessions, and pending PKCE logins alike.
+/// The expiry attribute of every `Tokens` row — operator OIDC sessions and
+/// pending PKCE logins alike.
 ///
 /// This name is the `Tokens` table's `ttl { attribute_name }` in
 /// `infra/modules/core/main.tf`: `DynamoDB` reclaims a row only when the
@@ -95,9 +95,9 @@ pub const STATUS_ATTR: &str = "status";
 /// be confused with the id itself.
 ///
 /// Tags appear only where a table holds more than one kind of item. `Counters`
-/// holds the event plus its shard counters, and `Tokens` holds admission-token
-/// reservations, operator OIDC sessions and pending PKCE logins — without the
-/// tag a session id and a token for the same string would be one row.
+/// holds the event plus its shard counters, and `Tokens` holds operator OIDC
+/// sessions and pending PKCE logins — without the tag a session id and a
+/// pending login for the same string would be one row.
 /// `Positions` and `PreQueue` hold one kind each and take bare ids: a tag there
 /// disambiguates nothing and costs bytes in the partition key of every row, of
 /// which there is one per visitor.

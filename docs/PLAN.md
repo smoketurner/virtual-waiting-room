@@ -78,7 +78,7 @@ Throwaway code. Measures what documentation cannot settle.
 
 ### 1f. Admission, session, and outflow control
 - [ ] Deploy-time signing key into an SSM Parameter Store SecureString
-- [ ] `/generate_token` — single-use admission token, short expiry [F3.3]
+- [x] `/generate_token` — mints the session cookie directly; the admission token it once issued was removed with the origin authorizer (ADR-0032) [F3.3]
 - Gate decision tree: session cookie → protection match → 302. Built as a CloudFront
       Function (ADR-0021); the origin authorizer that also implemented it was removed (ADR-0032) [F3.4]
 - [ ] Session cookie set after token validation (ADR-0011), signed over different inputs
