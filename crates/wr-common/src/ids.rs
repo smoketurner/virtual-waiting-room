@@ -195,11 +195,12 @@ pub fn resolve(stored: StoredControl, fail_open_until: u64, now: u64) -> Admissi
     }
 }
 
-/// A string that names no known [`StoredControl`]. A stored value that fails to
-/// parse resolves to [`StoredControl::Open`] (the safe default) — including a
-/// legacy `"fail_open"` string left by a table written before issue #71, which
-/// decays to `Open` rather than sticking: the epoch is the sole authority for
-/// fail-open now, so a stale string carries no window to reopen.
+/// A string that names no known [`StoredControl`]. A stored value that is
+/// present and fails to parse holds admission rather than resuming it — see
+/// [`crate::Counters::from_item`] for why that direction is the safe one. A
+/// legacy `"fail_open"` string from before issue #71 lands there too and does
+/// not reopen anything: the epoch is the sole authority for fail-open, and a
+/// stale string carries no window.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("unknown admission control: {0}")]
 pub struct UnknownControl(pub String);

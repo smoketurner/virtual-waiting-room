@@ -225,13 +225,7 @@ impl Counters {
                 .and_then(|v| v.as_s().ok())
                 .filter(|s| !s.is_empty())
                 .cloned(),
-            stored_control: item
-                .get("admission_control")
-                .and_then(|v| v.as_s().ok())
-                .and_then(|s| s.parse().ok())
-                // Missing, empty, or unrecognized (including a legacy
-                // "fail_open" string): normal admission (safe default).
-                .unwrap_or_default(),
+            stored_control: stored_control_of(item),
             fail_open_until: num("fail_open_until").unwrap_or(0),
             starts_at: num(STARTS_AT_ATTR),
         }
@@ -257,6 +251,38 @@ pub enum ResolveError {
     /// The stored shard is outside `0..SHARDS` (a corrupt row).
     #[error("shard index out of range")]
     BadShard,
+}
+
+/// Reads the operator's admission control off a `Counters` item.
+///
+/// Absent or empty means an event nobody has paused, which is normal
+/// admission. A value that is *present* and unreadable is a different thing:
+/// the only writer is the operator's pause, so a stored string this cannot
+/// parse is a pause that did not land cleanly, and reading it as
+/// [`StoredControl::Open`] resumes admission during the incident someone was
+/// trying to stop. Holding is both the safe direction and the visible one — a
+/// queue that stops moving gets noticed; an un-pause does not.
+///
+/// A legacy `"fail_open"` string from before issue #71 lands in the same place
+/// and holds rather than reopening, which is correct: the epoch is the sole
+/// authority for fail-open and a stale string carries no window. An operator
+/// with a live window still gets it, because [`crate::resolve`] checks the
+/// epoch before the stored value.
+///
+/// Shared rather than duplicated per reader: the controller is the component
+/// that acts on this, and two copies of the rule are two chances for the
+/// component that releases people to disagree with the one that displays the
+/// state.
+#[must_use]
+pub fn stored_control_of<S: std::hash::BuildHasher>(
+    item: &HashMap<String, AttributeValue, S>,
+) -> StoredControl {
+    item.get("admission_control")
+        .and_then(|v| v.as_s().ok())
+        .filter(|s| !s.is_empty())
+        .map_or(StoredControl::Open, |stored| {
+            stored.parse().unwrap_or(StoredControl::Paused)
+        })
 }
 
 /// Reads a shard item's own index, or `None` if it is missing or out of range.
@@ -497,6 +523,61 @@ mod tests {
         assert_eq!(
             counters.resolve_prequeue(&prequeue_row(0, 10)).unwrap(),
             ResolvedPosition::LiveJoin
+        );
+    }
+
+    #[test]
+    fn an_unreadable_admission_control_holds_rather_than_resumes() {
+        // The only writer of this attribute is the operator's pause, so a
+        // value that will not parse is a pause that did not land cleanly.
+        // Reading it as Open would resume admission during the incident
+        // someone was trying to stop -- silently, because nothing else
+        // changes. Holding is both the safe direction and the visible one.
+        for stored in ["fail_open", "PAUSED", "paused ", "\u{1}", "0"] {
+            let item = HashMap::from([(
+                "admission_control".to_owned(),
+                aws_sdk_dynamodb::types::AttributeValue::S(stored.to_owned()),
+            )]);
+            assert_eq!(
+                Counters::from_item("evt-1", &item).stored_control,
+                StoredControl::Paused,
+                "{stored:?} resumed admission"
+            );
+        }
+    }
+
+    #[test]
+    fn an_absent_admission_control_is_still_normal_admission() {
+        // Absent is not corrupt: it is an event nobody has paused. Holding
+        // here would stall every event that never touched the control.
+        assert_eq!(
+            Counters::from_item("evt-1", &HashMap::new()).stored_control,
+            StoredControl::Open
+        );
+        let empty = HashMap::from([(
+            "admission_control".to_owned(),
+            aws_sdk_dynamodb::types::AttributeValue::S(String::new()),
+        )]);
+        assert_eq!(
+            Counters::from_item("evt-1", &empty).stored_control,
+            StoredControl::Open
+        );
+    }
+
+    #[test]
+    fn a_live_fail_open_window_outranks_an_unreadable_stored_control() {
+        // resolve() checks the epoch first, so an operator who engaged
+        // fail-open still gets it even if the stored string is garbage. The
+        // hold must not strand a deliberate break-glass.
+        let item = HashMap::from([(
+            "admission_control".to_owned(),
+            aws_sdk_dynamodb::types::AttributeValue::S("nonsense".to_owned()),
+        )]);
+        let counters = Counters::from_item("evt-1", &item);
+        assert_eq!(counters.stored_control, StoredControl::Paused);
+        assert_eq!(
+            crate::resolve(counters.stored_control, 2_000, 1_000),
+            crate::AdmissionControl::FailOpen
         );
     }
 

@@ -71,10 +71,20 @@ async fn init() -> Result<AppState<DynamoStore>, Error> {
         event_id: env::var("EVENT_ID")?,
         session_cookie_name: env::var("SESSION_COOKIE_NAME")
             .unwrap_or_else(|_| "vwr_session".to_owned()),
-        session_ttl_secs: env::var("SESSION_TTL_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_SESSION_TTL_SECS),
+        // Absent is a real choice — the default is a sensible hour. A value
+        // that is *present* and unparseable is a typo in the deployment, and
+        // silently substituting the default means the operator's chosen
+        // session lifetime is not the one in force. That difference is
+        // invisible until a visitor is logged out mid-checkout, which is
+        // exactly the failure `session_ttl_seconds` exists to prevent.
+        session_ttl_secs: match env::var("SESSION_TTL_SECS") {
+            Err(_unset) => DEFAULT_SESSION_TTL_SECS,
+            Ok(raw) => raw.parse().map_err(|_| {
+                Error::from(format!(
+                    "SESSION_TTL_SECS is set to {raw:?}, which is not a whole number of seconds"
+                ))
+            })?,
+        },
     })
 }
 
@@ -145,11 +155,29 @@ async fn handle<S: Store>(state: &AppState<S>, req: Request) -> Result<Response<
         issued_at: now,
         expires_at,
     };
+    // A signing failure must not become an empty cookie. An empty string is
+    // not a well-formed JWS, so the gate would refuse it and the visitor would
+    // bounce between the origin and the waiting page — while the response that
+    // sent them there said `admitted: true`. Refusing is the honest answer, and
+    // it is retryable: the position is still theirs, and the next poll tries
+    // again.
+    //
+    // The arrival was already recorded above, which is the right order for the
+    // reason given there: a visitor counted but not admitted understates the
+    // no-show rate, which under-releases. The opposite mistake over-releases.
+    let Ok(credential) = session.sign(&state.key) else {
+        error!(
+            event = "session_sign_failed",
+            "could not sign the session credential; refusing rather than issuing an empty cookie"
+        );
+        return json(
+            500,
+            &serde_json::json!({ "admitted": false, "error": "try again" }),
+        );
+    };
     let set_cookie = format!(
         "{}={}; Path=/; Max-Age={}; Secure; HttpOnly; SameSite=Lax",
-        state.session_cookie_name,
-        session.sign(&state.key),
-        state.session_ttl_secs
+        state.session_cookie_name, credential, state.session_ttl_secs
     );
 
     info!(position = grant.position, "admitted");
