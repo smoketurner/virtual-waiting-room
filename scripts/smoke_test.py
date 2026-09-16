@@ -12,8 +12,13 @@ position. Registers fresh UUIDv7 request ids each run.
 Re-runnable: it resets the environment first, via `scripts/reset-env.py`, which
 clears the open outputs from any previous run. Without that a second run finds
 `shuffle_seed` already set, so the joins take the live path, no PreQueue rows
-appear, and step 2 fails after 90s with nothing to say why. Pass `--no-reset`
-if you have just reset by hand.
+appear, and step 2 fails after 90s with nothing to say why.
+
+Pass `--no-reset` if you have just reset by hand -- or on the first run after a
+fresh `make apply`, which now seeds the event item itself. That case is worth
+running deliberately: `--no-reset` against a new stack is the test that the
+deployment serves on its own, without a script whose docstring is headed
+DESTRUCTIVE having been run first.
 
 The script reads the API URL, table names, open function, and event id from
 `terraform output` and never touches Terraform state — deploy with `make apply`

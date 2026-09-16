@@ -39,6 +39,13 @@ module "core" {
   # Shared with module.edge below so generate_token and the gate's CloudFront
   # Function cannot drift onto different cookie names (issue #71).
   session_cookie_name = var.session_cookie_name
+
+  # Seeded at apply so the stack serves without an operator driving a script or
+  # the dashboard first.
+  admission_rate     = var.admission_rate
+  gate_rules         = var.gate_rules
+  starts_at          = var.starts_at
+  starts_at_timezone = var.starts_at_timezone
 }
 
 # demo-origin: a stand-in for the customer's protected origin. This is the dev

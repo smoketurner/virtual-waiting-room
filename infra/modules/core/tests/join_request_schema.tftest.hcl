@@ -23,6 +23,12 @@ variables {
   admin_artifact_path           = "tests/fixtures/bootstrap.zip"
   controller_artifact_path      = "tests/fixtures/bootstrap.zip"
   generate_token_artifact_path  = "tests/fixtures/bootstrap.zip"
+
+  # The admin Lambda's preconditions refuse a stack whose control plane cannot
+  # start, so a test harness has to describe a deployable configuration.
+  oidc_client_id      = "test-client"
+  oidc_redirect_uri   = "https://example.invalid/admin/callback"
+  oidc_allowed_emails = "operator@example.invalid"
 }
 
 run "no_join_field_is_unbounded" {

@@ -62,3 +62,23 @@ locals {
 
   lambda_runtime_arch = var.lambda_architecture
 }
+
+locals {
+  # var.gate_rules is the dashboard's own one-rule-per-line grammar, so an
+  # operator writes the same thing whether they type it into terraform.tfvars
+  # or the Set rules form. Encoded here into the compact wire tuple the
+  # CloudFront Function reads and wr_common::rules round-trips:
+  # ["p","/checkout"], ["c","name"], ["u","substring"], ["h","name","value"].
+  # The variable's own validation has already rejected any other shape.
+  gate_rule_lines = [
+    for line in compact([for l in split("\n", var.gate_rules) : trimspace(l)]) :
+    line if !startswith(line, "#")
+  ]
+
+  gate_rule_wire = [
+    for line in local.gate_rule_lines :
+    startswith(line, "h")
+    ? concat(["h"], regex("^h\\s+(\\S+)\\s+(.+)$", line))
+    : concat([substr(line, 0, 1)], regex("^[pcu]\\s+(.+)$", line))
+  ]
+}

@@ -38,6 +38,12 @@ variables {
   admin_artifact_path           = "tests/fixtures/bootstrap.zip"
   controller_artifact_path      = "tests/fixtures/bootstrap.zip"
   generate_token_artifact_path  = "tests/fixtures/bootstrap.zip"
+
+  # The admin Lambda's preconditions refuse a stack whose control plane cannot
+  # start, so a test harness has to describe a deployable configuration.
+  oidc_client_id      = "test-client"
+  oidc_redirect_uri   = "https://example.invalid/admin/callback"
+  oidc_allowed_emails = "operator@example.invalid"
 }
 
 run "success_is_claimed_only_by_a_status_code_sqs_returns_on_success" {

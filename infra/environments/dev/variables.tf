@@ -113,3 +113,32 @@ variable "poll_divisor" {
   type        = number
   default     = 10
 }
+
+# --- Event seeding ------------------------------------------------------------
+# Seeded onto the stack at apply so a freshly applied deployment serves. The
+# control plane owns all three from there: Terraform writes them once and then
+# ignores changes.
+
+variable "admission_rate" {
+  description = "Target admission rate in visitors per second. Seeded onto the event item so the controller drains from the first apply; changed live from the dashboard."
+  type        = number
+  default     = 5
+}
+
+variable "gate_rules" {
+  description = "Which requests the edge gate covers, one rule per line: `p <path prefix>`, `c <cookie name>`, `u <user agent substring>`, `h <header name> <header value>`. Empty means dormant -- every request passes through."
+  type        = string
+  default     = ""
+}
+
+variable "starts_at" {
+  description = "When the event opens, local date-time with no zone (`2027-03-14T10:00:00`), evaluated in starts_at_timezone. Empty leaves the schedule disabled."
+  type        = string
+  default     = ""
+}
+
+variable "starts_at_timezone" {
+  description = "IANA zone the start time is evaluated in, e.g. America/New_York."
+  type        = string
+  default     = "UTC"
+}

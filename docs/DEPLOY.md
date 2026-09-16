@@ -97,23 +97,23 @@ override the file, so the file stays the single source of truth. Copy
 | `aws_profile`               | *(empty)*   | Named AWS profile to authenticate with. Empty uses the default credential chain — environment, active SSO session, or instance role. |
 | `event_id`                  | `default`   | The single event id this deployment serves.                             |
 | `lambda_architecture`       | `arm64`     | Lambda CPU architecture (`arm64` or `x86_64`). **Must match the built binaries.** |
-| `client_origin_domain_name` | *(none)*    | **Required.** Bare domain of the protected origin CloudFront fronts. Host only — no scheme, no path. |
-| `*_artifact_path`           | *(empty)*   | The four built zips. Empty = that function stays on the placeholder.     |
-| `oidc_*`                    | *(varies)*  | Admin login (ADR-0016). The client secret is not here — it goes in an SSM SecureString out of band. |
+| `client_origin_domain_name` | *(empty)*   | Bare domain of the protected origin CloudFront fronts. Host only — no scheme, no path. Empty protects the built-in demo origin instead, which is a working stack that guards nothing real. |
+| `admission_rate`            | `5`         | Visitors per second, seeded onto the event item. Zero would release nobody, forever, so this has a real default. Changed live from the dashboard. |
+| `gate_rules`                | *(empty)*   | Which requests the gate covers, one rule per line — same grammar as the dashboard's Set rules form. Empty is dormant: every request passes through. |
+| `starts_at`                 | *(empty)*   | When the event opens, local date-time with no zone. Empty leaves the schedule disabled. |
+| `starts_at_timezone`        | `UTC`       | IANA zone `starts_at` is evaluated in. |
+| `oidc_client_id`, `oidc_redirect_uri`, `oidc_allowed_emails` | *(empty)* | **Required — the apply fails without them.** See the two-pass note below. The client secret is not here; it goes in an SSM SecureString out of band. |
 
 The one `make`-level override is the build target:
 
-| Variable | Default  | Meaning                                                    |
-| -------- | -------- | ---------------------------------------------------------- |
-| `ARCH`   | `x86_64` | `cargo lambda build` target: `x86_64` or `arm64`.           |
+| Variable | Default | Meaning                                                              |
+| -------- | ------- | -------------------------------------------------------------------- |
+| `ARCH`   | read from `terraform.tfvars` | `cargo lambda build` target. The Makefile takes `lambda_architecture` out of `terraform.tfvars`, falling back to `arm64` if the file is absent, so the binaries cannot be built for an architecture the functions are not deployed with. Override for a one-off build only. |
 
-> **Architecture must match.** `ARCH` selects only what you *build*;
-> `lambda_architecture` in `terraform.tfvars` selects what the function *runs*,
-> and the two must agree. `ARCH` defaults to `x86_64` because that is what the
-> standard host toolchain builds, while `lambda_architecture` defaults to
-> `arm64` — so shipping the default `arm64` function means installing the
-> `aarch64-unknown-linux-gnu` Rust target and running `make build ARCH=arm64`.
-> A mismatch fails at invoke time, not at deploy.
+> **A manual override must still match.** `ARCH` selects what you *build*;
+> `lambda_architecture` selects what the function *runs*. They agree by default
+> because one is derived from the other — but `make build ARCH=x86_64` against
+> an `arm64` deployment still deploys cleanly and fails at first invoke.
 
 ## First deploy
 
@@ -121,19 +121,45 @@ The one `make`-level override is the build target:
 # 1. Authenticate to AWS (in your shell).
 aws sso login          # or: aws configure
 
-# 2. Configure the deployment: event id, region, origin domain, artifact paths.
+# 2. Configure the deployment: event id, region, origin domain.
 cp infra/environments/dev/example.tfvars infra/environments/dev/terraform.tfvars
 $EDITOR infra/environments/dev/terraform.tfvars
 
-# 3. Build the four Lambda binaries and stage them under .artifacts/.
-make build ARCH=arm64          # must match lambda_architecture
+# 3. Build the Lambda binaries and stage them under .artifacts/.
+make build
 
 # 4. Review the plan, then deploy. The gate's signing key is generated and
 #    written to both of its homes by this apply — there is no separate
-#    bootstrap step.
+#    bootstrap step. This apply also seeds the event item, the gate ruleset and
+#    the open schedule, so what comes up is a stack that serves.
 make plan
 make apply
 ```
+
+### The one sequencing step: OIDC
+
+`oidc_redirect_uri` is a path on the CloudFront distribution, and the
+distribution does not exist until the first apply. `core` cannot derive it
+either: `edge` consumes `core`'s KeyValueStore ARN, so `core` depending on
+`edge` would be a module cycle.
+
+So the first apply of a brand-new deployment is a two-pass operation:
+
+```bash
+make apply                              # fails: the admin Lambda has no OIDC config
+terraform -chdir=infra/environments/dev output cloudfront_domain_name
+
+# Register the OIDC application with that host's /admin/callback, then:
+aws ssm put-parameter --name /<name_prefix>/oidc-client-secret \
+  --type SecureString --value '<secret>' --overwrite
+
+$EDITOR infra/environments/dev/terraform.tfvars   # set the three oidc_* values
+make apply
+```
+
+The apply **fails** on the first pass rather than succeeding and leaving an
+admin Lambda that dies at Init on every invoke — a dead control plane whose only
+symptom was a 502. The error names the value it needs and where to find it.
 
 `make apply` prints the stack outputs, including the API invoke URL and the
 table names. To exercise the deployed stack end to end — register, open, and

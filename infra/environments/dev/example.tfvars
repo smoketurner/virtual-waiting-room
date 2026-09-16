@@ -44,3 +44,30 @@ oidc_allowed_emails = "" # comma-separated; "" = deny all (fail closed)
 poll_floor_ms   = 5000
 poll_ceiling_ms = 30000
 poll_divisor    = 10
+
+# --- Event seeding ------------------------------------------------------------
+# Seeded onto the stack at apply so a fresh deployment serves without an
+# operator driving a script or the dashboard first. The control plane owns all
+# of it from there: Terraform writes these once and then ignores changes.
+
+# Visitors per second. Zero would release nobody, forever, while the controller
+# logged a successful pass every ten seconds, so there is no zero default.
+admission_rate = 5
+
+# Which requests the gate covers, one rule per line, in the same grammar the
+# dashboard's Set rules form takes. Empty (the default) is dormant: every
+# request passes through untouched.
+#
+# gate_rules = <<-RULES
+#   p /checkout
+#   c loyalty_member
+#   u HeadlessChrome
+#   h x-internal-monitor true
+# RULES
+
+# When the event opens, local date-time with no zone, evaluated in the timezone
+# below. Empty leaves the one-time schedule disabled at a placeholder instant
+# that is never the real value, so an accidental enable cannot fire an open.
+#
+# starts_at          = "2027-03-14T10:00:00"
+# starts_at_timezone = "America/New_York"
