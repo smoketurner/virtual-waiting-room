@@ -299,9 +299,8 @@ pub async fn seal_event<S: Store>(
     //     one that folded in foreign rows. Contamination cannot be *ruled out*,
     //     so the report flags it; enforcement is *not* withheld, because
     //     burned indices are an expected, throughput-dependent residual and
-    //     withholding would disable demotion at any real scale. The complete
-    //     fix — an event id on `PreQueue` rows — is a design change the ADR
-    //     would revisit.
+    //     withholding would disable demotion at any real scale. Separating
+    //     the two needs an event id on `PreQueue` rows, which no row carries.
     let contamination =
         Contamination::assess(classification.cohort, distinct, values.participant_count);
     contamination.log(
@@ -361,6 +360,16 @@ pub async fn seal_event<S: Store>(
     );
 
     let mut report = DemotionReport::from_classification(config.mode, rules, &classification, now);
+    if contamination.contaminated {
+        // The classification is not this event's, so its per-group outputs are
+        // suppressed: the report keeps the scan width and the reason, not the
+        // groups another event's rows would have produced. The burned-index
+        // regime keeps them — there demotion ran, on rows that are this
+        // event's as far as anything can tell.
+        report.demoted = 0;
+        report.groups.clear();
+        report.groups_total = 0;
+    }
     report.error = contamination.caveat(classification.cohort, distinct, values.participant_count);
     if let Err(e) = store.write_report(event_id, &report).await {
         // The report is for the operator; the seal has landed, so this is
@@ -895,6 +904,12 @@ mod tests {
         let report = store.report.lock().unwrap().clone().unwrap();
         assert_eq!(report.cohort, 8);
         assert_eq!(report.mode, "enforce");
+        // The classification is not this event's, so its per-group outputs are
+        // suppressed: the report keeps the scan width (cohort) and the reason,
+        // not the groups another event's rows would have produced.
+        assert_eq!(report.demoted, 0);
+        assert!(report.groups.is_empty());
+        assert_eq!(report.groups_total, 0);
         let error = report.error.unwrap();
         assert!(error.contains('8'), "names the cohort: {error}");
         assert!(error.contains('5'), "names the registrations: {error}");
@@ -921,6 +936,10 @@ mod tests {
         let report = store.report.lock().unwrap().clone().unwrap();
         assert_eq!(report.mode, "observe");
         assert!(report.error.is_some());
+        assert_eq!(report.cohort, 8);
+        assert_eq!(report.demoted, 0);
+        assert!(report.groups.is_empty());
+        assert_eq!(report.groups_total, 0);
     }
 
     #[tokio::test]
@@ -1046,7 +1065,7 @@ mod tests {
         assert_eq!(sealed_phase(), Phase::Active);
     }
 
-    // --- cross-event contamination with burned indices (issue from PR #159) ---
+    // --- cross-event contamination with burned indices (issue #161) ---
     //
     // `participant_count` (N) counts indices *issued* — claimed by a shard
     // counter — not rows written. A burned slot (claimed-but-unwritten, from
@@ -1102,9 +1121,12 @@ mod tests {
         assert!(values.demotion.is_none());
         assert_eq!(values.demoted_count, 0);
         assert!(store.chunks.lock().unwrap().is_empty());
-        // The contaminated group set is still classified for the report (the
-        // operator sees what would have been demoted), but not enforced.
-        assert_eq!(report.demoted, 5);
+        // The classification is another event's, so the report carries the scan
+        // width and the reason, not its per-group outputs.
+        assert_eq!(report.cohort, 5);
+        assert_eq!(report.demoted, 0);
+        assert!(report.groups.is_empty());
+        assert_eq!(report.groups_total, 0);
         // The event still seals and opens on time.
         assert!(store.written.lock().unwrap().is_some());
     }

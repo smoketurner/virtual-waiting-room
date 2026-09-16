@@ -466,6 +466,31 @@ mod tests {
     }
 
     #[test]
+    fn a_contaminated_report_renders_no_group_row_from_another_event() {
+        let mut view = Dashboard::from_state(&state(), 0);
+        let report = wr_common::DemotionReport {
+            mode: "enforce".to_owned(),
+            rules: "address:4".to_owned(),
+            cohort: 8,
+            demoted: 0,
+            groups_total: 0,
+            groups: vec![],
+            sealed_at: 1,
+            error: Some(
+                "the scan covered 8 cohort rows against 5 registrations for this event, so it \
+                 included another event's rows; nothing was demoted"
+                    .to_owned(),
+            ),
+        };
+        view.with_demotion_report(Some(&report));
+        let html = view.render().unwrap();
+        assert!(!html.contains("<table class=\"groups\">"));
+        assert!(!html.contains("198.51.100.1"));
+        assert!(html.contains("another event"));
+        assert!(html.contains("<strong>0</strong> of 8 registrations in 0 groups"));
+    }
+
+    #[test]
     fn an_unscheduled_event_offers_no_clear_and_defaults_to_utc() {
         let html = Dashboard::from_state(&state(), 0).render().unwrap();
         assert!(html.contains("not set"));
