@@ -347,6 +347,9 @@ pub async fn seal_event<S: Store>(
 
     let mut report = DemotionReport::from_classification(config.mode, rules, &classification, now);
     if contaminated {
+        report.demoted = 0;
+        report.groups.clear();
+        report.groups_total = 0;
         report.error = Some(format!(
             "the scan covered {} cohort rows against {} registrations for this event, so it \
              included another event's rows; nothing was demoted",
@@ -785,6 +788,12 @@ mod tests {
         let report = store.report.lock().unwrap().clone().unwrap();
         assert_eq!(report.cohort, 8);
         assert_eq!(report.mode, "enforce");
+        // The classification is not this event's, so its per-group outputs are
+        // suppressed: the report keeps the scan width (cohort) and the reason,
+        // not the groups another event's rows would have produced.
+        assert_eq!(report.demoted, 0);
+        assert!(report.groups.is_empty());
+        assert_eq!(report.groups_total, 0);
         let error = report.error.unwrap();
         assert!(error.contains('8'), "names the cohort: {error}");
         assert!(error.contains('5'), "names the registrations: {error}");
@@ -811,6 +820,10 @@ mod tests {
         let report = store.report.lock().unwrap().clone().unwrap();
         assert_eq!(report.mode, "observe");
         assert!(report.error.is_some());
+        assert_eq!(report.cohort, 8);
+        assert_eq!(report.demoted, 0);
+        assert!(report.groups.is_empty());
+        assert_eq!(report.groups_total, 0);
     }
 
     #[tokio::test]
