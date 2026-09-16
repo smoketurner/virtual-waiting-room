@@ -420,7 +420,7 @@ mod tests {
             "action=\"/admin/phase\"",
             "action=\"/admin/rate\"",
             "action=\"/admin/message\"",
-            "action=\"/admin/reset\"",
+            "action=\"/admin/force_maintenance\"",
         ] {
             assert!(html.contains(action), "missing form {action}");
         }

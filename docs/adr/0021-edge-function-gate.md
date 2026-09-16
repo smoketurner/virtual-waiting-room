@@ -321,7 +321,9 @@ the first three; this figure is the whole decision tree. Multi-key ruleset reass
 it.
 
 **Compute utilization on the hot path is 11 of 100**, measured with `aws cloudfront test-function`
-against a real function and a real KeyValueStore (`scripts/spike_edge_gate.py`). The breakdown:
+against a real function and a real KeyValueStore. The spike tooling that took these measurements
+(`scripts/spike_edge_gate.py`) said to delete it once this ADR was decided, and it has been; the
+numbers below are what it produced. The breakdown:
 
 | Case | Utilization | Outcome |
 |---|---|---|
@@ -350,7 +352,7 @@ rules needs 3 keys. The encoding measured was hand-written; the committed format
 
 **KeyValueStore propagation to an edge is a median of 31 seconds** — 29.4s min, 32.4s max, five
 of five trials observed. Measured by publishing a probe function against a throwaway distribution
-and polling it over HTTPS after each write (`scripts/spike_edge_gate.py --propagation`).
+and polling it over HTTPS after each write.
 
 The tightness matters as much as the value: a three-second spread across five trials looks like a
 fixed sync interval rather than variable propagation, which makes it a number you can design

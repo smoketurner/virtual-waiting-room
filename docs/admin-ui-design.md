@@ -48,7 +48,7 @@ from `wr-domain::Counters` / `Phase`.
 | `/admin/open_now` | POST | Open the event immediately instead of waiting for the scheduled start: invokes the `open_event` function the schedule invokes. | `shuffle_seed`, prefix offsets, `participant_count`, `phase = active` (written by `open_event`); audit fields here |
 | `/admin/rate` | POST | Set the admission target rate the outflow controller reads (form `rate`). | `target_rate` (new attribute; controller is future work but the knob is set here) |
 | `/admin/message` | POST | Set the operator broadcast message shown on phase pages / `/status` (form `message`). | `message` |
-| `/admin/reset` | POST | Force **maintenance** phase (the override that suppresses standby alarms), the safe operator stop. | `phase = maintenance` |
+| `/admin/force_maintenance` | POST | Force **maintenance** phase (the override that suppresses standby alarms), the safe operator stop. | `phase = maintenance` |
 | `/admin/rules` | POST | Replace the edge gate's whole ruleset (path/header/cookie/user-agent match), written to the CloudFront KeyValueStore. | KeyValueStore `rules`; audited on `Counters` |
 
 ### MVP action set (implemented in Stages 3–5)

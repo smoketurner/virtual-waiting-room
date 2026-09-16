@@ -22,5 +22,5 @@ locals {
 
   # The waiting room's own URL. Derived from the distribution created here
   # rather than configured twice and left to drift.
-  waiting_room_url = "https://${module.edge.distribution_domain_name}/"
+  waiting_room_url = "https://${module.edge.viewer_domain_name}/"
 }

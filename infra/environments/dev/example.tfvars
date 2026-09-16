@@ -18,14 +18,16 @@ lambda_architecture = "arm64" # must match `make build ARCH=...`
 # any redirect it issues takes the visitor off the distribution entirely.
 client_origin_domain_name = ""
 
-# fall back to the vendored placeholder Lambda (lets `make plan` run pre-build).
-# admission and expires positions. Leave it empty and the queue forms but never
-# drains.
-
-# the arrivals counters the controller measures no-shows against. Building it
-# where the origin lives.
-
-# because the protected behaviour refuses every request that carries none.
+# --- Custom domain ------------------------------------------------------------
+# The hostname visitors actually use. Empty deploys on the distribution's own
+# *.cloudfront.net name, which works and is the testing default.
+#
+# A real event sets both: the session cookie is issued for the host the visitor
+# is on, so a waiting room on one domain and the origin it protects on another
+# hands the origin a cookie its requests never carry. The certificate must be in
+# us-east-1 and cover every name listed, and the two must be set together.
+aliases             = []
+acm_certificate_arn = ""
 
 # --- Admin OIDC login (ADR-0016) ----------------------------------------------
 # The client SECRET is NOT here — write it to the SSM SecureString out of band:
@@ -71,3 +73,10 @@ admission_rate = 5
 #
 # starts_at          = "2027-03-14T10:00:00"
 # starts_at_timezone = "America/New_York"
+
+# --- Sessions -----------------------------------------------------------------
+# How long an admitted visitor's session cookie lasts. Nothing renews it at the
+# edge, so a visitor still on the origin when it lapses is returned to the
+# queue: set it comfortably longer than the worst realistic time on the origin,
+# not tightly around the average.
+session_ttl_seconds = 3600

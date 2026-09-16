@@ -12,10 +12,9 @@
 // rewrite of production logic.
 //
 // This tests Node's Buffer, HMAC and base64url — not CloudFront's. It is a
-// proxy for what scripts/spike_edge_gate.py proved against a real
-// CloudFront Function (ADR-0021 §6), not a replacement for it; a release
-// still needs a manual `aws cloudfront test-function` run over these same
-// vectors.
+// proxy for what was measured against a real CloudFront Function while
+// ADR-0021 was being decided (§6), not a replacement for it; a release still
+// needs a manual `aws cloudfront test-function` run over these same vectors.
 
 "use strict";
 

@@ -107,7 +107,7 @@ Throwaway code. Measures what documentation cannot settle.
 - [ ] Every operator action available via API; no console dependency [F5.5]
 
 ### 1i. Control plane
-- [ ] Admin API: `/admin/phase`, `/admin/rate`, `/admin/message`, `/admin/reset`,
+- [ ] Admin API: `/admin/phase`, `/admin/rate`, `/admin/message`, `/admin/force_maintenance`,
       `/admin/rules` [F5.5]
 - [ ] `modules/core` — DynamoDB, SQS, Lambdas, IAM, regional REST API + validator [N5]
 - [ ] `modules/edge` — CloudFront with three cache behaviours per ADR-0013: polled
