@@ -152,3 +152,34 @@ than a classifier nobody can explain.
 - The WAF signals (#59: Bot Control labels, the anonymous-IP and hosting-provider lists) are
   a later input to the same classification: another attribute on the row, another signal name
   in the rules, the same seal. Nothing here precludes them; nothing here needs them.
+
+## Revision (2026-09-16): the count proxy is not a reliable contamination signal
+
+The §4 claim that "a cohort wider than the event's own participant count is therefore another
+event's rows" rests on the premise that *every issued index has a row*. That premise is false:
+`assign_position` claims a pre-queue index (`ADD shard_count`) *before* the row write, and both
+write outcomes that fail to land leave a **burned index** — the counter is incremented but no
+`PreQueue` row exists (`Duplicate` on a `request_id` collision; `Err` on a transient `PutItem`
+timeout/throttle/capacity). `N` therefore counts indices *issued*, not rows written, and a clean
+event reads `cohort < N`. A foreign row that fills a burned slot does not push `cohort` above
+`N`, so the `cohort > N` guard silently misses contamination that fits inside the burned gap and
+`seal_event` enforces demotion on another event's rows while recording it as a clean demotion.
+
+The guard now uses two signals instead of `cohort > N`:
+
+- **`cohort > distinct`**: a single event issues each `(shard, local index)` at most once, so a
+  slot observed more than once is another event's row duplicating a current one. This is a
+  *definite* contamination signal — demotion is withheld and the report says so, exactly as the
+  old guard did for the maximally contaminated (`cohort > N`) case.
+- **`cohort < N`** (the burned-index regime): burned slots make a clean read indistinguishable
+  from one that folded foreign rows into the gap, so contamination cannot be *ruled out*. The
+  report flags it rather than recording a clean demotion; enforcement is **not** withheld,
+  because burned indices are an expected, throughput-dependent residual and withholding here
+  would disable demotion at any real scale.
+
+The colliding half of the residual gap is closed (`cohort > distinct`). The complete fix —
+distinguishing current-event rows from foreign rows that fill burned slots — still requires an
+event identifier on `PreQueue` rows (or per-event isolation), since the scan carries no event
+tag and no proxy built from `cohort`, `N`, or distinct slots can separate the two in that
+shape. This is a design change the ADR has not made; until it is, the burned-index regime is
+*surfaced* rather than *detected*.

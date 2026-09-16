@@ -22,9 +22,17 @@
 //! 2. Scan the pre-queue and classify it. Nothing is written yet, so a
 //!    double-fire at this point costs a duplicate scan and nothing else. The
 //!    scan is the one store boundary that cannot be scoped to the event — the
-//!    pre-queue table is shared and its rows carry no event id — so a
-//!    classification covering more rows than the event registered is another
-//!    event's, and is reported rather than enforced.
+//!    pre-queue table is shared and its rows carry no event id. `N`
+//!    (`participant_count`) counts indices *issued*, not rows written, so a
+//!    burned slot (claimed-but-unwritten) makes `cohort < N` even on a clean
+//!    event, and `cohort > N` is no longer a reliable contamination signal.
+//!    Two signals are used instead: a *repeated `(shard, local index)` slot*
+//!    means another event's row duplicated a current one (a single event
+//!    issues each slot at most once), which is a definite contamination signal
+//!    and skips enforcement; and `cohort < N` means burned slots make the read
+//!    indistinguishable from one that folded in foreign rows, so contamination
+//!    cannot be ruled out and the report says so rather than recording a clean
+//!    demotion.
 //! 3. Write the demoted group set — the [`wr_common::DemotionSet`] every
 //!    resolver will match rows against — as chunk items under a per-run
 //!    nonce. Written *before* the election so the winning seal never names a
@@ -39,6 +47,7 @@
 //! No rules means no scan at all: the seal is then exactly the single write it
 //! was before this existed.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
@@ -275,32 +284,35 @@ pub async fn seal_event<S: Store>(
         return Ok(SealResult::Sealed(Box::new(values)));
     }
 
-    let classification = classify_cohort(store, &values, rules.clone()).await?;
+    let (classification, distinct) = classify_cohort(store, &values, rules.clone()).await?;
 
-    // A cohort wider than the event's own participant count means the scan
-    // read rows this event never wrote. Every registration holds a local index
-    // below its shard's sealed count, so all of them land in the cohort, and
-    // request_id reuse or a straggler can only take rows out of it — nothing
-    // in a single-event run puts the count above N. The excess is therefore
-    // another event's registrations left in the shared table, and the groups
-    // built from them are not this event's to demote.
-    //
-    // The seal itself is unharmed: its values come from the shard counts, not
-    // the scan. So the event opens on time with the control switched off, and
-    // the report carries both numbers and the reason — the same trade the
-    // unparsable-rules path makes, for the same reason.
-    let contaminated = classification.cohort > values.participant_count;
-    if contaminated {
-        tracing::error!(
-            event_id,
-            participant_count = values.participant_count,
-            cohort = classification.cohort,
-            "pre-queue scan covered more rows than this event registered; sealing without demotion"
-        );
-    }
+    // `N` (`participant_count`) counts indices *issued* — claimed by a shard
+    // counter — not rows written: a registration whose row write failed after
+    // the counter incremented (see `assign_position`'s `Duplicate` and `Err`
+    // branches) leaves a *burned* slot with no row, so a clean event can read
+    // `cohort < N` and `cohort > N` is no longer a reliable contamination
+    // signal. Two signals are used instead, set up by [`Contamination::assess`]:
+    //   - A repeated `(shard, local_index)` slot (a single event issues each
+    //     at most once) is a *definite* contamination signal — demotion is
+    //     withheld.
+    //   - `cohort < N` means burned slots make the read indistinguishable from
+    //     one that folded in foreign rows. Contamination cannot be *ruled out*,
+    //     so the report flags it; enforcement is *not* withheld, because
+    //     burned indices are an expected, throughput-dependent residual and
+    //     withholding would disable demotion at any real scale. Separating
+    //     the two needs an event id on `PreQueue` rows, which no row carries.
+    let contamination =
+        Contamination::assess(classification.cohort, distinct, values.participant_count);
+    contamination.log(
+        event_id,
+        classification.cohort,
+        distinct,
+        values.participant_count,
+    );
 
-    let enforcing =
-        !contaminated && config.mode == DemotionMode::Enforce && classification.demoted > 0;
+    let enforcing = !contamination.contaminated
+        && config.mode == DemotionMode::Enforce
+        && classification.demoted > 0;
     if enforcing {
         let set = DemotionSet::from_groups(&classification.groups);
         let chunks = set.to_chunks(MAX_CHUNK_BYTES);
@@ -337,25 +349,28 @@ pub async fn seal_event<S: Store>(
         event_id,
         participant_count = values.participant_count,
         cohort = classification.cohort,
+        distinct,
         demoted_groups = classification.groups.len(),
         demoted = classification.demoted,
         enforced = enforcing,
-        contaminated,
+        contaminated = contamination.contaminated,
+        burned_regime = contamination.burned_regime,
         mode = config.mode.as_wire_str(),
         "event sealed"
     );
 
     let mut report = DemotionReport::from_classification(config.mode, rules, &classification, now);
-    if contaminated {
+    if contamination.contaminated {
+        // The classification is not this event's, so its per-group outputs are
+        // suppressed: the report keeps the scan width and the reason, not the
+        // groups another event's rows would have produced. The burned-index
+        // regime keeps them — there demotion ran, on rows that are this
+        // event's as far as anything can tell.
         report.demoted = 0;
         report.groups.clear();
         report.groups_total = 0;
-        report.error = Some(format!(
-            "the scan covered {} cohort rows against {} registrations for this event, so it \
-             included another event's rows; nothing was demoted",
-            classification.cohort, values.participant_count
-        ));
     }
+    report.error = contamination.caveat(classification.cohort, distinct, values.participant_count);
     if let Err(e) = store.write_report(event_id, &report).await {
         // The report is for the operator; the seal has landed, so this is
         // logged rather than fatal.
@@ -365,23 +380,111 @@ pub async fn seal_event<S: Store>(
     Ok(SealResult::Sealed(Box::new(values)))
 }
 
+/// How the seal treats a scanned cohort relative to the event's own
+/// registrations: definitely contaminated, unverifiable, or clean.
+///
+/// `N` (`participant_count`) counts indices *issued*, not rows written, so a
+/// burned slot makes `cohort < N` even on a clean event and `cohort > N` is
+/// not a reliable contamination signal. This replaces it with two checks:
+///   - `cohort > distinct`: a single event issues each `(shard, local_index)`
+///     at most once, so a slot seen more than once is another event's row
+///     duplicating a current one. Definite contamination — demotion withheld.
+///   - `cohort < N`: burned slots make a clean read indistinguishable from one
+///     that folded in foreign rows. Unverifiable — reported, not withheld.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Contamination {
+    contaminated: bool,
+    burned_regime: bool,
+}
+
+impl Contamination {
+    /// Assesses a scanned cohort of `cohort` rows in `distinct` slots against
+    /// `participant_count` (`N`) claimed indices.
+    #[must_use]
+    fn assess(cohort: u64, distinct: u64, participant_count: u64) -> Self {
+        Self {
+            contaminated: cohort > distinct,
+            burned_regime: cohort < participant_count,
+        }
+    }
+
+    /// Emits the run's contamination log: `error` when contamination is
+    /// definite, `warn` when it cannot be ruled out, nothing when clean.
+    fn log(self, event_id: &str, cohort: u64, distinct: u64, participant_count: u64) {
+        if self.contaminated {
+            tracing::error!(
+                event_id,
+                participant_count,
+                cohort,
+                distinct,
+                "pre-queue scan read repeated pre-queue slots; sealing without demotion"
+            );
+        } else if self.burned_regime {
+            tracing::warn!(
+                event_id,
+                participant_count,
+                cohort,
+                "pre-queue scan read fewer rows than were registered; contamination cannot be \
+                 ruled out"
+            );
+        }
+    }
+
+    /// The operator-facing `DemotionReport::error` caveat for the run, or
+    /// `None` for a clean full turnout.
+    #[must_use]
+    fn caveat(self, cohort: u64, distinct: u64, participant_count: u64) -> Option<String> {
+        if self.contaminated {
+            Some(format!(
+                "the scan covered {cohort} cohort rows in {distinct} distinct pre-queue slots \
+                 against {participant_count} registrations for this event; a single event issues \
+                 each (shard, local index) at most once, so this included another event's rows \
+                 and nothing was demoted"
+            ))
+        } else if self.burned_regime {
+            Some(format!(
+                "the scan covered {cohort} cohort rows against {participant_count} \
+                 registrations for this event; burned pre-queue indices make this read \
+                 indistinguishable from one that folded in another event's rows, so \
+                 contamination cannot be ruled out"
+            ))
+        } else {
+            None
+        }
+    }
+}
+
 /// Scans the pre-queue and classifies every row the sealed offsets place in
 /// the cohort. A straggler (local index at or past its shard's issued count)
 /// is a live joiner with no pre-queue position and is left out.
+///
+/// Returns the classification plus the count of *distinct* `(shard,
+/// local_index)` slots observed inside the cohort. A single event issues each
+/// slot at most once (`assign_position` claims a fresh contiguous block per
+/// batch and never reuses an index), so `cohort > distinct` means another
+/// event's row duplicated a current one — the cross-event contamination signal
+/// [`seal_event`] uses alongside `participant_count`. It cannot detect a
+/// foreign row that fills a *burned* slot (no current row to duplicate); the
+/// burned-index regime `cohort < N` surfaces that residual to the operator.
 async fn classify_cohort<S: Store>(
     store: &S,
     values: &SealValues,
     rules: DemotionRules,
-) -> Result<Classification, StoreError> {
+) -> Result<(Classification, u64), StoreError> {
     let offsets = SealedOffsets::from_parts(values.offsets, values.participant_count);
     let cohort = Arc::new(Mutex::new(Cohort::new(rules)));
+    let slots = Arc::new(Mutex::new(HashSet::<(u8, u64)>::new()));
     let sink = Arc::clone(&cohort);
+    let slot_sink = Arc::clone(&slots);
     let visit: Arc<dyn Fn(ScannedRow) + Send + Sync> =
         Arc::new(move |row: ScannedRow| {
             match offsets.assign(usize::from(row.shard), row.local_index) {
                 wr_common::Assignment::PreQueue { .. } => {
                     if let Ok(mut cohort) = sink.lock() {
                         cohort.observe(row.telemetry.as_ref());
+                    }
+                    if let Ok(mut seen) = slot_sink.lock() {
+                        seen.insert((row.shard, row.local_index));
                     }
                 }
                 wr_common::Assignment::LiveJoin => {}
@@ -392,8 +495,21 @@ async fn classify_cohort<S: Store>(
         .map_err(|_arc| StoreError("scan still holds the cohort".to_owned()))?
         .into_inner()
         .map_err(|_poison| StoreError("cohort lock poisoned".to_owned()))?;
-    tracing::info!(scanned, cohort = cohort.len(), "pre-queue scanned");
-    Ok(cohort.classify())
+    let distinct = u64::try_from(
+        Arc::try_unwrap(slots)
+            .map_err(|_arc| StoreError("scan still holds the slot set".to_owned()))?
+            .into_inner()
+            .map_err(|_poison| StoreError("slot set lock poisoned".to_owned()))?
+            .len(),
+    )
+    .unwrap_or(u64::MAX);
+    tracing::info!(
+        scanned,
+        cohort = cohort.len(),
+        distinct,
+        "pre-queue scanned"
+    );
+    Ok((cohort.classify(), distinct))
 }
 
 /// The phase the seal leaves the event in.
@@ -947,5 +1063,253 @@ mod tests {
         // There is no held phase any more: with nothing to write per row after
         // the election, the seal write itself is the moment the event opens.
         assert_eq!(sealed_phase(), Phase::Active);
+    }
+
+    // --- cross-event contamination with burned indices (issue #161) ---
+    //
+    // `participant_count` (N) counts indices *issued* — claimed by a shard
+    // counter — not rows written. A burned slot (claimed-but-unwritten, from
+    // `assign_position`'s `Duplicate` and `Err` branches) makes a clean event
+    // read `cohort < N`, and a foreign row that fills a burned slot does not
+    // push `cohort` above `N`, so the old `cohort > N` guard missed it. These
+    // tests pin the two signals that replace it.
+
+    /// `REPRO_A`: foreign rows duplicating current-event slots while burned
+    /// indices keep `cohort == N`. The old guard (`cohort > N`) does not fire
+    /// (`5 > 5` is false); the duplicate-slot guard (`cohort > distinct`) does:
+    /// distinct pre-queue slots is 3 against 5 cohort rows, so contamination is
+    /// flagged and demotion is withheld. This is the test the bug report says
+    /// the suite never combined: contamination plus burned indices.
+    #[tokio::test]
+    async fn burned_indices_do_not_mask_contamination_from_repeated_slots() {
+        // counts[0] = 5: five indices 0..4 CLAIMED on shard 0.
+        // l=2,3,4 are BURNED (claimed, no row written).
+        // CURRENT event only has surviving rows for l=0,1 (address A).
+        // Three FOREIGN rows from a previous event remain at l=0,1,2 (also
+        // address A); l=0,1 collide with current (duplicate slots), l=2 fills a
+        // burned slot.
+        let mut rows: Vec<ScannedRow> = Vec::new();
+        for l in 0..3u64 {
+            rows.push(row(0, l, "198.51.100.1")); // foreign
+        }
+        for l in 0..2u64 {
+            rows.push(row(0, l, "198.51.100.1")); // current
+        }
+        let store = FakeStore::new([5, 0, 0, 0, 0, 0, 0, 0, 0, 0], false).with_rows(rows);
+        let result = seal_event(
+            &store,
+            "evt-1",
+            [1u8; 32],
+            NONCE,
+            &config("address:2", DemotionMode::Enforce),
+            1,
+        )
+        .await
+        .unwrap();
+        let SealResult::Sealed(values) = result else {
+            panic!("expected a first seal");
+        };
+        let report = store.report.lock().unwrap().clone().unwrap();
+        // Contamination is surfaced, not hidden: the report carries an error.
+        assert!(report.error.is_some(), "expected a contamination error");
+        assert!(
+            report.error.as_deref().unwrap().contains("another event"),
+            "expected the error to name another event: {:?}",
+            report.error
+        );
+        // Demotion is withheld: no chunks written, no tail in the seal.
+        assert!(values.demotion.is_none());
+        assert_eq!(values.demoted_count, 0);
+        assert!(store.chunks.lock().unwrap().is_empty());
+        // The classification is another event's, so the report carries the scan
+        // width and the reason, not its per-group outputs.
+        assert_eq!(report.cohort, 5);
+        assert_eq!(report.demoted, 0);
+        assert!(report.groups.is_empty());
+        assert_eq!(report.groups_total, 0);
+        // The event still seals and opens on time.
+        assert!(store.written.lock().unwrap().is_some());
+    }
+
+    /// `REPRO_B`: foreign rows filling *only* burned slots collide with no
+    /// current row, so `cohort == distinct` and the duplicate-slot guard does
+    /// not fire either — the scan genuinely cannot tell these foreign rows
+    /// from current survivors. The run is therefore *flagged* as
+    /// "contamination cannot be ruled out" rather than recorded as clean, and
+    /// demotion is not withheld (the burned-index regime is the expected,
+    /// throughput-dependent normal case; withholding would disable demotion
+    /// at any real scale).
+    #[tokio::test]
+    async fn burned_slot_fill_surfaces_as_unverifiable_in_the_report() {
+        // counts[0] = 5: indices 0..4 claimed. l=2,3,4 BURNED (no current row).
+        // CURRENT wrote l=0,1. Two FOREIGN rows remain at l=3,4 — each fills a
+        // burned slot, colliding with no current row.
+        let rows = vec![
+            row(0, 0, "198.51.100.1"), // current
+            row(0, 1, "198.51.100.1"), // current
+            row(0, 3, "198.51.100.1"), // foreign, fills a burned slot
+            row(0, 4, "198.51.100.1"), // foreign, fills a burned slot
+        ];
+        let store = FakeStore::new([5, 0, 0, 0, 0, 0, 0, 0, 0, 0], false).with_rows(rows);
+        let SealResult::Sealed(values) = seal_event(
+            &store,
+            "evt-1",
+            [1u8; 32],
+            NONCE,
+            &config("address:2", DemotionMode::Enforce),
+            1,
+        )
+        .await
+        .unwrap() else {
+            panic!("expected seal");
+        };
+        let report = store.report.lock().unwrap().clone().unwrap();
+        // cohort (4) < N (5): the run is flagged, not recorded as clean.
+        assert!(report.error.is_some());
+        assert!(
+            report
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("cannot be ruled out"),
+            "expected the burned-index regime to be flagged: {:?}",
+            report.error
+        );
+        assert!(
+            !report
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("nothing was demoted"),
+            "the burned-index regime is not a no-demotion outcome: {:?}",
+            report.error
+        );
+        // Demotion is not withheld on the burned-index regime, so the tail is
+        // in use and the (mixed) address group is demoted.
+        assert!(values.demotion.is_some());
+        assert_eq!(store.chunks.lock().unwrap().len(), 1);
+        assert_eq!(values.demoted_count, 4);
+        assert_eq!(values.queue_counter_start().unwrap(), 10);
+    }
+
+    /// A clean event with burned indices and no foreign rows reads
+    /// `cohort < N` too — it is indistinguishable from `REPRO_B`, so the report
+    /// honestly flags it "cannot be ruled out". Demotion still proceeds: a
+    /// burned index is the expected throughput-dependent residual, and the
+    /// operator tuned the threshold against real (clean) data.
+    #[tokio::test]
+    async fn a_clean_event_with_burned_indices_is_flagged_uncertain_but_still_demotes() {
+        // counts[0] = 5: indices 0..4 claimed; l=3,4 burned (no row). Three
+        // real registrations, all one address, over the threshold of 2.
+        let rows = vec![
+            row(0, 0, "198.51.100.1"),
+            row(0, 1, "198.51.100.1"),
+            row(0, 2, "198.51.100.1"),
+        ];
+        let store = FakeStore::new([5, 0, 0, 0, 0, 0, 0, 0, 0, 0], false).with_rows(rows);
+        let SealResult::Sealed(values) = seal_event(
+            &store,
+            "evt-1",
+            [1u8; 32],
+            NONCE,
+            &config("address:2", DemotionMode::Enforce),
+            1,
+        )
+        .await
+        .unwrap() else {
+            panic!("expected seal");
+        };
+        let report = store.report.lock().unwrap().clone().unwrap();
+        assert_eq!(report.cohort, 3);
+        assert!(report.error.is_some());
+        assert!(
+            report
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("cannot be ruled out")
+        );
+        // Demotion still enforced on the clean (if burned) cohort.
+        assert!(values.demotion.is_some());
+        assert_eq!(values.demoted_count, 3);
+        assert_eq!(store.chunks.lock().unwrap().len(), 1);
+    }
+
+    /// The burned-index flag is mode-independent: under observe the
+    /// classification is reported with the same caveat, and nobody is demoted.
+    #[tokio::test]
+    async fn the_burned_regime_is_flagged_under_observe_too() {
+        let rows = vec![
+            row(0, 0, "198.51.100.1"),
+            row(0, 1, "198.51.100.1"),
+            row(0, 2, "198.51.100.1"),
+        ];
+        let store = FakeStore::new([5, 0, 0, 0, 0, 0, 0, 0, 0, 0], false).with_rows(rows);
+        let SealResult::Sealed(values) = seal_event(
+            &store,
+            "evt-1",
+            [1u8; 32],
+            NONCE,
+            &config("address:2", DemotionMode::Observe),
+            1,
+        )
+        .await
+        .unwrap() else {
+            panic!("expected seal");
+        };
+        let report = store.report.lock().unwrap().clone().unwrap();
+        assert_eq!(report.mode, "observe");
+        assert!(report.error.is_some());
+        assert!(
+            report
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("cannot be ruled out")
+        );
+        // Observe never enforces.
+        assert!(values.demotion.is_none());
+        assert_eq!(values.demoted_count, 0);
+        assert!(store.chunks.lock().unwrap().is_empty());
+    }
+
+    /// Distinct-slot counting is over the `(shard, local_index)` tuple, not
+    /// `local_index` alone: a clean full turnout whose shards each issued a
+    /// `0, 1` block reads `cohort == distinct == N` and is *not* flagged. A
+    /// distinct impl that collapsed on `local_index` would see 3 slots here
+    /// against 5 cohort rows and false-positive contamination.
+    #[tokio::test]
+    async fn distinct_slots_are_counted_per_shard_so_a_clean_multi_shard_turnout_is_clean() {
+        // counts = [3, 2, 0, ...]: shard 0 issued l=0,1,2; shard 1 issued
+        // l=0,1. Five rows, all one address (over a threshold of 4 so the
+        // whole cohort is demoted), all distinct (shard, l) tuples.
+        let rows = vec![
+            row(0, 0, "198.51.100.1"),
+            row(0, 1, "198.51.100.1"),
+            row(0, 2, "198.51.100.1"),
+            row(1, 0, "198.51.100.1"),
+            row(1, 1, "198.51.100.1"),
+        ];
+        let store = FakeStore::new([3, 2, 0, 0, 0, 0, 0, 0, 0, 0], false).with_rows(rows);
+        let SealResult::Sealed(values) = seal_event(
+            &store,
+            "evt-1",
+            [1u8; 32],
+            NONCE,
+            &config("address:4", DemotionMode::Enforce),
+            1,
+        )
+        .await
+        .unwrap() else {
+            panic!("expected seal");
+        };
+        let report = store.report.lock().unwrap().clone().unwrap();
+        assert_eq!(report.cohort, 5);
+        // cohort == N and cohort == distinct: no flag, no residual caveat.
+        assert!(report.error.is_none());
+        // A real demotion over a clean cohort still runs.
+        assert!(values.demotion.is_some());
+        assert_eq!(values.demoted_count, 5);
+        assert_eq!(store.chunks.lock().unwrap().len(), 1);
     }
 }
