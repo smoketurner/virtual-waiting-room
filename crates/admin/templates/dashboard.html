@@ -217,51 +217,6 @@
       </div>
     </section>
 
-    <!-- Demotion at open (issue #145): what opening the event moved to the tail and
-         on what basis. Read-only — the rules are deploy-time settings. -->
-    <section class="card span-2">
-      <div class="card-header">
-        <h2>Demotion at open</h2>
-        <p class="sub">Groups of registrations sharing one address, ASN, JA4 fingerprint or user agent beyond a threshold are served behind the rest of the cohort. The demoted groups are stored once when the event opens; every position lookup matches against them. Rules and mode are set in <code>terraform.tfvars</code>.</p>
-      </div>
-      <div class="card-body">
-        {% if !demotion.reported %}
-        <p class="deferred">No report yet. One is written when the event opens with demotion rules set; with no rules the cohort is never scanned.</p>
-        {% else %}
-        {% if !demotion.error.is_empty() %}
-        <p class="status status-error">The configured rules did not parse and the event opened without demotion: {{ demotion.error }}</p>
-        {% endif %}
-        <dl class="kv-pairs">
-          <div>
-            <dt class="kv-key">Mode</dt>
-            <dd class="kv-val"><strong>{{ demotion.mode }}</strong>{% if demotion.mode == "observe" %} (reported, not applied){% endif %}</dd>
-          </div>
-          <div>
-            <dt class="kv-key">Rules</dt>
-            <dd class="kv-val"><code>{{ demotion.rules }}</code></dd>
-          </div>
-          <div>
-            <dt class="kv-key">{% if !demotion.error.is_empty() %}Scanned{% else if demotion.mode == "enforce" %}Demoted{% else %}Would demote{% endif %}</dt>
-            <dd class="kv-val"><strong>{{ demotion.demoted }}</strong> of {{ demotion.cohort }} registrations in {{ demotion.groups_total }} group{% if demotion.groups_total != 1 %}s{% endif %}</dd>
-          </div>
-        </dl>
-        {% if !demotion.groups.is_empty() %}
-        <table class="groups">
-          <thead><tr><th>Signal</th><th>Value</th><th>Registrations</th><th>Threshold</th></tr></thead>
-          <tbody>
-            {% for g in demotion.groups %}
-            <tr><td>{{ g.signal }}</td><td><code>{{ g.value }}</code></td><td>{{ g.count }}</td><td>{{ g.max }}</td></tr>
-            {% endfor %}
-          </tbody>
-        </table>
-        {% if demotion.groups_total > demotion.groups_shown %}
-        <p class="help">Largest {{ demotion.groups_shown }} of {{ demotion.groups_total }} groups shown.</p>
-        {% endif %}
-        {% endif %}
-        {% endif %}
-      </div>
-    </section>
-
     <!-- Edge gate protection rules (issue #71). Last because a full-width card
          cannot share a row: placed earlier it splits the single-column cards
          above it onto rows of their own. -->

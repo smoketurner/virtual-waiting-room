@@ -22,8 +22,6 @@ use std::future::Future;
 use serde::{Deserialize, Serialize};
 use wr_common::{AdmissionControl, Phase, SHARDS, StoredControl, resolve};
 
-pub use tiers::Tiers;
-
 pub mod dynamo;
 
 /// The controller interval in seconds. The `EventBridge` Scheduler `rate()`
@@ -108,12 +106,8 @@ pub struct ReleaseInputs {
     /// Operator target rate in visitors per second (the `/admin/rate` value).
     pub target_rate: u32,
     /// `N`, the opened pre-queue cohort size; `0` before an open or for a
-    /// live-join-only event. With `demoted_count` it lays out the position
-    /// space ([`Tiers`]) the cursor walks.
+    /// live-join-only event.
     pub participant_count: u64,
-    /// `D`, how many cohort rows the open demoted into the tail `[N, 2N)`
-    /// (issue #145); `0` when none.
-    pub demoted_count: u64,
 }
 
 /// The outcome of one release computation.
@@ -180,11 +174,9 @@ pub fn compute_release(inputs: ReleaseInputs, prev: Option<NoShowState>) -> Rele
     // an over-release waiting for the moment real traffic starts. Counting only
     // issued positions keeps this the same units as `observed_arrivals`: people.
     //
-    // Counted in people, not positions: with a demotion tail (issue #145) a
-    // position is a person only at its tier's density, and the no-show rate
-    // is a ratio of people.
-    let tiers = Tiers::new(inputs.participant_count, inputs.demoted_count);
-    let released_last = tiers.people_in(inputs.last_serving_counter.max(1), inputs.serving_counter);
+    let released_last = inputs
+        .serving_counter
+        .saturating_sub(inputs.last_serving_counter.max(1));
 
     let target = target_release_per_interval(inputs.target_rate);
 
@@ -235,11 +227,8 @@ pub fn compute_release(inputs: ReleaseInputs, prev: Option<NoShowState>) -> Rele
         smoothed_rate: smoothed,
     };
 
-    // `release` is people; the cursor moves in positions. Inside a demotion
-    // tail one person is many positions, and the conversion is exact for the
-    // density the open recorded rather than a correction the EWMA has to
-    // discover — which it could not, bounded at twice the target.
-    let positions = tiers.positions_for_people(inputs.serving_counter, release);
+    // One position is one person, so the cursor moves by the release itself.
+    let positions = release;
 
     // The cursor is exclusive — position p is admitted once p < serving_counter —
     // and queue_counter is the highest position ever issued, so one past it
@@ -536,11 +525,7 @@ pub async fn run_pass<S: Store>(
     let expired = expire_due(
         store,
         event_id,
-        expiry_cutoff(
-            decision.next_serving_counter,
-            state.inputs.target_rate,
-            Tiers::new(state.inputs.participant_count, state.inputs.demoted_count),
-        ),
+        expiry_cutoff(decision.next_serving_counter, state.inputs.target_rate),
     )
     .await?;
 
@@ -561,21 +546,19 @@ pub async fn run_pass<S: Store>(
 /// The position below which an unclaimed position counts as a no-show: the
 /// cursor less the ground it covers during the grace window.
 ///
-/// The grace is `target_rate * ADMISSION_GRACE_SECS` *people*, walked back
-/// through the tiers: inside a demotion tail (issue #145) the cursor covers
-/// many positions per person, and a grace measured in positions there would
-/// shrink to seconds of wall clock.
+/// The grace is `target_rate * ADMISSION_GRACE_SECS` positions behind the
+/// cursor.
 ///
 /// A rate of zero releases nobody, so nothing has been offered and nothing can
 /// have been declined; returning zero expires nothing rather than treating the
 /// entire queue as no-shows.
 #[must_use]
-pub fn expiry_cutoff(serving_counter: u64, target_rate: u32, tiers: Tiers) -> u64 {
+pub fn expiry_cutoff(serving_counter: u64, target_rate: u32) -> u64 {
     if target_rate == 0 {
         return 0;
     }
     let grace = u64::from(target_rate).saturating_mul(ADMISSION_GRACE_SECS);
-    tiers.walk_back(serving_counter, grace)
+    serving_counter.saturating_sub(grace)
 }
 
 /// Expires every position the cursor left behind and advances
@@ -600,208 +583,6 @@ async fn expire_due<S: Store>(store: &S, event_id: &str, cutoff: u64) -> Result<
     store.advance_max_expired(event_id, highest).await?;
 
     Ok(due.len())
-}
-
-/// The position space as the open laid it out, and the conversions between
-/// positions and people the controller needs to walk it.
-mod tiers {
-    /// How positions map to people (issue #145).
-    ///
-    /// Without a demotion tail every position is a person and this is the
-    /// identity. With one, the open's `[0, N)` holds `N − D` people, its
-    /// second copy `[N, 2N)` holds the `D` demoted, and live joins from `2N`
-    /// are dense again. The densities are exact — the open counted them — so
-    /// the controller converts rather than corrects: it releases a target
-    /// number of *people* per interval, measures no-shows against people, and
-    /// keeps the expiry grace a duration rather than a distance.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct Tiers {
-        participant_count: u64,
-        demoted_count: u64,
-    }
-
-    /// One region of the position space.
-    enum Tier {
-        /// `[start, end)` holding `people` people spread uniformly.
-        Sparse { start: u64, end: u64, people: u64 },
-        /// Every position from `start` is a person.
-        Dense { start: u64 },
-    }
-
-    impl Tiers {
-        /// The layout for a fixed cohort of `participant_count` with
-        /// `demoted_count` demoted. `D` is clamped to `N`: more demoted than
-        /// opened is a corrupt item, and a clamp keeps every density in
-        /// `[0, 1]` rather than letting one wrap.
-        #[must_use]
-        pub fn new(participant_count: u64, demoted_count: u64) -> Self {
-            Self {
-                participant_count,
-                demoted_count: demoted_count.min(participant_count),
-            }
-        }
-
-        /// No tail: every position is a person.
-        #[must_use]
-        pub fn none() -> Self {
-            Self::new(0, 0)
-        }
-
-        fn has_tail(self) -> bool {
-            self.demoted_count > 0
-        }
-
-        /// Where the dense live-join region starts.
-        fn tail_end(self) -> u64 {
-            self.participant_count.saturating_mul(2)
-        }
-
-        /// The tier containing `position`.
-        fn tier_at(self, position: u64) -> Tier {
-            if !self.has_tail() {
-                return Tier::Dense { start: 0 };
-            }
-            let n = self.participant_count;
-            if position < n {
-                Tier::Sparse {
-                    start: 0,
-                    end: n,
-                    people: n.saturating_sub(self.demoted_count),
-                }
-            } else if position < self.tail_end() {
-                Tier::Sparse {
-                    start: n,
-                    end: self.tail_end(),
-                    people: self.demoted_count,
-                }
-            } else {
-                Tier::Dense {
-                    start: self.tail_end(),
-                }
-            }
-        }
-
-        /// People in `[from, to)`; `0` when the range is empty or inverted.
-        /// Floors per tier, so a span never claims a person it does not hold.
-        #[must_use]
-        pub fn people_in(self, from: u64, to: u64) -> u64 {
-            let mut cursor = from;
-            let mut people = 0u64;
-            while cursor < to {
-                match self.tier_at(cursor) {
-                    Tier::Dense { .. } => {
-                        return people.saturating_add(to.saturating_sub(cursor));
-                    }
-                    Tier::Sparse {
-                        start,
-                        end,
-                        people: tier_people,
-                    } => {
-                        let stop = to.min(end);
-                        let span = stop.saturating_sub(cursor);
-                        let width = end.saturating_sub(start);
-                        people = people.saturating_add(scale_floor(span, tier_people, width));
-                        cursor = stop;
-                    }
-                }
-            }
-            people
-        }
-
-        /// Positions the cursor must advance from `from` to release `people`
-        /// people: exactly `people` in a dense region, more in a sparse one,
-        /// and a whole tier at once when that tier holds nobody. Rounds up
-        /// within a tier, so the people released are never fewer than asked.
-        #[must_use]
-        pub fn positions_for_people(self, from: u64, people: u64) -> u64 {
-            let mut cursor = from;
-            let mut remaining = people;
-            let mut advanced = 0u64;
-            loop {
-                if remaining == 0 {
-                    return advanced;
-                }
-                match self.tier_at(cursor) {
-                    Tier::Dense { .. } => return advanced.saturating_add(remaining),
-                    Tier::Sparse {
-                        start,
-                        end,
-                        people: tier_people,
-                    } => {
-                        let span = end.saturating_sub(cursor);
-                        let width = end.saturating_sub(start);
-                        let available = scale_floor(span, tier_people, width);
-                        if remaining <= available && tier_people > 0 {
-                            let positions = scale_ceil(remaining, width, tier_people).min(span);
-                            return advanced.saturating_add(positions);
-                        }
-                        remaining = remaining.saturating_sub(available);
-                        advanced = advanced.saturating_add(span);
-                        cursor = end;
-                    }
-                }
-            }
-        }
-
-        /// The position `people` people behind `cursor`, walking back through
-        /// the tiers; `0` when the queue holds fewer than that below the
-        /// cursor.
-        #[must_use]
-        pub fn walk_back(self, cursor: u64, people: u64) -> u64 {
-            let mut cursor = cursor;
-            let mut remaining = people;
-            loop {
-                if remaining == 0 || cursor == 0 {
-                    return cursor;
-                }
-                match self.tier_at(cursor.saturating_sub(1)) {
-                    Tier::Dense { start } => {
-                        let span = cursor.saturating_sub(start);
-                        if remaining <= span {
-                            return cursor.saturating_sub(remaining);
-                        }
-                        remaining = remaining.saturating_sub(span);
-                        cursor = start;
-                    }
-                    Tier::Sparse {
-                        start,
-                        end,
-                        people: tier_people,
-                    } => {
-                        let span = cursor.saturating_sub(start);
-                        let width = end.saturating_sub(start);
-                        let available = scale_floor(span, tier_people, width);
-                        if remaining <= available && tier_people > 0 {
-                            let positions = scale_ceil(remaining, width, tier_people).min(span);
-                            return cursor.saturating_sub(positions);
-                        }
-                        remaining = remaining.saturating_sub(available);
-                        cursor = start;
-                    }
-                }
-            }
-        }
-    }
-
-    /// `floor(value * numerator / denominator)`, `0` for a zero denominator,
-    /// in 128-bit so no product wraps.
-    fn scale_floor(value: u64, numerator: u64, denominator: u64) -> u64 {
-        if denominator == 0 {
-            return 0;
-        }
-        let scaled = u128::from(value) * u128::from(numerator) / u128::from(denominator);
-        u64::try_from(scaled).unwrap_or(u64::MAX)
-    }
-
-    /// `ceil(value * numerator / denominator)`, `0` for a zero denominator.
-    fn scale_ceil(value: u64, numerator: u64, denominator: u64) -> u64 {
-        if denominator == 0 {
-            return 0;
-        }
-        let product = u128::from(value) * u128::from(numerator);
-        let scaled = product.div_ceil(u128::from(denominator));
-        u64::try_from(scaled).unwrap_or(u64::MAX)
-    }
 }
 
 #[cfg(test)]
@@ -831,7 +612,6 @@ mod tests {
             queue_counter: u64::MAX,
             target_rate: rate,
             participant_count: 0,
-            demoted_count: 0,
         }
     }
 
@@ -1156,24 +936,24 @@ mod tests {
         // in an event the cursor has not covered the grace window, so no
         // position is old enough to expire — expiring on a join-time deadline
         // instead throws people out for waiting the length of the queue.
-        assert_eq!(expiry_cutoff(0, 50, Tiers::none()), 0);
-        assert_eq!(expiry_cutoff(5_999, 50, Tiers::none()), 0);
-        assert_eq!(expiry_cutoff(6_001, 50, Tiers::none()), 1);
+        assert_eq!(expiry_cutoff(0, 50), 0);
+        assert_eq!(expiry_cutoff(5_999, 50), 0);
+        assert_eq!(expiry_cutoff(6_001, 50), 1);
     }
 
     #[test]
     fn a_zero_rate_expires_nobody() {
         // Releasing nobody means offering nobody, so nobody can have declined.
         // A cutoff at the cursor would expire the entire released queue.
-        assert_eq!(expiry_cutoff(100_000, 0, Tiers::none()), 0);
+        assert_eq!(expiry_cutoff(100_000, 0), 0);
     }
 
     #[test]
     fn the_grace_window_is_the_same_duration_at_any_rate() {
         // Positional grace has to track the rate, or a fast event expires
         // people seconds after offering them a place.
-        let slow = 10_000 - expiry_cutoff(10_000, 5, Tiers::none());
-        let fast = 100_000 - expiry_cutoff(100_000, 50, Tiers::none());
+        let slow = 10_000 - expiry_cutoff(10_000, 5);
+        let fast = 100_000 - expiry_cutoff(100_000, 50);
         assert_eq!(slow, 5 * ADMISSION_GRACE_SECS);
         assert_eq!(fast, 50 * ADMISSION_GRACE_SECS);
         assert_eq!(fast, slow * 10);
@@ -1649,94 +1429,6 @@ mod tests {
         assert_eq!(*store.advanced.lock().unwrap(), Some(14_609));
     }
 
-    // --- Demotion tail (issue #145): positions versus people ------------------
-
-    #[test]
-    fn without_a_tail_the_tiers_are_the_identity() {
-        let t = Tiers::none();
-        assert_eq!(t.positions_for_people(1_234, 500), 500);
-        assert_eq!(t.people_in(1_234, 1_734), 500);
-        assert_eq!(t.people_in(10, 5), 0);
-        assert_eq!(t.walk_back(6_001, 6_000), 1);
-        assert_eq!(t.walk_back(5_999, 6_000), 0);
-        // A cohort with nothing demoted is the identity too.
-        let t = Tiers::new(1_000_000, 0);
-        assert_eq!(t.positions_for_people(999_999, 500), 500);
-        assert_eq!(t.people_in(0, 1_000_000), 1_000_000);
-    }
-
-    #[test]
-    fn inside_the_tail_one_person_is_many_positions() {
-        // N = 1000, D = 10: the tail [1000, 2000) holds 10 people, one per
-        // 100 positions. Releasing 5 people from its start covers 500
-        // positions, measures back as 5 people, and a 5-person grace walks
-        // back 500 positions, not 5.
-        let t = Tiers::new(1_000, 10);
-        assert_eq!(t.positions_for_people(1_000, 5), 500);
-        assert_eq!(t.people_in(1_000, 1_500), 5);
-        assert_eq!(t.walk_back(1_500, 5), 1_000);
-        // Beyond the tail the live-join region is dense again.
-        assert_eq!(t.positions_for_people(2_000, 5), 5);
-        assert_eq!(t.people_in(2_000, 2_005), 5);
-    }
-
-    #[test]
-    fn a_release_that_crosses_a_tier_boundary_is_exact_per_tier() {
-        // N = 1000, D = 100: [0, 1000) holds 900 people at 0.9 per position,
-        // [1000, 2000) holds 100 at 0.1. From 991 the primary tier has 9
-        // positions = 8 people left; 2 more people in the tail are 20
-        // positions, so 10 people are 29 positions.
-        let t = Tiers::new(1_000, 100);
-        assert_eq!(t.positions_for_people(991, 10), 29);
-        assert_eq!(t.people_in(991, 1_020), 10);
-        // Walking 10 people back from 1020 lands where the release started,
-        // give or take the rounding a tier boundary costs.
-        let back = t.walk_back(1_020, 10);
-        assert!((989..=991).contains(&back), "walked back to {back}");
-    }
-
-    #[test]
-    fn a_tier_holding_nobody_is_skipped_whole() {
-        // Everyone was demoted: the primary tier is 1000 empty positions.
-        let t = Tiers::new(1_000, 1_000);
-        assert_eq!(t.positions_for_people(0, 5), 1_005);
-        assert_eq!(t.people_in(0, 1_000), 0);
-        assert_eq!(t.people_in(0, 1_005), 5);
-        assert_eq!(t.walk_back(1_005, 5), 1_000);
-        // And walking back past it costs nothing, since nobody is there.
-        assert_eq!(t.walk_back(1_005, 6), 0);
-    }
-
-    #[test]
-    fn the_controller_releases_the_target_in_people_across_a_sparse_tail() {
-        // N = 100,000, D = 1,000, cursor at the tail's start, rate 50/s: the
-        // interval's 500 people are 50,000 positions, and the next pass
-        // measures exactly 500 released — not 50,000 — so a full turnout
-        // reads as zero no-show rather than 99%.
-        let mut i = inputs(0, 0, 100_000, 100_000, 50);
-        i.participant_count = 100_000;
-        i.demoted_count = 1_000;
-        let d = compute_release(i, None);
-        assert_eq!(d.next_serving_counter, 150_000);
-
-        let mut i = inputs(500, 0, 150_000, 100_000, 50);
-        i.participant_count = 100_000;
-        i.demoted_count = 1_000;
-        let d = compute_release(i, None);
-        assert!(d.no_show.smoothed_rate.abs() < 1e-9);
-        // And the grace stays 120 s of people: 6,000 people back is the whole
-        // tail's 1,000 plus 5,000 of the primary tier's 99,000 at 0.99.
-        let cutoff = expiry_cutoff(d.next_serving_counter, 50, Tiers::new(100_000, 1_000));
-        assert!(
-            cutoff < 100_000,
-            "cutoff {cutoff} did not reach back past the tail"
-        );
-        assert_eq!(
-            Tiers::new(100_000, 1_000).people_in(cutoff, d.next_serving_counter),
-            6_000
-        );
-    }
-
     // --- Property tests: no input underflows/overflows or panics -------------
 
     use proptest::prelude::{
@@ -1776,8 +1468,7 @@ mod tests {
                     queue_counter: queue,
                     target_rate: rate,
                     participant_count: 0,
-                    demoted_count: 0,
-                },
+                        },
                 prev_rate,
             );
             // release is bounded by the cap (2x target per interval), a finite u64.
@@ -1819,38 +1510,7 @@ mod tests {
         }
 
         #[test]
-        fn tiers_release_at_least_the_people_asked_and_never_wildly_more(
-            n in 1u64..1_000_000,
-            d_share in 0u64..=1_000,
-            from_share in 0u64..=2_500,
-            people in 0u64..100_000,
-        ) {
-            let d = n * d_share / 1_000;
-            let from = n * from_share / 1_000;
-            let t = Tiers::new(n, d);
-            let positions = t.positions_for_people(from, people);
-            let released = t.people_in(from, from.saturating_add(positions));
-            // Never fewer than asked: the origin gets its target.
-            prop_assert!(released >= people, "asked {people}, released {released} (n={n}, d={d}, from={from})");
-            // Never more than the rounding a tier boundary costs: at most one
-            // person per tier crossed, and there are two sparse tiers.
-            prop_assert!(released <= people.saturating_add(2), "asked {people}, released {released} (n={n}, d={d}, from={from})");
-            // Walking the same number of people back from where the release
-            // ended covers at least that many people again: the grace is a
-            // count of people, and rounding within a sparse tier may move the
-            // landing by up to one person's spacing but never by a person.
-            let cursor = from.saturating_add(positions);
-            let back = t.walk_back(cursor, released);
-            prop_assert!(back <= cursor);
-            prop_assert!(
-                t.people_in(back, cursor) >= released.min(t.people_in(0, cursor)),
-                "walked back to {back} from {cursor} covers {} people, released {released}",
-                t.people_in(back, cursor)
-            );
-        }
-
-        #[test]
-        fn compute_release_with_a_tail_still_never_panics_or_rewinds(
+        fn compute_release_never_panics_or_rewinds(
             arrivals in shard_arrivals(),
             last_arrivals in any::<u64>(),
             serving in any::<u64>(),
@@ -1858,7 +1518,6 @@ mod tests {
             queue in any::<u64>(),
             rate in 1u32..=100_000,
             n in any::<u64>(),
-            demoted in any::<u64>(),
         ) {
             let d = compute_release(
                 ReleaseInputs {
@@ -1869,7 +1528,6 @@ mod tests {
                     queue_counter: queue,
                     target_rate: rate,
                     participant_count: n,
-                    demoted_count: demoted,
                 },
                 None,
             );
@@ -1879,10 +1537,9 @@ mod tests {
             );
             prop_assert_eq!(d.release, d.next_serving_counter - serving);
             prop_assert!(d.no_show.smoothed_rate.is_finite());
-            // In people the release is still bounded by the cap.
-            let tiers = Tiers::new(n, demoted);
+            // The release stays bounded by the cap.
             let cap = target_release_per_interval(rate).saturating_mul(2);
-            prop_assert!(tiers.people_in(serving, d.next_serving_counter) <= cap.saturating_add(3));
+            prop_assert!(d.release <= cap);
         }
     }
 }

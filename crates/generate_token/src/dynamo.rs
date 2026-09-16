@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::types::AttributeValue;
-use wr_common::expr::{DEMOTION_ENTRIES_ATTR, Key, SHARD_COUNT_ATTR, SHARD_INDEX_ATTR, Update};
+use wr_common::expr::{Key, SHARD_COUNT_ATTR, SHARD_INDEX_ATTR, Update};
 use wr_common::{Counters, PositionStatus, PreQueueItem, Shard};
 
 use crate::{Store, StoreError};
@@ -84,45 +84,6 @@ impl Store for DynamoStore {
             .map_err(|e| StoreError(format!("get_item positions: {e}")))?;
 
         Ok(out.item().and_then(position_from_item))
-    }
-
-    async fn load_demotion_entries(
-        &self,
-        event_id: &str,
-        nonce: &str,
-        chunks: u32,
-    ) -> Result<Option<Vec<String>>, StoreError> {
-        let mut entries: Vec<String> = Vec::new();
-        for chunk in 0..chunks {
-            let out = self
-                .client
-                .get_item()
-                .table_name(&self.counters_table)
-                .set_key(Some(
-                    Key::DemotionGroups {
-                        event_id,
-                        nonce,
-                        chunk,
-                    }
-                    .build(),
-                ))
-                .send()
-                .await
-                .map_err(|e| StoreError(format!("get_item demotion chunk {chunk}: {e}")))?;
-            let Some(list) = out
-                .item()
-                .and_then(|item| item.get(DEMOTION_ENTRIES_ATTR))
-                .and_then(|v| v.as_l().ok())
-            else {
-                return Ok(None);
-            };
-            for value in list {
-                if let Ok(entry) = value.as_s() {
-                    entries.push(entry.clone());
-                }
-            }
-        }
-        Ok(Some(entries))
     }
 
     async fn record_arrival(&self, event_id: &str, shard: Shard) -> Result<(), StoreError> {

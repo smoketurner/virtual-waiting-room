@@ -100,8 +100,6 @@ override the file, so the file stays the single source of truth. Copy
 | `client_origin_domain_name` | *(none)*    | **Required.** Bare domain of the protected origin CloudFront fronts. Host only — no scheme, no path. |
 | `*_artifact_path`           | *(empty)*   | The four built zips. Empty = that function stays on the placeholder.     |
 | `oidc_*`                    | *(varies)*  | Admin login (ADR-0016). The client secret is not here — it goes in an SSM SecureString out of band. |
-| `demotion_rules`            | *(empty)*   | Open-time demotion (ADR-0029): `signal:max` entries over `address`, `asn`, `ja4`, `ua`. Empty = the open never scans. |
-| `demotion_mode`             | `observe`   | `observe` reports what the rules would demote; `enforce` demotes. Read a real event's report before enforcing. |
 
 The one `make`-level override is the build target:
 

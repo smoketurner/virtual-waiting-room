@@ -9,8 +9,8 @@ use serde::Serialize;
 #[cfg(test)]
 use wr_common::StoredControl;
 use wr_common::{
-    Counters, DemotionSet, Phase, PreQueueItem, ResolveError, ResolvedPosition, SHARDS,
-    ServingState, resolve, serving_state,
+    Counters, Phase, PreQueueItem, ResolveError, ResolvedPosition, SHARDS, ServingState, resolve,
+    serving_state,
 };
 
 /// Holds the event's `Counters` item for a beat inside one execution
@@ -251,10 +251,6 @@ pub enum QueueNumError {
     /// The stored shard is outside `0..SHARDS` (corrupt row).
     #[error("shard index out of range")]
     BadShard,
-    /// The open demoted rows and the demotion set could not be supplied, so
-    /// no position can be answered without risking un-demoting one.
-    #[error("demotion set unavailable")]
-    DemotionUnavailable,
 }
 
 /// Resolves a pre-queue registrant's queue position.
@@ -270,16 +266,12 @@ pub enum QueueNumError {
 /// # Errors
 ///
 /// [`QueueNumError::NotOpen`] before the open; [`QueueNumError::BadShard`] if
-/// the stored shard is out of range; [`QueueNumError::DemotionUnavailable`]
-/// when the event demoted rows (issue #145), the demotion set is `None`, and
-/// the row is a cohort row — a straggler resolves to
-/// [`ResolvedQueueNum::Straggler`] regardless of the set.
+/// the stored shard is out of range.
 pub fn queue_num(
     counters: &Counters,
     row: &PreQueueItem,
-    demotion: Option<&DemotionSet>,
 ) -> Result<ResolvedQueueNum, QueueNumError> {
-    match counters.resolve_prequeue(row, demotion) {
+    match counters.resolve_prequeue(row) {
         Ok(ResolvedPosition::PreQueue(position)) => {
             Ok(ResolvedQueueNum::PreQueue(QueueNumResponse {
                 position,
@@ -289,7 +281,6 @@ pub fn queue_num(
         Ok(ResolvedPosition::LiveJoin) => Ok(ResolvedQueueNum::Straggler),
         Err(ResolveError::NotOpen) => Err(QueueNumError::NotOpen),
         Err(ResolveError::BadShard) => Err(QueueNumError::BadShard),
-        Err(ResolveError::DemotionUnavailable) => Err(QueueNumError::DemotionUnavailable),
     }
 }
 
@@ -320,8 +311,6 @@ mod tests {
             shuffle_seed: Some(seed),
             participant_count: Some(opened.participant_count()),
             prequeue_offsets: Some(offsets),
-            demoted_count: 0,
-            demotion: None,
             message: None,
             target_rate: None,
             stored_control: StoredControl::Open,
@@ -350,8 +339,6 @@ mod tests {
             shuffle_seed: None,
             participant_count: None,
             prequeue_offsets: None,
-            demoted_count: 0,
-            demotion: None,
             message: None,
             target_rate: None,
             stored_control: StoredControl::Open,
@@ -404,7 +391,7 @@ mod tests {
         for (shard, &count) in counts.iter().enumerate() {
             for l in 0..count {
                 let recomputed = prp(&seed, offsets[shard] + l, n);
-                match queue_num(&counters, &row(shard as u8, l), None).unwrap() {
+                match queue_num(&counters, &row(shard as u8, l)).unwrap() {
                     ResolvedQueueNum::PreQueue(resp) => assert_eq!(resp.position, recomputed),
                     ResolvedQueueNum::Straggler => panic!("issued index resolved as a straggler"),
                 }
@@ -412,54 +399,6 @@ mod tests {
             }
         }
         assert_eq!(checked, n);
-    }
-
-    #[test]
-    fn a_demoted_row_is_served_behind_the_whole_cohort() {
-        // Issue #145: a row the demotion set matches resolves to N + p, and
-        // an event that demoted rows will not answer without the set.
-        let counts = [3, 0, 5, 1, 0, 0, 2, 0, 0, 4];
-        let mut counters = opened_counters(counts, [42u8; 32]);
-        let n = counters.participant_count.unwrap();
-        counters.demoted_count = 4;
-        counters.demotion = Some(wr_common::DemotionRef {
-            nonce: "0badcafe".to_owned(),
-            chunks: 1,
-        });
-        counters.queue_counter = 2 * n;
-        let set = DemotionSet::from_entries(vec!["asn:64500".to_owned()]).unwrap();
-
-        let mut demoted = row(2, 1);
-        demoted.v = Some(wr_common::Telemetry {
-            a: None,
-            n: Some("64500".to_owned()),
-            c: None,
-            j: None,
-            u: None,
-            q: None,
-        });
-        let plain = row(2, 1);
-        let primary = match queue_num(&counters, &plain, Some(&set)).unwrap() {
-            ResolvedQueueNum::PreQueue(resp) => resp.position,
-            ResolvedQueueNum::Straggler => panic!("issued index resolved as a straggler"),
-        };
-        match queue_num(&counters, &demoted, Some(&set)).unwrap() {
-            ResolvedQueueNum::PreQueue(resp) => {
-                assert!(!resp.live_join);
-                assert_eq!(resp.position, n + primary);
-            }
-            ResolvedQueueNum::Straggler => panic!("demoted row resolved as a straggler"),
-        }
-        assert_eq!(
-            queue_num(&counters, &demoted, None).unwrap_err(),
-            QueueNumError::DemotionUnavailable
-        );
-        // The published open outputs are unchanged by demotion: N is still the
-        // cohort, and the tail is not announced to visitors.
-        let json = serde_json::to_value(status(&counters, None, 0)).unwrap();
-        assert_eq!(json["participant_count"], n);
-        assert!(json.get("demoted_count").is_none());
-        assert!(json.get("demotion_nonce").is_none());
     }
 
     #[test]
@@ -771,8 +710,6 @@ mod tests {
             shuffle_seed: None,
             participant_count: None,
             prequeue_offsets: None,
-            demoted_count: 0,
-            demotion: None,
             message: None,
             target_rate: None,
             stored_control: StoredControl::Open,
@@ -780,7 +717,7 @@ mod tests {
             starts_at: None,
         };
         assert_eq!(
-            queue_num(&counters, &row(0, 0), None),
+            queue_num(&counters, &row(0, 0)),
             Err(QueueNumError::NotOpen)
         );
     }
@@ -794,7 +731,7 @@ mod tests {
         let mut positions = std::collections::BTreeSet::new();
         for (shard, &count) in counts.iter().enumerate() {
             for l in 0..count {
-                match queue_num(&counters, &row(shard as u8, l), None).unwrap() {
+                match queue_num(&counters, &row(shard as u8, l)).unwrap() {
                     ResolvedQueueNum::PreQueue(resp) => {
                         assert!(!resp.live_join);
                         assert!(resp.position < n);
@@ -813,7 +750,7 @@ mod tests {
         let counters = opened_counters(counts, [42u8; 32]);
         // Last shard local index 4 is past its own count: a straggler.
         assert_eq!(
-            queue_num(&counters, &row(9, 4), None).unwrap(),
+            queue_num(&counters, &row(9, 4)).unwrap(),
             ResolvedQueueNum::Straggler
         );
     }
@@ -827,44 +764,7 @@ mod tests {
         let counts = [3, 0, 5, 1, 0, 0, 2, 0, 0, 4];
         let counters = opened_counters(counts, [42u8; 32]);
         assert_eq!(
-            queue_num(&counters, &row(2, 5), None).unwrap(),
-            ResolvedQueueNum::Straggler
-        );
-    }
-
-    #[test]
-    fn a_straggler_on_a_demoting_event_falls_through_even_without_the_set() {
-        // The straggler rule runs before the demotion-availability gate, so a
-        // row that raced the open resolves to `Straggler` (→ a `Positions`
-        // lookup) even when the demotion set could not be supplied — the
-        // cold-start / transient-failure window, where the set is `None`
-        // while `demoted_count > 0`. A straggler answers no primary slot, so
-        // nothing is un-demoted; the symmetric cohort row still refuses.
-        let counts = [3, 0, 5, 1, 0, 0, 2, 0, 0, 4]; // shard 2's own count is 5
-        let mut counters = opened_counters(counts, [42u8; 32]);
-        let n = counters.participant_count.unwrap();
-        counters.demoted_count = 4;
-        counters.demotion = Some(wr_common::DemotionRef {
-            nonce: "0badcafe".to_owned(),
-            chunks: 1,
-        });
-        counters.queue_counter = 2 * n;
-        let set = DemotionSet::from_entries(vec!["asn:64500".to_owned()]).unwrap();
-        let straggler = row(2, 5); // local 5 is past shard 2's issued count of 5
-        let cohort = row(2, 1);
-        // No set: the straggler falls through; the cohort row refuses.
-        assert_eq!(
-            queue_num(&counters, &straggler, None).unwrap(),
-            ResolvedQueueNum::Straggler
-        );
-        assert_eq!(
-            queue_num(&counters, &cohort, None).unwrap_err(),
-            QueueNumError::DemotionUnavailable
-        );
-        // With the set supplied the straggler is still a straggler, matching
-        // the no-set case and the existing `Some(set)` straggler test.
-        assert_eq!(
-            queue_num(&counters, &straggler, Some(&set)).unwrap(),
+            queue_num(&counters, &row(2, 5)).unwrap(),
             ResolvedQueueNum::Straggler
         );
     }
@@ -879,10 +779,7 @@ mod tests {
             t: 1_788_000_000,
             v: None,
         };
-        assert_eq!(
-            queue_num(&counters, &bad, None),
-            Err(QueueNumError::BadShard)
-        );
+        assert_eq!(queue_num(&counters, &bad), Err(QueueNumError::BadShard));
     }
 
     // --- counters cache -----------------------------------------------------

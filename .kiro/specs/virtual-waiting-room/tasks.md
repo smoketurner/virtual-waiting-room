@@ -76,24 +76,18 @@ Throwaway code. Measures what documentation cannot settle.
 
 ### 1g. Entry gating and abuse mitigation
 
-- [ ] Deferred bot enforcement: admit to pre-queue, block at randomization [F6.3]
-      `Partial:` built as open-time demotion (ADR-0029, issue #145): `open_event` groups the
-      cohort by the join-time telemetry (address, ASN, JA4, user agent) under operator-set
-      `signal:max` rules, stores the demoted group set once (no per-row write), and every
-      resolver matches rows against it (`N + PRP(seed, i, N)`, live joins from `2N`); the
-      controller walks the sparse tail at its known density. A report the dashboard renders is
-      written at the open. Off by default (no rules) and `observe`
-      by default. Missing: the false-positive measurement against a real event that the
-      acceptance requires before the control is enforced by default, and the WAF-derived
-      signals (Bot Control labels, reputation lists) as further inputs.
+- Deferred bot enforcement: admit to pre-queue, block at randomization — **F6.3 retired**
+      (ADR-0030). Built as open-time demotion, never enabled, removed. A client that posts
+      to the regional API Gateway URL rather than through CloudFront carried no viewer
+      telemetry, so the control was blind to the traffic it was aimed at.
 - [ ] Bound how many positions one visitor can hold
       `Partial:` nothing does. `request_id` is client-supplied, so volume converts into share
       of the front of the queue linearly and every deployment is a bare raffle. The entry
       tickets that bounded identifier *minting* were removed (ADR-0028) — they needed the
       customer to build a signing endpoint, and they never bounded volume. Open-time demotion
-      (ADR-0029) now bounds the share a farm that shares an address, ASN, JA4 or user agent can
-      take of the *front*; it does not bound how many positions one visitor holds. Proof of
-      work at registration is what would.
+      (ADR-0029) bounded the share a farm sharing an address, ASN, JA4 or user agent could take
+      of the *front*, and it was removed without ever being enabled (ADR-0030). Proof of work at
+      registration is what would bound this.
 
 ### 1h. Operator surface
 
