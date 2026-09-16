@@ -979,7 +979,7 @@ Which section implements which requirement from [`REQUIREMENTS.md`](./REQUIREMEN
 | F4.5 — client retries 429 with jitter | §10 |
 | F5.1, F5.2, F5.3, F5.4, F5.5 — metrics, branding, messaging, wait estimate, API-first | §9 |
 | F6.1, F6.2 — entry gating on a client-signed identifier | §8 |
-| F6.3 — deferred bot enforcement | §4.2, §8 (ADR-0029) |
+| F6.3 — deferred bot enforcement | §8 |
 | C1, C2 — pre-queue scale, atomic assignment | §4.2 |
 | C3 — live-join throughput | §5.3 |
 | C4 — polling load independent of visitor count | §8 |
