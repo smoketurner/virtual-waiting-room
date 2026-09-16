@@ -229,10 +229,7 @@
         <p class="deferred">No report yet. The seal writes one when it runs with demotion rules set; with no rules it never scans the cohort.</p>
         {% else %}
         {% if !demotion.error.is_empty() %}
-        <p class="status status-error">The seal ran without demotion: {{ demotion.error }}</p>
-        {% endif %}
-        {% if !demotion.caveat.is_empty() %}
-        <p class="status status-warning">The seal {% if demotion.mode == "enforce" %}demoted on{% else %}classified{% endif %} a cohort it could not verify: {{ demotion.caveat }}</p>
+        <p class="status status-error">The configured rules did not parse and the seal ran without demotion: {{ demotion.error }}</p>
         {% endif %}
         <dl class="kv-pairs">
           <div>
