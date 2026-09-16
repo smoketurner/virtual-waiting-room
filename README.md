@@ -9,11 +9,13 @@ deployable — see [`docs/DEPLOY.md`](./docs/DEPLOY.md).
 
 - [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) — start here: the shape of the system and why
 - [`docs/DEPLOY.md`](./docs/DEPLOY.md) — build → package → deploy, and the `make` targets
+- [`docs/RUNBOOK.md`](./docs/RUNBOOK.md) — running an event: the controls, the readiness
+  checklist, and what to do when the queue stops moving
 - [`docs/REQUIREMENTS.md`](./docs/REQUIREMENTS.md) — numbered, testable requirements
 - [`docs/DESIGN.md`](./docs/DESIGN.md) — how the system works, with sourced constraints
 - [`docs/DYNAMODB.md`](./docs/DYNAMODB.md) — the data layer: key design, scaling techniques, ceilings
 - [`docs/adr/`](./docs/adr/) — architecture decision records: why it works that way
-- [`docs/PLAN.md`](./docs/PLAN.md) — phased implementation plan
+- [`docs/PLAN.md`](./docs/PLAN.md) — phased implementation plan (shape and order; status lives in `.kiro/specs/virtual-waiting-room/tasks.md`)
 
 ## Why this exists
 

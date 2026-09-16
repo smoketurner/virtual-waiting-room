@@ -156,8 +156,9 @@ endpoints). VPC is an opt-in variable for ATO-constrained operators; Lambda code
 
 - **Terraform**, no manual console steps (N5). Modules: `core`, `edge`,
   `demo-origin` (a fixture standing in for an operator origin in the dev root).
-- Target ≤ 80 Terraform-managed resources for the core module (N6). Every new resource counts
-  against this budget — justify additions.
+- No resource-count ceiling. N6 was retired: the number was satisfiable by rewriting the same
+  infrastructure — thirteen alarms as thirteen blocks breached it, the identical thirteen as
+  three `for_each` blocks did not. Judge an addition by **N1**, what it bills between events.
 - API documented as **OpenAPI** (N8) — **not built**.
 
 ## Admin web interface

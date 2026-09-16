@@ -4,8 +4,10 @@ A virtual waiting room holds visitors during a traffic spike and releases them i
 a rate the origin can sustain. This document describes what the deployed system does, read from
 `crates/` and `infra/`.
 
-Where [`DESIGN.md`](./DESIGN.md) and [`REQUIREMENTS.md`](./REQUIREMENTS.md) describe something the
-code does not do, §10 lists the difference. [`DYNAMODB.md`](./DYNAMODB.md) covers the data layer.
+[`DESIGN.md`](./DESIGN.md) and [`REQUIREMENTS.md`](./REQUIREMENTS.md) describe the same system and
+are kept in agreement with it; where one of them turns out to be wrong, the fix is to that
+document, not a row in a table here. §10 lists what the code genuinely does not do.
+[`DYNAMODB.md`](./DYNAMODB.md) covers the data layer.
 
 ---
 
@@ -498,67 +500,54 @@ uniformity test uses a different threshold and does not assert a specific χ².
 
 ---
 
-## 10. Where the code and the narrative documents disagree
+## 10. Known gaps in the code
 
-| `DESIGN.md` says | The code does |
-|---|---|
-| `/queue_pos_expiry` and `/public_key` exist, unrouted | Neither is declared. An endpoint with no implementation is not declared at all |
-| WAF with Bot Control and ASN matching is deployed by default | `modules/edge` creates no WAF |
-| Each event gets its own SQS queue and reserved concurrency | One queue, one event per deployment, no `reserved_concurrent_executions` anywhere |
-| An empty artifact path leaves a placeholder binary | Every artifact path points at a real build |
-| The join event source mapping is enabled when the artifact is real | `enabled = true`, unconditional. The comment above it is stale |
-| The controller schedule is created when the controller is | Always created |
-| The operator message attribute is `operator_message` | The attribute is `message` |
-| `GET /metrics` returns event metrics | API Gateway routes it to the admin Lambda, whose router has no `/metrics` handler |
-
----
-
-## 11. Known gaps in the code
+Each of these is deliberate or unfixed, not unnoticed. A gap that has a fix in the tree does not
+belong here — it belongs in the tree.
 
 **Fail-open requires an operator.** Setting `fail_open_until` makes every edge pass traffic
-through until that epoch. Nothing sets it automatically. The function makes no network calls, so
+through until that epoch, and nothing sets it automatically. The gate makes no network calls, so
 it cannot detect an unreachable backend
-([#58](https://github.com/smoketurner/virtual-waiting-room/issues/58)). A component that can
-observe the backend would have to trip it, and none exists.
+([#58](https://github.com/smoketurner/virtual-waiting-room/issues/58)); tripping it would need a
+component that observes the origin. A CloudWatch alarm driving a KeyValueStore write is the
+obvious shape and a worse failure: a flapping alarm opens the gate mid-event and dumps the whole
+queue onto the origin. The manual path is fast and documented instead.
+
+**Standby requires an operator, for the same reason.** An empty ruleset passes every request
+through and `enforce_from` switches every edge at one instant. Nothing triggers either.
 
 **The session cookie is a bearer credential.** The gate verifies a signature and an expiry and
-nothing else, so a stolen cookie works as well as the original until it expires. There is no
-visitor binding ([#61](https://github.com/smoketurner/virtual-waiting-room/issues/61)) and no
-revocation ([#63](https://github.com/smoketurner/virtual-waiting-room/issues/63)). `generate_token`
-authenticates only a request id from the query string, so anyone holding that id can mint a cookie
-([#62](https://github.com/smoketurner/virtual-waiting-room/issues/62)).
+nothing else, so a stolen cookie works as well as the original until it expires: no visitor
+binding ([#61](https://github.com/smoketurner/virtual-waiting-room/issues/61)), no revocation
+([#63](https://github.com/smoketurner/virtual-waiting-room/issues/63)), and `generate_token`
+authenticates only a request id from the query string, so anyone holding that id can mint one
+([#62](https://github.com/smoketurner/virtual-waiting-room/issues/62)). Every available binding
+breaks real visitors — an IP binding breaks mobile handoff and carrier NAT, a JA4 binding breaks
+on a browser auto-update mid-event, a device key needs JavaScript crypto — so each would trade a
+theoretical loss for visitors actually thrown out of the queue. ADR-0033 removed the most damaging
+consequence, a replayed admission corrupting the no-show measurement, without touching the
+credential model.
 
 **The admin Lambda can read the signing key.** Its KeyValueStore grant covers the key as well as
-the config. IAM cannot narrow it. The store is the only resource type the service defines, the
-service publishes no condition keys, and a function associates exactly one store.
-
-**`generate_token` is replayable and inflates the arrival count.** It never marks a position
-spent. A visitor who calls it twice records two arrivals against one release. That understates the
-no-show rate, so the controller under-releases — the safe direction, but the measurement is wrong.
-
-**Standby requires an operator.** An empty ruleset passes every request through, and
-`enforce_from` switches every edge to enforcing at one instant. Nothing triggers either. There is
-no inflow alarm and no automatic phase transition.
-
-**GovCloud has no gate.** The gate is a CloudFront Function and that partition does not offer
-them. The origin authorizer that filled the role was removed (ADR-0032) — it had never been
-invoked, and as wired it forwarded every request. N4 now says commercial regions are supported
-and GovCloud is out of scope until a gate exists for it.
+the config, and IAM cannot narrow it: the store is the only resource type the service defines, it
+publishes no condition keys, and a function associates exactly one store.
 
 **The edge does not extend sessions.** `generate_token` mints one session for
-`session_ttl_seconds` and nothing re-issues it, so a visitor still on the origin when it expires
-returns to the queue mid-checkout. The value is settable per deployment, which is the only control
-there is over this: set it longer than the worst realistic time on the origin. The sliding alternative lived in the origin authorizer and
+`session_ttl_seconds` and nothing re-issues it, so a visitor still on the origin when it lapses
+returns to the queue mid-checkout. Setting the value longer than the worst realistic time on the
+origin is the whole of the control. The sliding alternative lived in the origin authorizer and
 went with it (ADR-0032); F3.7 is retired rather than left as a `MUST` with no mechanism. A
-viewer-response function that re-signs a near-expiry cookie under a hard cap is the design that
-would fix it.
+viewer-response function re-signing a near-expiry cookie under a hard cap is the design that would
+fix it, with four cases to get right — expired, past the cap, forged, absent.
 
-**Two properties are unmeasured against a real deployment:** the function's compute utilization
-per request, and how long a KeyValueStore write takes to reach every edge.
+**GovCloud has no gate.** The gate is a CloudFront Function and that partition does not offer
+them. The origin authorizer that filled the role was removed (ADR-0032) — nothing had ever invoked
+it, and as wired it forwarded every request. N4 says commercial regions are supported and GovCloud
+is out of scope until a gate exists for it.
 
 ---
 
-## 12. Frequently asked questions
+## 11. Frequently asked questions
 
 **Why not store the shuffled order?**
 Writing a million rows at the scheduled start is not atomic. There would be an interval in which

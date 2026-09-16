@@ -160,7 +160,7 @@ The one place where being wrong is unrecoverable in production.
 What makes this a service rather than a repository.
 
 - [ ] Pre-event readiness checklist [O1, O2, O3] — API Gateway RPS increase filed, DynamoDB per-table write request unit (WRU) increase filed, tables pre-warmed, Provisioned Mode enabled, load test executed, rollback plan
-- [ ] Operator runbook [O4, O5] — rate adjustment, reset, pause, incident response, COUNT-then-BLOCK promotion, post-event flat-rate plan cancellation
+- [ ] Operator runbook [O4, O5] — Partial: `docs/RUNBOOK.md` covers what every control does and what a waiting visitor sees (the distinction that matters under pressure), a pre-event readiness checklist carrying O1-O3, what to do when the queue stops moving or the origin is in trouble, what each alarm means, and what the system will not do on its own. Not covered: COUNT-then-BLOCK rule promotion (no web ACL is created -- see N7), post-event flat-rate plan cancellation, and a rehearsal to exercise any of it.
 - [ ] Waiting-room reference client — countdown, position, estimated time of arrival (ETA), auto-advance; 429 retry with jitter [F4.5]; 404 means re-join with a fresh universally unique identifier version 7 (UUIDv7) [F4.4]; UUIDv7 via the `uuid` package
 - [ ] Client integration guide: CloudFront/ALB/CDN placement
 - [ ] Per-client cost model [O6] — poll interval is the dominant variable; compute the flat-rate versus pay-as-you-go (PAYG) crossover and include pre-warming

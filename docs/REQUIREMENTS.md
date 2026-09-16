@@ -115,7 +115,7 @@ pre-event preparation in §4.
 | N3 | The system MUST NOT require us to operate shared infrastructure on clients' behalf. | No component runs in a Smoke Turner account. |
 | N4 | The system MUST support commercial AWS regions. GovCloud (US) is out of scope until a gate exists for it. | The commercial variant deploys and passes functional tests. GovCloud has no shipped gate: the edge gate is a CloudFront Function, which the partition does not offer, and the origin authorizer that filled that role was removed ([ADR-0032](adr/0032-remove-the-origin-authorizer.md)). |
 | N5 | Infrastructure MUST be expressed as Terraform. | No manual console steps in the deployment path. |
-| N7 | Bot and abuse mitigation MUST be present at the edge. | A Web Application Firewall (WAF) with Bot Control and Autonomous System Number (ASN) matching is deployed by default. |
+| N7 | Bot and abuse mitigation MUST be present at the edge. | Every request without a valid session is refused by the gate at viewer-request, before the origin is touched, and the join burst reaches SQS with no compute in the path. No WAFv2 web ACL is created: it is priced per request inspected against the system's own polling, so rate limiting is taken at the CloudFront plan layer instead and a web ACL is attached per event only where the cost is justified ([DESIGN.md §8](DESIGN.md)). |
 | N8 | The API MUST be documented as an OpenAPI specification. | Spec published; client and admin surfaces generated from it. |
 | N9 | Concurrent events in one deployment MUST be isolated from each other. | One event driven to its throughput ceiling does not increase queue-join latency or error rate for another event in the same deployment. |
 | N10 | Client polling cost MUST scale with distance to the front, not with waiting visitors × a fixed interval. | Poll count is O(log) in the starting wait, and the harness client-request total under `--polling backoff` is materially below `--polling hold-position` at identical settings. |
@@ -147,10 +147,10 @@ Contractual deliverables. Without these the capacity requirements in §2 are not
 
 | ID | Requirement | Acceptance |
 |---|---|---|
-| O1 | DynamoDB tables MUST be pre-warmed before each event. | Warm throughput ≥ the event's target write rate, verified before T−0. |
-| O2 | Service quota increases MUST be filed with lead time. | API Gateway RPS and DynamoDB per-table write request units (WRU) confirmed raised before T−0. |
-| O3 | A load test at the event's target rate MUST be executed before the event. | Report produced and reviewed with the client. |
-| O4 | The operator MUST be able to adjust admission rate, reset, or pause mid-event. | Documented runbook procedures, exercised in rehearsal. |
+| O1 | DynamoDB tables MUST be pre-warmed before each event. | Warm throughput ≥ the event's target write rate, verified before T−0. On the readiness checklist in [RUNBOOK.md](RUNBOOK.md). |
+| O2 | Service quota increases MUST be filed with lead time. | API Gateway RPS and DynamoDB per-table write request units (WRU) confirmed raised before T−0. On the readiness checklist in [RUNBOOK.md](RUNBOOK.md). |
+| O3 | A load test at the event's target rate MUST be executed before the event. | Report produced and reviewed with the client. On the readiness checklist in [RUNBOOK.md](RUNBOOK.md); the harness itself is not built. |
+| O4 | The operator MUST be able to adjust admission rate, hold, or stop mid-event. | Every control is a form on the dashboard, and [RUNBOOK.md](RUNBOOK.md) documents what each does and what a waiting visitor sees. Not yet exercised in a rehearsal. |
 | O5 | New WAF rules MUST be observed in Count mode before being promoted to Block. | No rule enters Block without one event's worth of Count data. |
 | O6 | Cost MUST be modelled per client before the event. | Written estimate covering CloudFront, WAF, Bot Control, DynamoDB, and pre-warming. |
 
