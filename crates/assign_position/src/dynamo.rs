@@ -7,16 +7,12 @@ use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::put_item::PutItemError;
 use aws_sdk_dynamodb::types::{AttributeValue, KeysAndAttributes, ReturnValue};
 use wr_common::expr::{
-    Condition, Key, POSITIONS_KEY_ATTR, SHARD_COUNT_ATTR, SHARD_INDEX_ATTR, Update,
+    Condition, Key, POSITION_TTL_SECS, POSITIONS_KEY_ATTR, SHARD_COUNT_ATTR, SHARD_INDEX_ATTR,
+    Update,
 };
 use wr_common::{Counters, PositionItem, PositionStatus, PreQueueItem, Shard};
 
 use crate::{PositionWrite, PreQueueWrite, Store, StoreError, WriteOutcome};
-
-/// How long a `Positions` row is kept before `DynamoDB` TTL reclaims it. Storage
-/// hygiene only: whether a position is still claimable is decided by the
-/// controller against the admission cursor, not by this.
-const POSITION_TTL_SECS: u64 = 86_400;
 
 /// The maximum number of keys `BatchGetItem` accepts in one call.
 const BATCH_GET_LIMIT: usize = 100;

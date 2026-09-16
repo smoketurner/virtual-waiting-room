@@ -71,6 +71,19 @@ locals {
       value     = "1"
     }
 
+    # The conditional write that makes an admission count once did not land, so
+    # the arrival is counted on the conservative assumption it was not counted
+    # before. Harmless for one visitor; if the claim is failing for everyone --
+    # a missing grant, a throttled table -- every poll of the waiting page
+    # counts another arrival, the measured no-show rate collapses toward zero,
+    # and the controller stops correcting for the people who never showed up.
+    # Visitors keep being admitted throughout, so nothing else reports it.
+    admission_claim_failed = {
+      log_group = local.generate_token_name
+      pattern   = "{ $.event = \"admission_claim_failed\" }"
+      value     = "1"
+    }
+
     # The stored admission control could not be parsed, so the controller is
     # holding admission rather than resuming it. Holding is the safe direction
     # (the only writer of that attribute is the operator's pause, so an

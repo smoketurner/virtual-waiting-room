@@ -311,6 +311,12 @@ table is read across the whole cohort during an audit. A row is about 60 bytes.
 because it is written once and read a handful of times, not incremented in a hot loop. A row is
 about 110 bytes.
 
+`status` is `issued` or `admitted`, and the transition between them is the conditional write that
+makes an admission count once (ADR-0033). A live joiner's row starts at `issued`; a pre-queue
+member has no row at all until the claim creates one at `admitted`, since their position is
+derived from the seed rather than stored. A row already at `admitted` is not refused — the status
+governs whether the arrival is counted, not whether the visitor is let in.
+
 `queue_position` and `entry_time` are separate numeric attributes, and
 `position_and_entry_time_are_separate_numeric_attributes` pins that. A reader looking for a
 timestamp must not parse a position.
@@ -481,35 +487,14 @@ waiting to be reclaimed.
 
 ## 12. Known gaps
 
-**The `Tokens` table's TTL attribute does not match what the code writes.** Terraform declares
-`ttl { attribute_name = "ttl" }`. Every writer to that table writes `expires_at` instead —
-`admin`'s `put_pending` (600-second lifetime) and `admin`'s `create_session` (8-hour
-lifetime). No row in `Tokens` is ever deleted by TTL.
-
-Behaviour is correct, because the session loader checks expiry on read and the reservation guard
-is `attribute_not_exists`, so nothing serves an expired row. The cost is that the table grows
-without bound: every operator login leaves a session row and a PKCE row behind forever. The fix is
-to point the Terraform TTL at `expires_at`, which is a table setting change and not a table
-replacement.
-
-**`generate_token` records an arrival on every call and never marks a position spent.** A visitor
-who calls it twice records two arrivals against one release. That over-counts arrivals,
-understates the no-show rate, and makes the controller release less than the target — the safe
-direction, but the measurement is wrong. Nothing in the data model prevents the replay.
-
-**Nothing writes `PositionStatus::Completed` or `Abandoned`.** Both variants exist and
-`generate_token` refuses on them, but no writer sets either. `/update_session` was the endpoint
-that would have, and it was removed with the origin authorizer (ADR-0032), so the enum's only
-reachable variant is `Issued`.
-
 **The `Tokens` partition key is named `request_id`.** It now holds operator session ids and PKCE
 states, neither of which is a request id. Renaming it changes the table's hash key, which replaces
 the table, so the name stays and `expr.rs` documents the misnomer at the constant.
 
 **`Positions` rows carry no `event_id`.** `PositionItem` has `request_id`, `queue_position`,
 `entry_time`, `status`, and `ttl`. Isolation between events comes from the deployment being
-single-event, not from the row. A second event sharing these tables would need the attribute and
-the scan filter would need to use it.
+single-event, not from the row. A second event sharing these tables would need the attribute, and
+every reader of a row would need to check it.
 
 ---
 

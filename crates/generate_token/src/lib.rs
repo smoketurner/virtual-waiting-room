@@ -50,6 +50,21 @@ pub trait Store {
         request_id: &str,
     ) -> impl Future<Output = Result<Option<(u64, PositionStatus)>, StoreError>> + Send;
 
+    /// Claims this visitor's one admission, reporting whether this call was the
+    /// one that claimed it.
+    ///
+    /// One conditional write on the visitor's `Positions` row, creating it for
+    /// a pre-queue member who has none. It is what makes the arrival countable
+    /// exactly once: `record_arrival` is an unconditional `ADD`, and
+    /// `request_id` travels in a URL, so without a claim a reloaded page counts
+    /// a second arrival against one release.
+    fn claim_admission(
+        &self,
+        request_id: &str,
+        position: u64,
+        now: u64,
+    ) -> impl Future<Output = Result<AdmissionClaim, StoreError>> + Send;
+
     /// `ADD arrivals#<shard> :one` — records that this visitor showed up, which
     /// is what the controller measures its no-show rate against.
     fn record_arrival(
@@ -57,6 +72,20 @@ pub trait Store {
         event_id: &str,
         shard: Shard,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
+}
+
+/// Whether an admission claim was this call's to make.
+///
+/// Not a refusal either way: a repeat still gets a session. It decides only
+/// whether the arrival is counted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionClaim {
+    /// This call claimed the admission. Count the arrival.
+    First,
+    /// Someone already claimed it — a reload, a retried request, a second tab.
+    /// The arrival is already counted; counting it again would tell the
+    /// controller more people showed up than it released.
+    Repeat,
 }
 
 /// Why a visitor is not being admitted right now.
@@ -74,10 +103,6 @@ pub enum Denied {
     /// The visitor's turn has not arrived.
     #[error("still queued at {position}, now serving {serving}")]
     StillQueued { position: u64, serving: u64 },
-    /// The position is no longer a live claim: expired by the controller,
-    /// already used, or abandoned. Permanent, unlike [`Denied::StillQueued`].
-    #[error("position is no longer valid")]
-    Spent,
     /// The stored registration is corrupt.
     #[error("corrupt registration")]
     Corrupt,
@@ -141,11 +166,13 @@ fn resolve_position(
 ) -> Result<u64, Denied> {
     if let Some((position, status)) = position_row {
         return match status {
-            PositionStatus::Issued => Ok(position),
-            // Already used or given up: neither is a live claim on a position,
-            // and both are permanent, so the visitor is told to stop rather
-            // than to keep polling.
-            PositionStatus::Completed | PositionStatus::Abandoned => Err(Denied::Spent),
+            // An already-admitted row is still a valid claim on the position.
+            // Refusing one would strand a visitor whose first response never
+            // arrived, or who reloaded the page, for a mistake that was not
+            // theirs -- and the cookie they are asking for is one they are
+            // entitled to. What the status governs is the arrival count, not
+            // admission; the claim in `main.rs` is where it is read.
+            PositionStatus::Issued | PositionStatus::Admitted => Ok(position),
         };
     }
 
@@ -267,11 +294,16 @@ mod tests {
     }
 
     #[test]
-    fn a_spent_position_is_refused() {
-        for status in [PositionStatus::Completed, PositionStatus::Abandoned] {
+    fn an_already_admitted_visitor_is_admitted_again() {
+        // Their first response may never have reached them, or they reloaded.
+        // Refusing would strand a visitor holding a position that is still
+        // theirs, for a failure that was not theirs. What being admitted
+        // already governs is whether the arrival is counted a second time, and
+        // that is the claim's job, not this one's.
+        for status in [PositionStatus::Issued, PositionStatus::Admitted] {
             assert_eq!(
-                decide(&counters(10), None, Some((3, status)), 0).unwrap_err(),
-                Denied::Spent
+                decide(&counters(10), None, Some((3, status)), 0).unwrap(),
+                Grant { position: 3 }
             );
         }
     }

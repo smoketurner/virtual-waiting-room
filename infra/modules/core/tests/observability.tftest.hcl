@@ -56,9 +56,9 @@ run "every_lambda_has_a_log_group_that_expires" {
 run "filters_key_on_the_event_names_the_crates_emit" {
   command = plan
 
-  # These four strings are `event = "..."` literals in the Rust. If a crate
-  # renames one without renaming it here, the filter matches nothing and the
-  # alarm stays green through exactly the failure it exists to catch.
+  # These strings are `event = "..."` literals in the Rust. If a crate renames
+  # one without renaming it here, the filter matches nothing and the alarm stays
+  # green through exactly the failure it exists to catch.
   assert {
     condition = alltrue([
       for name in [
@@ -67,6 +67,7 @@ run "filters_key_on_the_event_names_the_crates_emit" {
         "arrival_shard_draw_failed",
         "rules_audit_failed",
         "admission_control_unreadable",
+        "admission_claim_failed",
         ] : strcontains(
         aws_cloudwatch_log_metric_filter.event[name].pattern,
         "$.event = \"${name}\""
