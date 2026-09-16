@@ -28,7 +28,7 @@ Throwaway code. Measures what documentation cannot settle.
 ### 1a. Data and counter
 - [ ] Four tables — `Counters`, `PreQueue`, `Positions`, `Tokens` — on-demand, PITR,
       `warm_throughput_*` and optional `max_throughput_*` as variables (DESIGN §6.7) [O1]
-- [ ] `Counters` attributes: `queue_counter`, `serving_counter`, `max_expired_position`,
+- [ ] `Counters` attributes: `queue_counter`, `serving_counter`,
       `arrivals#0..9`, `phase`, `phase_override`, `target_rate`, `shuffle_seed`,
       `operator_message`
 - [ ] Batch range allocation via `UpdateItem ADD` / `ALL_NEW`; increment by **valid** count
@@ -108,20 +108,6 @@ Throwaway code. Measures what documentation cannot settle.
 ### 1i. Control plane
 - [ ] Admin API: `/admin/phase`, `/admin/rate`, `/admin/message`, `/admin/reset`,
       `/admin/rules`, `/metrics`, `/update_session` [F3.10, F5.5]
-- [ ] Position expiry in the controller (ADR-0006): query `expires_at` past due with
-      `status = issued`, mark expired, advance `max_expired_position`. Time to live (TTL)
-      enabled only for post-event storage reclamation, with `FilterExpression` on reads
-      that could see a pending-delete item [F3.9]
-
-**Exit:** all endpoints correct; every lifecycle phase serves its page; pre-queue assigns
-fairly and reproducibly; a visitor browses multiple pages on one session; standby activates
-on threshold; entry gating rejects unsigned identifiers; operator can see and steer a live
-event; authorizer fails open.
-
----
-
-## Phase 2 — Terraform module
-
 - [ ] `modules/core` — DynamoDB, SQS, Lambdas, IAM, regional REST API + validator [N5]
 - [ ] `modules/edge` — CloudFront with three cache behaviours per ADR-0013: polled
       endpoints (Min TTL 1 s, no cookie forwarding), write endpoints (uncached), protected

@@ -25,7 +25,6 @@ pub enum PositionStatus {
     Issued,
     Completed,
     Abandoned,
-    Expired,
 }
 
 /// A `PreQueue` row: shard `s` and local index `l` for a request, written at

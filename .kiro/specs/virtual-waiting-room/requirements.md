@@ -137,10 +137,6 @@ activation queues first-in, first-out (FIFO).
 - THE SYSTEM SHALL compensate admission rate control for **no-shows** — admitted visitors who never arrive at the origin.
 - Acceptance: With a 30% no-show rate and a target of 500/min, actual origin arrivals converge on 500/min, not 350.
 
-**F3.9** — As an operator, I want unused positions to expire so that the queue does not stall on absentees.
-- IF a queue position is unused within an operator-configured period, THEN THE SYSTEM SHALL expire it.
-- Acceptance: Position expires; the serving counter advances past it.
-
 **F3.10** — As an operator, I want session outcomes recorded so that completion and abandonment are measurable.
 - THE SYSTEM SHALL allow sessions to be marked as completed or abandoned.
 - Acceptance: `POST /update_session` updates the completion and abandonment counters.
@@ -210,6 +206,7 @@ here rather than deleted.
 |---|---|---|---|
 | F6.1 | Gate queue entry on a client-issued signed entry ticket carrying an opaque per-identity subject. | Nothing could use it without customer-side work the product does not supply. | ADR-0028 |
 | F6.2 | The entry ticket is signed by the client, not the waiting room, and its subject is opaque. | Retired with F6.1. | ADR-0028 |
+| F3.9 | Queue positions expire if unused within an operator-configured period. | Implemented as a controller `Scan` of `Positions` six times a minute: unbounded, blind to the pre-queue cohort (which has no `Positions` row), advancing an attribute nothing read, and applying a grace expressed in seconds as a distance in positions — so a hidden tab lost its place (#97). The no-show correction already compensates for absentees. | ADR-0031 |
 | F6.3 | Bot-blocking decisions enforceable at event start rather than during the pre-queue. | Built as open-time demotion and never enabled; structurally blind to a client that bypassed CloudFront. | ADR-0030 |
 
 ### 1.8 Operator web interface

@@ -1,6 +1,6 @@
 # ADR-0006: Drive position expiry from the controller, not DynamoDB TTL
 
-**Status:** Accepted
+**Status:** Superseded by [0031](0031-remove-controller-driven-expiry.md).
 
 ## Context
 

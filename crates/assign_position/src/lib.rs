@@ -77,15 +77,6 @@ pub struct BatchRecord {
 pub struct PositionWrite {
     pub request_id: String,
     pub position: u64,
-    /// Whether the write may overwrite an existing row whose `status` is
-    /// `expired`. A re-join keeps its `request_id`, so without this it could
-    /// never reclaim the id a controller-expired live join left behind,
-    /// permanently stranding a visitor whose reload advice says "take a new
-    /// place in line". Excluded for a request id that also
-    /// holds a `PreQueue` row, so a fixed-up straggler's expired live
-    /// position cannot be resurrected out from under the read path, which
-    /// prefers that `PreQueue` row and would keep serving the stale value.
-    pub allow_expired_overwrite: bool,
 }
 
 /// A pre-queue registration write to attempt: the request, the `(shard, local
@@ -108,11 +99,9 @@ pub trait Store {
         n: u64,
     ) -> impl Future<Output = Result<u64, StoreError>> + Send;
 
-    /// Writes one position row with [`PositionWrite::allow_expired_overwrite`]
-    /// choosing the condition: `attribute_not_exists(request_id)` alone, or
-    /// widened with `OR status = expired`. A conditional-check failure (a
-    /// duplicate, or a non-expired row already claiming the id) is reported as
-    /// `Ok(WriteOutcome::Duplicate)`, not an error — the position is simply
+    /// Writes one position row under `attribute_not_exists(request_id)`. A
+    /// conditional-check failure — a row already claiming the id — is reported
+    /// as `Ok(WriteOutcome::Duplicate)`, not an error: the position is simply
     /// abandoned, which is a permitted gap.
     fn put_position(
         &self,
@@ -152,7 +141,6 @@ pub trait Store {
     /// denies every storage tier re-sends the join on each reload, and
     /// without this check each reload burned a fresh index), and to keep a
     /// live-join expired-row overwrite from resurrecting a straggler who also
-    /// holds a `PreQueue` row (see [`PositionWrite::allow_expired_overwrite`]).
     ///
     /// This is an optimization over the authoritative `attribute_not_exists`
     /// guard, never a substitute for it: a store error, or an id
@@ -372,12 +360,6 @@ async fn process_live_batch<S: Store>(
     valid: Vec<(String, JoinMessage)>,
     outcome: &mut BatchOutcome,
 ) {
-    let ids: Vec<String> = valid
-        .iter()
-        .map(|(_, msg)| msg.request_id.clone())
-        .collect();
-    let has_prequeue_row = registered_ids_or_unknown(store, &ids).await;
-
     let n = valid.len() as u64;
     let end = match store.claim_block(event_id, n).await {
         Ok(end) => end,
@@ -397,7 +379,6 @@ async fn process_live_batch<S: Store>(
 
     for (offset, (message_id, msg)) in valid.into_iter().enumerate() {
         let write = PositionWrite {
-            allow_expired_overwrite: !has_prequeue_row.contains(&msg.request_id),
             request_id: msg.request_id,
             // Saturating for the same reason `start` itself is: a wrapped
             // position is indistinguishable from a valid low one, never a
@@ -572,7 +553,6 @@ async fn fixup_stragglers<S: Store>(store: &S, event_id: &str, written: Vec<PreQ
             position: start.saturating_add(offset as u64),
             // A straggler fix-up is the first live write for this id; there
             // is no row yet to collide with an expired one.
-            allow_expired_overwrite: true,
         };
         if let Err(err) = store.put_position(&position_write).await {
             tracing::error!(error = %err, "straggler position write failed; leaving to self-heal");
@@ -982,41 +962,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_request_id_with_a_prequeue_row_does_not_get_the_expired_overwrite() {
-        // The R4 fix: a live-join write for an id that also holds a PreQueue
-        // row (the fixed-up-straggler case) must not be allowed to overwrite
-        // an expired row, or /queue_num (which prefers the PreQueue row) would
-        // keep serving a stale position forever.
-        let store = FakeStore::default();
-        let id = "018f3a2b-7c9d-7e1f-8001-0123456789ab".to_owned();
-        store.already_registered.lock().unwrap().insert(id.clone());
-        let records = vec![rec("m1", &id)];
-        run_open(&store, &records).await;
-        let writes = store.writes.lock().unwrap();
-        assert_eq!(writes.len(), 1);
-        assert!(!writes[0].allow_expired_overwrite);
-    }
-
-    #[tokio::test]
-    async fn an_id_with_no_prequeue_row_gets_the_expired_overwrite() {
-        let store = FakeStore::default();
-        let records = vec![rec("m1", "018f3a2b-7c9d-7e1f-8001-0123456789ab")];
-        run_open(&store, &records).await;
-        let writes = store.writes.lock().unwrap();
-        assert_eq!(writes.len(), 1);
-        assert!(writes[0].allow_expired_overwrite);
-    }
-
-    #[tokio::test]
-    async fn a_registered_ids_failure_degrades_to_claim_anyway() {
+    async fn a_registered_ids_failure_degrades_to_claiming_anyway() {
+        // The cross-invocation dedupe read is an optimisation, not a guard:
+        // `attribute_not_exists(r)` on the write is authoritative. A failed
+        // BatchGetItem must therefore claim and write rather than fail the
+        // batch, and the write's own condition catches any real duplicate.
         let store = FakeStore {
             registered_ids_fails: true,
+            counters_sequence: Mutex::new(VecDeque::from([Some(counters_with_phase(
+                Phase::PreQueue,
+            ))])),
             ..FakeStore::default()
         };
         let records = vec![rec("m1", VALID_ID)];
         let outcome = run_open(&store, &records).await;
         assert!(outcome.failures.is_empty());
-        assert_eq!(store.writes.lock().unwrap().len(), 1);
+        assert_eq!(store.prequeue_writes.lock().unwrap().len(), 1);
     }
 
     // --- routing: open outputs, not phase -----------------------------------

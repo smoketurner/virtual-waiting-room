@@ -161,7 +161,7 @@ creates a placeholder under `ignore_changes` and an operator writes the real val
 
 Regenerating the key invalidates every session cookie already issued. The gate refuses those
 visitors with `x-wr-reason=signature` and redirects them to the waiting page. Visitors whose
-positions the controller has expired cannot rejoin. The deployment accepts one key at a time, so
+positions cannot rejoin. The deployment accepts one key at a time, so
 there is no overlap period. Regenerate only before an event opens.
 
 ### Choosing `SESSION_TTL_SECS`

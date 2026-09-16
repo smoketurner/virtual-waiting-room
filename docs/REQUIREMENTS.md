@@ -56,7 +56,6 @@ activation queues first-in, first-out (FIFO).
 | F3.6 | The session MUST be separately signed from the admission token, over different inputs. | A captured admission token cannot be replayed as a session credential, or vice versa. |
 | F3.7 | Session lifetime MUST support both a sliding window (extended on activity) and a hard cap from issue time. | Both modes configurable per event; hard cap does not extend regardless of activity. |
 | F3.8 | Admission rate control MUST compensate for **no-shows** — admitted visitors who never arrive at the origin. | With a 30% no-show rate and a target of 500/min, actual origin arrivals converge on 500/min, not 350. |
-| F3.9 | Queue positions MUST expire if unused within an operator-configured period. | Position expires; the serving counter advances past it. |
 | F3.10 | Sessions MUST be markable as completed or abandoned. | `POST /update_session` updates the completion and abandonment counters. |
 
 ### 1.5 Failure behaviour
@@ -137,6 +136,7 @@ carries the reasoning.
 |---|---|---|---|
 | F6.1 | Gate queue entry on a client-issued signed entry ticket carrying an opaque per-identity subject, deriving `request_id` from it so one identity held one position. | Nothing could use it without customer-side work the product does not supply. | [ADR-0028](adr/0028-remove-entry-tickets.md) |
 | F6.2 | The entry ticket is signed by the client, not the waiting room, and its subject is opaque. | Retired with F6.1; it constrained a mechanism that no longer exists. | [ADR-0028](adr/0028-remove-entry-tickets.md) |
+| F3.9 | Queue positions expire if unused within an operator-configured period. | Implemented as a controller `Scan` of `Positions` six times a minute: unbounded, blind to the pre-queue cohort (which has no `Positions` row), advancing an attribute nothing read, and applying a grace expressed in seconds as a distance in positions — so a hidden tab lost its place (#97). The no-show correction already compensates for absentees. | [ADR-0031](adr/0031-remove-controller-driven-expiry.md) |
 | F6.3 | Bot-blocking decisions enforceable at event start rather than during the pre-queue. | Built as open-time demotion and never enabled; sixteen concepts, a `Scan` grant, and a room-wide refusal if one chunk item went unread. Structurally blind to a client that bypassed CloudFront, which is the traffic it was aimed at. | [ADR-0030](adr/0030-remove-open-time-demotion.md) |
 
 ---

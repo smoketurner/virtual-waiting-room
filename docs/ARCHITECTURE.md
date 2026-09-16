@@ -337,19 +337,18 @@ people who were let through.
 The write is guarded on `serving_counter = :expected`, so two overlapping executions cannot
 double-advance. A failed condition is logged and skipped, not retried.
 
-### 6.2 Expiry
+### 6.2 No expiry
 
-Grace is expressed in time and applied positionally. The cutoff is
-`serving_counter − target_rate × 120`, because at `target_rate` per second the cursor covers that
-many positions in 120 seconds. This needs no per-position write when a position is reached, and it
-stops on its own when admission is paused, because a paused cursor does not move. A target rate of
-zero yields a cutoff of zero and expires nothing.
+A position lives until DynamoDB TTL reclaims its row, 24 hours after it was written
+([ADR-0031](adr/0031-remove-controller-driven-expiry.md)). The controller expires nothing and
+performs no `Scan`.
 
-`Positions` has no secondary index, so finding those rows is a `Scan` filtered on
-`queue_position < :cutoff AND #s = :issued`. Each row is then marked expired with an
-`UpdateItem` guarded on it still being `issued`, one round trip at a time. `max_expired_position`
-advances to the highest position expired — the highest position, not a count, because the
-attribute names a position.
+The mechanism that used to do this cost an unbounded `Scan` of `Positions` six times a minute,
+could not see the pre-queue cohort at all — those visitors have no `Positions` row — and
+advanced an attribute nothing read. Its grace was expressed in seconds but applied as a
+distance in positions, so under the no-show correction's `2×` cap it shrank to about half the
+advertised window and a hidden tab lost its place. The no-show correction already compensates
+for absentees by measuring arrivals against releases.
 
 ### 6.3 Minting the session cookie
 

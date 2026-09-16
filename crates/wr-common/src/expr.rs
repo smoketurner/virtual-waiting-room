@@ -87,9 +87,6 @@ pub const STARTS_AT_TZ_ATTR: &str = "starts_at_tz";
 /// know which words are reserved.
 pub const STATUS_ATTR: &str = "status";
 
-/// The `status` value of a row the controller has expired.
-pub const STATUS_EXPIRED: &str = "expired";
-
 /// Which item a key addresses.
 ///
 /// One type rather than a constructor per item kind, so the tag prefixes and
@@ -569,7 +566,7 @@ mod tests {
         assert_self_consistent(&plain);
 
         let widened = Condition::attribute_not_exists(POSITIONS_KEY_ATTR)
-            .or_equals(STATUS_ATTR, AttributeValue::S(STATUS_EXPIRED.to_owned()))
+            .or_equals(STATUS_ATTR, AttributeValue::S("completed".to_owned()))
             .build();
         assert!(widened.expression.contains(" OR "));
         assert_eq!(widened.values.len(), 1);
@@ -580,7 +577,7 @@ mod tests {
     fn a_reserved_word_is_referenced_through_a_name_placeholder() {
         // `status` is reserved, so it must never appear literally.
         let built = Condition::attribute_not_exists(POSITIONS_KEY_ATTR)
-            .or_equals(STATUS_ATTR, AttributeValue::S(STATUS_EXPIRED.to_owned()))
+            .or_equals(STATUS_ATTR, AttributeValue::S("completed".to_owned()))
             .build();
         assert!(
             !built.expression.contains(STATUS_ATTR),
@@ -597,7 +594,7 @@ mod tests {
             .add(SHARD_COUNT_ATTR, AttributeValue::N("1".to_owned()))
             .build();
         let condition = Condition::attribute_not_exists(POSITIONS_KEY_ATTR)
-            .or_equals(STATUS_ATTR, AttributeValue::S(STATUS_EXPIRED.to_owned()))
+            .or_equals(STATUS_ATTR, AttributeValue::S("completed".to_owned()))
             .build();
         for name in condition.names.keys() {
             assert!(!update.names.contains_key(name), "name collision: {name}");

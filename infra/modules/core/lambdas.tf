@@ -281,9 +281,8 @@ resource "aws_lambda_function" "controller" {
 
   environment {
     variables = merge(local.dynamo_lambda_env, {
-      COUNTERS_TABLE  = aws_dynamodb_table.counters.name
-      POSITIONS_TABLE = aws_dynamodb_table.positions.name
-      EVENT_ID        = var.event_id
+      COUNTERS_TABLE = aws_dynamodb_table.counters.name
+      EVENT_ID       = var.event_id
     })
   }
 

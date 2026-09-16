@@ -56,17 +56,6 @@ pub const EWMA_ALPHA: f64 = 0.3;
 /// identical at `1 - 0.7^836` and at `0`) but storable as a `DynamoDB` `Number`.
 pub const DDB_NUMBER_MIN_POSITIVE: f64 = 1e-130;
 
-/// How long a visitor has to claim a position after the cursor reaches it,
-/// before the controller treats them as a no-show and expires it.
-///
-/// Expressed as time but applied positionally: at `target_rate` per second the
-/// cursor covers `target_rate * ADMISSION_GRACE_SECS` positions in that window,
-/// so a position this far behind the cursor was offered that long ago. Doing it
-/// this way needs no per-position write when a position is reached, and it
-/// stops automatically when admission is paused, because a paused cursor does
-/// not move.
-pub const ADMISSION_GRACE_SECS: u64 = 120;
-
 /// Upper bound on the correction: `release_next` is capped at this multiple of
 /// `target_rate`, so even a no-show rate measured near 1.0 (almost nobody
 /// arrived) cannot release more than this many times the target in one interval
@@ -303,14 +292,6 @@ fn bounded_release(target: u64, smoothed_no_show: f64) -> u64 {
     }
 }
 
-/// A position the cursor passed long enough ago to count as a no-show, whose
-/// status is still `issued`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExpiredPosition {
-    pub request_id: String,
-    pub position: u64,
-}
-
 /// A store failure worth retrying.
 #[derive(Debug, thiserror::Error)]
 #[error("controller store error: {0}")]
@@ -368,7 +349,6 @@ pub struct ControllerState {
     pub fail_open_until: u64,
     pub inputs: ReleaseInputs,
     pub prev_no_show: Option<NoShowState>,
-    pub max_expired_position: u64,
 }
 
 /// The persistence port the controller drives. A trait seam so the pipeline runs
@@ -398,27 +378,6 @@ pub trait Store {
         decision: &ReleaseDecision,
         expected_serving_counter: u64,
     ) -> impl Future<Output = Result<ReleaseOutcome, StoreError>> + Send;
-
-    /// Returns positions below `cutoff` whose status is still `issued` — those
-    /// the cursor passed more than the grace window ago and nobody claimed.
-    fn query_expired(
-        &self,
-        cutoff_position: u64,
-    ) -> impl Future<Output = Result<Vec<ExpiredPosition>, StoreError>> + Send;
-
-    /// Marks a position `expired`, guarded on it still being `issued` so a
-    /// completed/abandoned position is not overwritten.
-    fn mark_expired(&self, request_id: &str)
-    -> impl Future<Output = Result<(), StoreError>> + Send;
-
-    /// Advances `max_expired_position` on the `Counters` item to the highest
-    /// position just expired (only ever forward; a lower value is a no-op at
-    /// the store).
-    fn advance_max_expired(
-        &self,
-        event_id: &str,
-        max_expired_position: u64,
-    ) -> impl Future<Output = Result<(), StoreError>> + Send;
 }
 
 /// The result of one controller pass.
@@ -433,11 +392,10 @@ pub enum PassOutcome {
     /// nothing. Distinct from [`PassOutcome::NotActive`]: the event is running
     /// and only the operator's hold stops admission.
     Held(AdmissionControl),
-    /// The controller ran: it released `released` positions and expired
-    /// `expired` positions. When the release lost its race against a concurrent
-    /// invoke, both are `0`: no release persisted and expiry was skipped rather
-    /// than run against a non-persisted cursor.
-    Ran { released: u64, expired: usize },
+    /// The controller ran and released `released` positions. `0` when the
+    /// release lost its race against a concurrent invoke: the winner persisted
+    /// the cursor, so this pass released nobody.
+    Ran { released: u64 },
 }
 
 /// Runs one controller pass for the event: read state, gate on `Active` and on
@@ -499,90 +457,29 @@ pub async fn run_pass<S: Store>(
         .write_release(event_id, &decision, state.inputs.serving_counter)
         .await?;
 
-    // The expiry cutoff is derived from `decision.next_serving_counter`, which
-    // is the persisted cursor only when the release landed. On a lost race the
-    // guarded `UpdateItem` did not write, so that value is a phantom the
-    // condition specifically refused to land — using it for expiry would mark
-    // positions `expired` whose owners were offered a place fewer than
-    // `ADMISSION_GRACE_SECS` ago, and the flip is one-way. Skip the whole
-    // expiry phase: the next pass reads the persisted cursor with a consistent
-    // read and computes the correct cutoff, so expiries that should have run
-    // this pass arrive one pass late — within the positional approximation the
-    // design already accepts — and no position is wrongly expired.
+    // A lost race is not an error: the winner persisted a consistent cursor.
+    // But this pass released nobody, so it reports zero rather than claiming
+    // the release the guarded `UpdateItem` specifically refused to land.
     if race.is_lost() {
         tracing::info!(
             event_id,
             stale_serving_counter = state.inputs.serving_counter,
             stale_next_serving_counter = decision.next_serving_counter,
-            "controller pass skipped expiry: release lost the race"
+            "controller pass released nothing: lost the race"
         );
-        return Ok(PassOutcome::Ran {
-            released: 0,
-            expired: 0,
-        });
+        return Ok(PassOutcome::Ran { released: 0 });
     }
-
-    let expired = expire_due(
-        store,
-        event_id,
-        expiry_cutoff(decision.next_serving_counter, state.inputs.target_rate),
-    )
-    .await?;
 
     tracing::info!(
         event_id,
         released = decision.release,
         serving_counter = decision.next_serving_counter,
         no_show_rate = decision.no_show.smoothed_rate,
-        expired,
         "controller pass"
     );
     Ok(PassOutcome::Ran {
         released: decision.release,
-        expired,
     })
-}
-
-/// The position below which an unclaimed position counts as a no-show: the
-/// cursor less the ground it covers during the grace window.
-///
-/// The grace is `target_rate * ADMISSION_GRACE_SECS` positions behind the
-/// cursor.
-///
-/// A rate of zero releases nobody, so nothing has been offered and nothing can
-/// have been declined; returning zero expires nothing rather than treating the
-/// entire queue as no-shows.
-#[must_use]
-pub fn expiry_cutoff(serving_counter: u64, target_rate: u32) -> u64 {
-    if target_rate == 0 {
-        return 0;
-    }
-    let grace = u64::from(target_rate).saturating_mul(ADMISSION_GRACE_SECS);
-    serving_counter.saturating_sub(grace)
-}
-
-/// Expires every position the cursor left behind and advances
-/// `max_expired_position` to the highest one. Returns the number expired.
-async fn expire_due<S: Store>(store: &S, event_id: &str, cutoff: u64) -> Result<usize, StoreError> {
-    if cutoff == 0 {
-        return Ok(0);
-    }
-    let due = store.query_expired(cutoff).await?;
-    if due.is_empty() {
-        return Ok(0);
-    }
-
-    for position in &due {
-        store.mark_expired(&position.request_id).await?;
-    }
-
-    // The highest position actually expired, not a count of them: the attribute
-    // names a position, and adding a count to it produces a number that means
-    // nothing and drifts further from the truth on every pass.
-    let highest = due.iter().map(|p| p.position).max().unwrap_or(0);
-    store.advance_max_expired(event_id, highest).await?;
-
-    Ok(due.len())
 }
 
 #[cfg(test)]
@@ -931,52 +828,6 @@ mod tests {
     }
 
     #[test]
-    fn nothing_expires_until_the_grace_window_has_closed() {
-        // A position is only a no-show once it was offered and declined. Early
-        // in an event the cursor has not covered the grace window, so no
-        // position is old enough to expire — expiring on a join-time deadline
-        // instead throws people out for waiting the length of the queue.
-        assert_eq!(expiry_cutoff(0, 50), 0);
-        assert_eq!(expiry_cutoff(5_999, 50), 0);
-        assert_eq!(expiry_cutoff(6_001, 50), 1);
-    }
-
-    #[test]
-    fn a_zero_rate_expires_nobody() {
-        // Releasing nobody means offering nobody, so nobody can have declined.
-        // A cutoff at the cursor would expire the entire released queue.
-        assert_eq!(expiry_cutoff(100_000, 0), 0);
-    }
-
-    #[test]
-    fn the_grace_window_is_the_same_duration_at_any_rate() {
-        // Positional grace has to track the rate, or a fast event expires
-        // people seconds after offering them a place.
-        let slow = 10_000 - expiry_cutoff(10_000, 5);
-        let fast = 100_000 - expiry_cutoff(100_000, 50);
-        assert_eq!(slow, 5 * ADMISSION_GRACE_SECS);
-        assert_eq!(fast, 50 * ADMISSION_GRACE_SECS);
-        assert_eq!(fast, slow * 10);
-    }
-
-    #[tokio::test]
-    async fn a_paused_event_expires_nobody_while_it_is_held() {
-        // The cursor does not move while paused, so the window behind it does
-        // not either: a hold cannot cost anyone their place.
-        let mut state = active_state(0);
-        state.stored_control = StoredControl::Paused;
-        let store = FakeStore::new(
-            state,
-            vec![ExpiredPosition {
-                request_id: "r1".to_owned(),
-                position: 3,
-            }],
-        );
-        run_pass(&store, "evt", 1_000_000).await.unwrap();
-        assert!(store.marked.lock().unwrap().is_empty());
-    }
-
-    #[test]
     fn sum_arrivals_saturates() {
         let d = compute_release(inputs(u64::MAX, 0, u64::MAX, 0, 100_000), None);
         // next_serving_counter saturates rather than wrapping.
@@ -987,10 +838,7 @@ mod tests {
 
     struct FakeStore {
         state: ControllerState,
-        due: Vec<ExpiredPosition>,
-        marked: Mutex<Vec<String>>,
         released: Mutex<Option<ReleaseDecision>>,
-        advanced: Mutex<Option<u64>>,
         /// When true, `write_release` reports a lost race without recording —
         /// mirroring `DynamoStore` returning `LostRace` on
         /// `ConditionalCheckFailedException`.
@@ -998,13 +846,10 @@ mod tests {
     }
 
     impl FakeStore {
-        fn new(state: ControllerState, due: Vec<ExpiredPosition>) -> Self {
+        fn new(state: ControllerState) -> Self {
             Self {
                 state,
-                due,
-                marked: Mutex::new(Vec::new()),
                 released: Mutex::new(None),
-                advanced: Mutex::new(None),
                 lose_release: false,
             }
         }
@@ -1012,8 +857,8 @@ mod tests {
         /// Returns a fake whose `write_release` loses the race on every call,
         /// mirroring a real store hitting `ConditionalCheckFailedException`
         /// after a concurrent invoke advanced `serving_counter` first.
-        fn losing_race(state: ControllerState, due: Vec<ExpiredPosition>) -> Self {
-            let mut s = Self::new(state, due);
+        fn losing_race(state: ControllerState) -> Self {
+            let mut s = Self::new(state);
             s.lose_release = true;
             s
         }
@@ -1037,48 +882,16 @@ mod tests {
                 // Mirrors `DynamoStore` returning `LostRace` on
                 // `ConditionalCheckFailedException`: the release did not
                 // persist, so `decision.next_serving_counter` is a phantom the
-                // guard refused and `run_pass` must skip `expire_due`.
+                // guard refused, so this pass released nothing.
                 std::future::ready(Ok(ReleaseOutcome::LostRace))
             } else {
                 *self.released.lock().unwrap() = Some(*decision);
                 std::future::ready(Ok(ReleaseOutcome::Advanced))
             }
         }
-
-        fn query_expired(
-            &self,
-            cutoff_position: u64,
-        ) -> impl Future<Output = Result<Vec<ExpiredPosition>, StoreError>> + Send {
-            // Mirrors the store's filter, so a test that changes the cutoff sees
-            // the same rows the real scan would return.
-            let due: Vec<ExpiredPosition> = self
-                .due
-                .iter()
-                .filter(|p| p.position < cutoff_position)
-                .cloned()
-                .collect();
-            std::future::ready(Ok(due))
-        }
-
-        fn mark_expired(
-            &self,
-            request_id: &str,
-        ) -> impl Future<Output = Result<(), StoreError>> + Send {
-            self.marked.lock().unwrap().push(request_id.to_owned());
-            std::future::ready(Ok(()))
-        }
-
-        fn advance_max_expired(
-            &self,
-            _event_id: &str,
-            max_expired_position: u64,
-        ) -> impl Future<Output = Result<(), StoreError>> + Send {
-            *self.advanced.lock().unwrap() = Some(max_expired_position);
-            std::future::ready(Ok(()))
-        }
     }
 
-    fn active_state(due_max_expired: u64) -> ControllerState {
+    fn active_state() -> ControllerState {
         ControllerState {
             phase: Phase::Active,
             stored_control: StoredControl::Open,
@@ -1093,80 +906,71 @@ mod tests {
                 i
             },
             prev_no_show: None,
-            max_expired_position: due_max_expired,
         }
     }
 
     #[tokio::test]
-    async fn pass_releases_and_expires_when_active() {
-        let due = vec![
-            ExpiredPosition {
-                request_id: "r1".to_owned(),
-                position: 3,
-            },
-            ExpiredPosition {
-                request_id: "r2".to_owned(),
-                position: 7,
-            },
-        ];
-        let store = FakeStore::new(active_state(10), due);
+    async fn pass_releases_when_active() {
+        let store = FakeStore::new(active_state());
         let outcome = run_pass(&store, "evt", 1_000_000).await.unwrap();
-        assert_eq!(
-            outcome,
-            PassOutcome::Ran {
-                released: 1000,
-                expired: 2,
-            }
+        assert!(
+            matches!(outcome, PassOutcome::Ran { released } if released > 0),
+            "an active event with a rate must release, got {outcome:?}"
         );
-        assert_eq!(store.marked.lock().unwrap().len(), 2);
-        // The highest position expired, not a count of them.
-        assert_eq!(*store.advanced.lock().unwrap(), Some(7));
-        assert!(store.released.lock().unwrap().is_some());
+        assert!(
+            store.released.lock().unwrap().is_some(),
+            "cursor not written"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lost_release_race_reports_releasing_nobody() {
+        // The guarded UpdateItem refused to land, so another invoke advanced
+        // the cursor and this pass released nobody. Reporting `decision.release`
+        // here would double-count the winner's release in the logs — which is
+        // the whole reason `write_release` returns an outcome rather than `()`.
+        let store = FakeStore::losing_race(stale_loser_state());
+        let outcome = run_pass(&store, "evt", 1_000_000).await.unwrap();
+        assert_eq!(outcome, PassOutcome::Ran { released: 0 });
+        assert!(
+            store.released.lock().unwrap().is_none(),
+            "a lost race must not record a release"
+        );
     }
 
     #[tokio::test]
     async fn pass_is_noop_when_not_active() {
-        let mut state = active_state(0);
+        let mut state = active_state();
         state.phase = Phase::PreQueue;
-        let store = FakeStore::new(state, Vec::new());
+        let store = FakeStore::new(state);
         let outcome = run_pass(&store, "evt", 1_000_000).await.unwrap();
         assert_eq!(outcome, PassOutcome::NotActive(Phase::PreQueue));
         assert!(store.released.lock().unwrap().is_none());
-        assert!(store.advanced.lock().unwrap().is_none());
     }
 
     #[tokio::test]
     async fn pause_stops_admission_entirely() {
         // A paused event is still Active, so the phase gate lets the pass
-        // through and only the admission control stops it. Nothing may advance:
-        // not serving_counter, not the expiry cursor.
-        let mut state = active_state(10);
+        // through and only the admission control stops it: serving_counter
+        // must not advance.
+        let mut state = active_state();
         state.stored_control = StoredControl::Paused;
-        let due = vec![ExpiredPosition {
-            request_id: "r1".to_owned(),
-            position: 3,
-        }];
-        let store = FakeStore::new(state, due);
+        let store = FakeStore::new(state);
         let outcome = run_pass(&store, "evt", 1_000_000).await.unwrap();
         assert_eq!(outcome, PassOutcome::Held(AdmissionControl::Paused));
         assert!(
             store.released.lock().unwrap().is_none(),
             "paused event released positions: pause is not holding admission"
         );
-        assert!(
-            store.marked.lock().unwrap().is_empty(),
-            "paused event expired a position the visitor could not act on"
-        );
-        assert_eq!(*store.advanced.lock().unwrap(), None);
     }
 
     #[tokio::test]
     async fn fail_open_holds_the_controller_too() {
         // Under fail-open the waiting room is bypassed, so metering releases
         // nothing real; the counter stays put for recovery to resume from.
-        let mut state = active_state(0);
+        let mut state = active_state();
         state.fail_open_until = 1000;
-        let store = FakeStore::new(state, Vec::new());
+        let store = FakeStore::new(state);
         let outcome = run_pass(&store, "evt", 500).await.unwrap();
         assert_eq!(outcome, PassOutcome::Held(AdmissionControl::FailOpen));
         assert!(store.released.lock().unwrap().is_none());
@@ -1177,9 +981,9 @@ mod tests {
         // now supplied per pass (not read from a clock inside run_pass) is
         // what makes this work: the same stored state, evaluated a moment
         // after the epoch, resolves to Open with no write on either side.
-        let mut state = active_state(0);
+        let mut state = active_state();
         state.fail_open_until = 1000;
-        let store = FakeStore::new(state, Vec::new());
+        let store = FakeStore::new(state);
         let held = run_pass(&store, "evt", 500).await.unwrap();
         assert_eq!(held, PassOutcome::Held(AdmissionControl::FailOpen));
         let ran = run_pass(&store, "evt", 1000).await.unwrap();
@@ -1190,29 +994,9 @@ mod tests {
     async fn resuming_lets_the_controller_run_again() {
         // The same state with the control back to Open runs a full pass, so a
         // hold costs nothing but the intervals it covered.
-        let store = FakeStore::new(active_state(0), Vec::new());
+        let store = FakeStore::new(active_state());
         let outcome = run_pass(&store, "evt", 1_000_000).await.unwrap();
-        assert_eq!(
-            outcome,
-            PassOutcome::Ran {
-                released: 1000,
-                expired: 0,
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn no_due_positions_skips_the_cursor_write() {
-        let store = FakeStore::new(active_state(5), Vec::new());
-        let outcome = run_pass(&store, "evt", 1_000_000).await.unwrap();
-        assert_eq!(
-            outcome,
-            PassOutcome::Ran {
-                released: 1000,
-                expired: 0,
-            }
-        );
-        assert_eq!(*store.advanced.lock().unwrap(), None);
+        assert_eq!(outcome, PassOutcome::Ran { released: 1000 });
     }
 
     #[tokio::test]
@@ -1223,7 +1007,7 @@ mod tests {
         // floored 0.0 — the pass succeeds and `serving_counter` advances,
         // rather than the pass failing (or, on the live store, the
         // `UpdateItem` being rejected) every minute until the next no-show.
-        let mut state = active_state(0);
+        let mut state = active_state();
         // Released 500 last interval, all 500 arrived -> observed_no_show 0,
         // so the only thing pulling the EWMA is the carried 1.36e-130.
         state.inputs = {
@@ -1234,7 +1018,7 @@ mod tests {
         state.prev_no_show = Some(NoShowState {
             smoothed_rate: 1.36e-130,
         });
-        let store = FakeStore::new(state, Vec::new());
+        let store = FakeStore::new(state);
 
         let outcome = run_pass(&store, "evt", 1_000_000).await.unwrap();
         assert!(
@@ -1253,180 +1037,18 @@ mod tests {
         assert_eq!(written.no_show.smoothed_rate.to_string(), "0");
     }
 
-    // --- Lost release race: expiry must skip, not run against a phantom cursor
+    // --- Lost release race: the pass reports what it actually released
 
-    /// State mirroring the bug report's realistic orientation: a staler arrivals
-    /// read (200 vs the winner's 250) yields a larger bounded release, so a
-    /// losing pass computes `next_serving_counter = 20_610` against the winner's
-    /// persisted `20_588`. `prev_no_show = Some(0.0)` makes the EWMA produce the
-    /// reported figures rather than the raw observed rate.
-    fn stale_loser_state(due_max_expired: u64) -> ControllerState {
-        let mut state = active_state(due_max_expired);
+    /// State in which a staler arrivals read (200 vs a winner's 250) yields a
+    /// larger bounded release, so a losing pass computes a higher
+    /// `next_serving_counter` than the winner persisted.
+    fn stale_loser_state() -> ControllerState {
+        let mut state = active_state();
         // Arrivals 200 (stale) vs the winner's 250 (fresh); the loser reads
         // fewer arrivals -> higher no-show -> larger release (610 vs 588).
         state.inputs.arrivals[0] = 200;
         state.prev_no_show = Some(NoShowState { smoothed_rate: 0.0 });
         state
-    }
-
-    #[tokio::test]
-    async fn lost_release_race_skips_expiry_so_grace_window_positions_survive() {
-        // The harmful orientation: the staler/larger-release invoke loses the
-        // guarded write. Its `decision.next_serving_counter = 20_610` was never
-        // persisted (the winner persisted 20_588), so the cutoff derived from it
-        // (14_610) is ahead of the real cursor's cutoff (14_588). Running
-        // `expire_due` against 14_610 would mark positions 14_588..14_609
-        // `expired` — still inside the 120s grace window — and the flip is
-        // one-way, so those visitors are permanently denied.
-        //
-        // The fix: on a lost race `run_pass` skips `expire_due` entirely. The
-        // next pass reads the persisted cursor with a consistent read and emits
-        // the correct cutoff, so expiries that should run this pass arrive one
-        // pass late — within the positional ±one-pass tolerance the design
-        // accepts — and no position is wrongly expired.
-        let due = vec![
-            ExpiredPosition {
-                request_id: "r_correct".to_owned(),
-                position: 14_500,
-            },
-            ExpiredPosition {
-                request_id: "r_in_window_a".to_owned(),
-                position: 14_589,
-            },
-            ExpiredPosition {
-                request_id: "r_in_window_b".to_owned(),
-                position: 14_600,
-            },
-            ExpiredPosition {
-                request_id: "r_in_window_c".to_owned(),
-                position: 14_609,
-            },
-        ];
-        let store = FakeStore::losing_race(stale_loser_state(10), due);
-        let outcome = run_pass(&store, "evt", 1_000_000).await.unwrap();
-        assert_eq!(
-            outcome,
-            PassOutcome::Ran {
-                released: 0,
-                expired: 0,
-            },
-            "a lost-race pass must report it released and expired nothing"
-        );
-        assert!(
-            store.released.lock().unwrap().is_none(),
-            "the release did not persist; FakeStore must not record it"
-        );
-        assert!(
-            store.marked.lock().unwrap().is_empty(),
-            "lost-race pass expired positions whose owners were offered a place \
-             fewer than 120s ago — the grace-window over-expiry"
-        );
-        assert_eq!(
-            *store.advanced.lock().unwrap(),
-            None,
-            "max_expired_position must not advance when no positions were expired"
-        );
-    }
-
-    #[tokio::test]
-    async fn lost_release_race_then_a_won_pass_expires_the_correct_positions() {
-        // The skip is a one-pass delay, not a permanent loss of the expiry: the
-        // next pass reads the persisted cursor and emits the correct cutoff.
-        // Here the same fake loses the first pass, then a second fake bound to
-        // the winner's persisted state (`serving_counter = 20_588`) wins its
-        // release and expires the truly-due position, demonstrating the system
-        // self-corrects within one pass — the tolerance the positional design
-        // already accepts.
-        let due = vec![
-            ExpiredPosition {
-                request_id: "r_correct".to_owned(),
-                position: 14_500,
-            },
-            ExpiredPosition {
-                request_id: "r_in_window".to_owned(),
-                position: 14_589,
-            },
-        ];
-        // First pass: loses the race; expiry skipped, nothing marked.
-        let loser = FakeStore::losing_race(stale_loser_state(10), due.clone());
-        let first = run_pass(&loser, "evt", 1_000_000).await.unwrap();
-        assert_eq!(
-            first,
-            PassOutcome::Ran {
-                released: 0,
-                expired: 0,
-            }
-        );
-        assert!(loser.released.lock().unwrap().is_none());
-        assert!(loser.marked.lock().unwrap().is_empty());
-
-        // Second pass: reads the winner's persisted cursor (20_588). With
-        // `last_serving_counter = 20_588` (released_last = 0), the no-show
-        // correction falls back to the raw target (500) and carries the prior
-        // smoothed state, so `release = 500`, `next_serving_counter = 21_088`,
-        // and `expiry_cutoff(21_088, 50) = 15_088`. Both due positions (14_500,
-        // 14_589) are below 15_088 and correctly expire — the lost pass skipped
-        // them, and the won pass picked them up one pass later.
-        let mut won_state = active_state(10);
-        won_state.inputs.serving_counter = 20_588;
-        won_state.inputs.last_serving_counter = 20_588;
-        won_state.prev_no_show = Some(NoShowState {
-            smoothed_rate: 0.15,
-        });
-        let winner = FakeStore::new(won_state, due);
-        let second = run_pass(&winner, "evt", 1_000_000).await.unwrap();
-        assert_eq!(
-            second,
-            PassOutcome::Ran {
-                released: 500,
-                expired: 2,
-            }
-        );
-        assert!(winner.released.lock().unwrap().is_some());
-        assert_eq!(winner.marked.lock().unwrap().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn a_won_release_race_expires_positions_below_the_persisted_cutoff() {
-        // Regression guard for the non-race path: when the release lands
-        // (`Advanced`), `run_pass` must still derive the cutoff from the just-
-        // persisted `next_serving_counter` and expire positions below it. The
-        // lost-race skip must not swallow the normal expiry.
-        //
-        // Loser's inputs but the release *lands*: `next_serving_counter =
-        // 20_610` is now the real cursor, so `expiry_cutoff(20_610, 50) =
-        // 14_610` is the correct cutoff and all four due positions (below
-        // 14_610) are correctly expired.
-        let due = vec![
-            ExpiredPosition {
-                request_id: "r1".to_owned(),
-                position: 14_500,
-            },
-            ExpiredPosition {
-                request_id: "r2".to_owned(),
-                position: 14_589,
-            },
-            ExpiredPosition {
-                request_id: "r3".to_owned(),
-                position: 14_600,
-            },
-            ExpiredPosition {
-                request_id: "r4".to_owned(),
-                position: 14_609,
-            },
-        ];
-        let store = FakeStore::new(stale_loser_state(10), due);
-        let outcome = run_pass(&store, "evt", 1_000_000).await.unwrap();
-        assert_eq!(
-            outcome,
-            PassOutcome::Ran {
-                released: 610,
-                expired: 4,
-            }
-        );
-        assert!(store.released.lock().unwrap().is_some());
-        assert_eq!(store.marked.lock().unwrap().len(), 4);
-        assert_eq!(*store.advanced.lock().unwrap(), Some(14_609));
     }
 
     // --- Property tests: no input underflows/overflows or panics -------------
