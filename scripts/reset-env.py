@@ -5,10 +5,10 @@
 # ///
 """Reset a deployed Virtual Waiting Room environment back to a testable state.
 
-Empties the per-visitor tables, deletes the striped counter shards, and
-rewrites the event's `Counters` item from scratch, so the next test run starts
-from a known state instead of inheriting positions, open outputs, and counters
-from the last one.
+Empties the per-visitor tables, deletes every `Counters` item belonging to the
+event, and rewrites the event's own item from scratch, so the next test run
+starts from a known state instead of inheriting positions, open outputs and
+counters from the last one.
 
 The `Counters` item is deleted and rewritten rather than patched. Stale
 attributes are the whole problem this script exists to solve: a leftover
@@ -62,23 +62,11 @@ VISITOR_TABLES = {
 
 PHASES = ("idle", "pre_queue", "active", "post_event", "maintenance")
 
-# The striped counters live in the Counters table as their own items, one
-# partition key per shard, so that incrementing them never contends with the
-# sequences on the event's own item. That means deleting the event item alone
-# leaves the shards behind, and a stale pre-queue count would be folded into
-# the next open as a cohort of visitors who do not exist.
-SHARDS = 10
-SHARD_TAGS = ("PQ", "AR")
-
 
 def event_key(event_id: str) -> str:
     """Partition key of the event's own item. Mirrors wr_common::expr::event_key."""
     return f"EVT#{event_id}"
 
-
-def shard_key(event_id: str, tag: str, shard: int) -> str:
-    """Partition key of one striped counter shard."""
-    return f"EVT#{event_id}#{tag}#{shard}"
 
 # DynamoDB caps a BatchWriteItem at 25 requests.
 BATCH_LIMIT = 25
@@ -141,6 +129,40 @@ def empty_table(ddb, table: str, key_attr: str) -> int:
     return deleted
 
 
+def delete_event_items(ddb, table: str, event_id: str) -> int:
+    """Deletes every Counters item belonging to `event_id`, returning the count.
+
+    Swept by key prefix rather than by an enumerated list of item kinds. The
+    striped counters (`#PQ#`, `#AR#`) are separate items so that incrementing
+    them never contends with the sequences on the event's own item, and the
+    event item is rewritten afterwards -- but an enumerated list silently
+    strands any kind it does not name, which is how the demotion chunks and
+    report would have survived a reset forever had they ever been written.
+
+    Matches the event item exactly and anything below it, never a longer event
+    id that merely starts the same way: `EVT#spring` must not sweep
+    `EVT#spring-2027`. `event_id` cannot contain `#`, so the two forms are
+    exhaustive.
+    """
+    exact = event_key(event_id)
+    prefix = f"{exact}#"
+    deleted = 0
+    batch: list[dict] = []
+    paginator = ddb.get_paginator("scan")
+    for page in paginator.paginate(TableName=table, ProjectionExpression="event_id"):
+        for item in page.get("Items", []):
+            key = item.get("event_id", {}).get("S")
+            if key is None or not (key == exact or key.startswith(prefix)):
+                continue
+            batch.append({"DeleteRequest": {"Key": {"event_id": {"S": key}}}})
+            if len(batch) == BATCH_LIMIT:
+                deleted += flush(ddb, table, batch)
+                batch = []
+    if batch:
+        deleted += flush(ddb, table, batch)
+    return deleted
+
+
 def flush(ddb, table: str, batch: list[dict]) -> int:
     """Writes one batch, retrying whatever DynamoDB declines to process.
 
@@ -152,11 +174,15 @@ def flush(ddb, table: str, batch: list[dict]) -> int:
     pending = {table: batch}
     for _ in range(10):
         response = ddb.batch_write_item(RequestItems=pending)
-        pending = {t: reqs for t, reqs in response.get("UnprocessedItems", {}).items() if reqs}
+        pending = {
+            t: reqs for t, reqs in response.get("UnprocessedItems", {}).items() if reqs
+        }
         if not pending:
             return count
     remaining = sum(len(reqs) for reqs in pending.values())
-    raise RuntimeError(f"{table}: {remaining} deletes still unprocessed after 10 attempts")
+    raise RuntimeError(
+        f"{table}: {remaining} deletes still unprocessed after 10 attempts"
+    )
 
 
 def invalidate(cf, distribution_id: str, wait: bool) -> str:
@@ -192,7 +218,9 @@ def invalidate(cf, distribution_id: str, wait: bool) -> str:
     return invalidation_id
 
 
-def fresh_counters(event_id: str, phase: str, target_rate: int, queue_ahead: int) -> dict:
+def fresh_counters(
+    event_id: str, phase: str, target_rate: int, queue_ahead: int
+) -> dict:
     """The `Counters` item for an event that has never run.
 
     Only the attributes a fresh event genuinely has. The sequences are written
@@ -296,7 +324,10 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     if args.target_rate < 1:
-        print("--target-rate must be at least 1; use --phase to stop admission", file=sys.stderr)
+        print(
+            "--target-rate must be at least 1; use --phase to stop admission",
+            file=sys.stderr,
+        )
         return 2
 
     region = os.environ.get("AWS_REGION", "us-east-1")
@@ -341,19 +372,14 @@ def main() -> int:
         count = empty_table(ddb, tables[name], key_attr)
         print(f"{tables[name]}: deleted {count}")
 
-    say("Deleting the striped counter shards")
-    shard_keys = [
-        shard_key(event_id, tag, shard) for tag in SHARD_TAGS for shard in range(SHARDS)
-    ]
-    batch = [{"DeleteRequest": {"Key": {"event_id": {"S": key}}}} for key in shard_keys]
-    for start in range(0, len(batch), BATCH_LIMIT):
-        flush(ddb, tables["counters"], batch[start : start + BATCH_LIMIT])
-    print(f"{tables['counters']}: deleted {len(shard_keys)} shard items")
+    say("Deleting every item belonging to this event")
+    count = delete_event_items(ddb, tables["counters"], event_id)
+    print(f"{tables['counters']}: deleted {count} items")
 
     say("Rewriting the Counters item")
-    # Deleted first so no attribute from the previous run can survive: PutItem
-    # replaces the item, but only for the attributes it names.
-    ddb.delete_item(TableName=tables["counters"], Key={"event_id": {"S": event_key(event_id)}})
+    # The sweep above already deleted it, which is what makes this a rewrite
+    # rather than a patch: PutItem replaces an item but only for the attributes
+    # it names, so no attribute from the previous run can survive.
     item = fresh_counters(event_id, args.phase, args.target_rate, args.queue_ahead)
     ddb.put_item(TableName=tables["counters"], Item=item)
     for key in sorted(item):
@@ -396,7 +422,9 @@ def main() -> int:
             "at 10s each, since the controller doubles its release while nobody arrives."
         )
     else:
-        print("The event is live. A visitor arriving now queues and is admitted within a minute.")
+        print(
+            "The event is live. A visitor arriving now queues and is admitted within a minute."
+        )
     print(
         "\nAdmission cookies already in a browser survive this reset — CloudFront verifies"
         "\nthem against the signing key, not against anything just deleted. Clear cookies for"
