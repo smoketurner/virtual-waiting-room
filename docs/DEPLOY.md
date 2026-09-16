@@ -100,7 +100,7 @@ override the file, so the file stays the single source of truth. Copy
 | `client_origin_domain_name` | *(empty)*   | Bare domain of the protected origin CloudFront fronts. Host only — no scheme, no path. Empty protects the built-in demo origin instead, which is a working stack that guards nothing real. |
 | `admission_rate`            | `5`         | Visitors per second, seeded onto the event item. Zero would release nobody, forever, so this has a real default. Changed live from the dashboard. |
 | `gate_rules`                | *(empty)*   | Which requests the gate covers, one rule per line — same grammar as the dashboard's Set rules form. Empty is dormant: every request passes through. |
-| `starts_at`                 | *(empty)*   | When the event opens, local date-time with no zone. Empty leaves the schedule disabled. |
+| `starts_at`                 | *(empty)*   | When the event opens, local date-time with no zone. Empty leaves the schedule disabled — the event then opens when an operator presses **Open now** on the dashboard, or never. |
 | `starts_at_timezone`        | `UTC`       | IANA zone `starts_at` is evaluated in. |
 | `oidc_client_id`, `oidc_redirect_uri`, `oidc_allowed_emails` | *(empty)* | **Required — the apply fails without them.** See the two-pass note below. The client secret is not here; it goes in an SSM SecureString out of band. |
 

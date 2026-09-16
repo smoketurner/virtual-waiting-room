@@ -15,6 +15,7 @@ pub mod arrival;
 pub mod dynamo;
 pub mod edge;
 pub mod oidc;
+pub mod opener;
 pub mod scheduler;
 pub mod security;
 pub mod sessions;
@@ -153,6 +154,31 @@ pub trait OpenSchedule {
 #[error("open schedule error: {0}")]
 pub struct ScheduleError(pub String);
 
+/// Opens the event immediately, rather than waiting for the schedule.
+///
+/// The open is a single conditional write guarded by the seed's absence, so
+/// this is idempotent: firing it twice, or firing it into a schedule that has
+/// already run, is a no-op rather than a second permutation.
+pub trait Opener {
+    /// Performs the open and reports whether this call was the one that did it.
+    fn open_now(&self) -> impl Future<Output = Result<OpenNow, OpenError>> + Send;
+}
+
+/// What an [`Opener::open_now`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenNow {
+    /// This call opened the event.
+    Opened,
+    /// The event was already open; nothing changed. A scheduled open that had
+    /// already fired, or a double-submitted form.
+    AlreadyOpen,
+}
+
+/// An open failure.
+#[derive(Debug, thiserror::Error)]
+#[error("open error: {0}")]
+pub struct OpenError(pub String);
+
 /// The persistence port the admin actions drive. Reading the current `Counters`
 /// state and applying one guarded mutation to it.
 pub trait Store {
@@ -265,6 +291,19 @@ pub trait Store {
         now: ArrivalTime,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
+    /// Stamps the audit fields alone, for an action whose real effect landed
+    /// somewhere other than this item. Unconditional and called *after* that
+    /// effect: it records what happened rather than causing it, and nothing
+    /// reads it back to make a decision, so a failure here is logged and
+    /// swallowed rather than failing the operator's action.
+    fn stamp_action(
+        &self,
+        event_id: &str,
+        action: AdminAction,
+        actor: &str,
+        now: ArrivalTime,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
     /// Forces the maintenance phase, guarded on the expected current phase and
     /// stamping audit. NOT debounced — the emergency full-stop must always apply.
     fn force_maintenance(
@@ -356,6 +395,8 @@ pub enum AdminAction {
     SetStartTime,
     /// Clears the scheduled start, disabling the open schedule.
     ClearStartTime,
+    /// Opens the event immediately rather than waiting for the schedule.
+    OpenNow,
 }
 
 impl AdminAction {
@@ -373,6 +414,7 @@ impl AdminAction {
             Self::Recover => "recover",
             Self::SetRules => "set_rules",
             Self::SetStartTime => "set_start_time",
+            Self::OpenNow => "open_now",
             Self::ClearStartTime => "clear_start_time",
         }
     }
@@ -437,6 +479,9 @@ pub enum ActionError {
     /// the client sent, not necessarily one of the offered options.
     #[error("unknown timezone")]
     UnknownTimezone,
+    /// The active phase was requested for an event that has never been opened.
+    #[error("the event has not been opened; use Open now or a scheduled start")]
+    NotOpened,
 }
 
 /// A validated operator-supplied start time (issue #128), carrying every form
@@ -586,10 +631,16 @@ pub fn next_phases(from: Phase) -> Vec<Phase> {
     use Phase::{Active, Idle, Maintenance, PostEvent, PreQueue};
     match from {
         Idle => vec![PreQueue],
-        PreQueue => vec![Active],
         Active => vec![PostEvent],
-        // Event over: no forward step; start a new event.
-        PostEvent => vec![],
+        // Two dead ends for different reasons. The pre-queue's way forward is
+        // the open itself — one conditional update writing the permutation
+        // seed, the prefix offsets, the cohort size and `Active` together —
+        // so a phase flipped to `Active` on its own is an event that says it
+        // is open while `/queue_num` tells every pre-queue visitor it is not,
+        // nothing having written the seed their position is derived from. The
+        // schedule opens it, or the operator presses Open now. The finished
+        // event has no forward step at all; start another.
+        PreQueue | PostEvent => vec![],
         // Maintenance is a recoverable stop, not a dead-end: offer a return to
         // the running event or a reset to idle. `transition_allowed` permits
         // maintenance -> anything, so both are legal.
@@ -614,8 +665,9 @@ pub fn next_phases(from: Phase) -> Vec<Phase> {
 /// [`ActionError::UnknownPhase`] if the phase string is not a known phase;
 /// [`ActionError::NotFound`] if the event is missing;
 /// [`ActionError::IllegalTransition`] if the transition is illegal (including
-/// any target of `Maintenance`); the store's [`StoreError`] is mapped to
-/// [`ActionError`] on a lost race.
+/// any target of `Maintenance`); [`ActionError::NotOpened`] if `active` is
+/// requested for an event the open has never run for; the store's
+/// [`StoreError`] is mapped to [`ActionError`] on a lost race.
 pub async fn apply_phase<S: Store>(
     store: &S,
     event_id: &str,
@@ -640,6 +692,17 @@ pub async fn apply_phase<S: Store>(
             to,
         }
         .into());
+    }
+    // `Active` means "opened", and only the open can make that true: it writes
+    // the permutation seed, the prefix offsets and the cohort size in the same
+    // conditional update as the phase. A cohort size on the item is proof all
+    // of it landed. Without it, this write would produce an event that reports
+    // itself open while `/queue_num` answers "not yet open" to every pre-queue
+    // visitor. The dropdown no longer offers the transition; this catches the
+    // hand-crafted request, and the recovery path out of maintenance for an
+    // event that was forced into it before it was ever opened.
+    if to == Phase::Active && state.participant_count.is_none() {
+        return Err(ActionError::NotOpened.into());
     }
     store
         .set_phase(event_id, state.phase, to, AdminAction::SetPhase, actor, now)
@@ -973,6 +1036,58 @@ pub async fn apply_start_time<S: Store, K: OpenSchedule>(
     Ok(())
 }
 
+/// Opens the event now, instead of waiting for the schedule.
+///
+/// This invokes the same function the schedule invokes, because the open is
+/// one conditional write — seed, prefix offsets, cohort size and the active
+/// phase together, guarded by the seed's absence — and that guard is what
+/// makes a double-fire safe. Setting the phase to `Active` from here instead
+/// would produce an event that *says* it is open while `/queue_num` answers
+/// "not yet open" to every pre-queue visitor, because nothing would have
+/// written the permutation seed their position is derived from.
+///
+/// Idempotent by construction: an event the schedule already opened reports
+/// [`OpenNow::AlreadyOpen`] and nothing changes. The audit stamp is written
+/// only when this call was the one that opened it, so the record does not
+/// claim an open it did not perform.
+///
+/// The open is the authoritative write, so the stamp follows it. A failed
+/// stamp is logged rather than returned: the event is open either way, and
+/// reporting failure would invite an operator to press the button again
+/// looking for an open that has already happened.
+///
+/// # Errors
+///
+/// [`ActionError::NotFound`] if the event item does not exist;
+/// [`ActionError::TooFast`] inside the debounce window; a [`StoreError`] if
+/// the invoke fails.
+pub async fn apply_open_now<S: Store, O: Opener>(
+    store: &S,
+    opener: &O,
+    event_id: &str,
+    actor: &str,
+    now: ArrivalTime,
+) -> Result<OpenNow, ApplyError> {
+    let Some(state) = store.load(event_id).await? else {
+        return Err(ActionError::NotFound.into());
+    };
+    debounce_check(&state, now)?;
+
+    let outcome = opener
+        .open_now()
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+
+    if outcome == OpenNow::Opened
+        && let Err(e) = store
+            .stamp_action(event_id, AdminAction::OpenNow, actor, now)
+            .await
+    {
+        tracing::error!(error = %e, event = "open_audit_failed", "event was opened but the audit stamp failed");
+    }
+    Ok(outcome)
+}
+
 /// Replaces the edge gate's ruleset (issue #71). The `KeyValueStore` is the
 /// sole store for `rules` — this reads the current config, keeps
 /// `enforce_from` and `fail_open_until` exactly as they were, replaces only
@@ -1216,6 +1331,10 @@ mod tests {
         rules_audit: Mutex<Option<(String, usize)>>,
         /// The scheduled start (issue #128), `None` when unscheduled.
         starts_at: Mutex<Option<u64>>,
+        /// The cohort size the open wrote, `None` until the open has run. It
+        /// is the admin's proof that the seed and offsets landed too, all four
+        /// being one conditional update.
+        participant_count: Mutex<Option<u64>>,
         starts_at_timezone: Mutex<Option<String>>,
         /// Ordered log of every write to either store, so a test can assert
         /// which one moved first rather than only that both did. Shared with
@@ -1239,6 +1358,7 @@ mod tests {
                 fail_open_until: Mutex::new(0),
                 starts_at: Mutex::new(None),
                 starts_at_timezone: Mutex::new(None),
+                participant_count: Mutex::new(None),
                 writes: Arc::new(Mutex::new(Vec::new())),
                 starts_at_write_fails: false,
                 control_action: Mutex::new(None),
@@ -1256,6 +1376,40 @@ mod tests {
     /// An in-memory [`EdgeConfigStore`], mirroring the `KeyValueStore`'s
     /// read-modify-write shape closely enough to exercise the write ordering
     /// `apply_fail_open`/`apply_recover` depend on.
+    /// An [`Opener`] that counts its invocations, so a test can tell "the open
+    /// ran and reported already-open" from "the open never ran".
+    struct FakeOpener {
+        calls: Mutex<u32>,
+        result: Result<OpenNow, &'static str>,
+    }
+
+    impl FakeOpener {
+        fn reporting(outcome: OpenNow) -> Self {
+            Self {
+                calls: Mutex::new(0),
+                result: Ok(outcome),
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                calls: Mutex::new(0),
+                result: Err("invoke failed"),
+            }
+        }
+
+        fn calls(&self) -> u32 {
+            *self.calls.lock().unwrap()
+        }
+    }
+
+    impl Opener for FakeOpener {
+        fn open_now(&self) -> impl Future<Output = Result<OpenNow, OpenError>> + Send {
+            *self.calls.lock().unwrap() += 1;
+            std::future::ready(self.result.map_err(|e| OpenError(e.to_owned())))
+        }
+    }
+
     /// A [`OpenSchedule`] that records what it was told, sharing the store's
     /// write log so a test can assert which of the two moved first.
     struct FakeOpenSchedule {
@@ -1356,6 +1510,17 @@ mod tests {
             }
         }
 
+        /// An event the open has already run for: it carries a cohort size, so
+        /// the `Active` phase is truthful rather than a claim with no
+        /// permutation behind it.
+        fn opened_with_phase(phase: Phase) -> Self {
+            Self {
+                phase: Mutex::new(phase),
+                participant_count: Mutex::new(Some(1_000)),
+                ..Self::default()
+            }
+        }
+
         /// Stamps all four audit fields, mirroring `apply_audit_values` in the
         /// real store; every mutating method calls this.
         fn stamp_audit(&self, action: AdminAction, actor: &str, now: ArrivalTime) {
@@ -1379,7 +1544,7 @@ mod tests {
                     phase: *self.phase.lock().unwrap(),
                     serving_counter: 0,
                     queue_counter: 0,
-                    participant_count: None,
+                    participant_count: *self.participant_count.lock().unwrap(),
                     target_rate: *self.rate.lock().unwrap(),
                     message: self.message.lock().unwrap().clone(),
                     stored_control: *self.control.lock().unwrap(),
@@ -1505,6 +1670,22 @@ mod tests {
             std::future::ready(result)
         }
 
+        fn stamp_action(
+            &self,
+            _event_id: &str,
+            action: AdminAction,
+            actor: &str,
+            now: ArrivalTime,
+        ) -> impl Future<Output = Result<(), StoreError>> + Send {
+            let result = if self.conflict {
+                Err(StoreError::Conflict)
+            } else {
+                self.stamp_audit(action, actor, now);
+                Ok(())
+            };
+            std::future::ready(result)
+        }
+
         fn set_rules_audit(
             &self,
             _event_id: &str,
@@ -1569,10 +1750,27 @@ mod tests {
     fn next_phases_offers_only_the_single_forward_step() {
         use Phase::{Active, Idle, PostEvent, PreQueue};
         assert_eq!(next_phases(Idle), vec![PreQueue]);
-        assert_eq!(next_phases(PreQueue), vec![Active]);
         assert_eq!(next_phases(Active), vec![PostEvent]);
         // Only the finished event is a dead end.
         assert_eq!(next_phases(PostEvent), Vec::<Phase>::new());
+    }
+
+    #[test]
+    fn the_operator_cannot_reach_active_without_opening_the_event() {
+        // `Active` is not a step an operator takes: the open writes the
+        // permutation seed, the prefix offsets, the cohort size and the phase
+        // together in one conditional update. Offering the phase alone let an
+        // operator produce an event that reports itself open while
+        // `/queue_num` answers "not yet open" to every pre-queue visitor,
+        // because nothing had written the seed their position derives from.
+        assert_eq!(
+            next_phases(Phase::PreQueue),
+            Vec::<Phase>::new(),
+            "the pre-queue's only way forward is the open itself"
+        );
+        // Maintenance is different: an event there has already been opened, so
+        // returning to Active resumes one that has its seed.
+        assert!(next_phases(Phase::Maintenance).contains(&Phase::Active));
     }
 
     #[test]
@@ -1991,7 +2189,7 @@ mod tests {
         // dashboard dropdown path: force_maintenance (audited) then
         // apply_phase(Maintenance -> Active) — the ADR-0017 Revision's
         // designated recovery route, which must also be audited.
-        let store = FakeStore::with_phase(Phase::Active);
+        let store = FakeStore::opened_with_phase(Phase::Active);
 
         // Audited emergency stop.
         apply_reset(&store, "evt", "op@x", ts(5_000)).await.unwrap();
@@ -2048,13 +2246,12 @@ mod tests {
         assert_eq!(state.last_action_by.as_deref(), Some("alice"));
         assert_eq!(state.last_action_time, Some(ts(1_000).timestamp()));
 
-        apply_phase(&store, "evt", "active", "bob", ts(2_000))
-            .await
-            .unwrap();
-        let state = store.load("evt").await.unwrap().unwrap();
-        assert_eq!(state.last_action.as_deref(), Some("set_phase"));
-        assert_eq!(state.last_action_by.as_deref(), Some("bob"));
-        assert_eq!(state.last_action_time, Some(ts(2_000).timestamp()));
+        // The open, not an operator, moves the pre-queue to active: it writes
+        // the cohort size and the phase in one conditional update. Standing in
+        // for it here, since `apply_phase` refuses `active` without the cohort
+        // size and there is nothing else that could write it.
+        *store.participant_count.lock().unwrap() = Some(1_000);
+        *store.phase.lock().unwrap() = Phase::Active;
 
         apply_phase(&store, "evt", "post_event", "carol", ts(3_000))
             .await
@@ -2063,6 +2260,144 @@ mod tests {
         assert_eq!(state.last_action.as_deref(), Some("set_phase"));
         assert_eq!(state.last_action_by.as_deref(), Some("carol"));
         assert_eq!(state.last_action_time, Some(ts(3_000).timestamp()));
+    }
+
+    #[tokio::test]
+    async fn the_active_phase_is_refused_for_an_event_that_was_never_opened() {
+        // The transition table still allows pre_queue -> active, and
+        // maintenance -> active is the recovery route, so a hand-crafted POST
+        // could reach `Active` on an event with no permutation seed. Both are
+        // refused on the same evidence: no cohort size means the open never
+        // ran, and the phase would be a claim with nothing behind it.
+        for from in [Phase::PreQueue, Phase::Maintenance] {
+            let store = FakeStore::with_phase(from);
+            let err = apply_phase(&store, "evt", "active", "op", ts(1_000)).await;
+            assert!(
+                matches!(err, Err(ApplyError::Action(ActionError::NotOpened))),
+                "{from:?} -> active must be refused without a cohort size, got {err:?}"
+            );
+            assert_eq!(
+                *store.phase.lock().unwrap(),
+                from,
+                "the phase must not move"
+            );
+        }
+
+        // The same recovery is legal once the open has run.
+        let store = FakeStore::opened_with_phase(Phase::Maintenance);
+        apply_phase(&store, "evt", "active", "op", ts(1_000))
+            .await
+            .unwrap();
+        assert_eq!(*store.phase.lock().unwrap(), Phase::Active);
+    }
+
+    #[tokio::test]
+    async fn open_now_opens_the_event_and_records_who_did_it() {
+        let store = FakeStore::with_phase(Phase::PreQueue);
+        let opener = FakeOpener::reporting(OpenNow::Opened);
+
+        let outcome = apply_open_now(&store, &opener, "evt", "op@x", ts(1_000))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, OpenNow::Opened);
+        assert_eq!(opener.calls(), 1);
+        let state = store.load("evt").await.unwrap().unwrap();
+        assert_eq!(state.last_action.as_deref(), Some("open_now"));
+        assert_eq!(state.last_action_by.as_deref(), Some("op@x"));
+        assert_eq!(state.last_action_time, Some(ts(1_000).timestamp()));
+        // The admin writes no phase of its own: the open's conditional update
+        // carries the phase along with the seed it derives from.
+        assert_eq!(*store.phase.lock().unwrap(), Phase::PreQueue);
+    }
+
+    #[tokio::test]
+    async fn an_open_that_was_already_open_is_not_recorded_as_an_opening() {
+        // A schedule that fired a second earlier, or a double-submitted form.
+        // The button is reported as succeeding — the event *is* open — but the
+        // audit line must not claim an operator opened it.
+        let store = FakeStore::with_phase(Phase::PreQueue);
+        let opener = FakeOpener::reporting(OpenNow::AlreadyOpen);
+
+        let outcome = apply_open_now(&store, &opener, "evt", "op@x", ts(1_000))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, OpenNow::AlreadyOpen);
+        assert_eq!(opener.calls(), 1);
+        let state = store.load("evt").await.unwrap().unwrap();
+        assert_eq!(state.last_action, None, "nothing was opened to record");
+    }
+
+    #[tokio::test]
+    async fn a_failed_open_is_reported_rather_than_read_as_an_open() {
+        let store = FakeStore::with_phase(Phase::PreQueue);
+        let opener = FakeOpener::failing();
+
+        let err = apply_open_now(&store, &opener, "evt", "op@x", ts(1_000)).await;
+
+        assert!(
+            matches!(err, Err(ApplyError::Store(StoreError::Backend(_)))),
+            "got {err:?}"
+        );
+        let state = store.load("evt").await.unwrap().unwrap();
+        assert_eq!(state.last_action, None, "a failed open audits nothing");
+    }
+
+    #[tokio::test]
+    async fn open_now_is_debounced_without_invoking_the_open() {
+        // The debounce is what a double-click hits. The open's own conditional
+        // write makes a second fire harmless, but the check must happen before
+        // the invoke: a second invoke is a second cold start and a second
+        // `UpdateItem` for an answer already known.
+        let store = FakeStore::with_phase(Phase::PreQueue);
+        let opener = FakeOpener::reporting(OpenNow::Opened);
+
+        apply_open_now(&store, &opener, "evt", "op@x", ts(1_000))
+            .await
+            .unwrap();
+        let err = apply_open_now(&store, &opener, "evt", "op@x", ts(1_001)).await;
+
+        assert!(
+            matches!(err, Err(ApplyError::Action(ActionError::TooFast))),
+            "got {err:?}"
+        );
+        assert_eq!(opener.calls(), 1, "the debounced press must not invoke");
+    }
+
+    #[tokio::test]
+    async fn open_now_on_a_missing_event_never_invokes_the_open() {
+        let store = FakeStore {
+            missing: true,
+            ..FakeStore::default()
+        };
+        let opener = FakeOpener::reporting(OpenNow::Opened);
+
+        let err = apply_open_now(&store, &opener, "evt", "op@x", ts(1_000)).await;
+
+        assert!(
+            matches!(err, Err(ApplyError::Action(ActionError::NotFound))),
+            "got {err:?}"
+        );
+        assert_eq!(opener.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_audit_stamp_does_not_report_the_open_as_failed() {
+        // The open is the authoritative write and it already landed. Reporting
+        // failure here would invite the operator to press the button again
+        // looking for an open that has happened.
+        let store = FakeStore {
+            conflict: true,
+            ..FakeStore::with_phase(Phase::PreQueue)
+        };
+        let opener = FakeOpener::reporting(OpenNow::Opened);
+
+        let outcome = apply_open_now(&store, &opener, "evt", "op@x", ts(1_000))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, OpenNow::Opened);
     }
 
     #[tokio::test]

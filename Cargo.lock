@@ -12,6 +12,7 @@ dependencies = [
  "aws-lc-rs",
  "aws-sdk-cloudfrontkeyvaluestore",
  "aws-sdk-dynamodb",
+ "aws-sdk-lambda",
  "aws-sdk-scheduler",
  "aws-sdk-ssm",
  "axum",

@@ -4,8 +4,8 @@
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 use lambda_runtime::{Error, LambdaEvent, service_fn};
 use open_event::dynamo::DynamoStore;
-use open_event::open_event;
-use serde::Deserialize;
+use open_event::{OpenResult, open_event};
+use serde::{Deserialize, Serialize};
 
 /// The scheduler payload names the event to open.
 #[derive(Debug, Deserialize)]
@@ -34,14 +34,25 @@ async fn main() -> Result<(), Error> {
     .await
 }
 
+/// What the open did. The scheduler ignores this; the admin Lambda's
+/// "Open now" reads it, because "already open" and "opened" are the same
+/// success to the caller and a different thing to say to the operator.
+#[derive(Debug, Serialize)]
+struct OpenResponse {
+    opened: bool,
+}
+
 async fn handle(
     store: &DynamoStore,
     rng: &SystemRandom,
     event: LambdaEvent<OpenRequest>,
-) -> Result<(), Error> {
+) -> Result<OpenResponse, Error> {
     let mut seed = [0u8; 32];
     rng.fill(&mut seed)
         .map_err(|_| Error::from("failed to generate open seed"))?;
-    open_event(store, &event.payload.event_id, seed).await?;
-    Ok(())
+    let opened = match open_event(store, &event.payload.event_id, seed).await? {
+        OpenResult::Opened(_) => true,
+        OpenResult::AlreadyOpen => false,
+    };
+    Ok(OpenResponse { opened })
 }

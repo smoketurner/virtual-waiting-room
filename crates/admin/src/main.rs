@@ -16,13 +16,14 @@ use admin::arrival::{ArrivalTime, arrival_layer};
 use admin::dynamo::DynamoStore;
 use admin::edge::KvsStore;
 use admin::oidc::{self, OidcClient, OidcConfig};
+use admin::opener::LambdaOpener;
 use admin::scheduler::SchedulerStore;
 use admin::sessions::{AdminSession, PendingLogin, SessionStore};
 use admin::templates::Dashboard;
 use admin::{
-    ApplyError, EdgeConfigStore, apply_fail_open, apply_message, apply_pause, apply_phase,
-    apply_rate, apply_recover, apply_reset, apply_resume, apply_set_rules, apply_start_time,
-    format_rules, parse_rules,
+    ApplyError, EdgeConfigStore, apply_fail_open, apply_message, apply_open_now, apply_pause,
+    apply_phase, apply_rate, apply_recover, apply_reset, apply_resume, apply_set_rules,
+    apply_start_time, format_rules, parse_rules,
 };
 use askama::Template;
 use axum::Form;
@@ -60,6 +61,9 @@ struct AppState {
     /// The one-time open schedule the operator's start time writes (issue
     /// #128).
     schedule: SchedulerStore,
+    /// Opens the event on demand, by invoking the same function the schedule
+    /// invokes.
+    opener: LambdaOpener,
     sessions: SessionStore,
     oidc: OidcClient,
     http: reqwest::Client,
@@ -115,11 +119,18 @@ async fn main() -> Result<(), Error> {
 
     let kvs = aws_sdk_cloudfrontkeyvaluestore::Client::new(&config);
     let scheduler = aws_sdk_scheduler::Client::new(&config);
+    let lambda = aws_sdk_lambda::Client::new(&config);
+    let event_id = std::env::var("EVENT_ID")?;
 
     let state = Arc::new(AppState {
         store: DynamoStore::new(dynamo.clone(), std::env::var("COUNTERS_TABLE")?),
         edge: KvsStore::new(kvs, std::env::var("EDGE_KVS_ARN")?),
         schedule: SchedulerStore::new(scheduler, std::env::var("OPEN_SCHEDULE_NAME")?),
+        opener: LambdaOpener::new(
+            lambda,
+            std::env::var("OPEN_EVENT_FUNCTION_NAME")?,
+            event_id.clone(),
+        ),
         sessions: SessionStore::new(dynamo, std::env::var("TOKENS_TABLE")?),
         oidc,
         http,
@@ -144,6 +155,7 @@ async fn main() -> Result<(), Error> {
         .route("/admin/rate", post(set_rate))
         .route("/admin/message", post(set_message))
         .route("/admin/start_time", post(set_start_time))
+        .route("/admin/open_now", post(open_now))
         .route("/admin/reset", post(reset))
         .route("/admin/pause", post(pause))
         .route("/admin/resume", post(resume))
@@ -506,6 +518,29 @@ async fn set_message(
 struct StartTimeForm {
     starts_at: String,
     timezone: String,
+}
+
+/// Opens the event immediately, rather than waiting for the schedule.
+///
+/// The phase dropdown deliberately does not offer this transition: the open is
+/// one conditional write carrying the permutation seed, and a phase flipped to
+/// `Active` without it is an event that says it is open while every pre-queue
+/// visitor is told it is not.
+async fn open_now(State(state): State<Shared>, headers: HeaderMap, now: ArrivalTime) -> Response {
+    let Some(session) = authed(&state, &headers, now).await else {
+        return Redirect::to("/admin/login").into_response();
+    };
+    finish(
+        apply_open_now(
+            &state.store,
+            &state.opener,
+            &state.event_id,
+            &session.email,
+            now,
+        )
+        .await
+        .map(|_outcome| ()),
+    )
 }
 
 async fn set_start_time(

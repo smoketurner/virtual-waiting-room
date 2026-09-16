@@ -243,6 +243,16 @@ data "aws_iam_policy_document" "admin" {
     }
   }
 
+  # "Open now" starts the event without waiting for the schedule, by invoking
+  # the function the schedule invokes. The same grant the scheduler's own role
+  # holds, on the same one function.
+  statement {
+    sid       = "OpenTheEventNow"
+    effect    = "Allow"
+    actions   = ["lambda:InvokeFunction"]
+    resources = [aws_lambda_function.open_event.arn]
+  }
+
   statement {
     sid    = "Logs"
     effect = "Allow"

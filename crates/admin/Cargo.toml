@@ -21,6 +21,7 @@ aws-config = { workspace = true, features = ["behavior-version-latest", "default
 aws-lc-rs = { workspace = true, features = ["aws-lc-sys"] }
 aws-sdk-cloudfrontkeyvaluestore = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio", "sigv4a"] }
 aws-sdk-dynamodb = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+aws-sdk-lambda = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 aws-sdk-scheduler = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 aws-sdk-ssm = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 axum = { workspace = true, features = ["http1", "query", "form", "json", "tokio"] }
