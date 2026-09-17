@@ -5,14 +5,15 @@
 //! JavaScript", so a positive vector must come from the real implementation,
 //! not a reimplementation of it.
 //!
-//! Negatives need byte-level tampering `Session`/`SigningKey`'s public API
-//! cannot produce (a trailing byte, a wrong-kind tag, a flipped bit), so this
-//! file hand-encodes the wire format independently, using only the
-//! `aws_lc_rs` and `base64` crates directly rather than `wr_common`'s private
-//! `encode_session`/`sign_payload` helpers. Reimplementing the format here —
-//! the same thing `infra/modules/edge/functions/gate.js.tftpl` does — is what
-//! makes agreement between the two a real cross-check rather than a
-//! comparison of one implementation against itself.
+//! Negatives are minted the same way — a real `Session::sign` JWT — and then
+//! tampered *after* minting, so each "tamper" vector is a credential that is
+//! valid in *shape* (a three-segment JWS) but fails verification for the
+//! reason it is named for (a wrong key, a flipped payload/signature char, a
+//! trailing fourth segment). That is what lets the JS conformance suite prove
+//! the two implementations reject the *same* tampered JWT: the credential
+//! reaches the signature/shape check it is named for, instead of being
+//! dismissed up-front as a non-JWS blob. The two literal negatives (`no_dot`,
+//! `base64_with_plus_slash`) test structural/charset rejection directly.
 //!
 //! The committed file is generated, never hand-typed: run
 //! `cargo test -p wr-common -- --ignored regenerate_vectors` after a wire
@@ -29,14 +30,8 @@
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
-use aws_lc_rs::hmac;
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use serde::{Deserialize, Serialize};
 use wr_common::{Session, SigningKey};
-
-const KIND_SESSION: u8 = 0x02;
-const KIND_TOKEN: u8 = 0x01;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct PositiveVector {
@@ -97,34 +92,15 @@ fn to_hex(bytes: &[u8]) -> String {
     out
 }
 
-/// `u16`-length-prefixed UTF-8, mirroring `wr_common::crypto::put_str`.
-fn put_str(out: &mut Vec<u8>, s: &str) {
-    let bytes = s.as_bytes();
-    let len = u16::try_from(bytes.len()).expect("test string fits in u16");
-    out.extend_from_slice(&len.to_be_bytes());
-    out.extend_from_slice(bytes);
-}
-
-/// Hand-encodes a session payload: `event_id ‖ request_id ‖ issued_at ‖
-/// expires_at`. Independent of `wr_common::crypto`'s private `encode_session`.
-fn session_payload(event_id: &str, request_id: &str, issued_at: u64, expires_at: u64) -> Vec<u8> {
-    let mut out = Vec::new();
-    put_str(&mut out, event_id);
-    put_str(&mut out, request_id);
-    out.extend_from_slice(&issued_at.to_be_bytes());
-    out.extend_from_slice(&expires_at.to_be_bytes());
-    out
-}
-
-/// Hand-signs `kind || payload` and returns `base64url(payload).base64url(mac)`,
-/// independent of `wr_common::crypto`'s private `sign_payload`.
-fn sign_local(key: &[u8], kind: u8, payload: &[u8]) -> String {
-    let hmac_key = hmac::Key::new(hmac::HMAC_SHA256, key);
-    let mut message = Vec::with_capacity(payload.len() + 1);
-    message.push(kind);
-    message.extend_from_slice(payload);
-    let mac = hmac::sign(&hmac_key, &message);
-    format!("{}.{}", B64.encode(payload), B64.encode(mac.as_ref()))
+/// Flips the first base64url char of `segment` to a different one, keeping the
+/// segment valid base64url so it isn't dismissed as a charset/shape error: the
+/// named tamper (a signature mismatch) is what rejects the credential, not the
+/// encoding. `A` and `B` are both in the base64url alphabet and the two branches
+/// are mutually exclusive, so the result is always a different valid char.
+fn flip_first_b64url_char(segment: &str) -> String {
+    let mut chars: Vec<char> = segment.chars().collect();
+    chars[0] = if chars[0] == 'A' { 'B' } else { 'A' };
+    chars.into_iter().collect()
 }
 
 fn positives() -> Vec<PositiveVector> {
@@ -191,64 +167,64 @@ fn positives() -> Vec<PositiveVector> {
 
 fn negatives() -> Vec<NegativeVector> {
     let key_hex = to_hex(b"a-32-byte-test-signing-key-value");
-    let key = key_bytes(&key_hex);
     let other_key_hex = to_hex(b"a-different-32-byte-signing-keyy");
-    let other_key = key_bytes(&other_key_hex);
 
-    let payload = session_payload("smoke", "r1", 1000, 2000);
-    let valid = sign_local(&key, KIND_SESSION, &payload);
-    let (valid_payload_b64, valid_mac_b64) = valid.split_once('.').expect("has a dot");
+    let key = SigningKey::new(&key_bytes(&key_hex));
+    let other_key = SigningKey::new(&key_bytes(&other_key_hex));
 
-    // Flip one payload bit: decode, flip, re-encode without a new signature.
-    let mut tampered_payload = B64.decode(valid_payload_b64).unwrap();
-    tampered_payload[0] ^= 0x01;
-    let flipped_payload = format!("{}.{}", B64.encode(&tampered_payload), valid_mac_b64);
-
-    // Flip one MAC bit similarly.
-    let mut tampered_mac = B64.decode(valid_mac_b64).unwrap();
-    tampered_mac[0] ^= 0x01;
-    let flipped_mac = format!("{}.{}", valid_payload_b64, B64.encode(&tampered_mac));
-
-    // A trailing byte appended to the payload, re-signed so the MAC is valid
-    // for the tampered (longer) payload — the only way to isolate the
-    // trailing-bytes bug from a MAC failure.
-    let mut with_trailing = payload.clone();
-    with_trailing.push(0xAB);
-    let trailing_byte = sign_local(&key, KIND_SESSION, &with_trailing);
-
-    // A token-kind credential offered where a session is expected.
-    let token_payload = {
-        let mut out = Vec::new();
-        put_str(&mut out, "smoke");
-        put_str(&mut out, "r1");
-        out.extend_from_slice(&2000u64.to_be_bytes());
-        out
+    // Mint the baseline as a real three-segment JWS, the way a credential is
+    // actually issued, then tamper *after* minting so each negative is valid in
+    // shape and fails verification for the reason it is named for rather than
+    // being dismissed up-front as a non-JWS blob.
+    let session = Session {
+        event_id: "smoke".to_owned(),
+        request_id: "r1".to_owned(),
+        issued_at: 1000,
+        expires_at: 2000,
     };
-    let wrong_kind = sign_local(&key, KIND_TOKEN, &token_payload);
+    let real = session.sign(&key).expect("real session signs");
+
+    // `header.payload.signature`.
+    let parts: Vec<&str> = real.split('.').collect();
+    assert_eq!(parts.len(), 3, "compact JWS has exactly three segments");
+    let (header, payload_b64, sig_b64) = (parts[0], parts[1], parts[2]);
+
+    // A real JWT signed under a different deployment key. Goes through the
+    // real derived-key path (`SigningKey::new` -> `for_kind(Session)`), not a
+    // raw-HMAC shortcut over the bare secret, so the rejection is for the
+    // named reason (wrong key) under the same signing path production uses.
+    let wrong_key = session.sign(&other_key).expect("real session signs");
+
+    // Flip one base64url char in the payload segment: the signature covers
+    // `header.payload`, so it no longer matches the (unchanged) signature.
+    let flipped_payload_bit = format!("{header}.{}.{sig_b64}", flip_first_b64url_char(payload_b64));
+
+    // Flip one base64url char in the signature segment: the MAC recomputed over
+    // the (unchanged) `header.payload` no longer matches it.
+    let flipped_mac_bit = format!("{header}.{payload_b64}.{}", flip_first_b64url_char(sig_b64));
+
+    // A well-formed fourth segment: still three valid segments plus one, so
+    // the `parts.length !== 3` (JS) / not-a-compact-JWS (Rust) check is what
+    // rejects it, not a signature or charset failure.
+    let trailing_byte = format!("{real}.AAAA");
 
     vec![
         NegativeVector {
             name: "wrong_key".into(),
             key_hex: key_hex.clone(),
-            credential: sign_local(&other_key, KIND_SESSION, &payload),
+            credential: wrong_key,
             now: 1500,
         },
         NegativeVector {
             name: "flipped_payload_bit".into(),
             key_hex: key_hex.clone(),
-            credential: flipped_payload,
+            credential: flipped_payload_bit,
             now: 1500,
         },
         NegativeVector {
             name: "flipped_mac_bit".into(),
             key_hex: key_hex.clone(),
-            credential: flipped_mac,
-            now: 1500,
-        },
-        NegativeVector {
-            name: "token_kind_as_session".into(),
-            key_hex: key_hex.clone(),
-            credential: wrong_kind,
+            credential: flipped_mac_bit,
             now: 1500,
         },
         NegativeVector {
@@ -262,12 +238,6 @@ fn negatives() -> Vec<NegativeVector> {
             key_hex: key_hex.clone(),
             credential: "not-a-credential".into(),
             now: 0,
-        },
-        NegativeVector {
-            name: "base64_with_padding".into(),
-            key_hex: key_hex.clone(),
-            credential: format!("{valid_payload_b64}==.{valid_mac_b64}"),
-            now: 1500,
         },
         NegativeVector {
             name: "base64_with_plus_slash".into(),

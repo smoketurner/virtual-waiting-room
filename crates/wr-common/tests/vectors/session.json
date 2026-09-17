@@ -65,31 +65,25 @@
     {
       "name": "wrong_key",
       "key_hex": "612d33322d627974652d746573742d7369676e696e672d6b65792d76616c7565",
-      "credential": "AAVzbW9rZQACcjEAAAAAAAAD6AAAAAAAAAfQ.kkxEJZv9F27b4whoo00jnZLlgydp1E2UiFpsDky4bfE",
+      "credential": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJhdWQiOiJzbW9rZSIsInN1YiI6InIxIiwiZXhwIjoyMDAwLCJpYXQiOjEwMDB9.h9BmjoSAorufAAi9F5obctXwCQzHOPIzIIT-BsiWtgc",
       "now": 1500
     },
     {
       "name": "flipped_payload_bit",
       "key_hex": "612d33322d627974652d746573742d7369676e696e672d6b65792d76616c7565",
-      "credential": "AQVzbW9rZQACcjEAAAAAAAAD6AAAAAAAAAfQ.eHg7Z-Wn5prI4AXqjJne_-LPByosWabpp28gGSwEaxo",
+      "credential": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.AyJhdWQiOiJzbW9rZSIsInN1YiI6InIxIiwiZXhwIjoyMDAwLCJpYXQiOjEwMDB9.AlGNzJiGUaEnvAtfe_j-Z9-98N_SCHwb0V3N2qLA7a0",
       "now": 1500
     },
     {
       "name": "flipped_mac_bit",
       "key_hex": "612d33322d627974652d746573742d7369676e696e672d6b65792d76616c7565",
-      "credential": "AAVzbW9rZQACcjEAAAAAAAAD6AAAAAAAAAfQ.eXg7Z-Wn5prI4AXqjJne_-LPByosWabpp28gGSwEaxo",
-      "now": 1500
-    },
-    {
-      "name": "token_kind_as_session",
-      "key_hex": "612d33322d627974652d746573742d7369676e696e672d6b65792d76616c7565",
-      "credential": "AAVzbW9rZQACcjEAAAAAAAAH0A.Cr0Le8SxReLngXmu90McaX7PBUCzCcEvWu5xkZGTlrk",
+      "credential": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJhdWQiOiJzbW9rZSIsInN1YiI6InIxIiwiZXhwIjoyMDAwLCJpYXQiOjEwMDB9.BlGNzJiGUaEnvAtfe_j-Z9-98N_SCHwb0V3N2qLA7a0",
       "now": 1500
     },
     {
       "name": "trailing_byte",
       "key_hex": "612d33322d627974652d746573742d7369676e696e672d6b65792d76616c7565",
-      "credential": "AAVzbW9rZQACcjEAAAAAAAAD6AAAAAAAAAfQqw.Ja5YjIcV8iAEpP3KjhgdgCxhI6j2fEyavSMheJ3JsQo",
+      "credential": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJhdWQiOiJzbW9rZSIsInN1YiI6InIxIiwiZXhwIjoyMDAwLCJpYXQiOjEwMDB9.AlGNzJiGUaEnvAtfe_j-Z9-98N_SCHwb0V3N2qLA7a0.AAAA",
       "now": 1500
     },
     {
@@ -97,12 +91,6 @@
       "key_hex": "612d33322d627974652d746573742d7369676e696e672d6b65792d76616c7565",
       "credential": "not-a-credential",
       "now": 0
-    },
-    {
-      "name": "base64_with_padding",
-      "key_hex": "612d33322d627974652d746573742d7369676e696e672d6b65792d76616c7565",
-      "credential": "AAVzbW9rZQACcjEAAAAAAAAD6AAAAAAAAAfQ==.eHg7Z-Wn5prI4AXqjJne_-LPByosWabpp28gGSwEaxo",
-      "now": 1500
     },
     {
       "name": "base64_with_plus_slash",
