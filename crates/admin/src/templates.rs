@@ -343,6 +343,89 @@ mod tests {
     }
 
     #[test]
+    fn an_idle_event_is_not_offered_open_now() {
+        // A freshly-applied event sits in `idle` with no `participant_count`.
+        // Open now closes the pre-queue, but from `idle` there is no
+        // pre-queue to close — running it would seed a cohort of 0 and
+        // irreversibly forfeit the pre-queue stage. The form must not render;
+        // the operator must first move to `pre_queue` (the only
+        // `next_phases(Idle)` entry).
+        let mut s = state();
+        s.phase = Phase::Idle;
+        s.participant_count = None;
+        let html = Dashboard::from_state(&s, 0).render().unwrap();
+
+        assert!(
+            !html.contains(r#"action="/admin/open_now""#),
+            "Open now must not be offered from idle (no pre-queue to close): {html}"
+        );
+        assert!(
+            !html.contains("Open now</button>"),
+            "no Open now button from idle: {html}"
+        );
+        assert!(
+            !html.contains("Already open"),
+            "an idle event is not opened; the false \"Already open\" copy must not show: {html}"
+        );
+        // The operator is told the precondition rather than left with an
+        // empty card: the hint names the phase they need to be in.
+        assert!(
+            html.contains("pre_queue"),
+            "the hint must name the pre_queue phase: {html}"
+        );
+    }
+
+    #[test]
+    fn an_unopened_maintenance_event_is_not_offered_open_now() {
+        // `maintenance` is reachable from anywhere, so an unopened event can
+        // sit in it (e.g. forced before it was ever opened). The same hazard
+        // as `idle` applies: there is no pre-queue to close, so the form must
+        // not render. Recovery back to `active` routes through `apply_phase`,
+        // which requires a cohort — the open is not the recovery path here.
+        let mut s = state();
+        s.phase = Phase::Maintenance;
+        s.participant_count = None;
+        let html = Dashboard::from_state(&s, 0).render().unwrap();
+
+        assert!(
+            !html.contains(r#"action="/admin/open_now""#),
+            "Open now must not be offered from an unopened maintenance event: {html}"
+        );
+        assert!(
+            !html.contains("Already open"),
+            "an unopened maintenance event is not opened: {html}"
+        );
+        assert!(
+            html.contains("pre_queue"),
+            "the hint must still point the operator at pre_queue: {html}"
+        );
+    }
+
+    #[test]
+    fn only_pre_queue_offers_open_now_across_the_lifecycle() {
+        // Pin the whole quadrant: the form renders iff phase == pre_queue &&
+        // !opened, for every phase. This is the regression guard for the bug
+        // that gated only on !opened and so rendered the form from idle.
+        for (phase, opens) in [
+            (Phase::Idle, false),
+            (Phase::PreQueue, true),
+            (Phase::Active, false),
+            (Phase::PostEvent, false),
+            (Phase::Maintenance, false),
+        ] {
+            let mut s = state();
+            s.phase = phase;
+            s.participant_count = None;
+            let html = Dashboard::from_state(&s, 0).render().unwrap();
+            assert_eq!(
+                html.contains(r#"action="/admin/open_now""#),
+                opens,
+                "phase {phase:?}: open-now form presence mismatch (expected {opens}): {html}"
+            );
+        }
+    }
+
+    #[test]
     fn a_scheduled_event_prefills_the_form_in_the_operators_own_zone() {
         // 2030-06-15T14:00Z is 10:00 in New York. The operator picked New
         // York, so that is what the form must show them -- re-rendering in UTC

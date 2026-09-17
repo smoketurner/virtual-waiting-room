@@ -193,10 +193,14 @@
         </form>
         {% endif %}
         {% if !opened %}
+        {% if phase == "pre_queue" %}
         <form method="post" action="/admin/open_now" data-confirm="Open the event now? The pre-queue closes, everyone waiting is assigned their place, and the event starts admitting. This cannot be undone." style="margin-top:12px;">
           <button type="submit" class="danger" title="Close the pre-queue and open the event immediately, without waiting for a scheduled time.">Open now</button>
           <span class="help">Closes the pre-queue and opens the event immediately. The same thing the schedule does, so a scheduled time that has not fired yet becomes a no-op rather than a second opening.</span>
         </form>
+        {% else %}
+        <p class="help" style="margin-top:12px;">Open now closes the pre-queue and opens immediately, so it needs a pre-queue to close. Move the event to <code>pre_queue</code> first; from <code>idle</code> that is the only <strong>Set phase</strong> option, and from <code>maintenance</code> return to <code>idle</code> then <code>pre_queue</code>.</p>
+        {% endif %}
         {% else %}
         <p class="help" style="margin-top:12px;">Already open — the pre-queue is closed and every waiting visitor has their place.</p>
         {% endif %}
