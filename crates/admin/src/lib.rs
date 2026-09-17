@@ -263,8 +263,15 @@ pub trait Store {
 
     /// Sets the fail-open epoch unconditionally (break-glass: not guarded on
     /// the prior value, not debounced — mirroring `force_maintenance`, the
-    /// operator must always be able to engage or clear it). Stamps `action`
-    /// and the audit fields atomically.
+    /// operator must always be able to engage or clear it). The shared
+    /// `last_action_epoch_ms` anchor that shares this `UpdateItem` is guarded
+    /// against regression: the write lands atomically when no newer anchor
+    /// already exists, and on the race path (a newer concurrent writer already
+    /// advanced the anchor during the yielding read-modify-write the callers
+    /// perform before this stamp) the functional `fail_open_until` still lands
+    /// unconditionally while the stamp is dropped (audit-loss, logged + metr'd),
+    /// so the break-glass effect always reaches the controller's data plane and
+    /// the debounce anchor never regresses.
     fn set_fail_open_until(
         &self,
         event_id: &str,
@@ -276,12 +283,17 @@ pub trait Store {
 
     /// Stamps the audit fields for a ruleset change (issue #71), plus
     /// `rules_digest` (first 16 hex characters of SHA-256 over the encoded
-    /// `KeyValueStore` value) and `rules_count`. Unconditional, and called
-    /// *after* the `KeyValueStore` write lands — the `KeyValueStore` is
-    /// authoritative for the ruleset itself, so this record only ever
-    /// describes a change that actually happened; nothing reads it back to
-    /// make a decision, so a failure here is logged and swallowed rather than
-    /// failing the operator's action.
+    /// `KeyValueStore` value) and `rules_count`. Called *after* the
+    /// `KeyValueStore` write lands — the `KeyValueStore` is authoritative for
+    /// the ruleset itself, so this record only ever describes a change that
+    /// actually happened; nothing reads it back to make a decision, so a
+    /// failure here is logged and swallowed rather than failing the operator's
+    /// action. The shared `last_action_epoch_ms` anchor that shares this
+    /// `UpdateItem` is guarded against regression (the stamp applies only when
+    /// no newer anchor already exists), so a stamp issued after the yielding
+    /// `KeyValueStore` read-modify-write cannot overwrite a newer concurrent
+    /// writer's anchor; a guard `Conflict` is logged and swallowed by the
+    /// caller, the ruleset having already landed.
     fn set_rules_audit(
         &self,
         event_id: &str,
@@ -1691,11 +1703,32 @@ mod tests {
             actor: &str,
             now: ArrivalTime,
         ) -> impl Future<Output = Result<(), StoreError>> + Send {
+            // Mirrors the live store's guarded-write-then-fallback shape: the
+            // functional `fail_open_until` always lands (break-glass), but the
+            // shared `last_action_epoch_ms` anchor is guarded against
+            // regression by the same `STAMP_PREDICATE` that `stamp_action` uses.
+            // On the happy path (this call's arrival advances the anchor) the
+            // stamp advances the anchor and audit fields together with the
+            // functional write. On a guard conflict — a newer writer already
+            // advanced the anchor, or a forced `conflict` — the fallback
+            // commits `fail_open_until` alone, preserving the winning writer's
+            // anchor and audit row (an audit-loss trade), and the call
+            // succeeds. The break-glass effect never depends on the guard.
             let result = if self.conflict {
-                Err(StoreError::Conflict)
+                *self.fail_open_until.lock().unwrap() = until;
+                Ok(())
             } else {
                 *self.fail_open_until.lock().unwrap() = until;
-                self.stamp_audit(action, actor, now);
+                let existing = *self.last_time.lock().unwrap();
+                if let Some(existing) = existing
+                    && now.timestamp() < existing
+                {
+                    // Race path: the guarded write conflicts and the fallback
+                    // lands only the functional field, leaving the newer
+                    // anchor and audit row untouched.
+                } else {
+                    self.stamp_audit(action, actor, now);
+                }
                 Ok(())
             };
             std::future::ready(result)
@@ -1735,7 +1768,20 @@ mod tests {
             actor: &str,
             now: ArrivalTime,
         ) -> impl Future<Output = Result<(), StoreError>> + Send {
+            // Mirrors the live store's `STAMP_PREDICATE` guard on the shared
+            // anchor: the ruleset itself already landed in the KeyValueStore,
+            // and this audit row also writes `last_action_epoch_ms`, so a stamp
+            // whose arrival time does not advance the anchor is rejected
+            // (`Conflict`) rather than overwriting a newer concurrent writer's
+            // anchor and audit row. The caller (`apply_set_rules`) logs and
+            // swallows the `Conflict` — the KV ruleset already landed — exactly
+            // as it does for `stamp_action`. Inclusive at the boundary: a
+            // stamp at the exact instant of the stored anchor still succeeds.
             let result = if self.conflict {
+                Err(StoreError::Conflict)
+            } else if let Some(existing) = *self.last_time.lock().unwrap()
+                && now.timestamp() < existing
+            {
                 Err(StoreError::Conflict)
             } else {
                 *self.rules_audit.lock().unwrap() = Some((rules_digest.to_owned(), rules_count));
@@ -2528,6 +2574,227 @@ mod tests {
         assert_eq!(state.last_action.as_deref(), Some("open_now"));
         assert_eq!(state.last_action_by.as_deref(), Some("opA@x"));
         assert_eq!(state.last_action_time, Some(ts(3_000).timestamp()));
+    }
+
+    #[tokio::test]
+    async fn fail_open_does_not_regress_a_newer_concurrent_anchor() {
+        // Bug (sibling of #186): `apply_fail_open` performs the yielding KVStore
+        // read-modify-write and only then stamps `last_action_epoch_ms`
+        // unconditionally, so a concurrent operator's debounced mutation that
+        // landed during that read-modify-write (here opB's `set_rate` at
+        // T=1100, against opA's `fail_open` arrival at T=1000) had its newer
+        // anchor overwritten by the older arrival stamp — regressing the
+        // debounce anchor by the RMW width and opening a bounded debounce
+        // bypass slot. The fix guards the stamp; the break-glass
+        // `fail_open_until` the controller reads must still land unconditionally.
+        let store = FakeStore::with_phase(Phase::Active);
+        let concurrent_at = ts(1_100).timestamp();
+        // The concurrent writer's already-landed audit row + anchor.
+        *store.last_action.lock().unwrap() = Some("set_rate".to_owned());
+        *store.last_action_by.lock().unwrap() = Some("opB@x".to_owned());
+        *store.last_action_at.lock().unwrap() = Some(concurrent_at.to_string());
+        *store.last_time.lock().unwrap() = Some(concurrent_at);
+        let edge = FakeEdgeStore::default();
+
+        apply_fail_open(&store, &edge, "evt", "30", "opA@x", ts(1_000))
+            .await
+            .unwrap();
+
+        let until = 1 + 30 * 60; // now/1000 seconds + minutes*60
+        // The break-glass functional write still landed on both stores.
+        assert_eq!(*store.fail_open_until.lock().unwrap(), until);
+        assert_eq!(edge.cfg.lock().unwrap().fail_open_until, until);
+        // The anchor was NOT regressed to the older arrival stamp.
+        assert_eq!(
+            *store.last_time.lock().unwrap(),
+            Some(concurrent_at),
+            "debounce anchor must not regress to the older fail_open arrival"
+        );
+        // And the dashboard's "latest action" line stays on the actual latest
+        // action, not the older fail_open's arrival attribution.
+        assert_eq!(
+            store.last_action.lock().unwrap().as_deref(),
+            Some("set_rate"),
+            "audit label"
+        );
+        assert_eq!(
+            store.last_action_by.lock().unwrap().as_deref(),
+            Some("opB@x"),
+            "audit actor"
+        );
+        assert_eq!(
+            store.last_action_at.lock().unwrap().as_deref(),
+            Some(concurrent_at.to_string().as_str()),
+            "audit timestamp"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_open_still_advances_an_older_anchor() {
+        // The anti-regression guard must not reject a legitimate fail_open
+        // whose arrival advances the anchor: when the operator's arrival is
+        // newer than the prior mutation, the stamp lands and the audit line
+        // records the fail_open, exactly as before. (The absent-anchor case
+        // is covered by `fail_open_writes_the_edge_before_dynamodb`; this
+        // asserts the older-anchor happy path.)
+        let store = FakeStore::with_phase(Phase::Active);
+        let prior_at = ts(500).timestamp();
+        *store.last_action.lock().unwrap() = Some("set_rate".to_owned());
+        *store.last_time.lock().unwrap() = Some(prior_at);
+        let edge = FakeEdgeStore::default();
+
+        apply_fail_open(&store, &edge, "evt", "5", "opA@x", ts(3_000))
+            .await
+            .unwrap();
+
+        assert!(*store.fail_open_until.lock().unwrap() > 0);
+        assert_eq!(
+            *store.last_time.lock().unwrap(),
+            Some(ts(3_000).timestamp()),
+            "newer fail_open arrival must advance the anchor"
+        );
+        assert_eq!(
+            store.last_action.lock().unwrap().as_deref(),
+            Some("fail_open"),
+            "audit label"
+        );
+        assert_eq!(
+            store.last_action_by.lock().unwrap().as_deref(),
+            Some("opA@x"),
+            "audit actor"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_rules_does_not_regress_a_newer_concurrent_anchor() {
+        // Bug (sibling of #186, audit-only row): `apply_set_rules` performs the
+        // yielding KVStore read-modify-write and only then stamps
+        // `last_action_epoch_ms` unconditionally. A concurrent opB `set_rate`
+        // at T=1100 landing during that read-modify-write (against opA's
+        // `set_rules` arrival at T=1000) had its newer anchor overwritten by
+        // the older arrival stamp. The fix guards the stamp — the audit row
+        // loses as `Conflict` (logged + swallowed, the KVStore ruleset already
+        // landed), and the anchor + audit line stay on opB's later action.
+        let store = FakeStore::with_phase(Phase::Active);
+        let concurrent_at = ts(1_100).timestamp();
+        *store.last_action.lock().unwrap() = Some("set_rate".to_owned());
+        *store.last_action_by.lock().unwrap() = Some("opB@x".to_owned());
+        *store.last_action_at.lock().unwrap() = Some(concurrent_at.to_string());
+        *store.last_time.lock().unwrap() = Some(concurrent_at);
+        let edge = FakeEdgeStore::default();
+        let rules = vec![ProtectionRule::PathPrefix("/checkout".to_owned())];
+
+        apply_set_rules(&store, &edge, "evt", rules.clone(), "opA@x", ts(1_000))
+            .await
+            .unwrap();
+
+        // The ruleset itself still landed in the (authoritative) KeyValueStore.
+        assert_eq!(edge.cfg.lock().unwrap().rules, rules);
+        // The audit stamp lost the race: nothing was written, and the anchor
+        // and audit line stay on the concurrent writer's later action.
+        assert!(
+            store.rules_audit.lock().unwrap().is_none(),
+            "the guard's Conflict must be swallowed, leaving no rules_audit row"
+        );
+        assert_eq!(
+            *store.last_time.lock().unwrap(),
+            Some(concurrent_at),
+            "debounce anchor must not regress to the older set_rules arrival"
+        );
+        assert_eq!(
+            store.last_action.lock().unwrap().as_deref(),
+            Some("set_rate"),
+            "audit label"
+        );
+        assert_eq!(
+            store.last_action_by.lock().unwrap().as_deref(),
+            Some("opB@x"),
+            "audit actor"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_rules_still_advances_an_older_anchor() {
+        // The anti-regression guard must not reject a legitimate set_rules
+        // whose arrival advances the anchor: the audit row lands and the audit
+        // line records the ruleset change, exactly as before.
+        let store = FakeStore::with_phase(Phase::Active);
+        let prior_at = ts(500).timestamp();
+        *store.last_action.lock().unwrap() = Some("set_rate".to_owned());
+        *store.last_time.lock().unwrap() = Some(prior_at);
+        let edge = FakeEdgeStore::default();
+        let rules = vec![ProtectionRule::Cookie("loyalty_member".to_owned())];
+
+        apply_set_rules(&store, &edge, "evt", rules.clone(), "opA@x", ts(3_000))
+            .await
+            .unwrap();
+
+        // The ruleset landed and the audit row recorded it.
+        assert_eq!(edge.cfg.lock().unwrap().rules, rules);
+        let (digest, count) = store.rules_audit.lock().unwrap().clone().unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(digest.len(), 16, "digest is the 16-hex-char prefix");
+        assert_eq!(
+            *store.last_time.lock().unwrap(),
+            Some(ts(3_000).timestamp()),
+            "newer set_rules arrival must advance the anchor"
+        );
+        assert_eq!(
+            store.last_action.lock().unwrap().as_deref(),
+            Some("set_rules"),
+            "audit label"
+        );
+        assert_eq!(
+            store.last_action_by.lock().unwrap().as_deref(),
+            Some("opA@x"),
+            "audit actor"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_does_not_regress_a_newer_concurrent_anchor() {
+        // `apply_recover` shares `set_fail_open_until`, so the guard covers it
+        // too. It writes `DynamoDB` first, then the KVStore; on the race path
+        // (opB's `set_rate` at T=1100 landed during opA's `recover` arrival at
+        // T=1000) the guarded write conflicts and the fallback clears
+        // `fail_open_until` alone — the break-glass clear still reaches the
+        // controller, the newer anchor + audit line are preserved, and the
+        // crash-safety ordering (DynamoDB cleared before the KVStore write) is
+        // unchanged.
+        let store = FakeStore::with_phase(Phase::Active);
+        let concurrent_at = ts(1_100).timestamp();
+        *store.fail_open_until.lock().unwrap() = 1_000_000;
+        *store.last_action.lock().unwrap() = Some("set_rate".to_owned());
+        *store.last_action_by.lock().unwrap() = Some("opB@x".to_owned());
+        *store.last_action_at.lock().unwrap() = Some(concurrent_at.to_string());
+        *store.last_time.lock().unwrap() = Some(concurrent_at);
+        let edge = FakeEdgeStore::default();
+        edge.cfg.lock().unwrap().fail_open_until = 1_000_000;
+
+        apply_recover(&store, &edge, "evt", "opA@x", ts(1_000))
+            .await
+            .unwrap();
+
+        // The functional clear still landed on both stores.
+        assert_eq!(*store.fail_open_until.lock().unwrap(), 0);
+        assert_eq!(edge.cfg.lock().unwrap().fail_open_until, 0);
+        assert_eq!(edge.writes.lock().unwrap().last(), Some(&0));
+        // The anchor was NOT regressed, and the audit line stays on opB.
+        assert_eq!(
+            *store.last_time.lock().unwrap(),
+            Some(concurrent_at),
+            "debounce anchor must not regress to the older recover arrival"
+        );
+        assert_eq!(
+            store.last_action.lock().unwrap().as_deref(),
+            Some("set_rate"),
+            "audit label"
+        );
+        assert_eq!(
+            store.last_action_by.lock().unwrap().as_deref(),
+            Some("opB@x"),
+            "audit actor"
+        );
     }
 
     #[tokio::test]
