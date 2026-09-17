@@ -215,11 +215,20 @@ impl Counters {
             .get("prequeue_offsets")
             .and_then(|v| v.as_l().ok())
             .and_then(|list| {
-                let parsed: Vec<u64> = list
+                // A present element that is not an `N` parsing as `u64` is
+                // corruption, not an absent offset — fail the whole parse so
+                // the item reads back as `None`. `filter_map` would instead
+                // drop the bad entry and let an over-length list collapse to a
+                // `SHARDS`-length array whose tail is shifted in from beyond
+                // the prefix, a wrong-but-plausible-looking result rather than
+                // the `None` callers fall back to. This matches the
+                // corruption-discipline of `shard_count_of` / `shard_index_of`
+                // above: a present-but-unreadable value surfaces as `None`.
+                let parsed: Result<Vec<u64>, ()> = list
                     .iter()
-                    .filter_map(|e| e.as_n().ok().and_then(|s| s.parse().ok()))
+                    .map(|e| e.as_n().ok().and_then(|s| s.parse().ok()).ok_or(()))
                     .collect();
-                <[u64; SHARDS]>::try_from(parsed).ok()
+                parsed.ok().and_then(|p| <[u64; SHARDS]>::try_from(p).ok())
             });
 
         Self {
@@ -719,5 +728,45 @@ mod tests {
             Some([0, 3, 3, 8, 9, 9, 9, 11, 11, 11])
         );
         assert!(counters.open_outputs().is_some());
+    }
+
+    #[test]
+    fn prequeue_offsets_shifts_on_unreadable_entries_are_surfaced_as_none() {
+        // A list longer than `SHARDS` with unparseable `Null`s: under the old
+        // `filter_map` parser the Nulls were dropped, exactly `SHARDS` numbers
+        // survived, and `try_from` succeeded — but the tail (800, 900) was
+        // drawn from list indices 10/11, beyond the `SHARDS`-length prefix,
+        // filling the gap the dropped Nulls left. That shifted-but-plausible
+        // array was served as `Some` instead of surfaced as a corrupt item, so
+        // `open_outputs()` admitted visitors against a wrong index space. The
+        // parser now fails the whole list on the first unreadable entry, so a
+        // corrupt `prequeue_offsets` reads back as `None` — matching the
+        // corruption-discipline of `shard_count_of` / `shard_index_of`, which
+        // treat a present-but-unreadable value as `None` rather than salvage.
+        let stored: Vec<AttributeValue> = vec![
+            AttributeValue::N("0".to_owned()),
+            AttributeValue::N("100".to_owned()),
+            AttributeValue::N("200".to_owned()),
+            AttributeValue::N("300".to_owned()),
+            AttributeValue::Null(true),
+            AttributeValue::N("400".to_owned()),
+            AttributeValue::N("500".to_owned()),
+            AttributeValue::N("600".to_owned()),
+            AttributeValue::Null(true),
+            AttributeValue::N("700".to_owned()),
+            AttributeValue::N("800".to_owned()),
+            AttributeValue::N("900".to_owned()),
+        ];
+        let mut item = HashMap::new();
+        item.insert("prequeue_offsets".to_owned(), AttributeValue::L(stored));
+        let counters = Counters::from_item("evt-1", &item);
+        assert!(
+            counters.prequeue_offsets.is_none(),
+            "corrupt prequeue_offsets must surface as None, not a shifted array"
+        );
+        assert!(
+            counters.open_outputs().is_none(),
+            "open_outputs must be None when prequeue_offsets is corrupt"
+        );
     }
 }
