@@ -90,6 +90,30 @@ for (const v of vectors.rules) {
   });
 }
 
+// Regression for PR #120: a malformed percent-escape later in the URI must
+// not make a whole-string decodeURIComponent revert an earlier valid escape
+// inside the protected prefix, which evaded a PathPrefix rule. The rule
+// vectors above already cover this through session.json; this names the
+// headline inputs directly in the test report.
+test("regression #120: mixed valid and malformed percent-encoding does not evade PathPrefix", () => {
+  const gate = loadGate();
+  assert.equal(
+    gate.matches(["p", "/admin"], { uri: "/%61dmin/secret%zz", headers: {}, cookies: {} }),
+    true,
+    "valid escape in prefix + malformed %zz later must match"
+  );
+  assert.equal(
+    gate.matches(["p", "/admin"], { uri: "/%61dmin/secret%ff", headers: {}, cookies: {} }),
+    true,
+    "valid escape in prefix + non-UTF-8 %ff later must match"
+  );
+  assert.equal(
+    gate.matches(["p", "/admin"], { uri: "/%zzdmin/secret", headers: {}, cookies: {} }),
+    false,
+    "a malformed escape inside the prefix that does not decode to the prefix must not match"
+  );
+});
+
 // CloudFront Function size ceiling (ADR-0021 §2): 10,240 bytes, not
 // adjustable, and there is no warning band below it — v1's "warn at 9,000"
 // framing was a mislabelled hard gate and was withdrawn (ADR-0021 §6). This

@@ -56,10 +56,14 @@ impl ProtectionRule {
     }
 }
 
-/// Percent-decodes ASCII `%XX` escapes; a `%` not followed by two valid hex
-/// digits is left as a literal byte, mirroring
-/// `infra/modules/edge/functions/gate.js.tftpl`'s
-/// decode-and-fall-back-to-the-raw-URI-on-throw behaviour.
+/// Percent-decodes ASCII `%XX` escapes one byte at a time; a `%` not
+/// followed by two valid hex digits is left as the literal bytes `%` plus
+/// whatever follows, not a throw-and-revert-the-whole-string decode. A
+/// malformed escape later in the input therefore never undoes an earlier
+/// valid decode. This is the reference behaviour that
+/// `infra/modules/edge/functions/gate.js.tftpl`'s `percentDecode` mirrors;
+/// the mixed valid+invalid case is pinned by conformance vectors in
+/// `crates/wr-common/tests/vectors/session.json`.
 fn percent_decode(s: &str) -> Vec<u8> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -81,10 +85,11 @@ fn percent_decode(s: &str) -> Vec<u8> {
 }
 
 /// Normalizes a path the same way `gate.js.tftpl`'s `normalizedPath` does:
-/// percent-decoded, case-folded, with a leading run of `/` collapsed to one
-/// and a leading `/./` stripped. Defence in depth against a `PathPrefix`
-/// rule being evaded by an encoding an origin would treat as equivalent to
-/// the rule's own prefix — not a full RFC 3986 path resolver, so `..`-segment
+/// per-byte percent-decoded (a malformed `%XX` is left literal, never thrown
+/// on), case-folded, with a leading run of `/` collapsed to one and a
+/// leading `/./` stripped. Defence in depth against a `PathPrefix` rule
+/// being evaded by an encoding an origin would treat as equivalent to the
+/// rule's own prefix — not a full RFC 3986 path resolver, so `..`-segment
 /// resolution is deliberately not attempted.
 fn normalized_path(path: &str) -> String {
     let decoded = String::from_utf8_lossy(&percent_decode(path)).into_owned();
@@ -315,8 +320,18 @@ mod tests {
     #[test]
     fn normalized_path_leaves_malformed_percent_encoding_as_is() {
         // "%zz" is not valid hex; the raw bytes are kept rather than the
-        // match failing outright, mirroring gate.js.tftpl's try/catch.
+        // match failing outright, mirroring gate.js.tftpl's percentDecode.
         assert_eq!(normalized_path("/foo%zzbar"), "/foo%zzbar");
+    }
+
+    #[test]
+    fn normalized_path_decodes_valid_escapes_and_keeps_malformed_literals() {
+        // The PR #120 regression: decodeURIComponent threw on a malformed
+        // escape and reverted the whole URI, dropping an earlier valid
+        // decode and so evading a PathPrefix rule. Per-byte decoding leaves
+        // the malformed escape literal instead, so the valid decode stands.
+        assert_eq!(normalized_path("/%61dmin/secret%zz"), "/admin/secret%zz");
+        assert_eq!(normalized_path("/foo%63bar%zz"), "/foocbar%zz");
     }
 
     #[test]

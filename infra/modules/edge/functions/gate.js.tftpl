@@ -87,13 +87,36 @@ function ownProperty(obj, key) {
 // CloudFront sends the raw path to the origin, so a rule must not be evaded
 // by an encoding the origin treats as equivalent. Not a full RFC 3986
 // resolver: ".." segments are deliberately not resolved.
-function normalizedPath(uri) {
-    var decoded = uri;
-    try {
-        decoded = decodeURIComponent(uri);
-    } catch (e) {
-        decoded = uri; // malformed percent-encoding: compare the raw URI
+function hexVal(c) {
+    return c >= 48 && c <= 57 ? c - 48
+         : c >= 65 && c <= 70 ? c - 55
+         : c >= 97 && c <= 102 ? c - 87
+         : -1;
+}
+// Per-byte percent-decode, mirroring wr_common::rules::percent_decode: a
+// valid %XX is decoded to its byte, a '%' not followed by two hex digits is
+// left literal. Not decodeURIComponent: that throws on one malformed escape
+// and reverts the whole URI, so a valid escape in a PathPrefix plus a
+// malformed one later evaded the rule (PR #120). Conformance vectors in
+// crates/wr-common/tests/vectors/session.json pin the mixed case.
+function percentDecode(uri) {
+    var out = '';
+    for (var i = 0; i < uri.length; ) {
+        if (uri.charCodeAt(i) === 0x25 && i + 2 < uri.length) {
+            var h = hexVal(uri.charCodeAt(i + 1)), l = hexVal(uri.charCodeAt(i + 2));
+            if (h >= 0 && l >= 0) {
+                out += String.fromCharCode(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out += uri.charAt(i);
+        i += 1;
     }
+    return out;
+}
+function normalizedPath(uri) {
+    var decoded = percentDecode(uri);
     decoded = decoded.replace(/^\/+/, '/').replace(/^\/\.\//, '/');
     return decoded.toLowerCase();
 }
