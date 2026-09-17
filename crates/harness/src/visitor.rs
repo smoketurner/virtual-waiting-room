@@ -309,12 +309,24 @@ pub async fn run<F, Fut>(
             serving_position = serving;
         }
         let closed = is_closed(&status_body);
+        // `waiting.js`'s closed branch calls `forgetPosition()` then `return
+        // schedule()` — it clears `knownPosition` and asks no `/v1/queue_num`
+        // that tick, so the next running poll re-asks. Clearing `held_position`
+        // here is the forget; the `!closed` ask gate below is the skip. Together
+        // they force the same re-ask on the first running tick after a
+        // `closed → running` reopen, where without this `held_position` would
+        // stay `Some(stale)` and the ask gate would stay false forever.
+        if closed {
+            held_position = None;
+        }
 
         let ask = match settings.polling {
             // The old client asked on every tick and knew nothing of a spread.
-            Polling::EveryTick => started.elapsed() >= first_ask_after,
+            // `!closed` mirrors the client's `return schedule()` in the closed
+            // branch: a closed tick asks no `/v1/queue_num`, whatever the mode.
+            Polling::EveryTick => !closed && started.elapsed() >= first_ask_after,
             Polling::HoldPosition | Polling::DerivePosition | Polling::Backoff => {
-                held_position.is_none() && started.elapsed() >= first_ask_after
+                !closed && held_position.is_none() && started.elapsed() >= first_ask_after
             }
         };
 
@@ -645,9 +657,10 @@ mod tests {
     /// `tokio::time`-paused) elapsed time, and reports `"running"` with a
     /// real position after — exercising `Polling::Backoff`'s `closed ⇒
     /// ceiling` branch when `closed_secs` outlasts `run_secs`, with
-    /// `held_position` genuinely still `None` (a non-200 `/queue_num` does
-    /// not set it), so the ceiling can only be coming from the `closed`
-    /// check, not the position-based fallback.
+    /// `held_position` genuinely `None`: a closed tick clears it
+    /// (`forgetPosition()`) and asks no `/queue_num` (`!closed` gate), so
+    /// the ceiling can only be coming from the `closed` check, not the
+    /// position-based fallback.
     ///
     /// `settings.countdown_ms` is always 0 here: it drives visitor arrival
     /// spread and `first_ask_after`, neither of which this helper is
@@ -764,11 +777,12 @@ mod tests {
         // closed_secs is 0), so it does not exercise the closed ⇒ ceiling
         // branch above — re-inverting it back to the floor would
         // leave every existing test green. closed_secs longer than the run
-        // means every /status answer is "closed" and /queue_num always
-        // refuses with a 409, so held_position stays None throughout:
-        // Backoff must fall through to the ceiling on the closed check
-        // alone, with no position-based path (the other end of the `if
-        // closed {} else {}` in the sleep arm) to coincidentally agree.
+        // means every /status answer is "closed": the closed branch mirrors
+        // `waiting.js`'s `forgetPosition()` + `return schedule()`, so
+        // `held_position` is cleared and no `/v1/queue_num` is asked while
+        // closed. Backoff must fall through to the ceiling on the closed
+        // check alone, with no position-based path (the other end of the
+        // `if closed {} else {}` in the sleep arm) to coincidentally agree.
         const VISITORS: u64 = 10;
         const RUN_SECS: u64 = 25;
         const CLOSED_SECS: u64 = 9999; // outlasts the run: never leaves "closed"
@@ -777,14 +791,114 @@ mod tests {
             measure_client_requests(Polling::Backoff, VISITORS, RUN_SECS, CLOSED_SECS).await;
 
         // Ceiling-clamped (>= 30s, jitter up to 39s) exceeds the 25s run, so
-        // exactly one /status poll and one refused /queue_num ask per
-        // visitor. Losing the closed check (falling through to
-        // `None => POLL_FLOOR_MS`) would instead produce several rounds of
-        // both per visitor in 25s.
+        // exactly one /status poll per visitor and no /v1/queue_num ask — a
+        // closed tick asks none, matching the client's `return schedule()`.
+        // Losing the closed check (falling through to
+        // `None => POLL_FLOOR_MS`) would instead produce several /status
+        // rounds per visitor in 25s.
         assert_eq!(
-            total,
+            total, VISITORS,
+            "closed ⇒ ceiling: exactly one status poll per visitor and no queue_num ask"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backoff_forgets_position_across_close_so_re_asks_after_reopen() {
+        // The shipped client's closed branch calls `forgetPosition()` (clears
+        // `knownPosition`) and `return schedule()` (asks no `/v1/queue_num` that
+        // tick), so on the first running tick after a `closed → running`
+        // reopen `knownPosition` is null, the cache-hit guard falls through,
+        // and the chain re-asks `/v1/queue_num`. The harness's `run()` models
+        // the closed branch's ceiling interval but, before the fix that cleared
+        // `held_position` on a closed tick and gated the ask on `!closed`, did
+        // not model `forgetPosition()`: `held_position` survived a close, so
+        // the ask gate (`held_position.is_none() && …`) stayed false after a
+        // reopen and the after-reopen re-ask the client makes never happened.
+        //
+        // Three phases — running [0,25s), closed [25,50s), running [50,120s) —
+        // with `/v1/queue_num` answering 409 while closed and
+        // `{"position":100000000}` while open. `countdown_ms`/`spread_ms` are
+        // 0 so `first_ask_after` is 0 and the whole cohort asks from the first
+        // poll; `arrives_at` is 0 (`arrival_offset_ms` short-circuits on a zero
+        // countdown), so the only pre-loop sleep is the sub-interval arrival
+        // jitter (`jitter.next() % POLL_MS`, 0–5s).
+        //
+        // Backoff's first sleep is the ceiling (30s) + proportional jitter
+        // (≤ ~9s, `JITTER_FRACTION = 0.3`), so the second poll lands at
+        // 30–44s — strictly inside the closed phase [25,50s). The post-close
+        // ceiling sleep (another 30–39s) lands the third poll at 60–83s —
+        // strictly inside the reopen [50,120s). These bounds hold for every
+        // seed, so the schedule is jitter-invariant: each visitor asks
+        // `/v1/queue_num` exactly twice — once before the close, once after the
+        // reopen. Before the fix the after-reopen re-ask never happened
+        // (`held_position` stayed `Some(stale)`), so the count was one per
+        // visitor rather than two.
+        const VISITORS: u64 = 6;
+        const RUN_SECS: u64 = 120;
+        const CLOSE_START_SECS: u64 = 25;
+        const CLOSE_END_SECS: u64 = 50;
+
+        let edge = Arc::new(Edge::new(Duration::from_secs(10), RUN_SECS));
+        let tally = Arc::new(VisitorTally::default());
+        let started = tokio::time::Instant::now();
+        let origin = Arc::new(move |path: String| async move {
+            let elapsed = started.elapsed().as_secs();
+            let closed = (CLOSE_START_SECS..CLOSE_END_SECS).contains(&elapsed);
+            if path.starts_with("/v1/status") {
+                if closed {
+                    (
+                        200,
+                        r#"{"serving_state":"closed","serving_position":0}"#.to_owned(),
+                    )
+                } else {
+                    (
+                        200,
+                        r#"{"serving_state":"running","serving_position":0,"target_rate":5}"#
+                            .to_owned(),
+                    )
+                }
+            } else if closed {
+                (409, r#"{"error":"event not yet open"}"#.to_owned())
+            } else {
+                (200, r#"{"position":100000000,"live_join":true}"#.to_owned())
+            }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(RUN_SECS);
+        let settings = RunSettings {
+            polling: Polling::Backoff,
+            spread_ms: 0,
+            countdown_ms: 0,
+            arrival: Arrival::Uniform,
+            deadline,
+            target_rate: 5,
+        };
+
+        let mut tasks = Vec::with_capacity(VISITORS as usize);
+        for n in 0..VISITORS {
+            tasks.push(tokio::spawn(run(
+                Arc::clone(&edge),
+                format!("req-{n}"),
+                n + 1,
+                settings,
+                Arc::clone(&origin),
+                Arc::clone(&tally),
+            )));
+        }
+        #[expect(
+            clippy::unwrap_used,
+            reason = "a panicked visitor task is a test bug, not an expected outcome"
+        )]
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        let queue_num = tally.queue_num_requests.load(Ordering::Relaxed);
+        assert_eq!(
+            queue_num,
             VISITORS * 2,
-            "closed ⇒ ceiling: exactly one status poll and one refused queue_num ask per visitor"
+            "expected one /v1/queue_num ask before the close and one after the reopen per visitor; \
+             harness only made {queue_num} (the after-reopen re-ask is missing — held_position is \
+             not cleared on a closed tick)"
         );
     }
 
