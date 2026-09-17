@@ -12,8 +12,11 @@
 //! trailing fourth segment). That is what lets the JS conformance suite prove
 //! the two implementations reject the *same* tampered JWT: the credential
 //! reaches the signature/shape check it is named for, instead of being
-//! dismissed up-front as a non-JWS blob. The two literal negatives (`no_dot`,
-//! `base64_with_plus_slash`) test structural/charset rejection directly.
+//! dismissed up-front as a non-JWS blob. The same rule governs the charset
+//! negatives (`base64_with_plus_slash`, `base64_with_padding`): they carry
+//! three segments so the arity check passes and the base64url charset check
+//! is what refuses them. `no_dot` is the one deliberate blob, testing the
+//! arity check itself.
 //!
 //! The committed file is generated, never hand-typed: run
 //! `cargo test -p wr-common -- --ignored regenerate_vectors` after a wire
@@ -206,7 +209,17 @@ fn negatives() -> Vec<NegativeVector> {
     // A well-formed fourth segment: still three valid segments plus one, so
     // the `parts.length !== 3` (JS) / not-a-compact-JWS (Rust) check is what
     // rejects it, not a signature or charset failure.
-    let trailing_byte = format!("{real}.AAAA");
+    let four_segments = format!("{real}.AAAA");
+
+    // Charset negatives. Both need the *right number of segments*, or the
+    // arity check rejects them first and the charset check they are named for
+    // never runs — the same defect as the tamper vectors above. Standard
+    // base64's `+` and `/`, and its `=` padding, are all outside base64url, so
+    // `gate.js.tftpl`'s `BASE64URL_RE` (and the `URL_SAFE_NO_PAD` decode Rust
+    // does) is what refuses them, on a credential that is otherwise a
+    // three-segment JWS.
+    let base64_with_plus_slash = format!("{header}.+/{}.{sig_b64}", &payload_b64[2..]);
+    let base64_with_padding = format!("{header}.{payload_b64}==.{sig_b64}");
 
     vec![
         NegativeVector {
@@ -228,9 +241,9 @@ fn negatives() -> Vec<NegativeVector> {
             now: 1500,
         },
         NegativeVector {
-            name: "trailing_byte".into(),
+            name: "four_segments".into(),
             key_hex: key_hex.clone(),
-            credential: trailing_byte,
+            credential: four_segments,
             now: 1500,
         },
         NegativeVector {
@@ -241,9 +254,15 @@ fn negatives() -> Vec<NegativeVector> {
         },
         NegativeVector {
             name: "base64_with_plus_slash".into(),
+            key_hex: key_hex.clone(),
+            credential: base64_with_plus_slash,
+            now: 1500,
+        },
+        NegativeVector {
+            name: "base64_with_padding".into(),
             key_hex,
-            credential: "AA+/.AA+/".into(),
-            now: 0,
+            credential: base64_with_padding,
+            now: 1500,
         },
     ]
 }
