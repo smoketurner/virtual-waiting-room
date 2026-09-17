@@ -292,10 +292,17 @@ pub trait Store {
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
     /// Stamps the audit fields alone, for an action whose real effect landed
-    /// somewhere other than this item. Unconditional and called *after* that
-    /// effect: it records what happened rather than causing it, and nothing
-    /// reads it back to make a decision, so a failure here is logged and
-    /// swallowed rather than failing the operator's action.
+    /// somewhere other than this item. Called *after* that effect, so it
+    /// records what happened rather than causing it. Guarded against
+    /// regression: the stamp applies only when no newer `last_action_epoch_ms`
+    /// already exists, so a stamp issued after a yielding network call (the
+    /// open invoke) cannot overwrite a newer concurrent writer's audit fields
+    /// -- nor its anchor, which the debounce guard reads back via
+    /// `DEBOUNCE_PREDICATE`. A regression-guard failure is logged and
+    /// swallowed by the caller rather than failing the operator's action,
+    /// the effect having already landed (so a successful open that loses the
+    /// race leaves no audit trace of itself, which is the desired outcome for
+    /// a "latest action" display).
     fn stamp_action(
         &self,
         event_id: &str,
@@ -1054,10 +1061,14 @@ pub async fn apply_start_time<S: Store, K: OpenSchedule>(
 /// only when this call was the one that opened it, so the record does not
 /// claim an open it did not perform.
 ///
-/// The open is the authoritative write, so the stamp follows it. A failed
-/// stamp is logged rather than returned: the event is open either way, and
-/// reporting failure would invite an operator to press the button again
-/// looking for an open that has already happened.
+/// The open is the authoritative write, so the stamp follows it. The stamp is
+/// guarded against regression: if a concurrent mutation advanced
+/// `last_action_epoch_ms` past this request's arrival time during the open
+/// invoke, the stamp no-ops (`Conflict`, logged) rather than overwriting the
+/// newer writer's audit fields and debounce anchor. A failed stamp is logged
+/// rather than returned: the event is open either way, and reporting failure
+/// would invite an operator to press the button again looking for an open that
+/// has already happened.
 ///
 /// # Errors
 ///
@@ -1697,7 +1708,17 @@ mod tests {
             actor: &str,
             now: ArrivalTime,
         ) -> impl Future<Output = Result<(), StoreError>> + Send {
+            // Mirrors the live store's `STAMP_PREDICATE` anti-regression guard:
+            // a stamp whose arrival time does not advance `last_action_epoch_ms`
+            // is rejected (`ConditionalCheckFailedException` -> `Conflict`), so it
+            // cannot overwrite a newer concurrent writer's audit fields and
+            // debounce anchor. Inclusive at the boundary: a stamp at the exact
+            // instant of the stored anchor still succeeds.
             let result = if self.conflict {
+                Err(StoreError::Conflict)
+            } else if let Some(existing) = *self.last_time.lock().unwrap()
+                && now.timestamp() < existing
+            {
                 Err(StoreError::Conflict)
             } else {
                 self.stamp_audit(action, actor, now);
@@ -2422,6 +2443,91 @@ mod tests {
             .unwrap();
 
         assert_eq!(outcome, OpenNow::Opened);
+    }
+
+    #[tokio::test]
+    async fn a_concurrent_writer_is_not_overwritten_by_a_later_open_stamp() {
+        // Bug (ce126ca): `stamp_action` ran after the open Lambda's yielding
+        // invoke with no condition, so a concurrent debounced mutation that
+        // landed during that invoke and advanced `last_action_epoch_ms` past
+        // the open's arrival time had its audit fields and debounce anchor
+        // overwritten by the older open stamp -- misattributing the dashboard's
+        // "latest action" line and regressing the anchor a later debounced
+        // mutation reads.
+        //
+        // Timeline mirrored from the report: opA's open arrived at T=1000; a
+        // concurrent opB's `set_rate` landed during the open invoke at T=1100,
+        // advancing the anchor; opA's `stamp_action(now=1000)` then runs
+        // against an anchor (`1100`) newer than itself. The fix's
+        // anti-regression guard rejects the stamp (`Conflict`), the open still
+        // reports `Opened`, and the audit line keeps opB's `set_rate`.
+        let store = FakeStore::with_phase(Phase::PreQueue);
+        // The concurrent writer's already-landed audit row.
+        *store.last_action.lock().unwrap() = Some("set_rate".to_owned());
+        *store.last_action_by.lock().unwrap() = Some("opB@x".to_owned());
+        *store.last_action_at.lock().unwrap() = Some(ts(1_100).timestamp().to_string());
+        *store.last_time.lock().unwrap() = Some(ts(1_100).timestamp());
+        let opener = FakeOpener::reporting(OpenNow::Opened);
+
+        let outcome = apply_open_now(&store, &opener, "evt", "opA@x", ts(1_000))
+            .await
+            .unwrap();
+
+        // The swallowed stamp conflict is invisible to the operator: the open
+        // succeeded.
+        assert_eq!(outcome, OpenNow::Opened);
+        assert_eq!(opener.calls(), 1);
+        // And the audit line was NOT regressed to the older open stamp.
+        let state = store.load("evt").await.unwrap().unwrap();
+        assert_eq!(
+            state.last_action.as_deref(),
+            Some("set_rate"),
+            "audit label"
+        );
+        assert_eq!(
+            state.last_action_by.as_deref(),
+            Some("opB@x"),
+            "audit actor"
+        );
+        assert_eq!(
+            state.last_action_at,
+            Some(ts(1_100).timestamp().to_string()),
+            "audit timestamp"
+        );
+        assert_eq!(
+            state.last_action_time,
+            Some(ts(1_100).timestamp()),
+            "debounce anchor must not regress"
+        );
+        // The admin handler writes no phase of its own: the open's conditional
+        // update carries the phase along with the seed it derives from.
+        assert_eq!(*store.phase.lock().unwrap(), Phase::PreQueue);
+    }
+
+    #[tokio::test]
+    async fn an_open_stamp_still_advances_an_older_anchor() {
+        // The anti-regression guard must not reject a legitimate stamp that
+        // advances the anchor: an open whose arrival time is newer than the
+        // prior mutation overwrites it as before, and stamps the audit fields
+        // to the open. (The absent-anchor case is covered by
+        // `open_now_opens_the_event_and_records_who_did_it`; this asserts the
+        // older-anchor case.)
+        let store = FakeStore::with_phase(Phase::PreQueue);
+        // A prior, strictly older mutation that the open must advance past.
+        *store.last_action.lock().unwrap() = Some("set_rate".to_owned());
+        *store.last_action_by.lock().unwrap() = Some("opB@x".to_owned());
+        *store.last_time.lock().unwrap() = Some(ts(500).timestamp());
+        let opener = FakeOpener::reporting(OpenNow::Opened);
+
+        let outcome = apply_open_now(&store, &opener, "evt", "opA@x", ts(3_000))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, OpenNow::Opened);
+        let state = store.load("evt").await.unwrap().unwrap();
+        assert_eq!(state.last_action.as_deref(), Some("open_now"));
+        assert_eq!(state.last_action_by.as_deref(), Some("opA@x"));
+        assert_eq!(state.last_action_time, Some(ts(3_000).timestamp()));
     }
 
     #[tokio::test]
