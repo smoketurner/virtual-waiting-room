@@ -71,16 +71,18 @@ impl EdgeConfigStore for KvsStore {
 
     async fn write_config(&self, cfg: &GateConfig) -> Result<(), EdgeStoreError> {
         let encoded = encode_gate_config(cfg).map_err(|e| EdgeStoreError(e.to_string()))?;
-        // One retry on a conflicting ETag: another writer landed between our
-        // describe and our put. The write is a read-modify-write of the whole
-        // document, so the loser must re-describe and re-try rather than
-        // clobber the winner's change with a stale precondition.
-        match self.try_put(&encoded).await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                tracing::warn!(error = %e, "put_key failed; retrying once against a fresh ETag");
-                self.try_put(&encoded).await
-            }
-        }
+        // A single describe-then-put. `PutKey`'s `IfMatch` pins the describe-time
+        // `ETag`, so a concurrent write that lands between this caller's
+        // `read_config` and its `PutKey` fails this put with `PreconditionFailed`
+        // rather than silently overwriting the winner's change with this
+        // caller's now-stale document. The conflict is surfaced as `Err` on
+        // purpose: `edge_read_modify_write` re-reads and re-mutates on `Err`.
+        // An inner retry that re-describes and re-puts these same already-encoded
+        // bytes would succeed against the winner's fresh `ETag` and return `Ok`,
+        // bypassing that outer re-read and clobbering the winner's change — the
+        // exact anti-pattern `edge_read_modify_write`'s outer retry was written
+        // to prevent. See `EdgeConfigStore::write_config`'s doc comment for the
+        // contract.
+        self.try_put(&encoded).await
     }
 }

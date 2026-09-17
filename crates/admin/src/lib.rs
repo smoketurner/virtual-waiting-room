@@ -113,6 +113,18 @@ pub trait EdgeConfigStore {
 
     /// Writes the gate config document (`c`), describe-then-put under the
     /// store's `ETag`.
+    ///
+    /// Implementations MUST surface a `PutKey` precondition conflict as
+    /// [`Err`] rather than retrying internally. A concurrent write may land
+    /// between this caller's `read_config` and its `PutKey`, bumping the
+    /// store's `ETag`; an inner retry that re-describes and re-puts the
+    /// caller's already-encoded (now-stale) document would succeed against
+    /// the winner's fresh `ETag` and return `Ok`, silently clobbering the
+    /// winner's change while bypassing the caller's outer re-read. That is
+    /// the anti-pattern [`edge_read_modify_write`]'s outer retry exists to
+    /// prevent, so the contract this caller depends on is: a precondition
+    /// conflict is `Err`, and the caller re-reads and re-mutates — never an
+    /// internal retry of the same stale bytes. See [`edge_read_modify_write`].
     fn write_config(
         &self,
         cfg: &GateConfig,
@@ -1533,6 +1545,88 @@ mod tests {
         }
     }
 
+    /// An in-memory [`EdgeConfigStore`] that mirrors the real
+    /// [`crate::edge::KvsStore`]'s describe-then-put-with-`IfMatch(etag)` write
+    /// path closely enough to exercise the precondition-conflict contract
+    /// [`edge_read_modify_write`] depends on. [`FakeEdgeStore`] cannot: it
+    /// has no `ETag` and no describe-then-put ordering, so it can only
+    /// synthesize a `write_config` that returns `Err` on demand — it cannot
+    /// model a concurrent write that bumps the `ETag` between a caller's
+    /// describe and its put, which is exactly the race the production
+    /// `KvsStore::write_config` retry-on-stale fix addresses.
+    ///
+    /// Every `write_config` here is a single describe (read the current
+    /// `etag`) then a put guarded by `IfMatch(etag)` — the shape the
+    /// `EdgeConfigStore::write_config` contract documents. There is no inner
+    /// retry: a precondition conflict surfaces as `Err` so the caller can
+    /// re-read and re-mutate, matching the fixed production impl.
+    struct EtagEdgeStore {
+        cfg: Mutex<GateConfig>,
+        etag: Mutex<u64>,
+        /// Armed before the call under test: a concurrent writer's put lands
+        /// its change AFTER the next `write_config`'s describe but BEFORE its
+        /// put's precondition check — the narrow race window between
+        /// `DescribeKeyValueStore` and `PutKey`. The stored config replaces
+        /// `cfg` and `etag` bumps, so the caller's `IfMatch(described_etag)`
+        /// fails `PreconditionFailed`. `read_config` does not consume this
+        /// (the real `GetKey` returns no `ETag`), so the next `read_config`
+        /// after the failed write observes the winner's state, as it does in
+        /// production.
+        inject_concurrent_after_describe: Mutex<Option<GateConfig>>,
+    }
+
+    impl EtagEdgeStore {
+        fn new(cfg: GateConfig) -> Self {
+            Self {
+                cfg: Mutex::new(cfg),
+                etag: Mutex::new(0),
+                inject_concurrent_after_describe: Mutex::new(None),
+            }
+        }
+    }
+
+    impl EdgeConfigStore for EtagEdgeStore {
+        fn read_config(&self) -> impl Future<Output = Result<GateConfig, EdgeStoreError>> + Send {
+            // GetKey returns the value with no ETag, so a read cannot pin a
+            // precondition — only a describe inside `write_config` can.
+            std::future::ready(Ok(self.cfg.lock().unwrap().clone()))
+        }
+
+        fn write_config(
+            &self,
+            cfg: &GateConfig,
+        ) -> impl Future<Output = Result<(), EdgeStoreError>> + Send {
+            // Mirrors the fixed `KvsStore::write_config`: a single
+            // describe-then-put under `IfMatch(etag)`, no inner retry.
+            let new_cfg = cfg.clone();
+            let result = (|| {
+                let encoded =
+                    encode_gate_config(&new_cfg).map_err(|e| EdgeStoreError(e.to_string()))?;
+                // describe → the ETag this put's `IfMatch` is pinned to.
+                let described_etag = *self.etag.lock().unwrap();
+                // Narrow race window: a concurrent writer's put lands here,
+                // AFTER this caller's describe and BEFORE its put's precondition
+                // check, bumping the ETag and replacing the config.
+                if let Some(winner) = self.inject_concurrent_after_describe.lock().unwrap().take() {
+                    *self.cfg.lock().unwrap() = winner;
+                    *self.etag.lock().unwrap() += 1;
+                }
+                // put with IfMatch(described_etag). A concurrent write above
+                // bumps the ETag, so the precondition fails and the conflict
+                // surfaces as Err — no internal retry of the stale bytes.
+                if described_etag != *self.etag.lock().unwrap() {
+                    return Err(EdgeStoreError("put_key: PreconditionFailed".to_owned()));
+                }
+                let stored: GateConfig = serde_json::from_str(&encoded)
+                    .map_err(|e| EdgeStoreError(format!("decode gate config: {e}")))?;
+                *self.cfg.lock().unwrap() = stored;
+                *self.etag.lock().unwrap() += 1;
+                Ok(())
+            })();
+            std::future::ready(result)
+        }
+    }
+
     impl FakeStore {
         fn with_phase(phase: Phase) -> Self {
             Self {
@@ -2935,6 +3029,127 @@ mod tests {
         assert!(
             final_cfg.fail_open_until > 0,
             "this action's own mutation must still apply on top of the concurrent change"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_open_surfaces_a_precondition_conflict_and_re_mutates_on_top_of_a_concurrent_write()
+     {
+        // Pins the fix for the narrow race in `KvsStore::write_config` (the
+        // inner retry that re-put stale bytes against the winner's fresh
+        // `ETag`). This `EtagEdgeStore` mocks the FIXED `KvsStore::write_config`:
+        // a single describe-then-put with `IfMatch(etag)` and NO inner retry, so
+        // a concurrent write between this caller's describe and its put surfaces
+        // `PreconditionFailed` as `Err`. `FakeEdgeStore` cannot catch this: it
+        // has no `ETag` to pin, so a `write_config` that returns `Ok` after an
+        // internal retry is indistinguishable from one that succeeded outright.
+        //
+        // Timeline (the bug report's exploit scenario, fail-open vs set-rules):
+        // both readers read `{ rules: [], fail_open_until: 0 }`. The loser
+        // (this `apply_fail_open`) mutates `fail_open_until = 600` and writes.
+        // `write_config` describes (`etag = e0`), then a concurrent winner's
+        // put lands in the narrow window after that describe and before the
+        // put, replacing the config with `{ rules: ["/from-B"], f: 0 }` and
+        // bumping the `ETag` to `e1`. The loser's `IfMatch(e0)` fails. With the
+        // inner retry GONE (the fix), `write_config` returns `Err`,
+        // `edge_read_modify_write`'s outer re-read observes `{ rules: ["/from-B"],
+        // f: 0 }`, re-mutates to `{ rules: ["/from-B"], f: 600 }`, and re-puts —
+        // both changes land; neither is silently clobbered.
+        let store = FakeStore::with_phase(Phase::Active);
+        let edge = EtagEdgeStore::new(GateConfig {
+            v: 1,
+            enforce_from: 0,
+            fail_open_until: 0,
+            rules: Vec::new(),
+        });
+        *edge.inject_concurrent_after_describe.lock().unwrap() = Some(GateConfig {
+            v: 1,
+            enforce_from: 0,
+            fail_open_until: 0,
+            rules: vec![ProtectionRule::PathPrefix("/from-B".to_owned())],
+        });
+
+        apply_fail_open(&store, &edge, "evt", "10", "op@x", ts(0))
+            .await
+            .unwrap();
+
+        let until = 10 * 60; // ts(0) -> 0 epoch seconds + minutes * 60
+        let final_cfg = edge.cfg.lock().unwrap().clone();
+        assert_eq!(
+            final_cfg.rules,
+            vec![ProtectionRule::PathPrefix("/from-B".to_owned())],
+            "the concurrent writer's rules must survive, not be silently clobbered"
+        );
+        assert_eq!(
+            final_cfg.fail_open_until, until,
+            "this action's own mutation must apply on top of the concurrent change"
+        );
+        // The edit carried through to `DynamoDB` too — both actions really did
+        // land, so the audit row is truthful.
+        assert_eq!(*store.fail_open_until.lock().unwrap(), until);
+        assert_eq!(
+            store.last_action.lock().unwrap().as_deref(),
+            Some("fail_open"),
+            "the action is recorded as fail_open, not silently lost"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_rules_preserves_a_concurrent_fail_open_through_the_precondition_conflict() {
+        // The mirror of the bug report's exploit scenario in the other
+        // direction: this caller is `apply_set_rules` and the concurrent winner
+        // is `apply_fail_open`. Same narrow window — the winner's put lands
+        // between the loser's describe and its put. With the fix, the loser's
+        // first put fails `PreconditionFailed`, `edge_read_modify_write` re-reads
+        // (now seeing the winner's `fail_open_until = 500`), re-mutates its
+        // ruleset onto that, and re-puts — the winner's break-glass epoch
+        // survives. The bug (an internal retry re-putting the stale
+        // `{ rules: ["/from-A"], f: 0 }` against the winner's fresh `ETag`)
+        // would have clobbered `fail_open_until` back to `0`, dropping the
+        // live fail-open window the gate would have been reading.
+        let store = FakeStore::with_phase(Phase::Active);
+        let edge = EtagEdgeStore::new(GateConfig {
+            v: 1,
+            enforce_from: 0,
+            fail_open_until: 0,
+            rules: Vec::new(),
+        });
+        // The concurrent winner engaged fail-open for 500 seconds while
+        // leaving the ruleset empty.
+        *edge.inject_concurrent_after_describe.lock().unwrap() = Some(GateConfig {
+            v: 1,
+            enforce_from: 0,
+            fail_open_until: 500,
+            rules: Vec::new(),
+        });
+
+        apply_set_rules(
+            &store,
+            &edge,
+            "evt",
+            vec![ProtectionRule::PathPrefix("/from-A".to_owned())],
+            "op@x",
+            ts(0),
+        )
+        .await
+        .unwrap();
+
+        let final_cfg = edge.cfg.lock().unwrap().clone();
+        // The caller's ruleset replaces `rules` (that is set_rules' job); the
+        // concurrent winner's fail-open epoch is preserved, not clobbered.
+        assert_eq!(
+            final_cfg.rules,
+            vec![ProtectionRule::PathPrefix("/from-A".to_owned())],
+            "the caller's ruleset must land"
+        );
+        assert_eq!(
+            final_cfg.fail_open_until, 500,
+            "the concurrent fail-open window must survive the set_rules write"
+        );
+        assert_eq!(
+            store.last_action.lock().unwrap().as_deref(),
+            Some("set_rules"),
+            "the action is recorded as set_rules with the truthful ruleset"
         );
     }
 
