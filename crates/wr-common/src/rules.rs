@@ -56,6 +56,21 @@ impl ProtectionRule {
     }
 }
 
+/// One hex digit's value, or `None` for anything else. Mirrors
+/// `gate.js.tftpl`'s `hexVal` digit-by-digit rather than deferring to
+/// `u8::from_str_radix`, which accepts a leading `+` (`from_str_radix("+4",
+/// 16)` is `Ok(4)`) and so would decode `%+4` to a byte the gate leaves
+/// literal — a divergence in the one function the two implementations exist
+/// to agree on.
+const fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        _ => None,
+    }
+}
+
 /// Percent-decodes ASCII `%XX` escapes one byte at a time; a `%` not
 /// followed by two valid hex digits is left as the literal bytes `%` plus
 /// whatever follows, not a throw-and-revert-the-whole-string decode. A
@@ -71,10 +86,10 @@ fn percent_decode(s: &str) -> Vec<u8> {
     while i < bytes.len() {
         if bytes[i] == b'%'
             && i + 2 < bytes.len()
-            && let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3])
-            && let Ok(byte) = u8::from_str_radix(hex, 16)
+            && let Some(hi) = hex_val(bytes[i + 1])
+            && let Some(lo) = hex_val(bytes[i + 2])
         {
-            out.push(byte);
+            out.push(hi * 16 + lo);
             i += 3;
             continue;
         }
@@ -322,6 +337,19 @@ mod tests {
         // "%zz" is not valid hex; the raw bytes are kept rather than the
         // match failing outright, mirroring gate.js.tftpl's percentDecode.
         assert_eq!(normalized_path("/foo%zzbar"), "/foo%zzbar");
+    }
+
+    #[test]
+    fn normalized_path_leaves_a_signed_hex_escape_literal() {
+        // `u8::from_str_radix("+4", 16)` is `Ok(4)`, so parsing the two
+        // characters as a number would decode `%+4` to a byte while
+        // gate.js.tftpl's digit-by-digit `hexVal` leaves it literal. Decoding
+        // per digit keeps the two in step: `%` followed by anything that is
+        // not two hex digits stays literal in both.
+        assert_eq!(normalized_path("/%+41dmin"), "/%+41dmin");
+        assert_eq!(normalized_path("/a%+a"), "/a%+a");
+        // A `+` that is itself percent-encoded still decodes, in both.
+        assert_eq!(normalized_path("/%2badmin"), "/+admin");
     }
 
     #[test]

@@ -346,6 +346,16 @@ fn rules() -> Vec<RuleVector> {
             request: req("/foo%63bar%zz", &[], &[]),
             matches: true,
         },
+        // A `+`-signed two-character escape is not a valid escape in either
+        // engine. Rust must not reach it through `u8::from_str_radix`, which
+        // accepts a leading sign; gate.js.tftpl reads the two characters as
+        // hex digits and refuses. Left literal, the prefix does not match.
+        RuleVector {
+            name: "path_prefix_no_match_signed_hex_escape_stays_literal".into(),
+            rule: serde_json::json!(["p", "/admin"]),
+            request: req("/%+41dmin", &[], &[]),
+            matches: false,
+        },
         RuleVector {
             name: "path_prefix_no_match_malformed_escape_in_prefix_does_not_recover".into(),
             rule: serde_json::json!(["p", "/admin"]),

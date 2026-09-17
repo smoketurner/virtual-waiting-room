@@ -204,6 +204,19 @@
       "matches": true
     },
     {
+      "name": "path_prefix_no_match_signed_hex_escape_stays_literal",
+      "rule": [
+        "p",
+        "/admin"
+      ],
+      "request": {
+        "path": "/%+41dmin",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": false
+    },
+    {
       "name": "path_prefix_no_match_malformed_escape_in_prefix_does_not_recover",
       "rule": [
         "p",
