@@ -66,7 +66,7 @@ impl Store for DynamoStore {
             participant_count: num("participant_count"),
             target_rate: num("target_rate").and_then(|n| u32::try_from(n).ok()),
             message: item.get("message").and_then(|v| v.as_s().ok()).cloned(),
-            stored_control: stored_control_from(item),
+            stored_control: wr_common::stored_control_of(item),
             fail_open_until: num("fail_open_until").unwrap_or(0),
             last_action: str_attr("last_action"),
             last_action_by: str_attr("last_action_by"),
@@ -338,19 +338,6 @@ impl Store for DynamoStore {
     }
 }
 
-/// Reads the stored admission control off a `Counters` item. Absent or
-/// unparsable — including a legacy "`fail_open`" string left by a table written
-/// before issue #71 — resolves to `Open`: that is the state an event is
-/// created in and the value no operator action has written, and the epoch
-/// (`fail_open_until`) is the sole authority for fail-open now, so a stale
-/// string carries no window to reopen.
-fn stored_control_from(item: &std::collections::HashMap<String, AttributeValue>) -> StoredControl {
-    item.get("admission_control")
-        .and_then(|v| v.as_s().ok())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(StoredControl::Open)
-}
-
 type UpdateReq = aws_sdk_dynamodb::operation::update_item::builders::UpdateItemFluentBuilder;
 
 /// Stamps the shared audit + epoch values onto a mutation.
@@ -470,28 +457,49 @@ mod tests {
     fn every_stored_control_reads_back_as_itself() {
         for control in [StoredControl::Open, StoredControl::Paused] {
             assert_eq!(
-                stored_control_from(&item(Some(control.as_wire_str()))),
+                wr_common::stored_control_of(&item(Some(control.as_wire_str()))),
                 control
             );
         }
     }
 
     #[test]
-    fn a_legacy_fail_open_string_now_reads_back_as_open() {
-        // INVERTED from the pre-#71 invariant: fail-open is no longer a
-        // storable string at all (StoredControl has two values), so a
-        // "fail_open" string left by a table written before this change must
-        // decay to Open — the epoch (fail_open_until) is the sole authority
-        // now, and a stale string carries no window to reopen.
-        let control = stored_control_from(&item(Some("fail_open")));
-        assert_eq!(control, StoredControl::Open);
+    fn a_present_unreadable_admission_control_holds_rather_than_resumes() {
+        // #175 made the rule shared rather than duplicated per reader: the
+        // controller is the component that releases people, and the admin
+        // dashboard is the one that displays the state, so two copies of the
+        // rule are two chances for them to disagree on the same stored
+        // value. The only writer of this attribute is the operator's pause,
+        // so a value that will not parse is a pause that did not land cleanly;
+        // reading it as Open would resume admission during the incident
+        // someone was trying to stop. Holding is both the safe direction and
+        // the visible one — a queue that stops moving gets noticed; an
+        // un-pause does not. This drives the same set as
+        // wr_common::items::an_unreadable_admission_control_holds_rather_than_resumes
+        // through the same shared rule the controller's read_state uses, so
+        // the admin suite fails if its reader is ever re-forked off it back
+        // to the permissive Open default this crate once carried.
+        for stored in ["fail_open", "PAUSED", "paused ", "\u{1}", "0"] {
+            assert_eq!(
+                wr_common::stored_control_of(&item(Some(stored))),
+                StoredControl::Paused,
+                "{stored:?} resumed admission"
+            );
+        }
     }
 
     #[test]
-    fn absent_or_unknown_control_defaults_to_open() {
-        assert_eq!(stored_control_from(&item(None)), StoredControl::Open);
+    fn an_absent_admission_control_is_still_normal_admission() {
+        // Absent is not corrupt: it is an event nobody has paused, and a
+        // non-string or empty attribute is as unusable as a missing one.
+        // Holding here would stall every event that never touched the
+        // control.
         assert_eq!(
-            stored_control_from(&item(Some("nonsense"))),
+            wr_common::stored_control_of(&item(None)),
+            StoredControl::Open
+        );
+        assert_eq!(
+            wr_common::stored_control_of(&item(Some(""))),
             StoredControl::Open
         );
         // A non-string attribute is as unusable as a missing one.
@@ -500,7 +508,10 @@ mod tests {
             "admission_control".to_owned(),
             AttributeValue::N("1".to_owned()),
         );
-        assert_eq!(stored_control_from(&wrong_type), StoredControl::Open);
+        assert_eq!(
+            wr_common::stored_control_of(&wrong_type),
+            StoredControl::Open
+        );
     }
 
     #[test]
