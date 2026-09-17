@@ -8,20 +8,26 @@
 //! since no redelivery makes attacker-chosen or malformed input valid.
 //!
 //! Each batch then reads the event's `Counters` item once (a strongly
-//! consistent `GetItem`) to decide which of two paths every accepted record in
-//! the batch takes, or to reject the batch outright when no `Counters` item
+//! consistent `GetItem`) to decide which of three paths every accepted record
+//! in the batch takes, or to reject the batch outright when no `Counters` item
 //! exists yet:
 //!
-//! - **Rejected (unconfigured event)** — no `Counters` item exists, so the
-//!   event has not been set up. Every accepted record is failed and claims
+//! - **Rejected (unconfigured or unopened non-pre-queue event)** — no
+//!   `Counters` item exists, so the event has not been set up, OR the item
+//!   exists but the open has not run (no open outputs) and the phase is not
+//!   `PreQueue` (the Terraform-seeded `idle` item, or an operator holding
+//!   `maintenance`). Either way every accepted record is failed and claims
 //!   nothing, surfacing the state as a hard failure rather than letting a
 //!   pre-open live join increment `queue_counter` before the open `SET`s it
-//!   to the cohort size (an unconditional `SET` that would discard the
+//!   to the cohort size — an unconditional `SET` that would discard the
 //!   increment and let a later cohort member or post-open joiner collide on
-//!   the same numeric position).
-//! - **Live join** — the event is open, or its phase is anything but
-//!   `PreQueue`. Allocates one contiguous block of queue positions with one
-//!   counter increment and writes one `Positions` row per accepted record.
+//!   the same numeric position.
+//! - **Live join** — the event has been opened (its open outputs are
+//!   present), in any phase. A walk-back `Active -> Maintenance -> Idle ->
+//!   PreQueue` does not erase the open outputs, so a record arriving in any of
+//!   those phases is still a live join. Allocates one contiguous block of
+//!   queue positions with one counter increment and writes one `Positions` row
+//!   per accepted record.
 //! - **Pre-queue** — the event is not open and its phase is `PreQueue`.
 //!   Deduplicates by `request_id` (within the batch, and against any row a
 //!   prior invocation already wrote) and claims one contiguous block of local
@@ -30,7 +36,10 @@
 //! The branch is decided on the open outputs ([`wr_common::Counters::opened`]),
 //! never on phase alone: an operator can walk the phase back to `PreQueue`
 //! after an open without undoing the index space, and a record arriving in
-//! that state is still a live join.
+//! that state is still a live join. Phase narrows the not-open branch to
+//! either the pre-queue path (`PreQueue`) or the reject path (anything else);
+//! it never reaches the live-join path on its own, so an unopened seeded
+//! `idle` event can never `ADD` `queue_counter`.
 //!
 //! A pre-queue write can race `open_event`'s `BatchGetItem` — the shard claim
 //! landing after the open read that shard's count, but the row write landing
@@ -240,10 +249,13 @@ fn classify_record(body: &str, event_id: &str) -> RecordVerdict {
 /// Every record that fails [`classify_record`] is counted, logged once per
 /// batch, and dropped without becoming a batch failure — an attacker-chosen or
 /// malformed record is not something a retry ever fixes. The remaining
-/// accepted records all take the same path — live join or pre-queue — decided
-/// once from the event's `Counters` item (see the module docs). A `Counters`
-/// read failure, or a missing `Counters` item (the event has not been set up
-/// yet), fails every accepted record and claims nothing.
+/// accepted records all take the same path — live join, pre-queue, or rejected
+/// — decided once from the event's `Counters` item (see the module docs). A
+/// `Counters` read failure, a missing `Counters` item (the event has not been
+/// set up yet), or an unopened event in a non-`PreQueue` phase (the seeded
+/// `idle` item or operator `maintenance`) all fail every accepted record and
+/// claim nothing, so a pre-open join can never `ADD` `queue_counter` ahead of
+/// the open's `SET queue_counter = participant_count`.
 ///
 /// `shard` is drawn once by the caller for the whole invocation (issue #59):
 /// it is server-random rather than derived from `request_id`, so a batch that
@@ -315,14 +327,42 @@ pub async fn process_batch<S: Store>(
 
     // Branch on the open outputs, never on phase alone: an operator can walk
     // the phase back to PreQueue after an open (Active -> Maintenance -> Idle
-    // -> PreQueue) without undoing the index space, and a record arriving
-    // in that state is still a live join.
-    let live_path = counters.open_outputs().is_some() || counters.phase != Phase::PreQueue;
+    // -> PreQueue) without undoing the index space, and a record arriving in
+    // that state is still a live join. `open_outputs().is_some()` is the only
+    // signal that an event has been opened; the `phase != PreQueue` clause that
+    // used to be OR-ed onto it routes an unopened event seeded in a
+    // non-`PreQueue` phase (the Terraform-seeded `idle` item, or an operator
+    // holding `maintenance`) onto the live path, where a pre-open join `ADD`s
+    // `queue_counter` and mints `Positions` rows that the later open unconditionally
+    // `SET`s `queue_counter = participant_count` over — discarding the increment
+    // and colliding the pre-open positions with the cohort's `[0, N)`.
+    let live_path = counters.open_outputs().is_some();
 
     if live_path {
         process_live_batch(store, event_id, valid, &mut outcome).await;
-    } else {
+    } else if counters.phase == Phase::PreQueue {
         process_prequeue_batch(store, event_id, shard, valid, &mut outcome).await;
+    } else {
+        // An unopened event in a non-`PreQueue` phase has no live-join sequence
+        // to claim from and no pre-queue to register into, so neither path can
+        // take a position without creating the rewind hazard the `Ok(None)`
+        // branch above already guards against for a missing `Counters` item: a
+        // pre-open live join `ADD`ing `queue_counter` before the open `SET`s it
+        // to the cohort size, which the open discards, leaving the pre-open
+        // position to collide with a cohort member inside `[0, N)` (a `prp`
+        // bijection) or with a post-open live joiner. Fail every accepted record
+        // and claim nothing, mirroring the unconfigured-event branch; the
+        // messages retry until the operator advances to `PreQueue` (and the
+        // pre-queue path takes them) or the open fires (and the live path does).
+        tracing::warn!(
+            event_id = event_id,
+            phase = ?counters.phase,
+            valid = valid.len(),
+            "event not open and not in pre_queue; failing batch until opened or advanced to pre_queue"
+        );
+        for (message_id, _) in &valid {
+            outcome.failures.push(message_id.clone());
+        }
     }
 
     outcome
@@ -594,7 +634,11 @@ mod tests {
         // `load_counters` canned responses, consumed in call order; the last
         // value repeats once the queue is down to one. `None` per response
         // means "no Counters item" (an unconfigured event: the batch is failed
-        // rather than taking the live path).
+        // rather than taking the live path). The default seeds an **opened**
+        // event — the live-path baseline — because the live join path is only
+        // reachable once the open has written `queue_counter = participant_count`
+        // and the open outputs; tests exercising an unopened event (the seeded
+        // `idle` reject path, or the `PreQueue` registration path) override it.
         counters_sequence: Mutex<VecDeque<Option<Counters>>>,
         counters_fail_from_call: Option<u32>,
         counters_calls: Mutex<u32>,
@@ -618,8 +662,9 @@ mod tests {
                 prequeue_seen: Mutex::new(Vec::new()),
                 prequeue_claim_fails: false,
                 fail_prequeue_write_for: None,
-                counters_sequence: Mutex::new(VecDeque::from([Some(counters_with_phase(
-                    Phase::Idle,
+                counters_sequence: Mutex::new(VecDeque::from([Some(opened_counters(
+                    [0; SHARDS],
+                    Phase::Active,
                 ))])),
                 counters_fail_from_call: None,
                 counters_calls: Mutex::new(0),
@@ -894,12 +939,16 @@ mod tests {
     async fn live_joins_after_an_open_land_above_the_pre_queue_cohort() {
         // The open starts queue_counter at the cohort size N. A live join
         // arriving afterwards must be numbered outside the pre-queue cohort's
-        // [0, N), or two visitors hold the same position.
+        // [0, N), or two visitors hold the same position. The opened `Counters`
+        // (queue_counter = N) and the live-claim counter (seeded to N) agree,
+        // which is exactly what `open_event::write_open`'s `SET` leaves behind.
         const COHORT: u64 = 1_000;
         let store = FakeStore {
             counter: Mutex::new(COHORT),
             ..FakeStore::default()
         };
+        let opened = opened_counters([COHORT, 0, 0, 0, 0, 0, 0, 0, 0, 0], Phase::Active);
+        *store.counters_sequence.lock().unwrap() = VecDeque::from([Some(opened)]);
         let records = vec![
             rec("m1", "018f3a2b-7c9d-7e1f-8001-0123456789ab"),
             rec("m2", "018f3a2b-7c9d-7e1f-8002-0123456789ab"),
@@ -993,7 +1042,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_prequeue_phases_take_live_path() {
+    async fn opened_events_in_non_prequeue_phases_take_live_path() {
+        // An opened event takes the live path in every phase, including the
+        // walk-back path `Active -> Maintenance -> Idle -> (PreQueue tested
+        // above)`: the open outputs persist through every phase transition, so
+        // the live-join sequence is still the right place to claim from. This
+        // is the only case the `phase != PreQueue` clause used to preserve;
+        // `open_outputs().is_some()` preserves it without also matching the
+        // unopened seeded `idle` item.
+        for phase in [
+            Phase::Idle,
+            Phase::Active,
+            Phase::PostEvent,
+            Phase::Maintenance,
+        ] {
+            let store = FakeStore::default();
+            *store.counters_sequence.lock().unwrap() =
+                VecDeque::from([Some(opened_counters([1, 0, 0, 0, 0, 0, 0, 0, 0, 0], phase))]);
+            let records = vec![rec("m1", VALID_ID)];
+            let outcome = run_open(&store, &records).await;
+            assert!(outcome.failures.is_empty(), "{phase:?}");
+            assert_eq!(store.writes.lock().unwrap().len(), 1, "{phase:?}");
+            assert!(
+                store.prequeue_writes.lock().unwrap().is_empty(),
+                "{phase:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unopened_non_prequeue_phases_fail_the_batch_and_claim_nothing() {
+        // The bug's reject path: an event that has not been opened (no open
+        // outputs) but is in a non-`PreQueue` phase — the Terraform-seeded
+        // `idle` item, an operator holding `maintenance`, or any other
+        // not-yet-opened non-pre-queue phase — must NOT take the live path and
+        // `ADD` `queue_counter`. Each such join would mint a `Positions` row
+        // that the later, correct open from `pre_queue` then unconditionally
+        // `SET queue_counter = participant_count` over, discarding the
+        // increment and colliding the pre-open position with a cohort member
+        // inside `[0, N)` (a `prp` bijection) or a post-open live joiner.
+        // Instead the batch fails and claims nothing, mirroring the
+        // unconfigured-event branch; the messages retry until the operator
+        // advances to `PreQueue` (and the pre-queue path takes them) or the
+        // open fires (and the live path does).
         for phase in [
             Phase::Idle,
             Phase::Active,
@@ -1005,9 +1096,80 @@ mod tests {
                 VecDeque::from([Some(counters_with_phase(phase))]);
             let records = vec![rec("m1", VALID_ID)];
             let outcome = run_open(&store, &records).await;
-            assert!(outcome.failures.is_empty(), "{phase:?}");
-            assert_eq!(store.writes.lock().unwrap().len(), 1, "{phase:?}");
+            assert_eq!(
+                outcome.failures,
+                vec!["m1".to_owned()],
+                "unopened {phase:?} must fail the batch, not take a path"
+            );
+            assert_eq!(
+                *store.counter.lock().unwrap(),
+                0,
+                "unopened {phase:?} must not ADD queue_counter"
+            );
+            assert!(
+                store.writes.lock().unwrap().is_empty(),
+                "unopened {phase:?} must write no Positions rows"
+            );
+            assert!(
+                store.prequeue_writes.lock().unwrap().is_empty(),
+                "unopened {phase:?} must not write PreQueue rows either"
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn pre_open_idle_then_open_then_live_join_never_collides() {
+        // The end-to-end shape of the reported hazard, modelled through the
+        // `Store` port: pre-open joins land on an unopened `idle` event and
+        // are failed (no `queue_counter` increment, no `Positions` rows); the
+        // event then "opens" — represented here by switching the canned
+        // `Counters` to an opened one whose `queue_counter` is the cohort size
+        // N (the value `open_event::write_open` would `SET`); a post-open live
+        // join then claims `N + 1`, never `1`. With the bug the first stage
+        // would have left `queue_counter = 3` and rows at `1, 2, 3`, the open
+        // would rewind to N, and a post-open joiner would take `N + 1` while
+        // the pre-open rows still held `1, 2, 3` inside `[0, N)` — a collision.
+        const COHORT: u64 = 10;
+        let store = FakeStore::default();
+
+        // Stage 1: unopened idle — pre-open joins fail and claim nothing.
+        *store.counters_sequence.lock().unwrap() =
+            VecDeque::from([Some(counters_with_phase(Phase::Idle))]);
+        let pre_open = vec![
+            rec("m1", "018f3a2b-7c9d-7e1f-8001-0123456789ab"),
+            rec("m2", "018f3a2b-7c9d-7e1f-8002-0123456789ab"),
+            rec("m3", "018f3a2b-7c9d-7e1f-8003-0123456789ab"),
+        ];
+        let outcome = run_open(&store, &pre_open).await;
+        assert_eq!(outcome.failures.len(), 3);
+        assert_eq!(*store.counter.lock().unwrap(), 0);
+
+        // Stage 2: the event opens. `open_event::write_open` would `SET
+        // queue_counter = N`; model that by switching the canned Counters to
+        // an opened event whose queue_counter is the cohort size, and seeding
+        // the live-claim counter to the same N so the live path starts there.
+        let opened = opened_counters([3, 2, 5, 0, 0, 0, 0, 0, 0, 0], Phase::Active);
+        assert_eq!(opened.queue_counter, COHORT);
+        *store.counter.lock().unwrap() = COHORT;
+        *store.counters_sequence.lock().unwrap() = VecDeque::from([Some(opened)]);
+
+        // Stage 3: a post-open live join claims N + 1 — outside `[0, N)`,
+        // so no collision with any cohort member's `prp` image.
+        let post_open = vec![rec("m4", "018f3a2b-7c9d-7e1f-8004-0123456789ab")];
+        let outcome = run_open(&store, &post_open).await;
+        assert!(outcome.failures.is_empty());
+        let writes = store.writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(
+            writes[0].position,
+            COHORT + 1,
+            "post-open live join lands one past the cohort, not at a pre-open idle position"
+        );
+        assert!(
+            writes[0].position >= COHORT,
+            "position {} collides with the cohort [0, {COHORT})",
+            writes[0].position
+        );
     }
 
     #[tokio::test]
