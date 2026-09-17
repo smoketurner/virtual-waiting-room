@@ -293,14 +293,26 @@ impl Store for DynamoStore {
         actor: &str,
         now: ArrivalTime,
     ) -> Result<(), StoreError> {
-        // Audit fields only: the action's real effect landed elsewhere (the
-        // open's own conditional write), so there is nothing here to guard a
-        // race against -- only the record of it.
+        // Audit fields only -- the action's real effect landed elsewhere (the
+        // open's own conditional write) -- but this runs *after* a yielding
+        // network call (the open invoke), so a concurrent debounced mutation
+        // (`set_rate`, `set_message`, ...) can advance `last_action*` and
+        // `last_action_epoch_ms` between that effect and this `UpdateItem`.
+        // `last_action_epoch_ms` is also the anchor `DEBOUNCE_PREDICATE` reads,
+        // so the stamp is guarded against regression: it applies only when no
+        // newer value already exists, matching the predicate's own
+        // anti-regression contract. A lost race surfaces as
+        // `ConditionalCheckFailedException` -> `Conflict`, which the caller
+        // logs and swallows (the open already happened), so the dashboard's
+        // "latest action" line keeps the actual latest action rather than a
+        // stale, earlier open's arrival time -- at the cost of leaving no
+        // audit trace of the open itself when it loses the race.
         let mut req = self
             .client
             .update_item()
             .table_name(&self.counters_table)
             .set_key(Some(Key::Event { event_id }.build()))
+            .condition_expression(STAMP_PREDICATE)
             .update_expression(
                 "SET last_action = :a, last_action_by = :by, last_action_at = :at, \
                  last_action_epoch_ms = :ms",
@@ -389,6 +401,20 @@ fn guard_expected_rate(req: UpdateReq, expected: Option<u32>) -> UpdateReq {
 /// success.
 const DEBOUNCE_PREDICATE: &str =
     "(attribute_not_exists(last_action_epoch_ms) OR last_action_epoch_ms <= :cutoff)";
+
+/// The anti-regression contract a post-effect audit stamp holds: the stamp
+/// applies only when no newer `last_action_epoch_ms` already exists. `stamp_action`
+/// runs *after* a yielding network call (the open invoke), so a concurrent
+/// debounced mutation can have advanced the anchor between the open's effect
+/// and the stamp; without this guard that newer anchor and its audit fields
+/// would be overwritten by the older open's arrival time. Mirrors
+/// [`DEBOUNCE_PREDICATE`]'s own inclusive `<= :ms`, so a stamp landing at the
+/// exact instant of the stored anchor (neither newer nor older) succeeds, like
+/// a debounce at the boundary, rather than rejecting a stamp that should
+/// apply. Pure so the inclusive boundary is unit-testable without a `DynamoDB`
+/// client; the live `DynamoStore` runs the same string via `stamp_action`.
+const STAMP_PREDICATE: &str =
+    "attribute_not_exists(last_action_epoch_ms) OR last_action_epoch_ms <= :ms";
 
 /// Composes [`DEBOUNCE_PREDICATE`] with any existing condition via `AND`. Pure
 /// so the inclusive boundary is unit-testable without a `DynamoDB` client; the
@@ -528,6 +554,32 @@ mod tests {
         assert!(
             !DEBOUNCE_PREDICATE.contains("< :cutoff"),
             "debounce predicate must not use the strict `<` operator at the cutoff"
+        );
+    }
+
+    #[test]
+    fn stamp_predicate_refuses_to_regress_a_newer_anchor() {
+        // `stamp_action` runs after the open's yielding invoke, so a concurrent
+        // mutation can have advanced `last_action_epoch_ms` past the open's
+        // arrival time by the time the stamp lands. The predicate must refuse
+        // to overwrite that newer anchor (and its audit fields), and must still
+        // allow the very first stamp on an event that has no anchor, mirroring
+        // `DEBOUNCE_PREDICATE`'s own contract. Inclusive at the boundary (`<=`),
+        // so a stamp landing at the exact instant of the stored anchor succeeds
+        // rather than rejecting a stamp that should apply.
+        assert!(
+            STAMP_PREDICATE.contains("attribute_not_exists(last_action_epoch_ms)"),
+            "stamp predicate must allow the first-ever stamp on an anchor-less event, got: \
+             {STAMP_PREDICATE}"
+        );
+        assert!(
+            STAMP_PREDICATE.contains("<= :ms"),
+            "stamp predicate must be inclusive at the cutoff, got: {STAMP_PREDICATE}"
+        );
+        assert!(
+            !STAMP_PREDICATE.contains("< :ms"),
+            "stamp predicate must not use the strict `<` operator, which would reject a stamp \
+             landing at the exact instant of the stored anchor"
         );
     }
 
