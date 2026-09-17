@@ -3,15 +3,25 @@
 //! gate's config document (`c`) in the `KeyValueStore` the function reads
 //! from.
 //!
-//! `PutKey` requires an `IfMatch` `ETag` from `DescribeKeyValueStore`, so a
-//! write is describe-then-put — and because `c` also carries `enforce_from`
-//! and the ruleset, which nothing in this crate writes yet, every write here
-//! is a read-modify-write of the whole document rather than a blind
-//! overwrite.
+//! `PutKey` requires an `IfMatch` `ETag`, and that `ETag` must name the store
+//! version the read observed — not a freshly-described one. `GetKey` returns
+//! the value but no `ETag`; only `DescribeKeyValueStore` exposes one. So
+//! `read_config` pairs `DescribeKeyValueStore` with `GetKey` and returns the
+//! read-time `ETag` alongside the value, and `write_config` puts under that
+//! read-time `ETag`. The put therefore guards the whole read→put window the
+//! read-modify-write spans: a concurrent `PutKey` landing between the read
+//! and the put bumps the store's `ETag`, so this caller's now-stale `IfMatch`
+//! fails with a `ConflictException` and the caller re-reads and re-applies,
+//! rather than the put matching a freshly-described post-concurrent `ETag`
+//! and silently clobbering the concurrent change with a stale document.
+//!
+//! Because `c` also carries `enforce_from` and the ruleset, which nothing in
+//! this crate writes yet, every write here is a read-modify-write of the
+//! whole document rather than a blind overwrite.
 
 use aws_sdk_cloudfrontkeyvaluestore::Client;
 
-use crate::{EdgeConfigStore, EdgeStoreError, GateConfig, encode_gate_config};
+use crate::{ETag, EdgeConfigStore, EdgeStoreError, GateConfig, encode_gate_config};
 
 const CONFIG_KEY: &str = "c";
 
@@ -27,7 +37,10 @@ impl KvsStore {
         Self { client, kvs_arn }
     }
 
-    /// The store's current `ETag`, the precondition every `PutKey` requires.
+    /// The store's current `ETag`, paired with `GetKey` in `read_config` so the
+    /// version the write's `IfMatch` carries names the value the caller's
+    /// mutation was derived from rather than whatever a concurrent writer may
+    /// have advanced the store to by write time.
     async fn etag(&self) -> Result<String, EdgeStoreError> {
         let out = self
             .client
@@ -38,25 +51,18 @@ impl KvsStore {
             .map_err(|e| EdgeStoreError(format!("describe_key_value_store: {e}")))?;
         Ok(out.e_tag().to_owned())
     }
-
-    /// One `PutKey` attempt under a freshly-described `ETag`.
-    async fn try_put(&self, value: &str) -> Result<(), EdgeStoreError> {
-        let etag = self.etag().await?;
-        self.client
-            .put_key()
-            .kvs_arn(&self.kvs_arn)
-            .key(CONFIG_KEY)
-            .value(value)
-            .if_match(etag)
-            .send()
-            .await
-            .map(|_| ())
-            .map_err(|e| EdgeStoreError(format!("put_key: {e}")))
-    }
 }
 
 impl EdgeConfigStore for KvsStore {
-    async fn read_config(&self) -> Result<GateConfig, EdgeStoreError> {
+    async fn read_config(&self) -> Result<(GateConfig, ETag), EdgeStoreError> {
+        // Describe immediately before `GetKey` so the `ETag` names a store
+        // state in which the returned value was present. A concurrent
+        // `PutKey` landing in the (narrow) describe→get_key window bumps the
+        // store's `ETag`, so the read-time `ETag` held here names a
+        // superseded version: the caller's `write_config` `IfMatch` then
+        // fails with a `ConflictException`, which the caller re-reads on
+        // rather than clobbering — fails safe in the reject direction.
+        let etag = self.etag().await?;
         let out = self
             .client
             .get_key()
@@ -65,22 +71,30 @@ impl EdgeConfigStore for KvsStore {
             .send()
             .await
             .map_err(|e| EdgeStoreError(format!("get_key: {e}")))?;
-        serde_json::from_str(out.value())
-            .map_err(|e| EdgeStoreError(format!("decode gate config: {e}")))
+        let cfg = serde_json::from_str(out.value())
+            .map_err(|e| EdgeStoreError(format!("decode gate config: {e}")))?;
+        Ok((cfg, ETag(etag)))
     }
 
-    async fn write_config(&self, cfg: &GateConfig) -> Result<(), EdgeStoreError> {
+    async fn write_config(&self, etag: &ETag, cfg: &GateConfig) -> Result<(), EdgeStoreError> {
         let encoded = encode_gate_config(cfg).map_err(|e| EdgeStoreError(e.to_string()))?;
-        // One retry on a conflicting ETag: another writer landed between our
-        // describe and our put. The write is a read-modify-write of the whole
-        // document, so the loser must re-describe and re-try rather than
-        // clobber the winner's change with a stale precondition.
-        match self.try_put(&encoded).await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                tracing::warn!(error = %e, "put_key failed; retrying once against a fresh ETag");
-                self.try_put(&encoded).await
-            }
-        }
+        // Put under the *read-time* `ETag`, not a freshly-described one: the
+        // `IfMatch` succeeds only when no concurrent `PutKey` has bumped the
+        // store since the read, so a stale document can never overwrite a
+        // concurrent writer's committed change. A `ConflictException`
+        // (precondition mismatch) surfaces as `Err` and is handled by the
+        // caller's re-read; it is deliberately not retried here, because
+        // retrying against a fresh `ETag` would reintroduce exactly the
+        // read→put clobber this write exists to prevent.
+        self.client
+            .put_key()
+            .kvs_arn(&self.kvs_arn)
+            .key(CONFIG_KEY)
+            .value(encoded)
+            .if_match(&etag.0)
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|e| EdgeStoreError(format!("put_key: {e}")))
     }
 }

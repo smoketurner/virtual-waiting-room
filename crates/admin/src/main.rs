@@ -396,7 +396,7 @@ async fn dashboard(State(state): State<Shared>, headers: HeaderMap, now: Arrival
             // an empty textarea is indistinguishable from a real dormant
             // ruleset, and submitting it would overwrite the real one.
             match state.edge.read_config().await {
-                Ok(cfg) => view.rules_text = format_rules(&cfg.rules),
+                Ok((cfg, _etag)) => view.rules_text = format_rules(&cfg.rules),
                 Err(e) => {
                     tracing::warn!(error = %e, "could not read the current ruleset");
                     view.rules_load_failed = true;
