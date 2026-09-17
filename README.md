@@ -44,14 +44,18 @@ rate, plus standby across the rest of the site for visitors who hit the homepage
 ## How it works
 
 ```
-  Web Application
-  Firewall (WAF) ──► CloudFront ──► API Gateway ──► SQS ──► Lambda ──► DynamoDB
-   │          │              (direct integration, no compute in the burst path)
-   │          └─ /status: Min TTL 1s, no cookies forwarded — CloudFront collapses
-   │             simultaneous misses into one origin fetch, so origin load is
-   │             independent of how many people are waiting
-   └─ Bot Control · Autonomous System Number (ASN) matching · anti-DDoS
+  CloudFront ──► API Gateway ──► SQS ──► Lambda ──► DynamoDB
+              (direct integration, no compute in the burst path)
+   └─ /status: Min TTL 1s, no cookies forwarded — CloudFront collapses
+      simultaneous misses into one origin fetch, so origin load is
+      independent of how many people are waiting
 ```
+
+No web ACL is created by default — it is priced per request inspected against the
+system's own waiting-page polling, which is not an attack. The edge gate is a
+CloudFront Function at viewer-request that refuses every request without a valid
+session before the origin is touched; WAF and Bot Control attach per event where
+the cost is justified. See [`DESIGN.md`](./docs/DESIGN.md) §8.
 
 Admission is a signed token, validated once and exchanged for a session cookie, so the
 origin never calls the waiting room on the hot path.
