@@ -6,7 +6,7 @@ use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
 use aws_sdk_dynamodb::types::AttributeValue;
-use wr_common::expr::{Condition, Key, Update};
+use wr_common::expr::{Condition, Expression, Key, Update};
 use wr_common::{Phase, SHARDS, Shard, shard_count_of, shard_index_of};
 
 use crate::{OpenValues, Store, StoreError};
@@ -101,11 +101,22 @@ impl Store for DynamoStore {
 
         // The seed is written by the open and nothing else, so its absence
         // means "not yet open" and a double-fire is rejected rather than
-        // reseeding.
-        let guard = Condition::attribute_not_exists("shuffle_seed").build();
+        // reseeding. The phase clause narrows the open to the
+        // `pre_queue → active` step the lifecycle is built around: an open
+        // from `idle` (or any other phase) closes a pre-queue that does not
+        // exist, seeds a cohort of 0, and forfeits the pre-queue stage for
+        // the life of the event — so the database rejects it rather than the
+        // admin path being trusted to. Both triggers — Open now and the
+        // scheduled fire — funnel through this one conditional update.
+        let guard = open_guard();
 
         let mut names = open.names;
         names.extend(guard.names);
+        // The seed-absence guard binds no values, but the phase clause does,
+        // so the guard's values must travel with the update's values on the
+        // same request or DynamoDB rejects it for an unbound placeholder.
+        let mut values = open.values;
+        values.extend(guard.values);
 
         let result = self
             .client
@@ -115,7 +126,7 @@ impl Store for DynamoStore {
             .update_expression(open.expression)
             .condition_expression(guard.expression)
             .set_expression_attribute_names(Some(names))
-            .set_expression_attribute_values(Some(open.values))
+            .set_expression_attribute_values(Some(values))
             .send()
             .await;
 
@@ -132,6 +143,25 @@ impl Store for DynamoStore {
             Err(e) => Err(StoreError(format!("update_item: {e}"))),
         }
     }
+}
+
+/// The conditional-update guard on the open: the seed must be absent (the
+/// event has not been opened yet) AND the event must be in the `pre_queue`
+/// phase (the open is the `pre_queue → active` step). Both clauses land on
+/// one `ConditionExpression` so a double-fire, an Open now from the wrong
+/// phase, or a scheduled fire on an `idle` event all reject in the same
+/// `UpdateItem` — rather than the open seeding a cohort of 0 and forfeiting
+/// the pre-queue stage the lifecycle is built around.
+///
+/// Extracted so the unit test can pin the clause shape and the bindings; the
+/// SDK call itself is the untested boundary (see the repo's testing notes).
+fn open_guard() -> Expression {
+    Condition::attribute_not_exists("shuffle_seed")
+        .and_equals(
+            "phase",
+            AttributeValue::S(Phase::PreQueue.as_wire_str().to_owned()),
+        )
+        .build()
 }
 
 /// Folds a batch-get response's shard items into per-shard counts.
@@ -212,5 +242,49 @@ mod tests {
         )]);
         let items = vec![shard_item(0, 3), corrupt];
         assert!(counts_from_shard_items(&items).is_err());
+    }
+
+    #[test]
+    fn the_open_guard_requires_an_absent_seed_and_a_pre_queue_phase() {
+        // The open is the `pre_queue → active` step. The guard must keep the
+        // seed-absence clause (a double-fire must not reseed) AND add a phase
+        // clause, so an open from `idle`/`maintenance`/`active` cannot reach
+        // the write at the single chokepoint both triggers funnel through.
+        let guard = open_guard();
+        assert!(
+            guard.expression.contains("attribute_not_exists("),
+            "the seed-absence guard must remain: {guard:?}"
+        );
+        assert!(
+            guard.expression.contains(" AND "),
+            "the phase precondition must be AND-ed onto the seed guard: {guard:?}"
+        );
+        assert!(
+            !guard.expression.contains(" OR "),
+            "AND must not degrade to OR: {}",
+            guard.expression
+        );
+        assert_eq!(
+            guard.names.len(),
+            2,
+            "one name placeholder per referenced attribute (shuffle_seed, phase): {guard:?}"
+        );
+        assert!(
+            guard.names.values().any(|v| v == "shuffle_seed"),
+            "shuffle_seed must stay name-bound: {guard:?}"
+        );
+        assert!(
+            guard.names.values().any(|v| v == "phase"),
+            "phase must be name-bound: {guard:?}"
+        );
+        // The seed-absence guard binds no values, so this one value is the
+        // phase clause's — and the one the caller must merge into
+        // ExpressionAttributeValues (which write_open now does).
+        assert_eq!(guard.values.len(), 1, "exactly the phase value: {guard:?}");
+        let phase_value = guard.values.values().next().unwrap();
+        assert!(
+            matches!(phase_value, AttributeValue::S(s) if s == Phase::PreQueue.as_wire_str()),
+            "the phase value must be the pre_queue wire string: {phase_value:?}"
+        );
     }
 }

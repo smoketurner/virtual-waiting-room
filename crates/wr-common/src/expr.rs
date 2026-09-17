@@ -360,6 +360,20 @@ impl Condition {
         self
     }
 
+    /// Narrows the condition with `AND <attr> = <value>`.
+    ///
+    /// Unlike [`Condition::attribute_not_exists`], this clause binds a value,
+    /// so a caller that previously sent only the update's
+    /// `ExpressionAttributeValues` must merge the built guard's `values` in
+    /// too, or `DynamoDB` rejects the request for an unbound placeholder.
+    #[must_use]
+    pub fn and_equals(mut self, attr: &str, value: AttributeValue) -> Self {
+        let name = self.bind_name(attr);
+        let placeholder = self.bind_value(value);
+        self.expression = format!("{} AND {name} = {placeholder}", self.expression);
+        self
+    }
+
     /// The expression and its bindings.
     #[must_use]
     pub fn build(self) -> Expression {
@@ -640,6 +654,76 @@ mod tests {
         assert!(widened.expression.contains(" OR "));
         assert_eq!(widened.values.len(), 1);
         assert_self_consistent(&widened);
+    }
+
+    #[test]
+    fn and_equals_narrows_the_condition_with_a_bound_clause() {
+        // The open guards on the seed's absence AND the phase being
+        // `pre_queue`, so the two clauses land on one `ConditionExpression`.
+        let narrowed = Condition::attribute_not_exists("shuffle_seed")
+            .and_equals("phase", AttributeValue::S("pre_queue".to_owned()))
+            .build();
+        assert!(narrowed.expression.contains("attribute_not_exists("));
+        assert!(narrowed.expression.contains(" AND "));
+        assert!(
+            !narrowed.expression.contains(" OR "),
+            "AND must not degrade to OR: {}",
+            narrowed.expression
+        );
+        assert_eq!(narrowed.names.len(), 2, "one name per referenced attribute");
+        assert!(
+            narrowed.names.values().any(|v| v == "phase"),
+            "the phase attribute must be name-bound"
+        );
+        assert!(
+            narrowed.names.values().any(|v| v == "shuffle_seed"),
+            "the shuffle_seed attribute must stay name-bound"
+        );
+        assert_eq!(
+            narrowed.values.len(),
+            1,
+            "the AND clause binds a value the seed-absence guard does not"
+        );
+        let value = narrowed.values.values().next().unwrap();
+        assert!(
+            matches!(value, AttributeValue::S(s) if s == "pre_queue"),
+            "the phase value must be the pre_queue wire string: {value:?}"
+        );
+        assert_self_consistent(&narrowed);
+    }
+
+    #[test]
+    fn and_equals_keeps_the_condition_namespace_disjoint_from_an_update() {
+        // The open sets `phase` in the update AND conditions on `phase` in
+        // the guard. Both reference the attribute through their own
+        // placeholder (#u<n> vs #c<n>), so two distinct names map to "phase"
+        // and the values stay disjoint (`:u<n>` vs `:c<n>`).
+        let update = Update::new()
+            .set("phase", AttributeValue::S("active".to_owned()))
+            .build();
+        let condition = Condition::attribute_not_exists("shuffle_seed")
+            .and_equals("phase", AttributeValue::S("pre_queue".to_owned()))
+            .build();
+        for name in condition.names.keys() {
+            assert!(!update.names.contains_key(name), "name collision: {name}");
+        }
+        for placeholder in condition.values.keys() {
+            assert!(
+                !update.values.contains_key(placeholder),
+                "value collision: {placeholder}"
+            );
+        }
+        // Merging the two names maps keeps both `phase` bindings distinct.
+        let mut merged_names = update.names.clone();
+        merged_names.extend(condition.names.clone());
+        assert_eq!(
+            merged_names.values().filter(|v| *v == "phase").count(),
+            2,
+            "both phase references must survive the merge"
+        );
+        let mut merged_values = update.values.clone();
+        merged_values.extend(condition.values.clone());
+        assert_eq!(merged_values.len(), 2, "no value lost in the merge");
     }
 
     #[test]

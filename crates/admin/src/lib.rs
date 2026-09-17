@@ -1047,11 +1047,14 @@ pub async fn apply_start_time<S: Store, K: OpenSchedule>(
 ///
 /// This invokes the same function the schedule invokes, because the open is
 /// one conditional write — seed, prefix offsets, cohort size and the active
-/// phase together, guarded by the seed's absence — and that guard is what
-/// makes a double-fire safe. Setting the phase to `Active` from here instead
-/// would produce an event that *says* it is open while `/queue_num` answers
-/// "not yet open" to every pre-queue visitor, because nothing would have
-/// written the permutation seed their position is derived from.
+/// phase together — guarded by the seed's absence AND the phase being
+/// `pre_queue` (the open is the `pre_queue → active` step). That guard is
+/// what makes a double-fire safe, and what stops an open from `idle` (or any
+/// other phase) from closing a pre-queue that does not exist and seeding a
+/// cohort of 0. Setting the phase to `Active` from here instead would
+/// produce an event that *says* it is open while `/queue_num` answers "not
+/// yet open" to every pre-queue visitor, because nothing would have written
+/// the permutation seed their position is derived from.
 ///
 /// Idempotent by construction: an event the schedule already opened reports
 /// [`OpenNow::AlreadyOpen`] and nothing changes. The audit stamp is written
@@ -1070,6 +1073,9 @@ pub async fn apply_start_time<S: Store, K: OpenSchedule>(
 /// # Errors
 ///
 /// [`ActionError::NotFound`] if the event item does not exist;
+/// [`ActionError::IllegalTransition`] if the event is not in the `pre_queue`
+/// phase — the open is the `pre_queue → active` step and is refused before
+/// the open is invoked, so a hand-crafted POST cannot seed a cohort of 0;
 /// [`ActionError::TooFast`] inside the debounce window; a [`StoreError`] if
 /// the invoke fails.
 pub async fn apply_open_now<S: Store, O: Opener>(
@@ -1082,6 +1088,20 @@ pub async fn apply_open_now<S: Store, O: Opener>(
     let Some(state) = store.load(event_id).await? else {
         return Err(ActionError::NotFound.into());
     };
+    // The open is the `pre_queue → active` step. From `idle` (or any other
+    // phase) there is no pre-queue to close, so the open would seed a cohort
+    // of 0 and forfeit the pre-queue stage for the life of the event. Reject
+    // before invoking, with the same `IllegalTransition` shape `apply_phase`
+    // uses; the dashboard hides the form on any other phase, so this catches
+    // a hand-crafted POST. The Dynamo write's own phase clause is the
+    // defense-in-depth that closes the scheduled trigger too.
+    if state.phase != Phase::PreQueue {
+        return Err(ActionError::IllegalTransition {
+            from: state.phase,
+            to: Phase::Active,
+        }
+        .into());
+    }
     debounce_check(&state, now)?;
 
     let outcome = opener
@@ -2508,6 +2528,114 @@ mod tests {
         assert_eq!(state.last_action.as_deref(), Some("open_now"));
         assert_eq!(state.last_action_by.as_deref(), Some("opA@x"));
         assert_eq!(state.last_action_time, Some(ts(3_000).timestamp()));
+    }
+
+    #[tokio::test]
+    async fn open_now_from_idle_is_rejected_before_invoking_the_open() {
+        // The freshly-applied event sits in `idle` with no cohort. Open now
+        // would close a pre-queue that does not exist, seeding a cohort of 0
+        // and forfeiting the pre-queue stage for the life of the event. The
+        // handler must refuse before the open is invoked, with the same
+        // `IllegalTransition` shape `apply_phase` uses — the dashboard hides
+        // the form on `idle`, so this catches a hand-crafted POST.
+        let store = FakeStore::with_phase(Phase::Idle);
+        let opener = FakeOpener::reporting(OpenNow::Opened);
+
+        let err = apply_open_now(&store, &opener, "evt", "op@x", ts(1_000)).await;
+
+        assert!(
+            matches!(
+                err,
+                Err(ApplyError::Action(ActionError::IllegalTransition {
+                    from: Phase::Idle,
+                    to: Phase::Active
+                }))
+            ),
+            "open from idle must be refused as an illegal transition, got {err:?}"
+        );
+        assert_eq!(opener.calls(), 0, "the open must not be invoked from idle");
+        // The store is untouched: no audit stamp and the phase stays idle.
+        let state = store.load("evt").await.unwrap().unwrap();
+        assert_eq!(state.phase, Phase::Idle);
+        assert_eq!(state.last_action, None, "nothing was attempted to record");
+    }
+
+    #[tokio::test]
+    async fn open_now_from_an_unopened_maintenance_event_is_rejected_without_invoking() {
+        // `maintenance` is reachable from anywhere, so an unopened event can
+        // sit in it. The same hazard as `idle` applies: there is no pre-queue
+        // to close. Recovery back to `active` routes through `apply_phase`
+        // (which requires a cohort), not through Open now.
+        let store = FakeStore::with_phase(Phase::Maintenance);
+        let opener = FakeOpener::reporting(OpenNow::Opened);
+
+        let err = apply_open_now(&store, &opener, "evt", "op@x", ts(1_000)).await;
+
+        assert!(
+            matches!(
+                err,
+                Err(ApplyError::Action(ActionError::IllegalTransition {
+                    from: Phase::Maintenance,
+                    to: Phase::Active
+                }))
+            ),
+            "open from maintenance must be refused as an illegal transition, got {err:?}"
+        );
+        assert_eq!(
+            opener.calls(),
+            0,
+            "the open must not be invoked from maintenance"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_now_from_an_active_event_is_rejected_as_an_illegal_transition() {
+        // An already-open event is in `active` with a cohort. The form is
+        // hidden when `opened`, so this only catches a hand-crafted POST.
+        // The open is the `pre_queue → active` step — running it from
+        // `active` is not legal, so it is refused at the handler rather than
+        // relying on the database's seed guard to report `AlreadyOpen`. The
+        // race where the schedule fires between the load and the invoke is
+        // still safe: a `pre_queue` load passes this check and the open's own
+        // conditional write reports `AlreadyOpen` (see
+        // `an_open_that_was_already_open_is_not_recorded_as_an_opening`).
+        let store = FakeStore::opened_with_phase(Phase::Active);
+        let opener = FakeOpener::reporting(OpenNow::AlreadyOpen);
+
+        let err = apply_open_now(&store, &opener, "evt", "op@x", ts(1_000)).await;
+
+        assert!(
+            matches!(
+                err,
+                Err(ApplyError::Action(ActionError::IllegalTransition {
+                    from: Phase::Active,
+                    to: Phase::Active
+                }))
+            ),
+            "open from active must be refused as an illegal transition, got {err:?}"
+        );
+        assert_eq!(
+            opener.calls(),
+            0,
+            "the open must not be invoked from active"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_now_from_pre_queue_still_invokes_the_open() {
+        // Regression guard: the phase precondition must not reject the one
+        // phase the open is legal from. A pre_queue event the schedule has
+        // already opened still reports `AlreadyOpen` through the open's own
+        // conditional write, not through the handler's phase check.
+        let store = FakeStore::with_phase(Phase::PreQueue);
+        let opener = FakeOpener::reporting(OpenNow::Opened);
+
+        let outcome = apply_open_now(&store, &opener, "evt", "op@x", ts(1_000))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, OpenNow::Opened);
+        assert_eq!(opener.calls(), 1);
     }
 
     #[tokio::test]
