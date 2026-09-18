@@ -37,7 +37,7 @@ waiting-room backend.
   T−0   EventBridge Scheduler → open_event (Rust, arm64)
           ONE UpdateItem on Counters:
             SET shuffle_seed = :seed, participant_count = :n, phase = :active
-            ConditionExpression: attribute_not_exists(shuffle_seed)
+            ConditionExpression: attribute_not_exists(shuffle_seed) AND phase = :pre_queue
                                     │
                                     ▼
   T+    /queue_num reads (s, l) from PreQueue, seed/N/offsets from /status, returns
@@ -240,7 +240,7 @@ sequence's starting value in the same conditional write
 ```
 UpdateExpression: SET shuffle_seed = :seed, participant_count = :n,
                       queue_counter = :n, prequeue_offsets = :offsets, phase = :active
-ConditionExpression: attribute_not_exists(shuffle_seed)
+ConditionExpression: attribute_not_exists(shuffle_seed) AND phase = :pre_queue
 ```
 
 `queue_counter = :n` is in the same write for a reason, not an afterthought: the live-join

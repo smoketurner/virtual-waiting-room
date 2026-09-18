@@ -142,7 +142,7 @@ live-join position would only be a gap.
 ```
 SET shuffle_seed = :seed, participant_count = :n, queue_counter = :n,
     prequeue_offsets = :offsets, phase = :active
-ConditionExpression: attribute_not_exists(shuffle_seed)
+ConditionExpression: attribute_not_exists(shuffle_seed) AND phase = :pre_queue
 ```
 
 `open_event` first gathers the ten shard counts with one strongly consistent `BatchGetItem`, then

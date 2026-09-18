@@ -109,7 +109,7 @@ Where a reserved word is unavoidable, the code uses a placeholder properly: `sta
 | `assign_position` | `Counters` | `GetItem` event item (fix-up re-read) | **Strong** | 1 per pre-queue batch |
 | `assign_position` | `Positions` | `PutItem` if `attribute_not_exists(request_id)` | — | 1 per live joiner |
 | `open_event` | `Counters` | `BatchGetItem` of ten pre-queue shards | **Strong** | Once per event |
-| `open_event` | `Counters` | `UpdateItem` if `attribute_not_exists(shuffle_seed)` | — | Once per event |
+| `open_event` | `Counters` | `UpdateItem` if `attribute_not_exists(shuffle_seed) AND phase = :pre_queue` | — | Once per event |
 | `read` | `Counters` | `GetItem` event item | Eventual, 1 s in-process cache | ≤1/s per execution environment |
 | `read` | `PreQueue` | `GetItem` by `r` | Eventual | 1 per `/v1/queue_num` |
 | `read` | `Positions` | `GetItem` by `request_id` | Eventual | 1 per `/v1/queue_num` with no `PreQueue` row |
@@ -239,7 +239,7 @@ test seam.
 |---|---|---|
 | `PreQueue` row | `attribute_not_exists(r)` | A duplicate registration consumes no index |
 | `Positions` row | `attribute_not_exists(request_id)` | A duplicate join consumes no position |
-| Open | `attribute_not_exists(shuffle_seed)` | A double-fire opens exactly once |
+| Open | `attribute_not_exists(shuffle_seed) AND phase = :pre_queue` | A double-fire opens exactly once |
 | Cursor advance | `attribute_not_exists(serving_counter) OR serving_counter = :expected` | Overlapping controller executions cannot double-advance |
 | Admission reservation | `attribute_not_exists(request_id)` | A reservation is taken once |
 | Phase change | `phase = :from` | A transition another operator applied is a 409 |
