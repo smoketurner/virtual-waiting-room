@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
+use aws_sdk_dynamodb::operation::get_item::builders::GetItemFluentBuilder;
 use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
 use aws_sdk_dynamodb::types::AttributeValue;
 use wr_common::expr::{Condition, Expression, Key, Update};
@@ -23,6 +24,39 @@ impl DynamoStore {
         Self {
             client,
             counters_table,
+        }
+    }
+
+    /// Builds the `is_already_open` `GetItem` — a single-attribute projection
+    /// on `shuffle_seed` — without sending it, so a regression test can pin
+    /// the projection shape. The open wrote `shuffle_seed` and nothing else
+    /// does, so its presence is the single authoritative "already open"
+    /// signal; the projection keeps the disambiguating read to one attribute
+    /// regardless of how many other attributes the event item accumulates.
+    /// Names `shuffle_seed` through a placeholder so a reserved word cannot
+    /// silently break the projection, matching the [`wr_common::expr`]
+    /// builders' convention of name-binding every attribute.
+    fn build_is_already_open_req(&self, event_id: &str) -> GetItemFluentBuilder {
+        self.client
+            .get_item()
+            .table_name(&self.counters_table)
+            .set_key(Some(Key::Event { event_id }.build()))
+            .projection_expression("#seed")
+            .expression_attribute_names("#seed", "shuffle_seed")
+    }
+
+    /// A `DynamoStore` over a zero-config client for regression tests that
+    /// inspect the `projection_expression`/`key` the builder emits. The
+    /// builder is never sent, so no network or credentials are needed; this
+    /// only exercises the SDK's fluent-builder construction.
+    #[cfg(test)]
+    fn for_test() -> Self {
+        let conf = aws_sdk_dynamodb::Config::builder()
+            .behavior_version_latest()
+            .build();
+        Self {
+            client: aws_sdk_dynamodb::Client::from_conf(conf),
+            counters_table: "Counters".to_owned(),
         }
     }
 }
@@ -143,6 +177,28 @@ impl Store for DynamoStore {
             Err(e) => Err(StoreError(format!("update_item: {e}"))),
         }
     }
+
+    async fn is_already_open(&self, event_id: &str) -> Result<bool, StoreError> {
+        // A GetItem projecting only shuffle_seed: the open wrote it and
+        // nothing else does, so its presence is the single authoritative
+        // "already open" signal. The projection keeps the read to one
+        // attribute however large the event item grows. This disambiguates a
+        // write_open false into "already open" (seed present) vs "wrong phase"
+        // (seed absent) — the two causes the narrowed open_guard collapses
+        // into one ConditionalCheckFailedException. A missing event item
+        // (the event does not exist) reads as "not already open" rather than
+        // an error: the caller treats that as a wrong-phase rejection and
+        // surfaces it, which is correct — an open against a non-existent
+        // event cannot succeed either.
+        let out = self
+            .build_is_already_open_req(event_id)
+            .send()
+            .await
+            .map_err(|e| StoreError(format!("get_item shuffle_seed: {e}")))?;
+        Ok(out
+            .item()
+            .is_some_and(|item| item.contains_key("shuffle_seed")))
+    }
 }
 
 /// The conditional-update guard on the open: the seed must be absent (the
@@ -191,7 +247,11 @@ fn counts_from_shard_items(
 
 #[cfg(test)]
 mod tests {
-    #![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
+    #![expect(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        reason = "test code panics on setup failure"
+    )]
 
     use wr_common::expr::{SHARD_COUNT_ATTR, SHARD_INDEX_ATTR};
 
@@ -286,5 +346,227 @@ mod tests {
             matches!(phase_value, AttributeValue::S(s) if s == Phase::PreQueue.as_wire_str()),
             "the phase value must be the pre_queue wire string: {phase_value:?}"
         );
+    }
+
+    #[test]
+    fn is_already_open_projects_only_shuffle_seed_on_the_event_item() {
+        // is_already_open disambiguates a write_open false. It must project only
+        // the one attribute that names "already open" — `shuffle_seed`, which
+        // the open wrote and nothing else does — so the read stays one
+        // attribute however large the event item grows, and a missing event
+        // item (the event does not exist) reads as "not already open" rather
+        // than an error. The FakeStore double cannot catch a regression that
+        // drops the projection or names the wrong attribute, so this pins the
+        // shape on the live builder the trait method actually sends.
+        let store = DynamoStore::for_test();
+        let req = store.build_is_already_open_req("evt");
+        assert_eq!(
+            req.get_projection_expression().as_deref(),
+            Some("#seed"),
+            "is_already_open must project shuffle_seed through a name placeholder"
+        );
+        let names = req
+            .get_expression_attribute_names()
+            .as_ref()
+            .expect("is_already_open binds #seed to shuffle_seed");
+        assert_eq!(
+            names.get("#seed").map(String::as_str),
+            Some("shuffle_seed"),
+            "the #seed name placeholder must bind to shuffle_seed"
+        );
+        // The key addresses the event item (the open's target), not a shard.
+        let key = req.get_key().as_ref().expect("is_already_open sets a key");
+        assert_eq!(
+            key.get("event_id")
+                .and_then(|v| v.as_s().ok())
+                .map(String::as_str),
+            Some("EVT#evt"),
+            "is_already_open must address the event item"
+        );
+    }
+
+    /// Live disambiguation test against DynamoDB-Local. Validates the part the
+    /// `cfg(test)` builder test and `FakeStore` cannot reach: that a real
+    /// `write_open` against a `phase = idle` (no `shuffle_seed`) event returns
+    /// `Ok(false)` (the narrowed `open_guard` rejects), that
+    /// `is_already_open` then reads `Ok(false)` (no seed — the wrong-phase
+    /// disambiguator), that nothing was written, and that after moving the
+    /// phase to `pre_queue` the next `write_open` returns `Ok(true)` with the
+    /// seed/phase/count/offsets all written. Skipped unless `DDB_LOCAL_ENDPOINT`
+    /// is set, so the normal `cargo test` run is unaffected; run with
+    /// `cargo test -p open_event -- --ignored live_open_disambiguates_wrong_phase_from_already_open`.
+    #[tokio::test]
+    #[ignore = "requires DDB_LOCAL_ENDPOINT (DynamoDB-Local)"]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "live DDB-Local: table setup + a two-phase (wrong-phase then pre_queue) scenario under test"
+    )]
+    async fn live_open_disambiguates_wrong_phase_from_already_open() {
+        use crate::open_values;
+
+        let endpoint = std::env::var("DDB_LOCAL_ENDPOINT")
+            .expect("DDB_LOCAL_ENDPOINT must point at a running DynamoDB-Local");
+        let table = format!("CountersTest_{}", std::process::id());
+        let conf = aws_sdk_dynamodb::Config::builder()
+            .behavior_version_latest()
+            .endpoint_url(endpoint)
+            .region(aws_sdk_dynamodb::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_dynamodb::config::Credentials::new(
+                "key", "secret", None, None, "test",
+            ))
+            .build();
+        let client = aws_sdk_dynamodb::Client::from_conf(conf);
+        let store = DynamoStore::new(client.clone(), table.clone());
+
+        client
+            .create_table()
+            .table_name(&table)
+            .attribute_definitions(
+                aws_sdk_dynamodb::types::AttributeDefinition::builder()
+                    .attribute_name("event_id")
+                    .attribute_type(aws_sdk_dynamodb::types::ScalarAttributeType::S)
+                    .build()
+                    .unwrap(),
+            )
+            .key_schema(
+                aws_sdk_dynamodb::types::KeySchemaElement::builder()
+                    .attribute_name("event_id")
+                    .key_type(aws_sdk_dynamodb::types::KeyType::Hash)
+                    .build()
+                    .unwrap(),
+            )
+            .billing_mode(aws_sdk_dynamodb::types::BillingMode::PayPerRequest)
+            .send()
+            .await
+            .expect("create_table");
+
+        // Seed: an event seeded `idle` with no shuffle_seed — exactly the path
+        // the scheduled open rejects. The store addresses the row by the
+        // `EVT#<event_id>` prefixed key (`Key::Event`), so the seed uses that
+        // key, not the bare id.
+        let key = Key::Event { event_id: "evt" }.build();
+        client
+            .put_item()
+            .table_name(&table)
+            .set_item(Some(key.clone()))
+            .item("phase", AttributeValue::S("idle".to_owned()))
+            .send()
+            .await
+            .expect("seed put");
+
+        // A wrong-phase open: the narrowed open_guard (seed absent AND
+        // phase = pre_queue) rejects because phase = idle, so write_open
+        // returns Ok(false) — the same false a double-fire would, but with no
+        // seed present.
+        let values = open_values([0; SHARDS], [9u8; 32]).unwrap();
+        let wrote = store
+            .write_open("evt", &values)
+            .await
+            .expect("write_open returns Ok");
+        assert!(
+            !wrote,
+            "a wrong-phase open must reject (Ok(false)), not write"
+        );
+
+        // The disambiguating read: no shuffle_seed means NOT already open, so
+        // a caller must treat this as a wrong-phase rejection (Err), not an
+        // already-open no-op. This is the read the open_event disambiguation
+        // branches on.
+        let already = store
+            .is_already_open("evt")
+            .await
+            .expect("is_already_open returns Ok");
+        assert!(
+            !already,
+            "an idle event with no seed is not already open; the guard failed on phase, not on the seed"
+        );
+
+        // Net effect: nothing was written. The event stays idle with no seed —
+        // the protective rejection the phase clause exists for.
+        let item = client
+            .get_item()
+            .table_name(&table)
+            .set_key(Some(key.clone()))
+            .send()
+            .await
+            .expect("get_item")
+            .item
+            .expect("item exists");
+        assert_eq!(
+            item.get("phase")
+                .and_then(|v| v.as_s().ok())
+                .map(String::as_str),
+            Some("idle"),
+            "a rejected open must not flip the phase"
+        );
+        assert!(
+            !item.contains_key("shuffle_seed"),
+            "a rejected open must not write the seed"
+        );
+        assert!(
+            !item.contains_key("participant_count"),
+            "a rejected open must not write the cohort size"
+        );
+
+        // Move the phase to pre_queue (the operator's lifecycle step), then
+        // re-open: the guard now passes, and the open writes the seed, cohort
+        // size, offsets, queue_counter, and active phase together.
+        client
+            .update_item()
+            .table_name(&table)
+            .set_key(Some(key.clone()))
+            .update_expression("SET phase = :p")
+            .expression_attribute_values(":p", AttributeValue::S("pre_queue".to_owned()))
+            .send()
+            .await
+            .expect("move to pre_queue");
+
+        let wrote = store
+            .write_open("evt", &values)
+            .await
+            .expect("write_open returns Ok");
+        assert!(wrote, "an open from pre_queue must succeed (Ok(true))");
+
+        let item = client
+            .get_item()
+            .table_name(&table)
+            .set_key(Some(key.clone()))
+            .send()
+            .await
+            .expect("get_item")
+            .item
+            .expect("item exists");
+        assert_eq!(
+            item.get("phase")
+                .and_then(|v| v.as_s().ok())
+                .map(String::as_str),
+            Some("active"),
+            "a successful open flips the phase to active"
+        );
+        assert!(
+            item.contains_key("shuffle_seed"),
+            "a successful open writes the seed"
+        );
+        assert_eq!(
+            item.get("participant_count")
+                .and_then(|v| v.as_n().ok())
+                .map(String::as_str),
+            Some("0"),
+            "an empty cohort opens to participant_count = 0"
+        );
+        assert!(
+            item.contains_key("prequeue_offsets"),
+            "a successful open writes the prefix offsets"
+        );
+
+        // And the disambiguator now reads "already open" — a retried fire or a
+        // double-fire must land in AlreadyOpen, not retry forever.
+        let already = store
+            .is_already_open("evt")
+            .await
+            .expect("is_already_open returns Ok");
+        assert!(already, "after a successful open the seed is present");
+
+        let _ = client.delete_table().table_name(&table).send().await;
     }
 }
