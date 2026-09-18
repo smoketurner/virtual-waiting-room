@@ -322,6 +322,46 @@ fn rules() -> Vec<RuleVector> {
             request: req("/%63heckout", &[], &[]),
             matches: true,
         },
+        // Mixed valid + malformed percent-encoding (the PR #120 regression):
+        // a valid escape inside the protected prefix must still be decoded
+        // when a later malformed escape is present. gate.js.tftpl previously
+        // called decodeURIComponent whole-string and reverted the entire URI
+        // on the malformed escape, dropping the valid decode and evading the
+        // rule; these vectors pin the per-byte behaviour both engines share.
+        RuleVector {
+            name: "path_prefix_matches_valid_escape_with_malformed_hex_later".into(),
+            rule: serde_json::json!(["p", "/admin"]),
+            request: req("/%61dmin/secret%zz", &[], &[]),
+            matches: true,
+        },
+        RuleVector {
+            name: "path_prefix_matches_valid_escape_with_non_utf8_byte_later".into(),
+            rule: serde_json::json!(["p", "/admin"]),
+            request: req("/%61dmin/secret%ff", &[], &[]),
+            matches: true,
+        },
+        RuleVector {
+            name: "path_prefix_matches_valid_escape_mid_string_with_malformed_later".into(),
+            rule: serde_json::json!(["p", "/foocbar"]),
+            request: req("/foo%63bar%zz", &[], &[]),
+            matches: true,
+        },
+        // A `+`-signed two-character escape is not a valid escape in either
+        // engine. Rust must not reach it through `u8::from_str_radix`, which
+        // accepts a leading sign; gate.js.tftpl reads the two characters as
+        // hex digits and refuses. Left literal, the prefix does not match.
+        RuleVector {
+            name: "path_prefix_no_match_signed_hex_escape_stays_literal".into(),
+            rule: serde_json::json!(["p", "/admin"]),
+            request: req("/%+41dmin", &[], &[]),
+            matches: false,
+        },
+        RuleVector {
+            name: "path_prefix_no_match_malformed_escape_in_prefix_does_not_recover".into(),
+            rule: serde_json::json!(["p", "/admin"]),
+            request: req("/%zzdmin/secret", &[], &[]),
+            matches: false,
+        },
         RuleVector {
             name: "path_prefix_matches_doubled_leading_slash".into(),
             rule: serde_json::json!(["p", "/checkout"]),

@@ -165,6 +165,71 @@
       "matches": true
     },
     {
+      "name": "path_prefix_matches_valid_escape_with_malformed_hex_later",
+      "rule": [
+        "p",
+        "/admin"
+      ],
+      "request": {
+        "path": "/%61dmin/secret%zz",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": true
+    },
+    {
+      "name": "path_prefix_matches_valid_escape_with_non_utf8_byte_later",
+      "rule": [
+        "p",
+        "/admin"
+      ],
+      "request": {
+        "path": "/%61dmin/secret%ff",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": true
+    },
+    {
+      "name": "path_prefix_matches_valid_escape_mid_string_with_malformed_later",
+      "rule": [
+        "p",
+        "/foocbar"
+      ],
+      "request": {
+        "path": "/foo%63bar%zz",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": true
+    },
+    {
+      "name": "path_prefix_no_match_signed_hex_escape_stays_literal",
+      "rule": [
+        "p",
+        "/admin"
+      ],
+      "request": {
+        "path": "/%+41dmin",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": false
+    },
+    {
+      "name": "path_prefix_no_match_malformed_escape_in_prefix_does_not_recover",
+      "rule": [
+        "p",
+        "/admin"
+      ],
+      "request": {
+        "path": "/%zzdmin/secret",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": false
+    },
+    {
       "name": "path_prefix_matches_doubled_leading_slash",
       "rule": [
         "p",
