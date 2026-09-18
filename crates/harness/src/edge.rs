@@ -216,6 +216,23 @@ impl Edge {
                     Err(_) => (502, String::from("collapse failed"), Disposition::Collapsed),
                 };
             }
+            // A previous leader may have finished and populated `entries`
+            // between the cache check above and here — its in-flight entry is
+            // already gone, so the `inflight` re-check above would miss it and
+            // this task would start a redundant origin fetch. Re-check the
+            // cache while holding `inflight` so no leader can remove its entry
+            // between this read and the insert below.
+            {
+                let now = Instant::now();
+                let entries = self.entries.lock().await;
+                if let Some(entry) = entries.get(key)
+                    && entry.expires_at > now
+                {
+                    drop(inflight);
+                    counts.hits.fetch_add(1, Ordering::Relaxed);
+                    return (entry.status, entry.body.clone(), Disposition::Hit);
+                }
+            }
             inflight.insert(key.to_owned(), tx.clone());
         }
 
