@@ -44,7 +44,7 @@ The event item carries, by writer:
 |---|---|---|
 | `queue_counter` | `open_event`, `assign_position` | Live-join position sequence; set to `N` at the open |
 | `serving_counter` | `controller` | Admission cursor, exclusive |
-| `last_serving_counter`, `last_arrivals_total`, `no_show_rate` | `controller` | Measurement state carried across passes |
+| `last_serving_counter`, `last_arrivals_total`, `no_show_rate`, `last_open_pass_at` | `controller` | Measurement state carried across passes (the open-pass timestamp lets the resume pass detect that a `Paused`/`FailOpen` hold froze the baselines) |
 | `phase` | `open_event`, `admin` | `idle` / `pre_queue` / `active` / `post_event` / `maintenance` |
 | `admission_control` | `admin` | `open` / `paused` |
 | `fail_open_until` | `admin` | Epoch-seconds break-glass deadline; absent or `0` means not engaged |

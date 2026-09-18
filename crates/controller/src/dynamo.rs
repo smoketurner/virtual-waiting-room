@@ -113,6 +113,12 @@ impl Store for DynamoStore {
                 serving_counter: num(item, "serving_counter"),
                 queue_counter: num(item, "queue_counter"),
                 target_rate,
+                // Absent on a fresh event (defaults to 0): `now - 0` is huge,
+                // so the first post-deploy open pass falls back to the raw
+                // `target` rather than seeding the EWMA off `0/0`. Benign —
+                // and self-correcting, since the first `write_release` landing
+                // sets it for everything that follows.
+                last_open_pass_at: num(item, "last_open_pass_at"),
             },
             prev_no_show,
         })
@@ -131,7 +137,8 @@ impl Store for DynamoStore {
             .set_key(Some(Key::Event { event_id }.build()))
             .update_expression(
                 "SET serving_counter = :next, last_serving_counter = :last_serving, \
-                 last_arrivals_total = :arrivals_total, no_show_rate = :no_show",
+                 last_arrivals_total = :arrivals_total, no_show_rate = :no_show, \
+                 last_open_pass_at = :last_open_pass",
             )
             // Guard against a lost race: only advance if serving_counter is still
             // what we read, so two overlapping invokes cannot double-advance.
@@ -157,6 +164,15 @@ impl Store for DynamoStore {
             .expression_attribute_values(
                 ":no_show",
                 AttributeValue::N(decision.no_show.smoothed_rate.to_string()),
+            )
+            // The epoch at which this open pass ran, read back next interval as
+            // `last_open_pass_at` for the staleness check in `compute_release`.
+            // Written here — the sole writer — so the `Held` path stays a pure
+            // read, and the baselines freeze across a `Paused`/`FailOpen` hold
+            // exactly as they did before, only now the resume pass can tell.
+            .expression_attribute_values(
+                ":last_open_pass",
+                AttributeValue::N(decision.last_open_pass_at.to_string()),
             )
             .expression_attribute_values(
                 ":expected",
