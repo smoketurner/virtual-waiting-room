@@ -46,8 +46,8 @@ visible fairness failure at 1,000,000 people. Tests are the primary evidence.
 - **Cross-language credential and rule conformance (ADR-0021, issue #71)** — a frozen wire
   contract with the edge, proven by generated vectors rather than hand-written assertions on
   either side. `crates/wr-common/tests/vectors.rs` generates
-  `crates/wr-common/tests/vectors/session.json` (positive credentials minted by the real
-  `Session::sign`, negatives hand-encoded independently of `wr_common`'s private wire helpers,
+  `crates/wr-common/tests/vectors/session.json` (positives minted by the real `Session::sign`,
+  negatives minted the same way then tampered byte-wise after minting,
   and `(rule, request) → bool` vectors) and self-checks it against the real Rust implementation;
   `infra/modules/edge/tests/gate.conformance.test.js` loads the **shipped**
   `gate.js.tftpl` under `node:vm` and checks the same vectors against the JS implementation.
