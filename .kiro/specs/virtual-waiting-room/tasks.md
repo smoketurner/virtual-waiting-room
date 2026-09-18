@@ -191,7 +191,7 @@ Reliability — the waiting room must not be the reason the site is down:
 - [ ] [#64](https://github.com/smoketurner/virtual-waiting-room/issues/64) Origin 403s replaced by the waiting page
 - [ ] [#67](https://github.com/smoketurner/virtual-waiting-room/issues/67) Visitors without JavaScript can never join
 - [ ] [#68](https://github.com/smoketurner/virtual-waiting-room/issues/68) Single-region failure domain undocumented and untested
-- [ ] [#70](https://github.com/smoketurner/virtual-waiting-room/issues/70) Pre-event readiness as a command, not a runbook [O1, O2, N7]
+- [ ] [#70](https://github.com/smoketurner/virtual-waiting-room/issues/70) Pre-event readiness as a diagnostics panel in the admin UI, not a command [O1, O2, N7] — the manual checklist now exists in `docs/RUNBOOK.md`; what is missing is a panel that asserts the same rows against live deployed state, and the checklist being generated from that list so the two cannot drift
 
 Fairness and abuse — nothing bounds how many places one visitor takes:
 

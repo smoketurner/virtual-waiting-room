@@ -194,8 +194,9 @@ resource "aws_lambda_function" "admin" {
   depends_on = [aws_cloudwatch_log_group.lambda]
 }
 
-# API Gateway invokes the admin Lambda for the SigV4 /admin, /metrics, and
-# /update_session routes.
+# API Gateway invokes the admin Lambda for the SigV4 /admin routes. /metrics and
+# /update_session were removed with the origin authorizer (ADR-0032): the first
+# was routed with no handler behind it, the second returned 501.
 resource "aws_lambda_permission" "admin_apigw" {
   statement_id  = "AllowAPIGatewayInvokeAdmin"
   action        = "lambda:InvokeFunction"
