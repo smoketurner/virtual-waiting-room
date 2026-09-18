@@ -68,6 +68,7 @@ run "filters_key_on_the_event_names_the_crates_emit" {
         "rules_audit_failed",
         "admission_control_unreadable",
         "admission_claim_failed",
+        "fail_open_audit_lost",
         ] : strcontains(
         aws_cloudwatch_log_metric_filter.event[name].pattern,
         "$.event = \"${name}\""

@@ -105,6 +105,22 @@ locals {
       pattern   = "{ $.event = \"rules_audit_failed\" }"
       value     = "1"
     }
+
+    # A `set_fail_open_until` audit stamp lost the anti-regression race to a
+    # newer concurrent writer, so the break-glass `fail_open_until` was
+    # committed without the stamp to preserve the newer anchor. The functional
+    # write landed (the operator's fail-open is in force), but the dashboard's
+    # "latest action" line did not record this fail-open -- the audit-loss trade
+    # of the guard. Rare by construction (needs a concurrent writer to have
+    # advanced the anchor inside the same event's yielding KVStore
+    # read-modify-write), but a regression that spuriously took the fallback on
+    # every `set_fail_open_until` call would produce no other signal, so this
+    # alarms at threshold zero like `rules_audit_failed`.
+    fail_open_audit_lost = {
+      log_group = local.admin_name
+      pattern   = "{ $.event = \"fail_open_audit_lost\" }"
+      value     = "1"
+    }
   }
 
   metric_namespace = "VirtualWaitingRoom/${var.name_prefix}"
