@@ -217,6 +217,21 @@ resource "aws_lambda_permission" "admin_apigw" {
 # far in the future rather than near, so that even an accidental enable of the
 # placeholder cannot fire an open.
 
+# The dead-letter queue for the open schedule. Returning Err from the open
+# handler (a wrong-phase rejection, a persistent store failure) makes
+# EventBridge retry up to maximum_retry_attempts; once those exhaust, the
+# schedule delivers the failed invocation here so a scheduled open that never
+# landed is inspectable and alarmed (see open_dlq_not_empty in logging.tf)
+# rather than silently dropped. The scheduler's execution role needs
+# sqs:SendMessage on this ARN (see aws_iam_role_policy.open_scheduler below);
+# no queue policy is needed because access is governed by the sender's IAM.
+resource "aws_sqs_queue" "open_dlq" {
+  name                      = "${var.name_prefix}-open-dlq"
+  message_retention_seconds = 1209600 # 14 days, to inspect a fire that exhausted retries
+
+  tags = var.tags
+}
+
 resource "aws_scheduler_schedule" "open" {
   name = "${var.name_prefix}-open"
 
@@ -236,6 +251,16 @@ resource "aws_scheduler_schedule" "open" {
     arn      = aws_lambda_function.open_event.arn
     role_arn = aws_iam_role.open_scheduler.arn
     input    = jsonencode({ event_id = var.event_id })
+
+    # A failed open (the handler returned Err — a wrong-phase rejection, or a
+    # store failure) retries up to maximum_retry_attempts; once those exhaust,
+    # EventBridge delivers the failed invocation to the DLQ so a schedule fire
+    # that never opened the event is surfaced and alarmed rather than silently
+    # dropped. Without this, the retry exhaust path is invisible: the schedule
+    # records a final failed fire and nothing retains the payload.
+    dead_letter_config {
+      arn = aws_sqs_queue.open_dlq.arn
+    }
 
     # Deliberately not the AWS defaults (86400 seconds / 185 attempts). Two
     # reasons. An open that could not be delivered for 24 hours would open the
@@ -270,11 +295,21 @@ resource "aws_iam_role_policy" "open_scheduler" {
   role = aws_iam_role.open_scheduler.id
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Effect   = "Allow"
-      Action   = "lambda:InvokeFunction"
-      Resource = aws_lambda_function.open_event.arn
-    }]
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = "lambda:InvokeFunction"
+        Resource = aws_lambda_function.open_event.arn
+      },
+      # Delivery of a failed invocation to the schedule's dead-letter queue
+      # (the schedule's target.dead_letter_config) is made by Scheduler
+      # assuming this role, so the role needs sqs:SendMessage on the DLQ ARN.
+      {
+        Effect   = "Allow"
+        Action   = ["sqs:SendMessage"]
+        Resource = aws_sqs_queue.open_dlq.arn
+      },
+    ]
   })
 }
 

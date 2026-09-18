@@ -121,6 +121,29 @@ locals {
       pattern   = "{ $.event = \"fail_open_audit_lost\" }"
       value     = "1"
     }
+
+    # An error from the open_event Lambda -- today only the scheduled open
+    # rejected because the event was not in the pre_queue phase when the
+    # schedule fired (event = "open_rejected_wrong_phase" in the structured
+    # log). Before the open_event disambiguation, this was misreported as
+    # AlreadyOpen and recorded by EventBridge as a silent success, leaving the
+    # event unopened with no signal; the open now returns Err (so EventBridge
+    # retries and eventually dead-letters via open_dlq), and this filter
+    # alarms on the first occurrence so a misfire is surfaced even when the
+    # retries that follow it eventually succeed.
+    #
+    # Keys on the top-level `level` field rather than `$.event` because the
+    # Lambda's tracing-subscriber JSON formatter
+    # (tracing_subscriber::fmt().json(), no flatten_event) nests user fields
+    # like `event` under a `fields` object, while `level` serializes at the
+    # root as uppercase "ERROR" (tracing-serde). The other filters in this map
+    # key on `$.event` and share a separate latent gap; this one is keyed to
+    # actually match the open_event log group's output.
+    open_event_error = {
+      log_group = local.open_event_name
+      pattern   = "{ $.level = \"ERROR\" }"
+      value     = "1"
+    }
   }
 
   metric_namespace = "VirtualWaitingRoom/${var.name_prefix}"
@@ -183,6 +206,35 @@ resource "aws_cloudwatch_metric_alarm" "join_dlq_not_empty" {
   metric_name = "ApproximateNumberOfMessagesVisible"
   dimensions = {
     QueueName = aws_sqs_queue.join_dlq.name
+  }
+
+  statistic           = "Maximum"
+  period              = 300
+  threshold           = 0
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  # SQS publishes this metric only while the queue has been active, so absent
+  # data is an idle queue, which is the healthy state.
+  treat_missing_data = "notBreaching"
+
+  tags = var.tags
+}
+
+# The open schedule's dead-letter queue: a message here is a scheduled open
+# EventBridge retried to exhaustion and gave up on -- the handler kept
+# returning Err (e.g. the event never reached pre_queue before the retry
+# window elapsed), so the event stayed unopened with no further automatic
+# attempt, and the one-time `at(...)` schedule is consumed. Mirrors
+# join_dlq_not_empty: SQS publishes its own depth, so this alarms at one
+# message rather than via a log metric filter.
+resource "aws_cloudwatch_metric_alarm" "open_dlq_not_empty" {
+  alarm_name        = "${var.name_prefix}-open-dlq-not-empty"
+  alarm_description = "A scheduled open reached the dead-letter queue: retried to exhaustion and lost. The event stayed unopened; the one-time schedule is consumed and needs the operator to re-arm."
+
+  namespace   = "AWS/SQS"
+  metric_name = "ApproximateNumberOfMessagesVisible"
+  dimensions = {
+    QueueName = aws_sqs_queue.open_dlq.name
   }
 
   statistic           = "Maximum"
