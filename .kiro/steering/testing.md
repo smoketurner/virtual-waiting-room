@@ -55,8 +55,8 @@ visible fairness failure at 1,000,000 people. Tests are the primary evidence.
   `toLowerCase()` (JS) diverge on non-ASCII input even though both read the same wire encoding.
   Regenerate with `cargo test -p wr-common -- --ignored regenerate_vectors` after a wire-format
   change; the committed file drifting from the generator fails CI. `node:vm` exercises Node's
-  `Buffer`/HMAC/base64url, not CloudFront's — it is a proxy for what
-  `scripts/spike_edge_gate.py` proved against a real function, not a replacement for it.
+  `Buffer`/HMAC/base64url, not CloudFront's — it is a proxy for what was measured against a real
+  CloudFront Function while ADR-0021 was being decided, not a replacement for it.
 - **Edge gate decision-tree branches (ADR-0021)** — `infra/modules/edge/tests/gate.decision-tree.test.js`
   covers every branch against the shipped function: dormancy (`r: []`), `enforce_from` pending,
   `fail_open_until` active and lapsed, each refusal reason (`none`/`signature`/`event`/`expired`),
