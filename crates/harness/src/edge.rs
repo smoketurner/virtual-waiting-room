@@ -25,9 +25,16 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::sync::{Mutex, broadcast};
+// `tokio::time::Instant`, not `std::time::Instant`: the cache's expiry clock
+// must follow the runtime's time source so a paused `#[tokio::test]` advances
+// it alongside the poll sleeps. `std::time::Instant` is the real wall clock and
+// never moves during a paused test, so a 1s TTL would never expire and the
+// cache would serve the first phase's body for the whole run. In production
+// (no pause) the two clocks are identical.
+use tokio::time::Instant;
 
 /// What the CDN did with one client request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
