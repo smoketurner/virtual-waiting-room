@@ -154,6 +154,7 @@ conditions the system would otherwise survive in silence.
 | `admission_claim_failed` | The write that makes an admission count once did not land | Harmless for one visitor. If it is firing continuously, every poll of the waiting page counts another arrival, the measured no-show rate collapses toward zero, and the controller stops correcting |
 | `admission_control_unreadable` | The stored admission control could not be parsed, so the controller is holding admission | The queue has stopped moving. Pause and Resume to rewrite the attribute |
 | `rules_audit_failed` | The gate's ruleset changed but the audit stamp did not | The gate is correct; the dashboard's "last changed by" is stale. No visitor impact |
+| `fail_open_audit_lost` | Fail-open was engaged or cleared but the audit stamp lost a race to a newer writer | The fail-open change took effect; the dashboard's "last changed by" is stale. No visitor impact |
 
 ---
 
