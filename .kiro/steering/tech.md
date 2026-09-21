@@ -120,12 +120,10 @@ scenario-dependent and is A/B-measured in the Phase 0 spike, not assumed.
 (unoptimized, SHA3) — several ms to ~1 s on a cold start, worst on small-memory / frequently-cold
 functions ([smithy-rs #4541](https://github.com/smithy-lang/smithy-rs/discussions/4541),
 [lambdabench.dev/rust](https://lambdabench.dev/rust.html)). This system is idle by definition, so
-cold starts are the common case. **Preferred mitigation: force one real TLS handshake in the Init
-phase** (a cheap warm-up call on the client the handler uses), so the tax lands on boosted Init
-CPU rather than the first invoke — and no entropy source is dropped. The build flag
-`AWS_LC_SYS_NO_JITTER_ENTROPY=1` removes the tax outright but drops one of two defense-in-depth
-entropy sources; given the GovCloud/FIPS posture we lean **against** it. Settle both in the Phase 0
-spike.
+cold starts are the common case. The build flag `AWS_LC_SYS_NO_JITTER_ENTROPY=1` is set in
+`.cargo/config.toml`, removing the jitter tax outright at the cost of one of two defense-in-depth
+entropy sources, and the `controller` forces one real read in the Init phase so the TLS handshake
+lands on boosted Init CPU rather than the first invoke.
 
 ## AWS services (core, commercial regions)
 
