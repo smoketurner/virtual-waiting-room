@@ -31,9 +31,9 @@ whole positioning. It sets two bars, and both are testable:
   threshold, then queues new visitors **FIFO** (the spike is unplanned, so arrival order
   carries information).
 
-Both are designed to run simultaneously on one origin. **Standby is not deliverable through
-the CloudFront gate today** (#60) — the gate has no dormant state — so only the scheduled mode
-is served end to end.
+Both are designed to run simultaneously on one origin. The gate supports dormancy (#60), but
+**standby activation is not built** — nothing flips the phase when inflow crosses the threshold —
+so only the scheduled mode is served end to end.
 
 ## Load-bearing principles (do not violate without an ADR)
 
@@ -77,8 +77,9 @@ Two things are ours:
 - **Position as a keyed permutation computed on read** (ADR-0002). Queue-it materializes queue
   numbers; the AWS solution stores them in ElastiCache; Cloudflare orders one-minute buckets
   and has no per-visitor position. Only ours makes the ordering independently verifiable.
-- **CloudFront trusted key groups as the gate** (ADR-0020). Everyone else runs code per
-  request. Ours costs nothing per request and works against an origin we cannot put code near.
+- **A gate that decides at the edge** (ADR-0021). A CloudFront Function on the protected
+  behaviour only, reading its rules and signing secret from a KeyValueStore — no round trip to
+  any backend, and it works against an origin we cannot put code near.
 
 What they have that we do not, and it is not only breadth:
 
@@ -86,12 +87,12 @@ What they have that we do not, and it is not only breadth:
   rooms, enqueue tokens, IP binding, proof-of-work, reputation, deferred bot mitigation at
   randomization. Randomization converts volume into expected share, so a raffle without
   identity is a raffle a bot farm wins (#59). This is the gap that matters most.
-- **A decision point in the request path.** Their connector, Cloudflare's Worker. Removing it
-  is what buys us zero marginal cost, and it is why fail-open (#58), standby (#60), revocation
-  (#63), per-request rules (#66) and the no-JavaScript path (#67) are all open.
+- **A gate that can observe the backend.** Their connector and Cloudflare's Worker can call
+  home; our CloudFront Function makes no network calls. That is why automatic fail-open (#58)
+  and revocation (#63) are open, and the no-JavaScript path (#67) is open too.
 
 The difference is therefore **architecture as well as deployment model**, and the consequences
-above are the honest cost of ADR-0020.
+above are the cost of ADR-0021.
 
 Narrative source: `docs/`. SDD source of truth: `.kiro/specs/virtual-waiting-room/`. What is
 actually built is tracked in `.kiro/specs/virtual-waiting-room/tasks.md`.

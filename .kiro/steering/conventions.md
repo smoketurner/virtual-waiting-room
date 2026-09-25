@@ -2,7 +2,7 @@
 
 ## Rust
 
-**Runtime:** latest stable via `rustup`. Edition 2024, `resolver = "3"`.
+**Runtime:** the toolchain pinned in `rust-toolchain.toml`. Edition 2024, `resolver = "3"`.
 
 | purpose | tool |
 |---|---|
@@ -102,9 +102,9 @@ means you cannot silently `#[allow]` it — justify it or remove the cause.
 
 - Imperative mood, ≤72-char subject, one logical change per commit. Never amend/rebase commits
   already pushed to shared branches. **Never push to `main`** — feature branches and PRs only.
-- Never commit secrets. The per-deployment signing keys live in SSM Parameter Store
-  SecureStrings, never in the repo. Note the exception recorded in ADR-0020: the CloudFront
-  signing key pair is generated at apply time and therefore lives in Terraform state, which a
-  deployment whose threat model excludes state must override by supplying the pair out of band.
+- Never commit secrets. The per-deployment signing key lives in an SSM Parameter Store
+  SecureString and the edge gate's KeyValueStore, never in the repo. It is generated at apply
+  time (`random_bytes.signing_key`), so it also lives in Terraform state — protect state
+  accordingly.
 - PR descriptions describe what the diff does now — not discarded approaches or alternatives.
 - Install and run `prek` (pre-commit) in the repo; run `prek run` before committing.

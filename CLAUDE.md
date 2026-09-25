@@ -96,11 +96,9 @@ distribution-wide association would bill every `/status` poll from every waiter.
 locally, reading its whole configuration and the HMAC signing secret from one CloudFront
 KeyValueStore (`infra/modules/edge/functions/gate.js.tftpl`): no rule matches → pass through
 (dormancy, #60); a valid session cookie → pass through; otherwise refuse with a reason (#73), a
-302 to the waiting page for navigation and 403 JSON for XHR (#72). This replaces the earlier
-trusted-key-group gate, which could verify a signature but not decide, closing #58's mechanism,
-#60, #64, #66, #72 and #73. `event_id` and the session cookie name are templated into the
-function's own source rather than carried in the KeyValueStore value, so Terraform stays their
-single source of truth.
+302 to the waiting page for navigation and 403 JSON for XHR (#72). `event_id` and the session
+cookie name are templated into the function's own source rather than carried in the
+KeyValueStore value, so Terraform stays their single source of truth.
 
 `generate_token` mints the session cookie the gate verifies: it checks the visitor's position
 against `serving_counter` (resolving the operator's admission control through
@@ -136,8 +134,9 @@ Every Lambda crate follows the same three-file split, and new ones should:
 - `dynamo.rs` — the SDK-backed `Store` implementation.
 - `main.rs` — runtime wiring, environment variables, handler.
 
-`admin` is an Axum Lambda rendering askama compile-time templates with Cloudscape design
-tokens as plain CSS — no React, no bundler, no runtime npm dependency (ADR-0014, ADR-0018).
+`admin` is an Axum Lambda rendering askama compile-time templates, styled with the Vouch design
+language as one self-contained plain-CSS stylesheet — no React, no bundler, no runtime npm
+dependency (ADR-0014, ADR-0018).
 Auth is OIDC Authorization Code + PKCE with sessions in DynamoDB (ADR-0016). Core operator
 actions must work with JavaScript disabled, and the UI adds no capability the admin API lacks.
 
@@ -185,9 +184,8 @@ target architecture from `terraform.tfvars`.
 
 **The apply seeds a working stack.** Terraform writes the event's `Counters` item, the gate's
 ruleset and the open schedule, then ignores changes to all three — the control plane owns them
-from there. Before this, none of them had a Terraform writer: the event item's only writer was
-`scripts/reset-env.py`, so a freshly applied stack answered 404 on `/status` and `NotFound` on
-every admin action until a destructive test script had been run. The admin Lambda's OIDC
+from there. A fresh apply therefore answers `/status` and every admin action without running
+`scripts/reset-env.py`, which is a destructive test script, not a setup step. The admin Lambda's OIDC
 configuration is the one thing an apply cannot derive — the redirect URI is a path on the
 distribution, and `edge` already depends on `core` — so a missing value fails the apply through
 a `precondition` rather than deploying a Lambda that dies at Init.
@@ -201,9 +199,8 @@ needs SigV4A, which the Rust SDK signs with RustCrypto (`p256`/`hmac`/`sha2`, th
 `aws-sdk-cloudfrontkeyvaluestore` crate's `sigv4a` feature). That path is control-plane only. The
 admission path mints and verifies with `aws-lc-rs`.
 
-There is no resource-count ceiling: N6 was retired because the number never measured what it
-was standing in for and moved when the same infrastructure was written differently. The
-constraint that matters is **N1 — idle cost under $5/month when no event is running**. Judge an
+The constraint that matters is **N1 — idle cost under $5/month when no event is running**; there
+is no resource-count ceiling (N6 is retired, see `tech.md`). Judge an
 addition by what it bills between events, not by how many blocks it takes.
 
 ## Conventions specific to this repo
@@ -225,9 +222,9 @@ most often:
   `unwrap_used`, `panic`, `todo`, `print_stdout` are denied workspace-wide.
 - Controller and permutation arithmetic must be checked or saturating — the release profile
   has no overflow checks, and a wrapped subtraction there releases a damaging burst.
-- Newtypes over primitives, enums over boolean flags. `StoredControl` (`Open`/`Paused`) plus a
-  `fail_open_until` epoch replaced the three-valued `AdmissionControl` as the *stored* form
-  (issue #71): `resolve()` is the only thing that produces the third value, `FailOpen`, so it can
+- Newtypes over primitives, enums over boolean flags. The *stored* admission form is
+  `StoredControl` (`Open`/`Paused`) plus a `fail_open_until` epoch (issue #71): `resolve()` is
+  the only thing that produces the third value, `FailOpen`, so it can
   never be written to storage as a string — the storage codec has two values where the display
   type has three, and that asymmetry is the invariant. Exhaustive `match` with no `_` arms.
 - Pin GitHub Actions to a SHA with a version comment, set `persist-credentials: false`, and
