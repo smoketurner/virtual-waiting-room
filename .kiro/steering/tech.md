@@ -13,7 +13,7 @@ costs the most, because it is loaded into every session.
   `SendMessage`. Lambda appears only downstream of SQS and on the control/admin plane.
 - Async with `tokio`; AWS SDK for Rust.
 
-## The seven Lambdas
+## The six Lambdas
 
 | Function | Trigger | Job |
 |---|---|---|
@@ -41,7 +41,7 @@ only in the member crate that uses them):
 | Templating + static assets (admin UI) | `askama`, `rust-embed`, `mime_guess` |
 | Admin OIDC login (ADR-0016) | `openidconnect`, `jsonwebtoken`, `reqwest`, `rustls`, `cookie` |
 | Serialization | `serde`, `serde_json`, `serde_dynamo`, `base64` |
-| Crypto | **`aws-lc-rs`** — signing/HMAC backend for tokens, sessions, the CloudFront cookie signature, and the permutation HMAC |
+| Crypto | **`aws-lc-rs`** — signing/HMAC backend for tokens, the session cookie the edge gate verifies, and the permutation HMAC |
 | Errors and logging | `thiserror` (libs), `anyhow` (binaries), `tracing`, `tracing-subscriber` |
 | Dev | `proptest` |
 
@@ -63,11 +63,9 @@ would be wrong on the far side of a daylight-saving change.
 - **The admission path is `aws-lc-rs` only.** Credentials are minted and verified with `aws-lc-rs`
   throughout. Select the AWS SDK's `aws-lc-rs`-backed TLS/crypto path and disable defaults so no
   second crypto stack is pulled in by accident.
-- **`ring` and `openssl` are banned outright** (`deny.toml` `[bans].deny`, issue #71/#74). `ring`
-  reached the tree only via `crates/harness`'s `reqwest` feature selection; switching it to the
-  same `rustls-tls-webpki-roots-no-provider` pattern `admin` already used, plus installing the
-  `aws-lc-rs` rustls provider there too, removed it entirely — `cargo tree --workspace -i ring`
-  prints nothing.
+- **`ring` and `openssl` are banned outright** (`deny.toml` `[bans].deny`). Every `reqwest` in
+  the workspace (`admin`, `crates/harness`) uses `rustls-tls-webpki-roots-no-provider` and installs
+  the `aws-lc-rs` rustls provider; `cargo tree --workspace -i ring` prints nothing.
 - **RustCrypto is accepted, scoped to two control-plane paths, never the admission path**: the
   admin OIDC login (`openidconnect`'s `p256`/`rsa` dependencies, below) and the admin's edge-gate
   KeyValueStore writer (`aws-sdk-cloudfrontkeyvaluestore`'s `sigv4a` feature, which signs via
@@ -92,9 +90,8 @@ the reasoning lives here:
   does the same for the same reason.
 - `jsonwebtoken` verifies JWKS signatures with its `aws_lc_rs` feature.
 
-Changing any one of these can silently pull `ring` back into the tree — `deny.toml` now catches
-it (`cargo deny check bans` fails with `error[banned]` on a crate that is present), closing
-[#74](https://github.com/smoketurner/virtual-waiting-room/issues/74). `ring` still has no
+Changing any one of these can pull `ring` back into the tree; `cargo deny check bans` fails with
+`error[banned]` when it does. `ring` has no
 `wrappers` exemption and gets none: a list that passed would have to name `rustls`, the crate that
 wanted `ring` in the first place, which would permit exactly what the rule exists to forbid.
 
@@ -134,7 +131,7 @@ lands on boosted Init CPU rather than the first invoke.
 | Bot & abuse mitigation | **Nothing is built.** Open-time demotion was removed without ever being enabled (ADR-0030); entry tickets before it (ADR-0028). WAF Bot Control, ASN matching and anti-DDoS in Count mode are unbuilt too (N7, #59, #70) |
 | Ingest | API Gateway **REST** (regional) with request validator → SQS |
 | Buffer | SQS standard queue + DLQ (`maxReceiveCount` 5), ESM `ReportBatchItemFailures` |
-| Compute | Lambda (Rust, arm64) — the seven functions above |
+| Compute | Lambda (Rust, arm64) — the six functions above |
 | State | DynamoDB on-demand + PITR: `Counters`, `PreQueue`, `Positions`, `Tokens` |
 | Scheduling | EventBridge Scheduler (T−0 open, controller every minute × six passes via durable waits) |
 | Secrets | **SSM Parameter Store SecureString** — the per-deployment HMAC signing key (Terraform generates it and writes the same value to the edge gate's CloudFront KeyValueStore, issue #71) and the OIDC client secret. Not Secrets Manager: a SecureString is free where a secret is $0.40/mo, which N1 does not allow |
