@@ -80,3 +80,23 @@ admission_rate = 5
 # queue: set it comfortably longer than the worst realistic time on the origin,
 # not tightly around the average.
 session_ttl_seconds = 3600
+
+# --- Edge protection (ADR-0038) ----------------------------------------------
+# The WAF web ACL: a WAF token, earned through a silent JavaScript challenge,
+# required on every API call the waiting page makes, rate limits per token and per IP,
+# and AWS managed rules. Its cost is bundled into a CloudFront flat-rate plan
+# (Business or above), which also requires it; on pay-as-you-go it bills every
+# month, so leave it off there. Subscribing the distribution to the plan is a
+# console step for now (docs/DEPLOY.md).
+waf_enabled = false
+
+# Managed and anonymous-IP rules observe ("count") until one event's worth of
+# data says they can act ("enforce"), per O5.
+waf_managed_rules_mode = "count"
+
+# Token requests plus joins per IP per 5 minutes before each further visitor on
+# that address solves a CAPTCHA once.
+waf_join_ip_limit = 100
+
+# false closes the no-JavaScript queue at the edge for this event.
+nojs_enabled = true

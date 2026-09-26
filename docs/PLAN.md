@@ -122,7 +122,9 @@ Throwaway code. Measures what documentation cannot settle.
   endpoints (Min TTL 1 s, no cookie forwarding), write endpoints (uncached), protected
   origin (uncached, session cookie forwarded). Web Application Firewall (WAF) with Bot
   Control, Autonomous System Number (ASN) match and anti-DDoS in Count mode
-  [N7, O5, C4]
+  [N7, O5, C4] — the web ACL is built, opt-in for a flat-rate deployment (ADR-0038); ASN
+  match is not
+- The REST API answers only CloudFront: an origin API key on every method (ADR-0038) [N7]
 - `modules/authorizer` — removed (ADR-0032): nothing invoked it, and as wired it
   forwarded every request.
   Note VPC origins require an internet gateway present but unused, forbid Lambda@Edge
@@ -130,7 +132,8 @@ Throwaway code. Measures what documentation cannot settle.
 - `var.enable_vpc` for ATO-constrained clients — design the seam now, do not retrofit
 - Flat-rate plan subscription [O6] — the better fit for a large planned event, but the
   AWS provider cannot create a flat-rate distribution yet (terraform-provider-aws#45450).
-  Default PAYG until it lands; document manual per-event selection + post-event cancellation
+  Default PAYG until it lands; document manual per-event selection + post-event cancellation.
+  The web ACL a plan requires is built behind `waf_enabled` (ADR-0038)
 - CloudWatch alarms and a shipped dashboard — the metrics an operator acts on, not
   every metric available
 - Publish the OpenAPI specification for public and admin surfaces [N8]

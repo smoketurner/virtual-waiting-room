@@ -103,3 +103,9 @@ output "edge_readiness_parameter_name" {
   description = "Name of the SSM parameter the edge module writes its distribution id, gate function ARN and polled /status path to. The admin Lambda's readiness panel (issue #70) reads it; passing the name this way keeps edge -> core the only module dependency."
   value       = local.edge_readiness_parameter_name
 }
+
+output "api_origin_key" {
+  description = "The API key every REST API method requires (ADR-0038). The edge module sends it as the x-api-key origin custom header; nothing else should hold it."
+  value       = aws_api_gateway_api_key.origin.value
+  sensitive   = true
+}

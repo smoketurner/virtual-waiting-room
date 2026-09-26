@@ -10,8 +10,8 @@
 #   Default  (/*) - the protected origin: uncached, session cookie forwarded.
 #
 # Public paths are path-versioned under /v1; the API origin's origin_path is the
-# stage (= env), so /v1/status is forwarded to /<env>/v1/status. WAF and standby
-# activation are added to this module in later steps.
+# stage (= env), so /v1/status is forwarded to /<env>/v1/status. The optional
+# WAF web ACL is in waf.tf (ADR-0038); standby activation is not built yet.
 
 # --- Cache policies (polled behaviours) --------------------------------------
 
@@ -193,6 +193,10 @@ resource "aws_cloudfront_distribution" "this" {
   comment             = "Virtual Waiting Room - ${var.name_prefix}"
   price_class         = var.price_class
 
+  # The edge web ACL (waf.tf, ADR-0038), when enabled. A distribution on a
+  # CloudFront flat-rate plan must have one and cannot shed it while subscribed.
+  web_acl_id = local.waf_enabled ? aws_wafv2_web_acl.this[0].arn : null
+
   # Empty deploys on the *.cloudfront.net name. A real event fronts the
   # distribution with the customer's own hostname: the session cookie is set
   # for the host the visitor is on, so a waiting room on one domain and an
@@ -206,6 +210,14 @@ resource "aws_cloudfront_distribution" "this" {
     origin_id   = local.api_origin_id
     domain_name = var.api_gateway_domain_name
     origin_path = "/${var.env}"
+
+    # The key every REST API method requires (ADR-0038). Sent on every request
+    # to this origin, and it replaces any x-api-key a viewer sends, so the
+    # distribution is the one client the API answers.
+    custom_header {
+      name  = "x-api-key"
+      value = var.api_origin_key
+    }
 
     custom_origin_config {
       http_port              = 80

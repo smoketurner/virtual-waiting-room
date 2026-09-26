@@ -24,6 +24,12 @@ output "api_invoke_url" {
   value       = module.core.api_invoke_url
 }
 
+output "api_origin_key" {
+  description = "The API key the REST API requires on every method (ADR-0038). Only CloudFront sends it; scripts/smoke_test.py reads it to call the API directly. Read with `terraform output -raw api_origin_key`."
+  value       = module.core.api_origin_key
+  sensitive   = true
+}
+
 output "open_event_function_name" {
   description = "Name of the open_event Lambda. Invoke it manually or via the open schedule to open the event."
   value       = module.core.open_event_function_name
@@ -73,4 +79,9 @@ output "cloudfront_distribution_id" {
 output "open_schedule_name" {
   description = "Name of the one-time open schedule (issue #128), so scripts can disable it alongside a reset."
   value       = module.core.open_schedule_name
+}
+
+output "web_acl_arn" {
+  description = "ARN of the edge web ACL, or null when waf_enabled is off. Subscribe it with the distribution to a CloudFront flat-rate plan (docs/DEPLOY.md)."
+  value       = module.edge.web_acl_arn
 }

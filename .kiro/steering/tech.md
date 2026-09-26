@@ -129,7 +129,7 @@ lands on boosted Init CPU rather than the first invoke.
 |---|---|
 | Edge / CDN / request collapsing | CloudFront — polled, write, waiting-page and protected behaviours (ADR-0013) |
 | **The admission gate** | CloudFront Function (`cloudfront-js-2.0`) at viewer-request on the protected behaviour only, deciding locally from a KeyValueStore (ADR-0021, issue #71); `generate_token` signs an HMAC-SHA256 session cookie the function verifies. Sub-millisecond compute at the edge, not zero, but no round trip to the origin |
-| Bot & abuse mitigation | **Nothing is built.** Open-time demotion was removed without ever being enabled (ADR-0030); entry tickets before it (ADR-0028). WAF Bot Control, ASN matching and anti-DDoS in Count mode are unbuilt too (N7, #59, #70) |
+| Bot & abuse mitigation | The REST API requires an API key only the distribution holds, so nothing bypasses the edge. On a CloudFront flat-rate plan, the opt-in edge web ACL (`waf_enabled`) requires a WAF challenge token on every JS API call, rate-limits per token and per IP (escalating to CAPTCHA), and runs Bot Control common, anti-DDoS, IP reputation and anonymous-IP rules in Count until promoted (ADR-0038). Nothing binds a place to a person: open-time demotion (ADR-0030) and entry tickets (ADR-0028) were removed. ASN matching is unbuilt |
 | Ingest | API Gateway **REST** (regional) with request validator → SQS |
 | Buffer | SQS standard queue + DLQ (`maxReceiveCount` 5), ESM `ReportBatchItemFailures` |
 | Compute | Lambda (Rust, arm64) — the six functions above |

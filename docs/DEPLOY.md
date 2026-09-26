@@ -201,6 +201,47 @@ the whole of the policy. Set `session_ttl_seconds` comfortably longer than the w
 protected origin — cart to confirmation, not the median — or a visitor can lose their admission to
 nothing more than a slow checkout.
 
+## Edge protection on a flat-rate plan (ADR-0038)
+
+Two things stand between a script and the queue, and only one is optional.
+
+**The API answers only CloudFront, always.** Every REST API method requires an API key that
+Terraform generates and that only the distribution sends, as an `x-api-key` origin custom header.
+A request straight to the `execute-api` URL is refused with a 403 and not billed. There is nothing
+to configure. Apply the change that introduces it between events: the stage requires the key
+the moment it deploys, while CloudFront takes minutes to add the header at every edge, so API
+calls fail with 403 in that window. Anything you run against the API directly needs the key:
+`terraform -chdir=infra/environments/dev output -raw api_origin_key`. The smoke test reads it
+itself, and checks that a keyless request is refused.
+
+**The edge web ACL is for a deployment on a CloudFront flat-rate plan.** The plan (Business,
+$200/month, or above) bundles WAF and requires a web ACL. On pay-as-you-go the same ACL bills per
+request inspected and a monthly fee per rule between events, so it is off by default. To run an
+event under it:
+
+1. Set `waf_enabled = true` in `terraform.tfvars` and `make apply`. This creates
+   `<name_prefix>-edge` in us-east-1 and attaches it to the distribution. The rules and what each
+   one does are in `docs/DESIGN.md` §8.
+2. Subscribe the distribution to the plan in the CloudFront console (the distribution's pricing
+   plan settings). The Terraform provider cannot do this yet (terraform-provider-aws#45450,
+   PR #49235). The distribution already carries the Terraform-managed web ACL, so keep that one.
+   Do not create or edit rules in the console: the next apply reverts them.
+3. Load the waiting page in a private window. On the first load the page detours through
+   `/_wr/verify.html` for a brief browser check, comes back, and the join goes through. The smoke test's
+   CloudFront step now reports the join as challenged, which is the design: only a browser can
+   solve the challenge.
+
+Plan for the subscription's constraints before you start:
+
+- **It is monthly.** While the distribution is subscribed, AWS refuses to delete it or remove its
+  web ACL, even after you cancel, until the billing cycle ends. `make destroy`, or an apply with
+  `waf_enabled = false`, fails until then (see Tear down).
+- **Managed rules start in Count** (`waf_managed_rules_mode = "count"`, O5). Promote them to
+  `enforce` only after reviewing an event's worth of their CloudWatch metrics (`docs/RUNBOOK.md`).
+- **Browsers that refuse cookies cannot queue with JavaScript.** The WAF token is a cookie, and
+  the waiting page says so rather than reloading in a loop. The no-JavaScript queue needs no
+  token.
+
 ## Availability
 
 A deployment lives in one region ([ADR-0034](adr/0034-single-region-failure-domain.md)). The
@@ -221,3 +262,8 @@ make destroy
 Terraform prompts for confirmation before deleting anything (the target does
 not pass `-auto-approve`). It reads the same `terraform.tfvars` you deployed
 with, so leave that file in place until the stack is gone.
+
+A distribution subscribed to a CloudFront flat-rate plan cannot be deleted, or shed its web ACL,
+until the billing cycle in which you cancel ends (ADR-0038). Cancel the plan in the console after
+the event, and run `make destroy` once the cycle has closed. Until then the stack stays up, and
+the plan covers its edge. The rest of the stack costs what an idle deployment costs (N1).

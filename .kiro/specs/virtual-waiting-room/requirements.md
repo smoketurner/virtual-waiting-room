@@ -176,15 +176,17 @@ activation queues first-in, first-out (FIFO).
 
 ### 1.7 Abuse mitigation
 
-No requirement in this section is currently met by a shipped mechanism.
+No requirement in this section is currently met by a shipped mechanism: nothing binds a place
+to a person.
 
-**No one-position-per-visitor control exists.** `request_id` is client-supplied, so nothing
-stops one visitor taking N places, and randomization converts volume into expected share
-linearly. Every deployment is a bare raffle. Bounding volume needs either an identity to bind a
-position to — which a public onsale open to anyone does not have — or a mechanism that costs the
-client something: proof of work, or behavioural classification over join-time
-telemetry. Open-time demotion was the second, and it was removed without ever being enabled
-(ADR-0030), so nothing bounds volume today.
+**Volume costs a challenge solve where the edge web ACL is on (ADR-0038).** `request_id` is
+client-supplied, so one visitor can still take N places, and randomization converts volume into
+expected share linearly. With the web ACL attached, each WAF token buys at most ten joins in ten
+minutes, a token needs a browser challenge solve, and past a per-IP limit each visitor on the
+address solves a CAPTCHA. The API answers only CloudFront, so posting to `execute-api` bypasses
+none of it. A farm running real browsers through residential proxies still takes places; bounding
+volume per person needs an identity a public onsale does not have (ADR-0028), and open-time
+demotion was removed without ever being enabled (ADR-0030).
 
 ### Retired requirements
 
@@ -284,8 +286,10 @@ pre-event preparation in the Operational section.
 
 **N7** — As an operator, I want edge abuse mitigation so that bots are handled before the origin.
 - THE SYSTEM SHALL refuse every request without a valid session at the edge, before the origin is touched.
-- THE SYSTEM SHALL NOT create a WAFv2 web ACL by default: it is priced per request inspected, against a request volume that is the system's own waiting-page polling rather than an attack.
-- Acceptance: The gate runs at viewer-request on the protected behaviour and the join burst reaches SQS with no compute in the path. Rate limiting is taken at the CloudFront plan layer; a web ACL is attached per event where the cost is justified, and the distribution ARN is exported so one can be.
+- THE SYSTEM SHALL answer API requests from its own distribution only: every REST API method requires an API key held by CloudFront alone.
+- WHERE the deployment is on a CloudFront flat-rate plan, THE SYSTEM SHALL attach the edge web ACL: a WAF token from a browser challenge on every JavaScript API call, rate limits per token and per IP (escalating to CAPTCHA), and AWS managed rules in Count until promoted (O5).
+- THE SYSTEM SHALL NOT create a WAFv2 web ACL by default: on pay-as-you-go it bills between events, against N1.
+- Acceptance: The gate runs at viewer-request on the protected behaviour and the join burst reaches SQS with no compute in the path. A request straight to `execute-api` is refused with 403. With `waf_enabled`, a join without a WAF token is challenged rather than enqueued, and the no-JavaScript queue is never challenged (ADR-0037, ADR-0038).
 
 **N8** — As an integrator, I want an OpenAPI spec so that client and admin surfaces are generated.
 - THE SYSTEM SHALL document the API as an OpenAPI specification.

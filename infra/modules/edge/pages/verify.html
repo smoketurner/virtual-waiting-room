@@ -1,0 +1,51 @@
+<!doctype html>
+<!--
+  Where a browser earns its WAF token (ADR-0038). The edge web ACL answers a
+  navigation here with the Challenge action (or, past a per-IP limit, a
+  CAPTCHA); once solved, WAF reloads this page with the token set and the
+  script below returns the visitor to the waiting room.
+
+  Only waiting.js ever sends anyone here. The challenge is on this page rather
+  than on waiting.html because waiting.html also carries the no-JavaScript
+  queue's form (ADR-0037), and a browser without JavaScript cannot pass a
+  challenge interstitial.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex" />
+    <title>Checking your browser</title>
+    <link rel="stylesheet" href="/_wr/waiting.css" />
+  </head>
+  <body>
+    <main class="room">
+      <h1>Checking your browser…</h1>
+      <p>This takes a moment. You keep your place in line.</p>
+      <noscript>
+        <p><a href="/_wr/waiting.html">Back to the waiting room</a></p>
+      </noscript>
+    </main>
+    <script>
+      (function () {
+        "use strict";
+        // back= is the waiting page this visitor came from, query included, so
+        // the gate's next= survives the detour. Only a page under /_wr/ is
+        // accepted: anything else could send the visitor off-site.
+        var back = "/_wr/waiting.html";
+        var match = /[?&]back=([^&]*)/.exec(window.location.search || "");
+        if (match) {
+          try {
+            var candidate = decodeURIComponent(match[1]);
+            if (/^\/_wr\/[A-Za-z0-9_.-]+(\?[^#\\]*)?$/.test(candidate)) {
+              back = candidate;
+            }
+          } catch (e) {
+            // Malformed escape: fall back to the waiting page.
+          }
+        }
+        window.location.replace(back);
+      })();
+    </script>
+  </body>
+</html>

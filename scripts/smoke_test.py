@@ -55,8 +55,10 @@ import secrets
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import NamedTuple
 
 import boto3
 
@@ -109,20 +111,47 @@ def join_body(rid: str, event_id: str) -> dict:
     return {"request_id": rid, "event_id": event_id, "h": h.decode()}
 
 
-def api_get(api_url: str, path: str) -> dict:
-    with urllib.request.urlopen(f"{api_url}{path}") as r:
+class Api(NamedTuple):
+    """The regional API stage and the key every method requires (ADR-0038).
+    Only CloudFront holds the key in production; this script reads it from
+    Terraform state so it can exercise the API without the edge in front."""
+
+    url: str
+    key: str
+
+
+def api_headers(api: Api) -> dict[str, str]:
+    # Through CloudFront the key is the edge's to add, so a viewer sends none.
+    return {"x-api-key": api.key} if api.key else {}
+
+
+def api_get(api: Api, path: str) -> dict:
+    req = urllib.request.Request(f"{api.url}{path}", headers=api_headers(api))
+    with urllib.request.urlopen(req) as r:
         return json.load(r)
 
 
-def api_post(api_url: str, path: str, body: dict) -> None:
+def api_post(api: Api, path: str, body: dict) -> tuple[int, str | None]:
+    """POSTs a JSON body; returns the status and any WAF action the edge took.
+    AWS WAF answers a request it challenges with a 2xx (202) carrying
+    x-amzn-waf-action, so a status alone would read a challenge as success."""
     req = urllib.request.Request(
-        f"{api_url}{path}",
+        f"{api.url}{path}",
         data=json.dumps(body).encode(),
-        headers={"content-type": "application/json"},
+        headers={"content-type": "application/json", **api_headers(api)},
         method="POST",
     )
-    with urllib.request.urlopen(req):
-        pass
+    with urllib.request.urlopen(req) as r:
+        return r.status, r.headers.get("x-amzn-waf-action")
+
+
+def refused_without_key(api: Api) -> bool:
+    """True when the stage refuses a keyless request, as it must (ADR-0038)."""
+    try:
+        urllib.request.urlopen(f"{api.url}/v1/status")
+    except urllib.error.HTTPError as err:
+        return err.code == 403
+    return False
 
 
 def main() -> int:
@@ -146,7 +175,7 @@ def main() -> int:
         check=True,
         capture_output=True,
     )
-    api_url = tf_output("api_invoke_url")
+    api = Api(tf_output("api_invoke_url"), tf_output("api_origin_key"))
     event_id = tf_output("event_id")
     tables = tf_output_json("table_names")
     counters, prequeue, positions = (
@@ -156,7 +185,16 @@ def main() -> int:
     )
     open_fn = tf_output("open_event_function_name")
     cf_host = tf_output("cloudfront_domain_name")
-    print(f"API: {api_url}  CDN: {cf_host}  event_id: {event_id}")
+    print(f"API: {api.url}  CDN: {cf_host}  event_id: {event_id}")
+
+    if not refused_without_key(api):
+        print(
+            "ERROR: the API stage answered a request with no x-api-key; anything "
+            "can bypass the edge (ADR-0038)",
+            file=sys.stderr,
+        )
+        return 1
+    print("the API stage refuses a keyless request")
 
     if args.no_reset:
         say("2. Skipping the reset (--no-reset)")
@@ -179,7 +217,7 @@ def main() -> int:
     say("3. Pre-queue registration: POST /v1/join for a small cohort during pre_queue")
     ids: list[str] = [uuid_v7() for _ in range(COHORT)]
     for rid in ids:
-        api_post(api_url, "/v1/join", join_body(rid, event_id))
+        api_post(api, "/v1/join", join_body(rid, event_id))
     print(
         f"posted {len(ids)} pre-queue joins; waiting for assign_position to drain the batch"
     )
@@ -236,7 +274,7 @@ def main() -> int:
         FunctionName=open_fn, Payload=json.dumps({"event_id": event_id}).encode()
     )
     time.sleep(2)
-    status = api_get(api_url, "/v1/status")
+    status = api_get(api, "/v1/status")
     print(json.dumps(status))
     assert status["phase"] == "active", status
     assert status.get("participant_count") == COHORT, status
@@ -245,7 +283,7 @@ def main() -> int:
     say("5. Resolve every pre-queue position via /queue_num; assert all distinct")
     seen: dict[int, str] = {}
     for rid in ids:
-        d = api_get(api_url, f"/v1/queue_num?request_id={rid}")
+        d = api_get(api, f"/v1/queue_num?request_id={rid}")
         p = d["position"]
         assert not d["live_join"], (rid, d)
         assert p not in seen, f"DUPLICATE position {p}: {rid} and {seen[p]}"
@@ -254,7 +292,7 @@ def main() -> int:
 
     say("6. Live join: POST /join, then confirm a Positions row is written")
     live_rid = uuid_v7()
-    api_post(api_url, "/v1/join", join_body(live_rid, event_id))
+    api_post(api, "/v1/join", join_body(live_rid, event_id))
     print(
         f"posted live join {live_rid}; waiting for assign_position to drain the batch"
     )
@@ -274,9 +312,16 @@ def main() -> int:
     # its origin request policy, and the SQS integration behind them — so a
     # misrouted or uncached join surfaces here and nowhere else.
     cdn_rid = uuid_v7()
-    api_post(
-        f"https://{cf_host}", "/v1/join", join_body(cdn_rid, event_id)
+    _, waf_action = api_post(
+        Api(f"https://{cf_host}", ""), "/v1/join", join_body(cdn_rid, event_id)
     )
+    if waf_action:
+        # With the web ACL on (ADR-0038) a join carrying no WAF token is
+        # challenged at the edge rather than enqueued, which is the design.
+        # Only a browser can solve it, so the row check below does not apply.
+        print(f"CloudFront join answered by the WAF ({waf_action}), as designed")
+        say("SMOKE TEST PASSED")
+        return 0
     print(f"posted {cdn_rid} via CloudFront; waiting for the row")
     cdn_item: dict = {}
     for _ in range(15):

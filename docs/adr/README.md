@@ -41,6 +41,7 @@ One record per decision. Each states the context, the decision, and its conseque
 | [0035](0035-request-id-proof-of-possession.md) | A request id is redeemed only with the secret it joined with (amends 0010) |
 | [0036](0036-optional-session-ip-binding.md) | Sessions can be bound to the visitor's network, off by default |
 | [0037](0037-no-javascript-queue.md) | A visitor without JavaScript queues through a small server-rendered path |
+| [0038](0038-edge-web-acl-on-flat-rate-plan.md) | A place in the queue costs a WAF challenge, and the API answers only CloudFront |
 
 ## Open
 
@@ -48,8 +49,8 @@ Decisions deferred until measurement or a client engagement supplies the input.
 
 | Question | Resolves how |
 |---|---|
-| Bot Control Common versus Targeted | Run Targeted in Count mode during a real event and measure what it catches that Common does not. Ten times the per-request cost. |
-| Flat-rate versus pay-as-you-go CloudFront pricing | Flat-rate is usually the better fit for a large planned event (predictable, caps exposure), but the Terraform provider cannot create a flat-rate distribution yet ([#45450](https://github.com/hashicorp/terraform-provider-aws/issues/45450), PR #49235). PAYG is the default until it lands; flat-rate is selected manually per event. The crossover is otherwise non-monotonic in event size, poll interval and Bot Control tier. |
+| Bot Control Common versus Targeted | Run Targeted in Count mode during a real event and measure what it catches that Common does not. Ten times the per-request cost, and a flat-rate plan cannot carry it at all (ADR-0038). |
+| Flat-rate versus pay-as-you-go CloudFront pricing | Flat-rate is the path for an event that runs the edge web ACL: the plan bundles its cost ([ADR-0038](0038-edge-web-acl-on-flat-rate-plan.md)). The Terraform provider cannot create the subscription yet ([#45450](https://github.com/hashicorp/terraform-provider-aws/issues/45450), PR #49235), so it is a console step after apply. PAYG stays the default for a deployment without the web ACL; the crossover is otherwise non-monotonic in event size, poll interval and Bot Control tier. |
 | Signing key rotation | Compromise permits minting admission for every event in the deployment. |
 | Standby inflow measurement placement | Authorizer-local versus centrally aggregated. |
 | No-show controller tuning | Smoothing window and correction bounds need a real event's data. |
