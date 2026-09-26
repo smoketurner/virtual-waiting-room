@@ -200,6 +200,18 @@ needs SigV4A, which the Rust SDK signs with RustCrypto (`p256`/`hmac`/`sha2`, th
 `aws-sdk-cloudfrontkeyvaluestore` crate's `sigv4a` feature). That path is control-plane only. The
 admission path mints and verifies with `aws-lc-rs`.
 
+**The REST API answers only CloudFront** (ADR-0038). Every method sets `api_key_required`; the key
+(`core/origin_key.tf`) is sent only by the distribution, as an `x-api-key` origin custom header, so
+a request straight to `execute-api` is refused unbilled. A new method must require it too — a
+terraform test fails otherwise. `edge/waf.tf` is the **opt-in edge web ACL** (`waf_enabled`), meant
+for a deployment on a CloudFront flat-rate plan, which bundles its cost: a WAF challenge token on
+every JavaScript API path (listed explicitly, and checked against the paths `waiting.js` calls),
+rate limits per token and per IP, managed rules in Count until promoted. The no-JavaScript paths
+must never be challenged, and neither may `waiting.html`, which carries their form: the challenge
+lives on `/_wr/verify.html`, the one navigation only `waiting.js` makes. `waiting.js` treats any
+response carrying `x-amzn-waf-action` (a 202 is one) as "renew the token on the verify page",
+never as success.
+
 The constraint that matters is **N1 — idle cost under $5/month when no event is running**; there
 is no resource-count ceiling (N6 is retired, see `tech.md`). Judge an
 addition by what it bills between events, not by how many blocks it takes.

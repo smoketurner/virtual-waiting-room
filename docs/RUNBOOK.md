@@ -78,6 +78,10 @@ if the two differ — regenerate with `cargo test -p admin -- --ignored regenera
       The pre-queue path is one write however large the cohort, so what needs testing is the
       live-join path and `/status` under polling load.
 - [ ] **Cost modelled for this event** (O6), including the CloudFront plan tier.
+- [ ] **Edge protection matches the plan** (N7, ADR-0038). On a flat-rate plan, `waf_enabled` is
+      on and the distribution is subscribed. Load the waiting page in a private window, see the
+      brief browser check on `/_wr/verify.html`, and confirm the join goes through. Decide before the event whether
+      the managed rules stay in Count or were promoted after the last event's review.
 
 Then, on the day (**manual**):
 
@@ -176,6 +180,24 @@ dashboard does not show a fail-open engaged this way, and needs no cleanup after
 region is still impaired when the window ends, write a new deadline. Queue state survives the
 impairment: once the region returns, visitors whose pages stayed open keep their places.
 
+### If scripts are flooding the queue
+
+With the edge web ACL on, each place already costs a browser challenge solve, and past
+`waf_join_ip_limit` each visitor on an address solves a CAPTCHA (ADR-0038). The levers beyond
+that are Terraform variables, not dashboard controls. Each is one `make apply`, and WAF changes
+reach the edge in about a minute:
+
+- **Lower `waf_join_ip_limit`** to make CAPTCHAs arrive sooner. Real buyers on a carrier NAT see
+  more CAPTCHAs, but none of them are locked out.
+- **Set `waf_managed_rules_mode = "enforce"`** to let Bot Control, IP reputation and the
+  anonymous-IP rules act. Doing this mid-event skips the Count review O5 asks for, so do it only
+  when the flood is worse than the false positives would be.
+- **Set `nojs_enabled = false`** if the no-JavaScript queue is the path being abused. Visitors
+  without JavaScript can't queue while it is off.
+
+None of this binds a place to a person. A farm running real browsers pays more per place but
+still takes them.
+
 ### Opening early
 
 **Open now** closes the pre-queue and opens the event immediately. It is the same operation the
@@ -212,7 +234,12 @@ conditions the system would otherwise survive in silence.
    rather than a queue that never moves.
 2. **Take what you need out of CloudWatch** before the stack goes. Log groups have 30-day
    retention, but they go with the deployment.
-3. **`make destroy`.** The deployment exists for one event.
+3. **Review the web ACL's Count metrics** if it was on. The managed and anonymous-IP rules
+   publish per-rule CloudWatch metrics under `<name_prefix>-*`. This event's data is what decides
+   whether they are promoted to `enforce` for the next one (O5).
+4. **`make destroy`.** The deployment exists for one event. On a flat-rate plan, cancel the plan
+   first and destroy after the billing cycle ends: AWS refuses to delete a subscribed
+   distribution until then (`docs/DEPLOY.md`, Tear down).
 
 ---
 
@@ -233,6 +260,9 @@ Stated here so it is not discovered mid-event:
   mobile) back through the waiting page once; a visitor whose address changes constantly cannot
   stay admitted at all and is told to stay on one connection. Leave it off unless passes are
   being resold.
+- **The edge web ACL prices places; it does not ration them per person.** Each ten places cost a
+  browser challenge solve, and a crowded address gets CAPTCHAs, but a farm running real browsers
+  through many addresses still takes places. Nothing binds a place to a person.
 - **A request id alone no longer admits anyone:** redeeming one also needs the secret the
   visitor's browser joined with. A visitor who hands over both hands over their place.
 - **Regenerating the signing key invalidates every session already issued.** Do it before an

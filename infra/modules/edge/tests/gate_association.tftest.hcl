@@ -15,6 +15,7 @@ mock_provider "aws" {}
 variables {
   name_prefix             = "test"
   api_gateway_domain_name = "api.example.com"
+  api_origin_key          = "test-origin-key"
   env                     = "test"
   demo_origin_domain_name = "demo.s3.example.com"
   gate_kvs_arn            = "arn:aws:cloudfront::123456789012:key-value-store/test"

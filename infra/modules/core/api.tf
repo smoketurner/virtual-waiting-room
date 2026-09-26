@@ -87,10 +87,11 @@ resource "aws_api_gateway_resource" "admin_proxy" {
 }
 
 resource "aws_api_gateway_method" "admin_proxy" {
-  rest_api_id   = aws_api_gateway_rest_api.this.id
-  resource_id   = aws_api_gateway_resource.admin_proxy.id
-  http_method   = "ANY"
-  authorization = "NONE"
+  rest_api_id      = aws_api_gateway_rest_api.this.id
+  resource_id      = aws_api_gateway_resource.admin_proxy.id
+  http_method      = "ANY"
+  authorization    = "NONE"
+  api_key_required = true # only CloudFront holds it (origin_key.tf, ADR-0038)
 }
 
 resource "aws_api_gateway_integration" "admin_proxy" {
@@ -118,10 +119,11 @@ resource "aws_api_gateway_resource" "static_proxy" {
 }
 
 resource "aws_api_gateway_method" "static_get" {
-  rest_api_id   = aws_api_gateway_rest_api.this.id
-  resource_id   = aws_api_gateway_resource.static_proxy.id
-  http_method   = "GET"
-  authorization = "NONE"
+  rest_api_id      = aws_api_gateway_rest_api.this.id
+  resource_id      = aws_api_gateway_resource.static_proxy.id
+  http_method      = "GET"
+  authorization    = "NONE"
+  api_key_required = true # only CloudFront holds it (origin_key.tf, ADR-0038)
 }
 
 resource "aws_api_gateway_integration" "static" {
@@ -150,6 +152,11 @@ resource "aws_api_gateway_method" "endpoint" {
   resource_id   = local.endpoint_resource_id[each.key]
   http_method   = each.value.method
   authorization = each.value.auth
+
+  # Every method, public and admin alike: the distribution is the only client
+  # the API has, and it attaches the key to all of them (origin_key.tf,
+  # ADR-0038). A request straight to execute-api is refused unbilled.
+  api_key_required = true
 
   # Endpoints that declare required_query get edge presence validation: each
   # named query-string parameter is marked required and the params validator is
@@ -202,6 +209,13 @@ resource "aws_api_gateway_deployment" "this" {
       jsonencode(aws_api_gateway_integration.join_sqs.request_parameters),
       aws_api_gateway_model.join.schema,
       aws_api_gateway_method.join_post.request_validator_id,
+      # Method ids are stable when api_key_required flips in place, so hash it:
+      # otherwise the stage keeps serving methods that accept a keyless request
+      # straight to execute-api (ADR-0038).
+      aws_api_gateway_method.join_post.api_key_required,
+      [for k in sort(keys(local.api_endpoints)) : aws_api_gateway_method.endpoint[k].api_key_required],
+      aws_api_gateway_method.admin_proxy.api_key_required,
+      aws_api_gateway_method.static_get.api_key_required,
       # Which SQS outcomes map to a 200 and which to a 502 (issue #144). Same
       # stable-id hazard: editing the selection pattern is an in-place update,
       # so without hashing it the stage keeps mapping every failed SendMessage

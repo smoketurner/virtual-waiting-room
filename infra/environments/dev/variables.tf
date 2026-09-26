@@ -168,3 +168,32 @@ variable "session_ttl_seconds" {
   type        = number
   default     = 3600
 }
+
+# --- Edge protection (ADR-0038) ----------------------------------------------
+# The WAF web ACL is priced into a CloudFront flat-rate plan and required by
+# one. Turn it on for a deployment that will be subscribed; on pay-as-you-go it
+# bills every month whether or not an event is running.
+
+variable "waf_enabled" {
+  description = "Attach the edge web ACL: a WAF token on the JavaScript API, per-token and per-IP rate limits, and AWS managed rules. For a flat-rate plan deployment."
+  type        = bool
+  default     = false
+}
+
+variable "waf_managed_rules_mode" {
+  description = "\"count\" (the default) observes the managed and anonymous-IP rules; \"enforce\" lets them act, after an event's worth of Count data (O5)."
+  type        = string
+  default     = "count"
+}
+
+variable "waf_join_ip_limit" {
+  description = "Token requests (verify-page loads) plus joins per IP per 5 minutes before further visitors on that address must solve a CAPTCHA."
+  type        = number
+  default     = 100
+}
+
+variable "nojs_enabled" {
+  description = "Whether the no-JavaScript queue stays open when the web ACL is on. false closes it at the edge for an event where it is being abused."
+  type        = bool
+  default     = true
+}

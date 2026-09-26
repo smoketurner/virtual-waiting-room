@@ -76,6 +76,7 @@ module "edge" {
   tags        = local.common_tags
 
   api_gateway_domain_name   = module.core.api_gateway_domain_name
+  api_origin_key            = module.core.api_origin_key
   env                       = var.env
   client_origin_domain_name = var.client_origin_domain_name
 
@@ -96,4 +97,11 @@ module "edge" {
   # The customer's own hostname, or empty for the *.cloudfront.net default.
   aliases             = var.aliases
   acm_certificate_arn = var.acm_certificate_arn
+
+  # Edge protection (ADR-0038). Off unless this deployment is on a CloudFront
+  # flat-rate plan, which bundles the web ACL's cost.
+  waf_enabled            = var.waf_enabled
+  waf_managed_rules_mode = var.waf_managed_rules_mode
+  waf_join_ip_limit      = var.waf_join_ip_limit
+  nojs_enabled           = var.nojs_enabled
 }

@@ -405,6 +405,7 @@ resource "aws_api_gateway_method" "join_post" {
   resource_id          = aws_api_gateway_resource.join.id
   http_method          = "POST"
   authorization        = "NONE"
+  api_key_required     = true # only CloudFront holds it (origin_key.tf, ADR-0038)
   request_validator_id = aws_api_gateway_request_validator.body.id
 
   request_models = {

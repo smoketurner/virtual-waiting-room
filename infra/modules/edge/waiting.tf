@@ -132,6 +132,20 @@ resource "aws_s3_object" "waiting_page" {
   tags          = var.tags
 }
 
+# Where waiting.js sends a browser to earn its WAF token (ADR-0038). Published
+# whether or not the web ACL is on: a page that only redirects back costs
+# nothing, and publishing it conditionally would leave a client that met a WAF
+# answer from a manually attached ACL navigating to a 404.
+resource "aws_s3_object" "verify_page" {
+  bucket        = aws_s3_bucket.waiting.id
+  key           = trimprefix(local.waf_verify_path, "/")
+  content       = file("${path.module}/pages/verify.html")
+  content_type  = "text/html; charset=utf-8"
+  cache_control = "max-age=0, s-maxage=300"
+  etag          = filemd5("${path.module}/pages/verify.html")
+  tags          = var.tags
+}
+
 resource "aws_s3_object" "waiting_style" {
   bucket        = aws_s3_bucket.waiting.id
   key           = "_wr/waiting.css"

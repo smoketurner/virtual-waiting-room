@@ -617,14 +617,17 @@ admission for every event in that deployment.
 
 None. `request_id` is client-supplied, so nothing binds a position to a person: a client that
 mints N identifiers takes N places, and randomization converts that volume into expected share
-of the front of the queue linearly. Every deployment is a bare raffle.
+of the front of the queue linearly. Without the edge web ACL every deployment is a bare raffle;
+with it, each ten places cost a browser challenge solve
+([ADR-0038](adr/0038-edge-web-acl-on-flat-rate-plan.md)).
 
 An earlier design verified a customer-signed entry ticket and derived `request_id` from its
 subject. It was removed: it required the customer to build and host a signing endpoint against a
 login they already ran, so no deployment could use it without that upstream work, and it bounded
 identifier minting rather than volume — a farm with N legitimate accounts still took N
 positions. Bounding volume needs a mechanism that costs the client something: proof of work, or
-behavioural classification over signals the join path would have to collect. Neither is built.
+behavioural classification over signals the join path would have to collect. The first is what
+the edge web ACL's challenge amounts to, where it is on (see WAF below); the second is not built.
 
 ### Deferred bot enforcement
 
@@ -643,32 +646,53 @@ it was aimed at. Requirement F6.3 is retired.
 
 WAF Bot Control's labels, and the anonymous-IP and hosting-provider reputation lists, are a
 later input to the same mechanism: another attribute on the row, another signal in the rules,
-acted on at the same open. They are not enabled on cost grounds (§8, §12).
+acted on at the same open. The edge web ACL now carries them where it is on (see WAF below), but as
+edge actions on the request, not as input to a deferred decision.
 
 ### Web Application Firewall (WAF)
 
-**No web ACL is created.** `modules/edge` has no `aws_wafv2_web_acl`, and this is a decision
-rather than an omission: WAF bills $0.60 per million requests inspected on top of Bot Control's
-per-request fee, against the same request count CloudFront serves. At 1M visitors polling every
-10 s for 20 minutes that exceeds the CloudFront bill (§12) — and the polling it would inspect is
-the system's own waiting page, not an attack. Rate limiting for an event is taken at the
-CloudFront plan layer instead, which is priced against the traffic rather than per inspection.
+**The REST API answers only CloudFront.** Every method, public and admin, requires an API key
+that Terraform generates and only the distribution holds: CloudFront sends it to the API origin
+as the `x-api-key` origin custom header, which replaces any value a viewer sends. A request
+straight to `execute-api` is refused with a 403 before any integration runs, and API Gateway does
+not bill it. This is unconditional ([ADR-0038](adr/0038-edge-web-acl-on-flat-rate-plan.md)).
+It is not a public API key: a key on a page served to browsers ships in client-side JavaScript,
+and this one never leaves the distribution's configuration.
 
-What does run at the edge is the gate: a CloudFront Function at viewer-request that refuses every
-request without a valid session before the origin is touched, and an ingest path where the burst
-reaches SQS through API Gateway with no compute in it at all.
+**The edge web ACL is opt-in, for a deployment on a CloudFront flat-rate plan** (`waf_enabled`,
+`modules/edge/waf.tf`). On pay-as-you-go WAF bills $0.60 per million requests inspected against
+the same request count CloudFront serves, mostly the system's own polling. At 1M visitors that
+exceeds the CloudFront bill (§12), and the ACL bills a monthly fee per ACL and per rule between
+events, which N1 does not allow. A flat-rate plan (Business and above) bundles the ACL, its rules,
+AWS managed rules and WAF request fees, doesn't count blocked requests against its allowance, and
+requires a web ACL. The ACL makes a place in the queue cost a browser challenge:
 
-Three rules are worth attaching **for a specific event that warrants the cost**, and the
-distribution ARN is exported so one can be:
+| Rule | Paths | Action |
+|---|---|---|
+| Verify-page challenge | `/_wr/verify.html` | Challenge: a silent interstitial on navigation, which issues the `aws-waf-token` cookie and returns the visitor to the waiting page. Not on `waiting.html`, which also serves the no-JS form |
+| Token required | `/v1/join`, `/v1/status`, `/v1/queue_num`, `/v1/generate_token` | Challenge: without a valid token WAF answers 202 with `x-amzn-waf-action`, and `waiting.js` goes to the verify page to earn one |
+| Joins per token | `/v1/join` | Block (429) past 10 per 10 min: what one challenge solve buys |
+| Requests per token | the four JS API paths | Block (429) past `waf_api_token_limit` per 5 min: far above an honest page's polling, below a script forcing `/v1/queue_num` origin misses |
+| Token requests + joins per IP | `/_wr/verify.html`, `/v1/join` | CAPTCHA past `waf_join_ip_limit` per 5 min. Escalates rather than blocks, because a carrier NAT holds many real buyers |
+| Anonymous / hosting-provider IP | verify page and join | CAPTCHA (Count until promoted) |
+| No-JS joins per IP | `/v1/enter` | Block past `waf_nojs_ip_limit` per 5 min, since the path cannot run a challenge ([ADR-0037](adr/0037-no-javascript-queue.md)) |
+| Anonymous IP, no JS | `/v1/enter` | Block (Count until promoted) |
+| No-JS closed | `/v1/enter`, `/v1/wait` | Block, only when `nojs_enabled = false` |
+| Managed: Anti-DDoS, IP reputation, Bot Control common | ACL-wide (Anti-DDoS) or the room's paths | Count until `waf_managed_rules_mode = "enforce"` (O5, [ADR-0012](adr/0012-anti-ddos-count-mode.md)) |
 
-1. **Bot Control** — bot-versus-human discrimination. Safe in Block.
-2. **Autonomous System Number (ASN) matching** — scalper infrastructure concentrates in a
-   small number of hosting ASNs.
-3. **Anti-distributed-denial-of-service (anti-DDoS) managed rule group** — Count mode first
-   ([ADR-0012](adr/0012-anti-ddos-count-mode.md)).
+The no-JavaScript paths are never challenged: their visitors cannot solve one. A Terraform test
+reads `waiting.js` and fails if it calls a `/v1` path the token rule does not cover.
 
-There is no public API key. A key on a page served to browsers ships in client-side
-JavaScript; rate-based rules do that job properly.
+Only rules a flat-rate plan accepts are used: individual rules, no rule groups of our own, no
+Targeted Bot Control, no ATP/ACFP. Thirteen rules (fourteen with the no-JS queue closed), within
+the Business plan's fifty. Autonomous System Number (ASN) matching is not built. Subscribing
+the distribution is a console step until the provider supports it
+(terraform-provider-aws#45450), and a subscribed distribution cannot be deleted or shed its web
+ACL until the billing cycle ends.
+
+What this does not do is bind a place to a person. It raises the price of a place from nothing to
+a browser session. A farm running real browsers through residential proxies still wins places,
+at a cost.
 
 ---
 
@@ -939,6 +963,16 @@ flat-rate plan ([hashicorp/terraform-provider-aws#45450](https://github.com/hash
 — configurable in the console, not in the provider). Until that lands (PR #49235), deployments
 are PAYG; a flat-rate plan is selected manually per event and cancelled afterwards (the O4
 runbook covers post-event cancellation).
+
+**On a flat-rate plan the WAF rows above are bundled.** The Business plan ($200/month) covers
+the edge web ACL, its rules, AWS managed rules (Bot Control at the common level included) and
+WAF request fees, and requests WAF blocks do not count against its 125M allowance
+([ADR-0038](adr/0038-edge-web-acl-on-flat-rate-plan.md)). That is why the web ACL is opt-in
+behind `waf_enabled` and meant for a subscribed deployment: on PAYG the same ACL bills per
+request inspected during an event and per ACL and rule every month between events. Two costs
+follow from the subscription rather than the traffic: it is monthly, and a subscribed
+distribution cannot be deleted until the billing cycle ends, so the stack outlives the event
+until then.
 
 ### The floor is a client-side guard, not an anti-abuse control
 

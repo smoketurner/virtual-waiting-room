@@ -354,11 +354,65 @@
     }
   }
 
+  // The edge web ACL (ADR-0038) answers an API call that carries no valid WAF
+  // token with a challenge (202) or, past an address's rate limit, a CAPTCHA
+  // (405), both marked by this header. The 202 is the trap: read by status
+  // alone it is a successful join, and the page would poll for a place nothing
+  // was ever asked to write. Neither can be solved from fetch(), only by
+  // navigating, so the page goes to the verify page: WAF challenges that
+  // navigation (silently) or shows the CAPTCHA, the browser gets its token,
+  // and the verify page sends it back here, where the request id is picked
+  // back up from storage. The challenge lives on its own page, not this one,
+  // because this page also serves visitors without JavaScript (ADR-0037).
+  var WAF_VERIFY_PATH = "/_wr/verify.html";
+  var WAF_RENEW_WINDOW_MS = 60000;
+
+  function wafAction(r) {
+    return r.headers && r.headers.get ? r.headers.get("x-amzn-waf-action") : null;
+  }
+
+  function renewWafToken() {
+    stop();
+    // A second WAF answer within a minute of renewing one means the
+    // token is not sticking — most likely cookies are blocked for this site.
+    // Renewing again would loop forever, so say what is wrong instead. The
+    // marker rides in the URL because storage may be exactly what is failing.
+    var search = window.location.search || "";
+    var last = /[?&]waf=(\d+)/.exec(search);
+    if (last && Date.now() - Number(last[1]) < WAF_RENEW_WINDOW_MS) {
+      say(
+        "We couldn't verify this browser",
+        "Allow cookies for this site, then reload this page to keep your place in line."
+      );
+      return;
+    }
+    var kept = search
+      .replace(/^\?/, "")
+      .split("&")
+      .filter(function (pair) {
+        return pair && pair.indexOf("waf=") !== 0;
+      });
+    kept.push("waf=" + Date.now());
+    say("Checking your browser…", "This takes a moment. You keep your place.");
+    var back = window.location.pathname + "?" + kept.join("&");
+    window.location.replace(WAF_VERIFY_PATH + "?back=" + encodeURIComponent(back));
+  }
+
+  // Rejects rather than resolving, so whichever chain made the call stops
+  // where it is; stop() above has already cancelled the next poll.
+  function checkWaf(r) {
+    if (wafAction(r)) {
+      renewWafToken();
+      throw new Error("waf " + wafAction(r));
+    }
+    return r;
+  }
+
   function getJSON(url) {
     return fetch(url, {
       credentials: "same-origin",
       headers: { Accept: "application/json" },
-    }).then(function (r) {
+    }).then(checkWaf).then(function (r) {
       return r.json().then(function (body) {
         return { status: r.status, body: body };
       });
@@ -371,7 +425,7 @@
       credentials: "same-origin",
       headers: { "Content-Type": "application/json", Accept: "application/json" },
       body: JSON.stringify(payload),
-    }).then(function (r) {
+    }).then(checkWaf).then(function (r) {
       return r
         .json()
         .catch(function () {

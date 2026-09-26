@@ -77,17 +77,21 @@ activation queues first-in, first-out (FIFO).
 
 ### 1.7 Abuse mitigation
 
-No requirement in this section is currently met by a shipped mechanism.
+No requirement in this section is currently met by a shipped mechanism: nothing binds a place
+to a person.
 
-**No one-position-per-visitor control exists.** `request_id` is client-supplied, so nothing
-stops one visitor taking N places, and randomization converts volume into expected share of the
-front of the queue linearly
-([ADR-0001](adr/0001-randomize-pre-queue-assignment.md)). Every deployment is therefore a bare
-raffle. Bounding volume needs either an identity to bind a position to — which a public onsale
-open to anyone does not have — or a mechanism that costs the client something: proof of work, or
-behavioural classification over join-time telemetry. Open-time demotion was the
-second, and it was removed without ever being enabled ([ADR-0030](adr/0030-remove-open-time-demotion.md)), so nothing bounds
-volume today.
+**Volume now costs something, where the edge web ACL is on.** `request_id` is client-supplied,
+so one visitor can still take N places, and randomization converts volume into expected share of
+the front of the queue linearly ([ADR-0001](adr/0001-randomize-pre-queue-assignment.md)). With
+the web ACL attached ([ADR-0038](adr/0038-edge-web-acl-on-flat-rate-plan.md)), each place costs
+a browser challenge solve (a WAF token buys at most ten joins in ten minutes), and past a per-IP
+limit each visitor on the address solves a CAPTCHA. The API no longer answers anything but
+CloudFront, so none of this can be bypassed by posting to `execute-api`. That raises a script's
+price per place from nothing to a real browser session. It does not stop a farm that runs real
+browsers through residential proxies: bounding volume per person needs an identity to bind a
+place to, which a public onsale open to anyone does not have. Entry tickets were the attempt at
+that and were removed ([ADR-0028](adr/0028-remove-entry-tickets.md)); open-time demotion was
+removed without ever being enabled ([ADR-0030](adr/0030-remove-open-time-demotion.md)).
 
 ---
 
@@ -115,7 +119,7 @@ pre-event preparation in §4.
 | N3 | The system MUST NOT require us to operate shared infrastructure on clients' behalf. | No component runs in a Smoke Turner account. |
 | N4 | The system MUST support commercial AWS regions. GovCloud (US) is out of scope until a gate exists for it. | The commercial variant deploys and passes functional tests. GovCloud has no shipped gate: the edge gate is a CloudFront Function, which the partition does not offer, and the origin authorizer that filled that role was removed ([ADR-0032](adr/0032-remove-the-origin-authorizer.md)). |
 | N5 | Infrastructure MUST be expressed as Terraform. | No manual console steps in the deployment path. |
-| N7 | Bot and abuse mitigation MUST be present at the edge. | Every request without a valid session is refused by the gate at viewer-request, before the origin is touched, and the join burst reaches SQS with no compute in the path. No WAFv2 web ACL is created: it is priced per request inspected against the system's own polling, so rate limiting is taken at the CloudFront plan layer instead and a web ACL is attached per event only where the cost is justified ([DESIGN.md §8](DESIGN.md)). |
+| N7 | Bot and abuse mitigation MUST be present at the edge. | Every request without a valid session is refused by the gate at viewer-request, before the origin is touched, and the join burst reaches SQS with no compute in the path. The REST API answers only the distribution: every method requires an API key only CloudFront holds, so a request straight to `execute-api` is refused unbilled. A deployment on a CloudFront flat-rate plan attaches the edge web ACL (`waf_enabled`): a WAF token from a browser challenge on every JavaScript API call, rate limits per token and per IP (escalating to CAPTCHA, not a block), and AWS managed rules in Count until promoted. Off by default, because on pay-as-you-go a web ACL bills between events against N1 ([ADR-0038](adr/0038-edge-web-acl-on-flat-rate-plan.md)). |
 | N8 | The API MUST be documented as an OpenAPI specification. | Spec published; client and admin surfaces generated from it. |
 | N9 | Concurrent events in one deployment MUST be isolated from each other. | One event driven to its throughput ceiling does not increase queue-join latency or error rate for another event in the same deployment. |
 | N10 | Client polling cost MUST scale with distance to the front, not with waiting visitors × a fixed interval. | Poll count is O(log) in the starting wait, and the harness client-request total under `--polling backoff` is materially below `--polling hold-position` at identical settings. |

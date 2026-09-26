@@ -10,7 +10,6 @@ terraform {
 }
 
 # NOTE: CloudFront distributions and cache/origin-request policies are global
-# resources managed through the default provider. A us-east-1 aliased provider
-# (configuration_aliases) is reintroduced when the WAFv2 web ACL (scope
-# CLOUDFRONT) and the AWS/CloudFront Requests standby alarm are added - both are
-# us-east-1 only.
+# resources managed through the default provider. The CLOUDFRONT-scoped WAF web
+# ACL (waf.tf) must live in us-east-1 and pins that with its own `region`
+# argument, so no aliased provider is needed for it.
