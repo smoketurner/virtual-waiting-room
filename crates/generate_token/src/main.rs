@@ -12,10 +12,12 @@
 use std::env;
 
 use generate_token::dynamo::DynamoStore;
-use generate_token::{AdmissionClaim, DEFAULT_SESSION_TTL_SECS, Denied, Store, decide, viewer_ip};
+use generate_token::{
+    Admission, DEFAULT_SESSION_TTL_SECS, Denied, Minting, Store, admit, viewer_ip,
+};
 use lambda_http::{Body, Error, Request, RequestExt, Response, run, service_fn};
-use tracing::{error, info};
-use wr_common::{PossessionSecret, Session, SigningKey};
+use tracing::info;
+use wr_common::{PossessionSecret, SigningKey};
 
 /// Resolved once at cold start and shared across invocations. Parameterized
 /// over [`Store`] so the handler's branching — what it loads, and in what
@@ -103,130 +105,52 @@ async fn handle<S: Store>(state: &AppState<S>, req: Request) -> Result<Response<
         return json(400, &serde_json::json!({ "error": "secret required" }));
     };
 
-    let Some(counters) = state.store.load_counters(&state.event_id).await? else {
-        return json(404, &serde_json::json!({ "error": "event not found" }));
-    };
-
-    // A live-join row is the authoritative position when one exists, so it is
-    // read first and the pre-queue lookup is skipped when it answers.
-    let position_row = state.store.load_position(&request_id).await?;
-    let prequeue = if position_row.is_none() {
-        state.store.load_prequeue(&request_id).await?
-    } else {
-        None
-    };
-
+    let viewer = req
+        .headers()
+        .get("cloudfront-viewer-address")
+        .and_then(|v| v.to_str().ok())
+        .and_then(viewer_ip);
     let now = now_secs();
-    let grant = match decide(
-        &counters,
-        prequeue.as_ref(),
-        position_row.as_ref(),
-        &secret,
-        now,
-    ) {
-        Ok(grant) => grant,
-        Err(denied) => return refusal(&denied),
-    };
-
-    // Claim the visitor's one admission, so their arrival is counted once
-    // however many times they call (issue #62). `request_id` travels in a URL
-    // and the waiting page polls, so a reload, a second tab or a retried
-    // request all arrive here again; `record_arrival` is an unconditional
-    // `ADD`, and a second one tells the controller more people showed up than
-    // it released, understating the no-show rate and under-releasing for the
-    // rest of the event.
-    //
-    // A failed claim leaves it unknown whether the arrival has been counted, so
-    // it is counted: over-counting understates the no-show rate and releases
-    // fewer people, while missing it releases more than the origin agreed to
-    // serve. Neither refuses the visitor -- the claim governs the count, not
-    // admission.
-    let claim = match state
-        .store
-        .claim_admission(&request_id, grant.position, &grant.digest, now)
-        .await
-    {
-        Ok(claim) => claim,
-        Err(e) => {
-            error!(error = %e, event = "admission_claim_failed", "could not claim the admission; counting the arrival and admitting anyway");
-            AdmissionClaim::First
-        }
-    };
-
-    match claim {
-        // The shard is drawn at random per admission (issue #59) rather than
-        // hashed from `request_id`, so it is drawn here rather than by
-        // `decide`, which stays a pure function of the queue state. A draw
-        // failure is logged and swallowed for the same reason a record failure
-        // is: the controller tolerates a missed arrival better than the visitor
-        // tolerates being refused at their turn.
-        AdmissionClaim::First => match wr_common::Shard::random() {
-            Ok(shard) => {
-                if let Err(e) = state.store.record_arrival(&state.event_id, shard).await {
-                    // Non-fatal for this visitor: the controller tolerates a
-                    // missed arrival better than the visitor tolerates being
-                    // refused at their turn. Logged at error with a stable event
-                    // name because the damage is cumulative and silent — every
-                    // uncounted arrival inflates the measured no-show rate, and
-                    // the controller answers that by releasing more people than
-                    // the origin agreed to serve. The metric filter and alarm on
-                    // `arrival_record_failed` live in modules/core/logging.tf.
-                    error!(error = %e, event = "arrival_record_failed", "failed to record arrival; admitting anyway");
-                }
-            }
-            Err(e) => {
-                error!(error = %e, event = "arrival_shard_draw_failed", "failed to draw a random shard; admitting without recording arrival");
-            }
+    let admission = admit(
+        &state.store,
+        &Minting {
+            key: &state.key,
+            event_id: &state.event_id,
+            session_ttl_secs: state.session_ttl_secs,
         },
-        // Already counted. The visitor still gets their session below.
-        AdmissionClaim::Repeat => {}
-    }
-
-    let expires_at = now.saturating_add(state.session_ttl_secs);
-    let session = Session {
-        event_id: state.event_id.clone(),
-        request_id: request_id.clone(),
-        issued_at: now,
-        expires_at,
-        // Always tagged when the address is known, so turning IP binding on
-        // (issue #61) also covers sessions minted before it was switched on.
-        ip_tag: req
-            .headers()
-            .get("cloudfront-viewer-address")
-            .and_then(|v| v.to_str().ok())
-            .and_then(viewer_ip)
-            .and_then(|ip| state.key.ip_tag(ip)),
-    };
-    // A signing failure must not become an empty cookie. An empty string is
-    // not a well-formed JWS, so the gate would refuse it and the visitor would
-    // bounce between the origin and the waiting page — while the response that
-    // sent them there said `admitted: true`. Refusing is the honest answer, and
-    // it is retryable: the position is still theirs, and the next poll tries
-    // again.
-    //
-    // The arrival was already counted above, which is the right order for the
-    // reason given there: a visitor counted but not admitted understates the
-    // no-show rate, which under-releases. The opposite mistake over-releases.
-    let Ok(credential) = session.sign(&state.key) else {
-        error!(
-            event = "session_sign_failed",
-            "could not sign the session credential; refusing rather than issuing an empty cookie"
-        );
-        return json(
-            500,
-            &serde_json::json!({ "admitted": false, "error": "try again" }),
-        );
+        &request_id,
+        &secret,
+        viewer,
+        now,
+    )
+    .await?;
+    let (position, expires_at, credential) = match admission {
+        Admission::Admitted {
+            position,
+            expires_at,
+            credential,
+        } => (position, expires_at, credential),
+        Admission::EventNotFound => {
+            return json(404, &serde_json::json!({ "error": "event not found" }));
+        }
+        Admission::Refused(denied) => return refusal(&denied),
+        Admission::SignFailed => {
+            return json(
+                500,
+                &serde_json::json!({ "admitted": false, "error": "try again" }),
+            );
+        }
     };
     let set_cookie = format!(
         "{}={}; Path=/; Max-Age={}; Secure; HttpOnly; SameSite=Lax",
         state.session_cookie_name, credential, state.session_ttl_secs
     );
 
-    info!(position = grant.position, "admitted");
+    info!(position, "admitted");
 
     let body = serde_json::to_string(&serde_json::json!({
         "admitted": true,
-        "position": grant.position,
+        "position": position,
         "expires_at": expires_at,
     }))?;
     Ok(Response::builder()
@@ -300,7 +224,7 @@ mod tests {
     use std::sync::Mutex;
 
     use generate_token::{AdmissionClaim, StoreError};
-    use wr_common::{Counters, Phase, PositionStatus, PreQueueItem, SHARDS, Shard};
+    use wr_common::{Counters, Phase, PositionStatus, PreQueueItem, SHARDS, Session, Shard};
 
     use super::*;
 

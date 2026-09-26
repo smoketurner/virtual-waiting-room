@@ -15,7 +15,7 @@ use std::future::Future;
 
 use wr_common::{
     Counters, Phase, PositionStatus, PossessionSecret, PreQueueItem, ResolveError,
-    ResolvedPosition, SecretDigest, Shard,
+    ResolvedPosition, SecretDigest, Session, Shard, SigningKey,
 };
 
 pub mod dynamo;
@@ -137,6 +137,151 @@ pub struct Grant {
     pub position: u64,
     /// The digest the secret was verified against, for the admission claim.
     pub digest: SecretDigest,
+}
+
+/// What a minted session is signed with and scoped to.
+pub struct Minting<'a> {
+    pub key: &'a SigningKey,
+    pub event_id: &'a str,
+    pub session_ttl_secs: u64,
+}
+
+/// The outcome of [`admit`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Admission {
+    /// Admitted: the signed session credential, for a `Set-Cookie`.
+    Admitted {
+        position: u64,
+        expires_at: u64,
+        credential: String,
+    },
+    /// Not admitted now, and why. [`Denied::StillQueued`] carries the
+    /// position, which is what a waiting page renders.
+    Refused(Denied),
+    /// The event has no `Counters` item.
+    EventNotFound,
+    /// Signing failed. Retryable; never an empty credential (see [`admit`]).
+    SignFailed,
+}
+
+/// The whole admission: load the rows, [`decide`], claim the admission,
+/// record the arrival, and sign the session. Shared by `/v1/generate_token`
+/// and the no-JavaScript waiting page (issue #67), so there is one path by
+/// which a session is minted.
+///
+/// # Errors
+///
+/// A store failure reading the queue state. Failures after the decision --
+/// the claim, the arrival record -- are logged and do not refuse the visitor.
+pub async fn admit<S: Store>(
+    store: &S,
+    minting: &Minting<'_>,
+    request_id: &str,
+    secret: &PossessionSecret,
+    viewer_ip: Option<&str>,
+    now: u64,
+) -> Result<Admission, StoreError> {
+    let Some(counters) = store.load_counters(minting.event_id).await? else {
+        return Ok(Admission::EventNotFound);
+    };
+
+    // A live-join row is the authoritative position when one exists, so it is
+    // read first and the pre-queue lookup is skipped when it answers.
+    let position_row = store.load_position(request_id).await?;
+    let prequeue = if position_row.is_none() {
+        store.load_prequeue(request_id).await?
+    } else {
+        None
+    };
+
+    let grant = match decide(
+        &counters,
+        prequeue.as_ref(),
+        position_row.as_ref(),
+        secret,
+        now,
+    ) {
+        Ok(grant) => grant,
+        Err(denied) => return Ok(Admission::Refused(denied)),
+    };
+
+    // Claim the visitor's one admission, so their arrival is counted once
+    // however many times they call. A reload, a second tab or a retried
+    // request all arrive here again; `record_arrival` is an unconditional
+    // `ADD`, and a second one tells the controller more people showed up than
+    // it released, understating the no-show rate and under-releasing for the
+    // rest of the event.
+    //
+    // A failed claim leaves it unknown whether the arrival has been counted, so
+    // it is counted: over-counting understates the no-show rate and releases
+    // fewer people, while missing it releases more than the origin agreed to
+    // serve. Neither refuses the visitor -- the claim governs the count, not
+    // admission.
+    let claim = match store
+        .claim_admission(request_id, grant.position, &grant.digest, now)
+        .await
+    {
+        Ok(claim) => claim,
+        Err(e) => {
+            tracing::error!(error = %e, event = "admission_claim_failed", "could not claim the admission; counting the arrival and admitting anyway");
+            AdmissionClaim::First
+        }
+    };
+
+    match claim {
+        // The shard is drawn at random per admission (issue #59) rather than
+        // hashed from `request_id`, so it is drawn here rather than by
+        // `decide`, which stays a pure function of the queue state. A draw
+        // failure is logged and swallowed for the same reason a record failure
+        // is: the controller tolerates a missed arrival better than the visitor
+        // tolerates being refused at their turn.
+        AdmissionClaim::First => match Shard::random() {
+            Ok(shard) => {
+                if let Err(e) = store.record_arrival(minting.event_id, shard).await {
+                    // Cumulative and silent: every uncounted arrival inflates
+                    // the measured no-show rate, and the controller answers by
+                    // releasing more people than the origin agreed to serve.
+                    // The metric filter and alarm on `arrival_record_failed`
+                    // live in modules/core/logging.tf.
+                    tracing::error!(error = %e, event = "arrival_record_failed", "failed to record arrival; admitting anyway");
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, event = "arrival_shard_draw_failed", "failed to draw a random shard; admitting without recording arrival");
+            }
+        },
+        // Already counted. The visitor still gets their session.
+        AdmissionClaim::Repeat => {}
+    }
+
+    let expires_at = now.saturating_add(minting.session_ttl_secs);
+    let session = Session {
+        event_id: minting.event_id.to_owned(),
+        request_id: request_id.to_owned(),
+        issued_at: now,
+        expires_at,
+        // Always tagged when the address is known, so turning IP binding on
+        // (issue #61) also covers sessions minted before it was switched on.
+        ip_tag: viewer_ip.and_then(|ip| minting.key.ip_tag(ip)),
+    };
+    // A signing failure must not become an empty cookie: an empty string is
+    // not a well-formed JWS, so the gate would refuse it and the visitor would
+    // bounce between the origin and the waiting page while being told they
+    // were admitted. The arrival was already counted, which is the safer
+    // order: counted-but-not-admitted under-releases, the opposite
+    // over-releases.
+    let Ok(credential) = session.sign(minting.key) else {
+        tracing::error!(
+            event = "session_sign_failed",
+            "could not sign the session credential; refusing rather than issuing an empty cookie"
+        );
+        return Ok(Admission::SignFailed);
+    };
+    Ok(Admission::Admitted {
+        position: grant.position,
+        expires_at,
+        credential,
+    })
 }
 
 /// The address part of a `CloudFront-Viewer-Address` header, which is
