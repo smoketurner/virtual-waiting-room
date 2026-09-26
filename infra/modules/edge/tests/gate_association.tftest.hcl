@@ -79,3 +79,32 @@ run "the_join_policy_whitelists_content_type" {
     error_message = "the join origin request policy must whitelist content-type, or API Gateway cannot parse the join body"
   }
 }
+
+# Issue #61: generate_token tags the session with the viewer's network, which
+# it can only read from CloudFront-Viewer-Address (API Gateway sees the edge).
+# Cookies must still be forwarded or CloudFront strips the Set-Cookie that is
+# the whole point of the path; Host must not be, or API Gateway rejects it.
+run "generate_token_receives_the_viewer_address_and_keeps_its_set_cookie" {
+  command = plan
+
+  assert {
+    condition = contains(
+      aws_cloudfront_origin_request_policy.generate_token.headers_config[0].headers[0].items,
+      "CloudFront-Viewer-Address"
+    )
+    error_message = "generate_token needs CloudFront-Viewer-Address to tag the session for IP binding"
+  }
+
+  assert {
+    condition     = aws_cloudfront_origin_request_policy.generate_token.cookies_config[0].cookie_behavior == "all"
+    error_message = "a behaviour that forwards no cookies has its Set-Cookie stripped"
+  }
+
+  assert {
+    condition = !contains(
+      [for h in aws_cloudfront_origin_request_policy.generate_token.headers_config[0].headers[0].items : lower(h)],
+      "host"
+    )
+    error_message = "forwarding Host to API Gateway makes it reject the request"
+  }
+}

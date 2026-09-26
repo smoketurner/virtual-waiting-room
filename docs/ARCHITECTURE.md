@@ -516,17 +516,17 @@ queue onto the origin. The manual path is fast and documented instead.
 **Standby requires an operator, for the same reason.** An empty ruleset passes every request
 through and `enforce_from` switches every edge at one instant. Nothing triggers either.
 
-**The session cookie is a bearer credential.** The gate verifies a signature and an expiry and
-nothing else, so a stolen cookie works as well as the original until it expires: no visitor
-binding ([#61](https://github.com/smoketurner/virtual-waiting-room/issues/61)), no revocation
-([#63](https://github.com/smoketurner/virtual-waiting-room/issues/63)), and `generate_token`
-authenticates only a request id from the query string, so anyone holding that id can mint one
-([#62](https://github.com/smoketurner/virtual-waiting-room/issues/62)). Every available binding
-breaks real visitors — an IP binding breaks mobile handoff and carrier NAT, a JA4 binding breaks
-on a browser auto-update mid-event, a device key needs JavaScript crypto — so each would trade a
-theoretical loss for visitors actually thrown out of the queue. ADR-0033 removed the most damaging
-consequence, a replayed admission corrupting the no-show measurement, without touching the
-credential model.
+**The session cookie is a bearer credential unless the operator binds it.** The gate verifies a
+signature, the event and an expiry. With IP binding on (dashboard, [ADR-0036](adr/0036-optional-session-ip-binding.md),
+[#61](https://github.com/smoketurner/virtual-waiting-room/issues/61)) it also checks a keyed tag
+of the visitor's IPv4 address or IPv6 /64, and a visitor whose network changes is sent through the
+waiting page once to re-mint. It is off by default because it breaks visitors whose address keeps
+changing, and it cannot separate clients behind one NAT. Nothing revokes a session
+([#63](https://github.com/smoketurner/virtual-waiting-room/issues/63)). Minting one needs the
+request id *and* the possession secret it joined with ([ADR-0035](adr/0035-request-id-proof-of-possession.md),
+[#62](https://github.com/smoketurner/virtual-waiting-room/issues/62)), so an id read from a log or
+a shared URL no longer admits anyone. ADR-0033 removed the most damaging consequence of a replayed
+admission, the corrupted no-show measurement.
 
 **The admin Lambda can read the signing key.** Its KeyValueStore grant covers the key as well as
 the config, and IAM cannot narrow it: the store is the only resource type the service defines, it

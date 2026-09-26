@@ -14,6 +14,26 @@ pub struct PhaseOption {
     pub label: String,
 }
 
+/// The gate's session IP binding as the dashboard shows it (issue #61).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IpBinding {
+    #[default]
+    Off,
+    On,
+}
+
+impl IpBinding {
+    #[must_use]
+    pub const fn from_enabled(enabled: bool) -> Self {
+        if enabled { Self::On } else { Self::Off }
+    }
+
+    #[must_use]
+    pub const fn is_on(self) -> bool {
+        matches!(self, Self::On)
+    }
+}
+
 /// The dashboard view. Optional fields render as "not set" when absent so the
 /// operator sees a label rather than a blank. Also serialized as JSON by the
 /// `/admin/state` poller endpoint.
@@ -100,6 +120,11 @@ pub struct Dashboard {
     /// the JSON state view.
     #[serde(skip)]
     pub rules_load_failed: bool,
+    /// Whether the gate binds sessions to the viewer's network (issue #61),
+    /// read with the ruleset from the same `KeyValueStore` document, so the
+    /// same `rules_load_failed` hides its form. Not part of the JSON state view.
+    #[serde(skip)]
+    pub ip_binding: IpBinding,
     /// The scheduled start for display (issue #128), rendered in the
     /// operator's own zone, or "not set".
     pub starts_at: String,
@@ -220,6 +245,7 @@ impl Dashboard {
             csp_nonce: String::new(),
             operator_email: String::new(),
             rules_text: String::new(),
+            ip_binding: IpBinding::Off,
             rules_load_failed: false,
             starts_at: {
                 let tz = state.starts_at_timezone.as_deref().unwrap_or("UTC");
@@ -461,6 +487,23 @@ mod tests {
         assert!(html.contains("action=\"/admin/rules\""));
         assert!(html.contains("p /checkout"));
         assert!(!html.contains("Could not read the current ruleset"));
+    }
+
+    #[test]
+    fn the_ip_binding_state_and_its_toggle_are_rendered() {
+        let mut view = Dashboard::from_state(&state(), 0);
+        let off = view.render().unwrap();
+        assert!(off.contains("action=\"/admin/ip_binding\""));
+        assert!(off.contains("IP binding: <strong>off</strong>"));
+        assert!(off.contains(r#"name="binding" value="on""#));
+
+        view.ip_binding = IpBinding::On;
+        let on = view.render().unwrap();
+        assert!(on.contains("IP binding: <strong>on</strong>"));
+        assert!(on.contains(r#"name="binding" value="off""#));
+
+        view.rules_load_failed = true;
+        assert!(!view.render().unwrap().contains("/admin/ip_binding"));
     }
 
     #[test]

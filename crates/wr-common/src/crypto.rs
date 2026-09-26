@@ -39,6 +39,10 @@ struct Claims {
     exp: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     iat: Option<u64>,
+    /// The viewer's network tag at minting ([`SigningKey::ip_tag`], issue
+    /// #61). Private claim; absent when the viewer address was unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cip: Option<String>,
 }
 
 /// A credential kind. Each signs under its own derived key, so kinds are
@@ -75,15 +79,43 @@ impl Kind {
 /// one with at apply time.
 pub struct SigningKey {
     session: [u8; 32],
+    ip: [u8; 32],
 }
 
+/// The derivation label for the key that tags a viewer's network (issue #61).
+/// Not a [`Kind`]: it signs no credential, so nothing can be presented as it.
+const IP_TAG_LABEL: &[u8] = b"vwr/ip/v1";
+
+/// Characters of base64url kept from the IP tag's HMAC: 132 bits, enough that
+/// guessing another network's tag is hopeless, short enough for a cookie.
+const IP_TAG_LEN: usize = 22;
+
 impl SigningKey {
-    /// Derives both per-kind keys from the deployment secret.
+    /// Derives the per-kind keys, and the IP-tag key, from the deployment
+    /// secret.
     #[must_use]
     pub fn new(secret: &[u8]) -> Self {
         Self {
-            session: derive(secret, Kind::Session),
+            session: derive(secret, Kind::Session.label()),
+            ip: derive(secret, IP_TAG_LABEL),
         }
+    }
+
+    /// A keyed tag of the viewer's network (issue #61, ADR-0036): the full
+    /// address for IPv4, the /64 for IPv6 (privacy addresses rotate inside
+    /// it). Keyed so a cookie never carries something an IPv4 address can be
+    /// brute-forced back out of. `None` for anything that is not an address.
+    #[must_use]
+    pub fn ip_tag(&self, ip: &str) -> Option<String> {
+        use base64::Engine as _;
+        let network = ip_network(ip)?;
+        let tag = hmac::sign(
+            &hmac::Key::new(hmac::HMAC_SHA256, &self.ip),
+            network.as_bytes(),
+        );
+        let mut out = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(tag.as_ref());
+        out.truncate(IP_TAG_LEN);
+        Some(out)
     }
 
     const fn for_kind(&self, kind: Kind) -> &[u8; 32] {
@@ -93,11 +125,26 @@ impl SigningKey {
     }
 }
 
+/// The network an IP tag binds to: the dotted address for IPv4, and for IPv6
+/// the first four hextets in lowercase hex without leading zeros, joined by
+/// `:` (`2001:db8:0:1`). The gate computes the same string; conformance
+/// vectors pin that they agree.
+#[must_use]
+pub fn ip_network(ip: &str) -> Option<String> {
+    match ip.parse::<std::net::IpAddr>().ok()? {
+        std::net::IpAddr::V4(v4) => Some(v4.to_string()),
+        std::net::IpAddr::V6(v6) => {
+            let s = v6.segments();
+            Some(format!("{:x}:{:x}:{:x}:{:x}", s[0], s[1], s[2], s[3]))
+        }
+    }
+}
+
 /// `HMAC-SHA256(secret, label)`. One pass is enough for a full-entropy secret
-/// and a fixed label; the labels are distinct constants, so the two outputs
+/// and a fixed label; the labels are distinct constants, so the outputs
 /// cannot collide.
-fn derive(secret: &[u8], kind: Kind) -> [u8; 32] {
-    let tag = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, secret), kind.label());
+fn derive(secret: &[u8], label: &[u8]) -> [u8; 32] {
+    let tag = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, secret), label);
     let mut out = [0u8; 32];
     out.copy_from_slice(tag.as_ref());
     out
@@ -124,6 +171,9 @@ pub struct Session {
     pub issued_at: u64,
     /// Epoch-seconds hard expiry (the cap; a sliding window re-issues).
     pub expires_at: u64,
+    /// [`SigningKey::ip_tag`] of the viewer that redeemed it. The gate
+    /// compares it only while the operator has IP binding on (issue #61).
+    pub ip_tag: Option<String>,
 }
 
 /// Why a credential string did not validate. Deliberately coarse: a caller
@@ -166,6 +216,7 @@ impl Session {
                 sub: self.request_id.clone(),
                 exp: self.expires_at,
                 iat: Some(self.issued_at),
+                cip: self.ip_tag.clone(),
             },
         )
     }
@@ -188,6 +239,7 @@ impl Session {
             request_id: claims.sub,
             issued_at: claims.iat.ok_or(VerifyError::Malformed)?,
             expires_at: claims.exp,
+            ip_tag: claims.cip,
         })
     }
 }
@@ -381,7 +433,44 @@ mod tests {
             request_id: "018f3a2b-7c9d-7e1f-abcd-0123456789ab".to_owned(),
             issued_at: 1_000_000_000,
             expires_at: 2_000_000_000,
+            ip_tag: None,
         }
+    }
+
+    #[test]
+    fn the_ip_tag_rides_in_the_credential_and_round_trips() {
+        let k = key();
+        let mut t = session();
+        t.ip_tag = k.ip_tag("198.51.100.7");
+        assert!(t.ip_tag.is_some());
+        let back = Session::verify(&t.sign(&k).unwrap(), &k, 1_500_000_000).unwrap();
+        assert_eq!(back.ip_tag, t.ip_tag);
+    }
+
+    #[test]
+    fn an_ipv6_tag_binds_the_64_not_the_address() {
+        let k = key();
+        let a = k.ip_tag("2001:db8:0:1:aaaa:bbbb:cccc:dddd");
+        assert_eq!(a, k.ip_tag("2001:0db8:0000:0001::1"));
+        assert_ne!(a, k.ip_tag("2001:db8:0:2::1"));
+        assert_eq!(ip_network("2001:0DB8::1").as_deref(), Some("2001:db8:0:0"));
+    }
+
+    #[test]
+    fn distinct_networks_get_distinct_tags_and_garbage_gets_none() {
+        let k = key();
+        assert_ne!(k.ip_tag("198.51.100.7"), k.ip_tag("198.51.100.8"));
+        assert_eq!(k.ip_tag("198.51.100.7").unwrap().len(), IP_TAG_LEN);
+        for bad in ["", "not-an-ip", "198.51.100.7:443", "1.2.3"] {
+            assert_eq!(k.ip_tag(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_ip_tag_does_not_depend_only_on_the_address() {
+        // Keyed: another deployment cannot precompute this one's tags.
+        let other = SigningKey::new(b"another-deployment-secret");
+        assert_ne!(key().ip_tag("198.51.100.7"), other.ip_tag("198.51.100.7"));
     }
 
     #[test]
@@ -417,6 +506,7 @@ mod tests {
                 out.copy_from_slice(SECRET);
                 out
             },
+            ip: derived.ip,
         };
         let signed = session().sign(&underived).unwrap();
         assert_eq!(
@@ -511,6 +601,7 @@ mod tests {
                 request_id,
                 issued_at: expires_at - 1,
                 expires_at,
+                ip_tag: None,
             };
             let signed = t.sign(&k).unwrap();
             let back = Session::verify(&signed, &k, expires_at - 1).unwrap();

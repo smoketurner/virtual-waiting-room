@@ -24,6 +24,8 @@
   var IDENTITY_RE = /^([0-9a-f-]{36})\.([A-Za-z0-9_-]{43})$/;
   var JOINED_KEY = "vwr_joined";
   var AHEAD_AT_START_KEY = "vwr_ahead_at_start";
+  var IP_REBIND_KEY = "vwr_ip_rebind";
+  var IP_REBIND_WINDOW_MS = 60000;
 
   // Adaptive poll interval (#69). No policy published ⇒ behave
   // exactly as this client always has: floor === ceiling === 5000ms, divisor
@@ -778,6 +780,22 @@
       secret: secret,
     }).then(function (res) {
       if (res.status === 200 && res.body.admitted) {
+        // The gate refused a session from another network (IP binding, issue
+        // #61) and this page just re-minted it. A second such refusal inside
+        // a minute means the new session is not holding either: stop, rather
+        // than bounce between the gate and this page.
+        if (/[?&]r=ip(&|$)/.test(window.location.search || "")) {
+          var last = Number(readStored(IP_REBIND_KEY)) || 0;
+          if (Date.now() - last < IP_REBIND_WINDOW_MS) {
+            say(
+              "Your connection keeps changing",
+              "This site only lets a pass work from the network it was issued to. Stay on one connection (Wi-Fi or mobile data) and reload this page."
+            );
+            stop();
+            return;
+          }
+          writeStored(IP_REBIND_KEY, String(Date.now()));
+        }
         say("You're through", "Taking you to the site…");
         // Replace so the waiting page does not sit in the back history.
         window.location.replace(nextDestination());

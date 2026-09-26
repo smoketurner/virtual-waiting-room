@@ -257,6 +257,17 @@
           </div>
           <button type="submit" title="Replace the edge gate's ruleset with what is in the box above.">Set rules</button>
         </form>
+        <form method="post" action="/admin/ip_binding" style="margin-top:12px;"
+          {% if ip_binding.is_on() %}data-confirm="Stop binding sessions to the visitor's network? A copied session cookie will work from anywhere again."{% else %}data-confirm="Bind admitted sessions to the visitor's network? Visitors whose address changes (mobile handoff, some carriers) are sent back to the waiting page, which lets them straight through again if they are still admitted."{% endif %}>
+          <p class="sub">IP binding: <strong>{% if ip_binding.is_on() %}on{% else %}off{% endif %}</strong>. While on, a session cookie only works from the network it was issued to (IPv4 address, or IPv6 /64), so it cannot be passed around.</p>
+          {% if ip_binding.is_on() %}
+          <input type="hidden" name="binding" value="off">
+          <button type="submit" class="normal" title="Let a session cookie work from any network.">Turn IP binding off</button>
+          {% else %}
+          <input type="hidden" name="binding" value="on">
+          <button type="submit" class="normal" title="Refuse a session cookie used from a different network than the one it was issued to.">Turn IP binding on</button>
+          {% endif %}
+        </form>
         {% endif %}
       </div>
     </section>

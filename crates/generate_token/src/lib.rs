@@ -139,6 +139,16 @@ pub struct Grant {
     pub digest: SecretDigest,
 }
 
+/// The address part of a `CloudFront-Viewer-Address` header, which is
+/// `ip:port` with no brackets around an IPv6 address — so the port is
+/// whatever follows the last `:` (issue #61). `None` for a header with no
+/// port, which `CloudFront` never sends.
+#[must_use]
+pub fn viewer_ip(header: &str) -> Option<&str> {
+    let (ip, port) = header.trim().rsplit_once(':')?;
+    (!ip.is_empty() && !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit())).then_some(ip)
+}
+
 /// Decides whether the visitor may be admitted.
 ///
 /// Both gates are checked, in this order: the event must be actively admitting
@@ -556,5 +566,20 @@ mod tests {
             decide(&counters(10), Some(&pq), Some(&admitted), &secret(), 0).unwrap_err(),
             Denied::NotHolder
         );
+    }
+
+    // --- issue #61: the viewer address the session is tagged with -----------
+
+    #[test]
+    fn the_viewer_address_header_loses_its_port() {
+        assert_eq!(viewer_ip("198.51.100.7:46532"), Some("198.51.100.7"));
+        assert_eq!(
+            viewer_ip("2001:0db8:85a3:0000:0000:8a2e:0370:7334:46532"),
+            Some("2001:0db8:85a3:0000:0000:8a2e:0370:7334")
+        );
+        assert_eq!(viewer_ip("2001:db8::1:443"), Some("2001:db8::1"));
+        for bad in ["", "198.51.100.7", ":443", "198.51.100.7:", "1.2.3.4:x"] {
+            assert_eq!(viewer_ip(bad), None, "{bad}");
+        }
     }
 }

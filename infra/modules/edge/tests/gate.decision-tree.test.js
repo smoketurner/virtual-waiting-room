@@ -31,12 +31,17 @@ function validSessionCredential(overrides) {
     overrides
   );
   const header = b64url({ alg: "HS256", typ: "JWT" });
-  const claims = b64url({
-    aud: fields.eventId,
-    sub: fields.requestId,
-    exp: fields.expiresAt,
-    iat: fields.issuedAt,
-  });
+  const claims = b64url(
+    Object.assign(
+      {
+        aud: fields.eventId,
+        sub: fields.requestId,
+        exp: fields.expiresAt,
+        iat: fields.issuedAt,
+      },
+      fields.cip === undefined ? {} : { cip: fields.cip }
+    )
+  );
   const key = crypto.createHmac("sha256", SECRET).update("vwr/jws/session/v1").digest();
   const mac = crypto.createHmac("sha256", key).update(`${header}.${claims}`).digest("base64url");
   return `${header}.${claims}.${mac}`;
@@ -197,4 +202,52 @@ test("spoofed x-wr-gate / x-wr-gate-failed headers are stripped before any decis
   const result = await gate.handler(req);
   assert.ok(!("x-wr-gate" in result.headers));
   assert.ok(!("x-wr-gate-failed" in result.headers));
+});
+
+// --- issue #61: optional IP binding -----------------------------------------
+
+async function withBinding({ bind, cip, viewerIp }) {
+  const gate = loadGate({ kvs: { c: protectedConfig(bind ? { b: true } : {}), k: SECRET } });
+  const tag = cip === "viewer" ? gate.ipTag(SECRET, "198.51.100.7") : cip;
+  const req = event("/checkout", {
+    headers: { accept: "text/html" },
+    cookies: { [COOKIE]: validSessionCredential({ cip: tag }) },
+    viewerIp: viewerIp ?? "198.51.100.7",
+  });
+  return { req, result: await gate.handler(req) };
+}
+
+test("binding on: a session tagged with the viewer's network passes", async () => {
+  const { req, result } = await withBinding({ bind: true, cip: "viewer" });
+  assert.equal(result, req.request);
+});
+
+test("binding on: the same session from another address is refused with reason ip", async () => {
+  const { result } = await withBinding({ bind: true, cip: "viewer", viewerIp: "203.0.113.50" });
+  assert.equal(result.statusCode, 302);
+  assert.equal(result.headers["x-wr-reason"].value, "ip");
+  assert.match(result.headers.location.value, /\?r=ip&next=/);
+});
+
+test("binding on: a session minted without a tag is refused", async () => {
+  const { result } = await withBinding({ bind: true, cip: undefined });
+  assert.equal(result.headers["x-wr-reason"].value, "ip");
+});
+
+test("binding off: the tag is not consulted", async () => {
+  for (const cip of [undefined, "viewer", "someone-elses-tag-xxxxxx"]) {
+    const { req, result } = await withBinding({ bind: false, cip, viewerIp: "203.0.113.50" });
+    assert.equal(result, req.request, `cip=${cip}`);
+  }
+});
+
+test("binding on: an IPv6 visitor keeps access across addresses in the same /64", async () => {
+  const gate = loadGate({ kvs: { c: protectedConfig({ b: true }), k: SECRET } });
+  const tag = gate.ipTag(SECRET, "2001:db8:0:1::aaaa");
+  const req = event("/checkout", {
+    headers: { accept: "text/html" },
+    cookies: { [COOKIE]: validSessionCredential({ cip: tag }) },
+    viewerIp: "2001:db8:0:1:ffff:1:2:3",
+  });
+  assert.equal(await gate.handler(req), req.request);
 });

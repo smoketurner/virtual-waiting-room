@@ -695,12 +695,13 @@ One credential (ADR-0011, ADR-0024):
   `generate_token` once a visitor's position is reached and checked by the edge gate. It is
   signed under a key derived from the deployment secret rather than the secret itself, so a
   future second credential kind cannot validate as a session. The admission token that used to
-  precede it was removed with the origin authorizer (ADR-0032). It is a bearer credential until
-  it expires: it carries no visitor binding, is scoped by `event_id`
-  ([#61](https://github.com/smoketurner/virtual-waiting-room/issues/61), closed for the
-  event-scoping half — the gate refuses a credential minted for another event), and cannot be
-  revoked ([#63](https://github.com/smoketurner/virtual-waiting-room/issues/63), still open — no
-  design chosen).
+  precede it was removed with the origin authorizer (ADR-0032). It is scoped by `event_id` (the
+  gate refuses a credential minted for another event), carries a keyed tag of the visitor's
+  network that the gate enforces while the operator has IP binding on (ADR-0036,
+  [#61](https://github.com/smoketurner/virtual-waiting-room/issues/61)), and cannot be revoked
+  ([#63](https://github.com/smoketurner/virtual-waiting-room/issues/63), no design chosen).
+  `generate_token` mints it only for a caller holding the possession secret the `request_id`
+  joined with (ADR-0035, [#62](https://github.com/smoketurner/virtual-waiting-room/issues/62)).
 
 The signing key is per-deployment, held in an SSM Parameter Store SecureString (a SecureString is free where a Secrets Manager secret is $0.40/mo, which N1 does not allow). Its compromise permits minting
 admission for every event in that deployment.

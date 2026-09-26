@@ -89,6 +89,30 @@ resource "aws_cloudfront_origin_request_policy" "join" {
   }
 }
 
+# --- Origin request policy (/v1/generate_token) -------------------------------
+# Cookies, because a behaviour that forwards none has its Set-Cookie response
+# headers stripped, and minting the session cookie is this path's whole job.
+# CloudFront-Viewer-Address, because the session is tagged with the viewer's
+# network for optional IP binding (issue #61, ADR-0036) and API Gateway
+# otherwise sees only the edge's address. No Host: API Gateway rejects it.
+resource "aws_cloudfront_origin_request_policy" "generate_token" {
+  name    = "${var.name_prefix}-generate-token"
+  comment = "POST /v1/generate_token: cookies (Set-Cookie survives), the viewer address, the body type."
+
+  cookies_config {
+    cookie_behavior = "all"
+  }
+  headers_config {
+    header_behavior = "whitelist"
+    headers {
+      items = ["content-type", "CloudFront-Viewer-Address"]
+    }
+  }
+  query_strings_config {
+    query_string_behavior = "all"
+  }
+}
+
 resource "aws_cloudfront_origin_request_policy" "protected" {
   name    = "${var.name_prefix}-protected"
   comment = "Protected origin: forward the session cookie and all viewer headers/query strings."
@@ -289,8 +313,8 @@ resource "aws_cloudfront_distribution" "this" {
   # forwards no cookies has its Set-Cookie response headers STRIPPED by
   # CloudFront before they reach the viewer. /generate_token's whole job is to
   # return the admission cookies, so without this the visitor is admitted,
-  # receives nothing, and waits forever. AllViewerExceptHostHeader forwards
-  # cookies and drops Host, which API Gateway rejects if forwarded.
+  # receives nothing, and waits forever. The generate_token policy forwards
+  # cookies and the viewer address, and drops Host, which API Gateway rejects.
   dynamic "ordered_cache_behavior" {
     for_each = toset(local.write_paths)
     content {
@@ -300,7 +324,7 @@ resource "aws_cloudfront_distribution" "this" {
       allowed_methods          = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
       cached_methods           = ["GET", "HEAD"]
       cache_policy_id          = local.caching_disabled_policy_id
-      origin_request_policy_id = local.all_viewer_except_host_policy_id
+      origin_request_policy_id = aws_cloudfront_origin_request_policy.generate_token.id
       compress                 = true
     }
   }

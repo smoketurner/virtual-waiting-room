@@ -21,9 +21,9 @@ use admin::scheduler::SchedulerStore;
 use admin::sessions::{AdminSession, PendingLogin, SessionStore};
 use admin::templates::Dashboard;
 use admin::{
-    ApplyError, EdgeConfigStore, apply_fail_open, apply_force_maintenance, apply_message,
-    apply_open_now, apply_pause, apply_phase, apply_rate, apply_recover, apply_resume,
-    apply_set_rules, apply_start_time, format_rules, parse_rules,
+    ApplyError, EdgeConfigStore, apply_fail_open, apply_force_maintenance, apply_ip_binding,
+    apply_message, apply_open_now, apply_pause, apply_phase, apply_rate, apply_recover,
+    apply_resume, apply_set_rules, apply_start_time, format_rules, parse_rules,
 };
 use askama::Template;
 use axum::Form;
@@ -162,6 +162,7 @@ async fn main() -> Result<(), Error> {
         .route("/admin/fail_open", post(fail_open))
         .route("/admin/recover", post(recover))
         .route("/admin/rules", post(set_rules))
+        .route("/admin/ip_binding", post(set_ip_binding))
         .route("/static/{*path}", get(static_asset))
         .with_state(state)
         // Security-headers middleware: apply the hardening + no-cache headers to
@@ -396,7 +397,10 @@ async fn dashboard(State(state): State<Shared>, headers: HeaderMap, now: Arrival
             // an empty textarea is indistinguishable from a real dormant
             // ruleset, and submitting it would overwrite the real one.
             match state.edge.read_config().await {
-                Ok((cfg, _etag)) => view.rules_text = format_rules(&cfg.rules),
+                Ok((cfg, _etag)) => {
+                    view.rules_text = format_rules(&cfg.rules);
+                    view.ip_binding = admin::templates::IpBinding::from_enabled(cfg.bind_ip);
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "could not read the current ruleset");
                     view.rules_load_failed = true;
@@ -636,6 +640,41 @@ async fn recover(State(state): State<Shared>, headers: HeaderMap, now: ArrivalTi
             &state.store,
             &state.edge,
             &state.event_id,
+            &session.email,
+            now,
+        )
+        .await,
+    )
+}
+
+#[derive(Deserialize)]
+struct IpBindingForm {
+    /// `on` or `off`; anything else is a 400, so a hand-built request cannot
+    /// flip the setting by omission.
+    binding: String,
+}
+
+/// Turns the gate's session IP binding on or off (issue #61, ADR-0036).
+async fn set_ip_binding(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    now: ArrivalTime,
+    Form(form): Form<IpBindingForm>,
+) -> Response {
+    let Some(session) = authed(&state, &headers, now).await else {
+        return Redirect::to("/admin/login").into_response();
+    };
+    let on = match form.binding.as_str() {
+        "on" => true,
+        "off" => false,
+        _ => return (StatusCode::BAD_REQUEST, "binding must be on or off").into_response(),
+    };
+    finish(
+        apply_ip_binding(
+            &state.store,
+            &state.edge,
+            &state.event_id,
+            on,
             &session.email,
             now,
         )

@@ -12,7 +12,7 @@
 use std::env;
 
 use generate_token::dynamo::DynamoStore;
-use generate_token::{AdmissionClaim, DEFAULT_SESSION_TTL_SECS, Denied, Store, decide};
+use generate_token::{AdmissionClaim, DEFAULT_SESSION_TTL_SECS, Denied, Store, decide, viewer_ip};
 use lambda_http::{Body, Error, Request, RequestExt, Response, run, service_fn};
 use tracing::{error, info};
 use wr_common::{PossessionSecret, Session, SigningKey};
@@ -188,6 +188,14 @@ async fn handle<S: Store>(state: &AppState<S>, req: Request) -> Result<Response<
         request_id: request_id.clone(),
         issued_at: now,
         expires_at,
+        // Always tagged when the address is known, so turning IP binding on
+        // (issue #61) also covers sessions minted before it was switched on.
+        ip_tag: req
+            .headers()
+            .get("cloudfront-viewer-address")
+            .and_then(|v| v.to_str().ok())
+            .and_then(viewer_ip)
+            .and_then(|ip| state.key.ip_tag(ip)),
     };
     // A signing failure must not become an empty cookie. An empty string is
     // not a well-formed JWS, so the gate would refuse it and the visitor would
@@ -520,5 +528,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn the_session_is_tagged_with_the_viewer_network() {
+        let state = state(FakeStore::admitting());
+        let mut req = request();
+        req.headers_mut().insert(
+            "cloudfront-viewer-address",
+            "198.51.100.7:46532".parse().unwrap(),
+        );
+        let response = handle(&state, req).await.unwrap();
+        let cookie = response.headers()["set-cookie"].to_str().unwrap();
+        let credential = cookie.split(';').next().unwrap().split_once('=').unwrap().1;
+        let session = Session::verify(credential, &state.key, 1).unwrap();
+        assert_eq!(session.ip_tag, state.key.ip_tag("198.51.100.7"));
+
+        // No header (a request that bypassed CloudFront): minted untagged.
+        let response = handle(&state, request()).await.unwrap();
+        let cookie = response.headers()["set-cookie"].to_str().unwrap();
+        let credential = cookie.split(';').next().unwrap().split_once('=').unwrap().1;
+        assert_eq!(
+            Session::verify(credential, &state.key, 1).unwrap().ip_tag,
+            None
+        );
     }
 }

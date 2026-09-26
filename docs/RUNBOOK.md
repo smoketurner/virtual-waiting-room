@@ -27,6 +27,7 @@ way to choose between them under pressure.
 | **Force maintenance** | The full stop. The event is down | An outage page, not a queue |
 | **Open now** | Opens the event immediately instead of waiting for the scheduled start | Their place in line, and the queue starts moving |
 | **Set message** | Publishes a line of text to the waiting page | The message, on the next poll (within ~5 s) |
+| **IP binding** | While on, an admitted visitor's pass only works from the network it was issued to (IPv4 address, or IPv6 /64), so it cannot be handed around | Nothing, unless their address changes: then one trip through the waiting page, which lets them straight back in |
 
 Two pairs are easy to confuse:
 
@@ -207,7 +208,13 @@ Stated here so it is not discovered mid-event:
 - **Sessions are not renewed.** A visitor still on the origin when `session_ttl_seconds` lapses
   is returned to the queue. Set it longer than the worst realistic time on the origin; there is
   no other control over this.
-- **A session cookie is a bearer credential.** It is not bound to a visitor and cannot be
-  revoked. So is a request id: anyone holding one can mint a cookie.
+- **A session cookie is a bearer credential unless IP binding is on,** and it cannot be revoked
+  either way. Binding stops a pass being redistributed across networks, not shared behind one
+  NAT (an office, some carriers). Turning it on sends visitors whose address changes (Wi-Fi to
+  mobile) back through the waiting page once; a visitor whose address changes constantly cannot
+  stay admitted at all and is told to stay on one connection. Leave it off unless passes are
+  being resold.
+- **A request id alone no longer admits anyone:** redeeming one also needs the secret the
+  visitor's browser joined with. A visitor who hands over both hands over their place.
 - **Regenerating the signing key invalidates every session already issued.** Do it before an
   event opens, never during one.

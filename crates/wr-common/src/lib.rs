@@ -21,7 +21,7 @@ pub mod rules;
 
 pub use crypto::{
     MalformedPossession, PossessionSecret, SecretDigest, Session, SignError, SigningKey,
-    VerifyError,
+    VerifyError, ip_network,
 };
 pub use expr::{STARTS_AT_ATTR, STARTS_AT_TZ_ATTR};
 pub use ids::{

@@ -449,6 +449,35 @@ test("a redemption refused as not the holder stops, rather than polling forever"
   assert.match(client.elements.headline.textContent, /couldn't confirm/);
 });
 
+// --- issue #61: re-minting a session refused for another network ----------
+
+test("a visitor sent back for another network is re-admitted straight through", async () => {
+  const client = loadClient({
+    route: admittedRoute(),
+    locationSearch: "?r=ip&next=%2Fcheckout",
+  });
+  await client.flush();
+  assert.equal(client.win.location.replacedTo, "/checkout");
+});
+
+test("a second ip refusal within a minute stops instead of looping", async () => {
+  const first = loadClient({ route: admittedRoute(), locationSearch: "?r=ip&next=%2Fcheckout" });
+  await first.flush();
+  const stamp = first.win.localStorage.getItem("vwr_ip_rebind");
+  assert.ok(stamp, "the re-mint is recorded");
+
+  const second = loadClient({
+    route: admittedRoute(),
+    locationSearch: "?r=ip&next=%2Fcheckout",
+    now: first.clock.now + 5_000,
+  });
+  second.win.localStorage.setItem("vwr_ip_rebind", stamp);
+  second.win.localStorage.setItem("vwr_identity", first.win.localStorage.getItem("vwr_identity"));
+  await second.flush();
+  assert.equal(second.win.location.replacedTo, undefined, "no second bounce");
+  assert.match(second.elements.headline.textContent, /keeps changing/);
+});
+
 test("a redemption that fails in flight is retried, not abandoned", async () => {
   // A network error, or an error page that is not JSON, rejects the
   // generate_token call. Left set, the in-flight flag turned every later

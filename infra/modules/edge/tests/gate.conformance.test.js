@@ -54,6 +54,7 @@ test("conformance vectors file is non-empty", () => {
   assert.ok(vectors.positives.length > 0);
   assert.ok(vectors.negatives.length > 0);
   assert.ok(vectors.rules.length > 0);
+  assert.ok(vectors.ip_tags.length > 0);
 });
 
 for (const v of vectors.positives) {
@@ -71,6 +72,13 @@ for (const v of vectors.negatives) {
     const gate = loadGate();
     const result = gate.verify(v.credential, secretFrom(v.key_hex));
     assert.equal(result, null, `vector ${v.name} was unexpectedly accepted`);
+  });
+}
+
+for (const v of vectors.ip_tags) {
+  test(`ip tag: ${v.name}`, () => {
+    const gate = loadGate();
+    assert.equal(gate.ipTag(secretFrom(v.key_hex), v.ip), v.tag, `ip vector ${v.name}`);
   });
 }
 
