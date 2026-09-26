@@ -80,6 +80,7 @@ impl Store for DynamoStore {
             entry_time: now,
             status: PositionStatus::Issued,
             ttl: now.saturating_add(POSITION_TTL_SECS),
+            h: Some(write.digest.clone()),
         };
         let attrs: HashMap<String, AttributeValue> =
             serde_dynamo::to_item(&item).map_err(|e| StoreError(format!("serialize: {e}")))?;
@@ -170,6 +171,7 @@ impl Store for DynamoStore {
             s: shard,
             l: write.local_index,
             t: now_epoch_secs(),
+            h: Some(write.digest.clone()),
         };
         let attrs: HashMap<String, AttributeValue> =
             serde_dynamo::to_item(&item).map_err(|e| StoreError(format!("serialize: {e}")))?;

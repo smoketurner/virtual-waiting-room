@@ -21,6 +21,7 @@ costs the most, because it is loaded into every session.
 | `open_event` | EventBridge Scheduler, one-time `at()` set by the operator on the dashboard (issue #128) | One conditional `UpdateItem` at T−0: seed, offsets, count, phase |
 | `read` | API Gateway | `GET /v1/status`, `GET /v1/queue_num` |
 | `generate_token` | API Gateway | Checks the position against `serving_counter`, records the arrival, mints a signed session cookie the edge gate's CloudFront Function verifies (issue #71) |
+| `nojs` | API Gateway | The queue for a visitor without JavaScript (ADR-0037): a form-post join onto the same SQS queue, and a self-refreshing wait page that admits through `generate_token::admit`. Its own small reserved concurrency |
 | `controller` | EventBridge Scheduler, `rate(1 minute)` | Durable function: six 10-second passes per execution — no-show correction and `serving_counter`. Waits between passes suspend the execution rather than being billed |
 | `admin` | API Gateway | Axum app: operator UI and `/admin/*` actions, OIDC-authenticated |
 
@@ -37,7 +38,7 @@ only in the member crate that uses them):
 | Lambda runtime | `lambda_runtime`, `lambda_http`, `aws_lambda_events` |
 | Web framework (admin UI) | `axum`, `tower`, `tower-http` |
 | Async runtime | `tokio` |
-| AWS SDK | `aws-config`, `aws-sdk-dynamodb`, `aws-sdk-ssm`, `aws-smithy-types`, `aws-sdk-cloudfrontkeyvaluestore` (admin only — writes the edge gate's config, issue #71), `aws-sdk-scheduler` (admin only — sets the open schedule's time, issue #128) |
+| AWS SDK | `aws-config`, `aws-sdk-dynamodb`, `aws-sdk-ssm`, `aws-smithy-types`, `aws-sdk-cloudfrontkeyvaluestore` (admin only — writes the edge gate's config, issue #71), `aws-sdk-scheduler` (admin only — sets the open schedule's time, issue #128), `aws-sdk-apigateway` and `aws-sdk-cloudfront` (admin only — read-only calls for the readiness panel, issue #70) |
 | Templating + static assets (admin UI) | `askama`, `rust-embed`, `mime_guess` |
 | Admin OIDC login (ADR-0016) | `openidconnect`, `jsonwebtoken`, `reqwest`, `rustls`, `cookie` |
 | Serialization | `serde`, `serde_json`, `serde_dynamo`, `base64` |
@@ -143,7 +144,7 @@ endpoints). VPC is an opt-in variable for ATO-constrained operators; Lambda code
 ### Public API surface as deployed
 
 `POST /v1/join` (direct SQS integration), `GET /v1/status`, `GET /v1/queue_num`,
-`POST /v1/generate_token`, plus `/admin`, `/admin/{proxy+}` and
+`POST /v1/generate_token`, `POST /v1/enter` and `GET /v1/wait` (the no-JavaScript queue, ADR-0037), plus `/admin`, `/admin/{proxy+}` and
 `/static/{proxy+}` fronting the admin Lambda. `/queue_pos_expiry` and `/public_key` appear in
 `docs/DESIGN.md` §8 but are **not routed**.
 

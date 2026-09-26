@@ -25,6 +25,7 @@ resource "aws_cloudwatch_log_group" "lambda" {
     local.admin_name,
     local.controller_name,
     local.generate_token_name,
+    local.nojs_name,
   ])
 
   name              = "/aws/lambda/${each.value}"
@@ -128,6 +129,16 @@ locals {
     fail_open_audit_lost = {
       log_group = local.admin_name
       pattern   = "{ $.fields.event = \"fail_open_audit_lost\" }"
+      value     = "1"
+    }
+
+    # A visitor without JavaScript pressed "Join the line" and the join could
+    # not be enqueued (issue #67). They were told so and hold no place; if
+    # this is continuous, nobody without JavaScript can get in line at all,
+    # and nothing else reports it.
+    nojs_join_failed = {
+      log_group = local.nojs_name
+      pattern   = "{ $.fields.event = \"nojs_join_failed\" }"
       value     = "1"
     }
 

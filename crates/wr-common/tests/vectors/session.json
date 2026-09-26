@@ -61,6 +61,78 @@
       "credential": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJhdWQiOiJzbW9rZSIsInN1YiI6InIxIiwiZXhwIjoxMDAwLCJpYXQiOjB9.cAV77K6JPYyYQoD5sA8zONep0gPvxNrgc3MIao6-UaA"
     }
   ],
+  "ip_tags": [
+    {
+      "name": "ipv4",
+      "key_hex": "612d33322d627974652d746573742d7369676e696e672d6b65792d76616c7565",
+      "ip": "198.51.100.7",
+      "network": "198.51.100.7",
+      "tag": "pMWQ2z67cOepL8vNLvYYIH"
+    },
+    {
+      "name": "ipv4_neighbour",
+      "key_hex": "612d33322d627974652d746573742d7369676e696e672d6b65792d76616c7565",
+      "ip": "198.51.100.8",
+      "network": "198.51.100.8",
+      "tag": "w3ZEzT2FP_JkxB-m4g_iGC"
+    },
+    {
+      "name": "ipv6_full",
+      "key_hex": "612d33322d627974652d746573742d7369676e696e672d6b65792d76616c7565",
+      "ip": "2001:0db8:0000:0001:aaaa:bbbb:cccc:dddd",
+      "network": "2001:db8:0:1",
+      "tag": "ZfHhk0lzcb6HSVhysLLSei"
+    },
+    {
+      "name": "ipv6_compressed_same_64",
+      "key_hex": "612d33322d627974652d746573742d7369676e696e672d6b65792d76616c7565",
+      "ip": "2001:db8:0:1::1",
+      "network": "2001:db8:0:1",
+      "tag": "ZfHhk0lzcb6HSVhysLLSei"
+    },
+    {
+      "name": "ipv6_leading_compression",
+      "key_hex": "612d33322d627974652d746573742d7369676e696e672d6b65792d76616c7565",
+      "ip": "::1",
+      "network": "0:0:0:0",
+      "tag": "u6yRpnsftx3n4XnwuZGaFu"
+    },
+    {
+      "name": "ipv6_uppercase",
+      "key_hex": "612d33322d627974652d746573742d7369676e696e672d6b65792d76616c7565",
+      "ip": "2001:DB8:AB::",
+      "network": "2001:db8:ab:0",
+      "tag": "CVLrTY2yYH9VP8L2HddUdz"
+    },
+    {
+      "name": "ipv6_other_64",
+      "key_hex": "612d33322d627974652d746573742d7369676e696e672d6b65792d76616c7565",
+      "ip": "2001:db8:0:2::1",
+      "network": "2001:db8:0:2",
+      "tag": "JmmY0tI1LwYy0fIsI1OrG2"
+    },
+    {
+      "name": "ipv4_mapped_ipv6",
+      "key_hex": "612d33322d627974652d746573742d7369676e696e672d6b65792d76616c7565",
+      "ip": "::ffff:198.51.100.7",
+      "network": "0:0:0:0",
+      "tag": "u6yRpnsftx3n4XnwuZGaFu"
+    },
+    {
+      "name": "not_an_address",
+      "key_hex": "612d33322d627974652d746573742d7369676e696e672d6b65792d76616c7565",
+      "ip": "not-an-ip",
+      "network": null,
+      "tag": null
+    },
+    {
+      "name": "empty",
+      "key_hex": "612d33322d627974652d746573742d7369676e696e672d6b65792d76616c7565",
+      "ip": "",
+      "network": null,
+      "tag": null
+    }
+  ],
   "negatives": [
     {
       "name": "wrong_key",

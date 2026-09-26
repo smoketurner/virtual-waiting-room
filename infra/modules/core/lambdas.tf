@@ -146,6 +146,16 @@ resource "aws_lambda_function" "admin" {
       # writing the open itself: the open is one conditional update carrying
       # the permutation seed, and a second copy of that write could drift.
       OPEN_EVENT_FUNCTION_NAME = aws_lambda_function.open_event.function_name
+      # The readiness panel (issue #70): read-only checks against what this
+      # apply deployed. The warm-throughput targets are what the tables were
+      # configured with, so the panel can tell "applied" from "asked for".
+      PREQUEUE_TABLE                = aws_dynamodb_table.prequeue.name
+      POSITIONS_TABLE               = aws_dynamodb_table.positions.name
+      WARM_THROUGHPUT_WRITE_UNITS   = tostring(var.warm_throughput_write_units)
+      WARM_THROUGHPUT_READ_UNITS    = tostring(var.warm_throughput_read_units)
+      ASSIGN_POSITION_FUNCTION_NAME = aws_lambda_function.assign_position.function_name
+      CONTROLLER_SCHEDULE_NAME      = aws_scheduler_schedule.controller.name
+      EDGE_READINESS_PARAM          = local.edge_readiness_parameter_name
       # API Gateway prefixes the path with the stage (e.g. /dev/admin); this
       # makes the Rust runtime strip it so the Axum routes match unprefixed.
       AWS_LAMBDA_HTTP_IGNORE_STAGE_IN_PATH = "true"

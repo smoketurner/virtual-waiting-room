@@ -27,6 +27,7 @@ way to choose between them under pressure.
 | **Force maintenance** | The full stop. The event is down | An outage page, not a queue |
 | **Open now** | Opens the event immediately instead of waiting for the scheduled start | Their place in line, and the queue starts moving |
 | **Set message** | Publishes a line of text to the waiting page | The message, on the next poll (within ~5 s) |
+| **IP binding** | While on, an admitted visitor's pass only works from the network it was issued to (IPv4 address, or IPv6 /64), so it cannot be handed around | Nothing, unless their address changes: then one trip through the waiting page, which lets them straight back in |
 
 Two pairs are easy to confuse:
 
@@ -45,32 +46,50 @@ defeats a double-click, not you.
 
 ### Readiness checklist
 
-Work down this list. The items above the line are contractual (O1–O3) and need lead time
-measured in days, not minutes.
+The dashboard's **Readiness** panel, at the top of the page above Current state, checks the
+items below against the running deployment every time the page loads: each row names the
+requirement it protects, shows the measured value, and on a failing or warning row links to
+where the fix happens. It changes nothing. A row it could not read says "could not evaluate"
+and why, which is not a pass.
 
-- [ ] **Quota increases filed and confirmed raised** (O2). API Gateway requests per second, and
-      DynamoDB per-table write request units. File these weeks ahead: an increase that is still
-      pending at T−0 means the load test measured throttling rather than the design.
-- [ ] **Tables pre-warmed** (O1). Set `warm_throughput_write_units` at or above the event's
-      target write rate and apply. The AWS minimum is 4,000 write units and 12,000 read units;
-      0 means no pre-warm, which leaves the tables at the on-demand cold baseline. Pre-warming
-      takes effect asynchronously — do it the day before, not the hour before.
+The quota and pre-warm rows (O1, O2) need lead time measured in days, not minutes: a quota
+increase still pending at T−0 means the load test measured throttling rather than the design,
+and pre-warming takes effect asynchronously. The panel shows the limits in force, not a request
+that is still pending.
+
+Checked by the panel (this list is generated from `crates/admin/src/readiness.rs`; a test fails
+if the two differ — regenerate with `cargo test -p admin -- --ignored regenerate_runbook_checklist`):
+
+<!-- readiness-checks:begin (generated from crates/admin/src/readiness.rs; do not edit) -->
+- [ ] **Tables pre-warmed** (O1). All four tables report warm throughput at or above the configured `warm_throughput_write_units` / `warm_throughput_read_units`, and `PreQueue` at or above the 10,000/s registration rate. The 4,000-unit AWS minimum is a floor, not a sized value; 0 configured means no pre-warm. Fix: Set `warm_throughput_write_units` (and `_read_units`) in `terraform.tfvars` at or above the event's target write rate and apply, the day before rather than the hour before: warming is asynchronous. ([fix](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/warm-throughput.html))
+- [ ] **DynamoDB throughput quotas** (O2). `DescribeLimits` reports a per-table write limit above the 40,000-unit default and at or above the configured warm throughput. Fix: File a Service Quotas increase for DynamoDB table-level write throughput weeks ahead; an increase still pending at T-0 means the load test measured throttling. ([fix](https://console.aws.amazon.com/servicequotas/home/services/dynamodb/quotas))
+- [ ] **API Gateway account throttle** (O2). The account's API Gateway steady-state rate is above the 10,000 requests/s default, which is what C3's 40,000 joins/s needs. Fix: File a Service Quotas increase for API Gateway throttle rate in this region, weeks ahead. ([fix](https://console.aws.amazon.com/servicequotas/home/services/apigateway/quotas))
+- [ ] **assign_position reserved concurrency** (N9). The join consumer has reserved concurrency above zero, so one event cannot starve another and the queue drains at a known rate. Fix: Set `assign_position_reserved_concurrency` in the core module (the default is sized for 10,000/s) and apply. ([fix](https://docs.aws.amazon.com/lambda/latest/dg/configuration-concurrency.html))
+- [ ] **Open schedule armed** (F0.3). The one-time open schedule is enabled at a time still in the future, so the event opens on its own at T-0. Fix: Set the start time on the dashboard (Start time), in the timezone you mean. The schedule itself is in EventBridge Scheduler. ([fix](https://console.aws.amazon.com/scheduler/home#schedules))
+- [ ] **Controller schedule running** (F3.2). The controller's `rate(1 minute)` schedule exists and is enabled; without it the queue forms and nobody is admitted. Fix: Re-apply Terraform, which creates the schedule enabled; check nobody disabled it in EventBridge Scheduler. ([fix](https://console.aws.amazon.com/scheduler/home#schedules))
+- [ ] **Gate ruleset** (F0.6). The gate's KeyValueStore holds at least one protection rule and no fail-open window is active. An empty ruleset passes every request through, which looks exactly like a working deployment. Fix: Set rules under Protection rules on the dashboard, then load a protected URL in a private window and confirm you are sent to the waiting page. (the dashboard)
+- [ ] **/status cache behaviour** (C4). The polled `/v1/status` behaviour has a Min TTL above zero and keeps cookies out of its cache key, so CloudFront collapses polls and origin load is independent of waiter count. Fix: Re-apply the edge module (`polled_min_ttl_seconds` must be at least 1); do not edit the cache policy in the console. ([fix](https://console.aws.amazon.com/cloudfront/v4/home#/policies/cache))
+- [ ] **Gate on the protected behaviour only** (N7). The gate CloudFront Function is associated at viewer-request with the default (protected) behaviour and with no other: elsewhere it bills every poll and refuses joins. Fix: Re-apply the edge module; remove any function association added to another behaviour in the console. ([fix](https://console.aws.amazon.com/cloudfront/v4/home#/distributions))
+<!-- readiness-checks:end -->
+
+**Manual** — the panel cannot check these:
+
 - [ ] **Load test executed at the event's target rate, report reviewed with the client** (O3).
       The pre-queue path is one write however large the cohort, so what needs testing is the
       live-join path and `/status` under polling load.
 - [ ] **Cost modelled for this event** (O6), including the CloudFront plan tier.
 
-Then, on the day:
+Then, on the day (**manual**):
 
 - [ ] **The stack answers.** `uv run scripts/smoke_test.py` registers, opens and verifies that no
       two visitors get the same position. It reads everything it needs from `terraform output`.
 - [ ] **The dashboard loads and you can log in.** Check this early: the OIDC path is the one part
       of the system that can be misconfigured in a way that only shows up when you need it.
-- [ ] **The gate covers the right paths.** Set rules on the dashboard, then load a protected URL
-      in a private window and confirm you are sent to the waiting page. **An empty ruleset passes
-      every request through** — which looks exactly like a working deployment.
+- [ ] **The gate covers the right paths.** The panel counts the rules; it cannot tell whether they
+      are the right ones. Load a protected URL in a private window and confirm you are sent to the
+      waiting page. **An empty ruleset passes every request through** — which looks exactly like a
+      working deployment.
 - [ ] **The admission rate is set to something the origin can serve**, not the seeded default.
-- [ ] **The start time is set**, in the timezone you mean. The waiting page counts down to it.
 - [ ] **Alarms have a destination.** The alarms below exist; check something is subscribed to
       them, or they fire into nothing.
 - [ ] **Someone is watching who can act.** Every automatic behaviour in this system is
@@ -181,6 +200,7 @@ conditions the system would otherwise survive in silence.
 | `admission_control_unreadable` | The stored admission control could not be parsed, so the controller is holding admission | The queue has stopped moving. Pause and Resume to rewrite the attribute |
 | `rules_audit_failed` | The gate's ruleset changed but the audit stamp did not | The gate is correct; the dashboard's "last changed by" is stale. No visitor impact |
 | `fail_open_audit_lost` | Fail-open was engaged or cleared but the audit stamp lost a race to a newer writer | The fail-open change took effect; the dashboard's "last changed by" is stale. No visitor impact |
+| `nojs_join_failed` | A visitor without JavaScript pressed "Join the line" and the join was not enqueued | They were told and can press again. If it is continuous, nobody without JavaScript can join: check the nojs function's logs and its SQS grant |
 | `open_event_error` | The open failed: most often the schedule fired while the event was not in the pre-queue phase, so nothing was opened | Check the event's phase. The scheduler retries for up to 10 minutes; once the phase is pre-queue a retry opens the event, or use **Open now** |
 | `open-dlq-not-empty` | A scheduled open failed on every retry and was given up | The event is **not open**, and the one-time schedule has been used. Fix the cause (usually the phase), then **Open now** |
 
@@ -207,7 +227,13 @@ Stated here so it is not discovered mid-event:
 - **Sessions are not renewed.** A visitor still on the origin when `session_ttl_seconds` lapses
   is returned to the queue. Set it longer than the worst realistic time on the origin; there is
   no other control over this.
-- **A session cookie is a bearer credential.** It is not bound to a visitor and cannot be
-  revoked. So is a request id: anyone holding one can mint a cookie.
+- **A session cookie is a bearer credential unless IP binding is on,** and it cannot be revoked
+  either way. Binding stops a pass being redistributed across networks, not shared behind one
+  NAT (an office, some carriers). Turning it on sends visitors whose address changes (Wi-Fi to
+  mobile) back through the waiting page once; a visitor whose address changes constantly cannot
+  stay admitted at all and is told to stay on one connection. Leave it off unless passes are
+  being resold.
+- **A request id alone no longer admits anyone:** redeeming one also needs the secret the
+  visitor's browser joined with. A visitor who hands over both hands over their place.
 - **Regenerating the signing key invalidates every session already issued.** Do it before an
   event opens, never during one.

@@ -28,6 +28,7 @@ variables {
   admin_artifact_path           = "tests/fixtures/bootstrap.zip"
   controller_artifact_path      = "tests/fixtures/bootstrap.zip"
   generate_token_artifact_path  = "tests/fixtures/bootstrap.zip"
+  nojs_artifact_path            = "tests/fixtures/bootstrap.zip"
 
   oidc_client_id      = "test-client"
   oidc_redirect_uri   = "https://example.invalid/admin/callback"
@@ -41,8 +42,8 @@ run "every_lambda_has_a_log_group_that_expires" {
   # does not own, so a function missing here grows without bound and silently
   # bills for it.
   assert {
-    condition     = length(aws_cloudwatch_log_group.lambda) == 6
-    error_message = "every Lambda needs a Terraform-owned log group; six functions ship"
+    condition     = length(aws_cloudwatch_log_group.lambda) == 7
+    error_message = "every Lambda needs a Terraform-owned log group; seven functions ship"
   }
 
   assert {
@@ -71,6 +72,7 @@ run "filters_key_on_the_event_names_the_crates_emit" {
         "admission_control_unreadable",
         "admission_claim_failed",
         "fail_open_audit_lost",
+        "nojs_join_failed",
         ] : strcontains(
         aws_cloudwatch_log_metric_filter.event[name].pattern,
         "$.fields.event = \"${name}\""

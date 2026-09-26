@@ -124,8 +124,9 @@ rather than a path that encodes which layer a type lives in.
 `crates/wr-common/tests/vectors.rs` generates the cross-language conformance vectors
 `infra/modules/edge/tests/*.conformance.test.js` check the CloudFront Function against.
 
-`assign_position`, `open_event`, `read`, `controller`, `admin` and `generate_token` are the
-Lambdas.
+`assign_position`, `open_event`, `read`, `controller`, `admin`, `generate_token` and `nojs` are
+the Lambdas. `nojs` is the queue for a visitor without JavaScript (ADR-0037): it depends on
+`generate_token`'s library so a session is only ever minted by `generate_token::admit`.
 
 Every Lambda crate follows the same three-file split, and new ones should:
 

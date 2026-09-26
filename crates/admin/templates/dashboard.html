@@ -21,6 +21,39 @@
   {% endif %}
 
   <div class="grid">
+    <!-- Readiness (issue #70). Diagnostics only: every row is a read, and every
+         remedy is a link out. Evaluated once per page load. -->
+    <section class="card span-2" id="readiness">
+      <div class="card-header">
+        <h2>Readiness</h2>
+        <p class="sub">Checked against the running deployment when this page loaded. Read-only: fixing a row happens where its link points.</p>
+      </div>
+      <div class="card-body">
+        <div class="readiness-wrap">
+        <table class="readiness">
+          <thead>
+            <tr><th scope="col">Check</th><th scope="col">Protects</th><th scope="col">Status</th><th scope="col">Measured</th></tr>
+          </thead>
+          <tbody>
+            {% for row in readiness %}
+            <tr>
+              <th scope="row">{{ row.name }}</th>
+              <td><code>{{ row.requirement }}</code></td>
+              <td><span class="status {{ row.status_class }}">{{ row.status }}</span></td>
+              <td>
+                {{ row.detail }}
+                {% if let Some((fix, url)) = row.fix %}
+                <span class="help">{{ fix }} <a href="{{ url }}"{% if !url.starts_with('#') %} target="_blank" rel="noopener noreferrer"{% endif %}>How to fix</a></span>
+                {% endif %}
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        </div>
+      </div>
+    </section>
+
     <!-- Current state -->
     <section class="card span-2">
       <div class="card-header">
@@ -234,7 +267,7 @@
     <!-- Edge gate protection rules (issue #71). Last because a full-width card
          cannot share a row: placed earlier it splits the single-column cards
          above it onto rows of their own. -->
-    <section class="card span-2">
+    <section class="card span-2" id="protection-rules">
       <div class="card-header">
         <h2>Protection rules</h2>
         <p class="sub">Which requests the edge gate covers. One rule per line; empty (no lines) means dormant — every request passes through untouched.</p>
@@ -256,6 +289,17 @@
             </span>
           </div>
           <button type="submit" title="Replace the edge gate's ruleset with what is in the box above.">Set rules</button>
+        </form>
+        <form method="post" action="/admin/ip_binding" style="margin-top:12px;"
+          {% if ip_binding.is_on() %}data-confirm="Stop binding sessions to the visitor's network? A copied session cookie will work from anywhere again."{% else %}data-confirm="Bind admitted sessions to the visitor's network? Visitors whose address changes (mobile handoff, some carriers) are sent back to the waiting page, which lets them straight through again if they are still admitted."{% endif %}>
+          <p class="sub">IP binding: <strong>{% if ip_binding.is_on() %}on{% else %}off{% endif %}</strong>. While on, a session cookie only works from the network it was issued to (IPv4 address, or IPv6 /64), so it cannot be passed around.</p>
+          {% if ip_binding.is_on() %}
+          <input type="hidden" name="binding" value="off">
+          <button type="submit" class="normal" title="Let a session cookie work from any network.">Turn IP binding off</button>
+          {% else %}
+          <input type="hidden" name="binding" value="on">
+          <button type="submit" class="normal" title="Refuse a session cookie used from a different network than the one it was issued to.">Turn IP binding on</button>
+          {% endif %}
         </form>
         {% endif %}
       </div>

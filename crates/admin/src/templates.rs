@@ -14,6 +14,26 @@ pub struct PhaseOption {
     pub label: String,
 }
 
+/// The gate's session IP binding as the dashboard shows it (issue #61).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IpBinding {
+    #[default]
+    Off,
+    On,
+}
+
+impl IpBinding {
+    #[must_use]
+    pub const fn from_enabled(enabled: bool) -> Self {
+        if enabled { Self::On } else { Self::Off }
+    }
+
+    #[must_use]
+    pub const fn is_on(self) -> bool {
+        matches!(self, Self::On)
+    }
+}
+
 /// The dashboard view. Optional fields render as "not set" when absent so the
 /// operator sees a label rather than a blank. Also serialized as JSON by the
 /// `/admin/state` poller endpoint.
@@ -100,6 +120,11 @@ pub struct Dashboard {
     /// the JSON state view.
     #[serde(skip)]
     pub rules_load_failed: bool,
+    /// Whether the gate binds sessions to the viewer's network (issue #61),
+    /// read with the ruleset from the same `KeyValueStore` document, so the
+    /// same `rules_load_failed` hides its form. Not part of the JSON state view.
+    #[serde(skip)]
+    pub ip_binding: IpBinding,
     /// The scheduled start for display (issue #128), rendered in the
     /// operator's own zone, or "not set".
     pub starts_at: String,
@@ -117,9 +142,44 @@ pub struct Dashboard {
     /// outside it can still be posted and is still validated.
     #[serde(skip)]
     pub timezones: Vec<&'static str>,
+    /// The readiness panel (issue #70), evaluated by the handler after
+    /// `from_state` the same way `rules_text` is. Empty until then. Not part
+    /// of the JSON state view: the poller refreshes live state every two
+    /// seconds, and these reads are too slow and too rate-limited for that.
+    #[serde(skip)]
+    pub readiness: Vec<ReadinessRow>,
 }
 
-impl Dashboard {}
+/// One readiness row as the template renders it.
+pub struct ReadinessRow {
+    pub name: &'static str,
+    pub requirement: &'static str,
+    pub status: &'static str,
+    pub status_class: &'static str,
+    /// The measured value, or why it could not be measured.
+    pub detail: String,
+    /// The remedy and where it happens, offered only on a row that needs one.
+    pub fix: Option<(String, &'static str)>,
+}
+
+impl From<&crate::readiness::Row> for ReadinessRow {
+    fn from(row: &crate::readiness::Row) -> Self {
+        let spec = row.check.spec();
+        Self {
+            name: spec.name,
+            requirement: spec.requirement,
+            status: row.status.label(),
+            status_class: row.status.css_class(),
+            detail: row.detail.clone(),
+            // The catalogue is written for the Markdown runbook too; the
+            // panel shows it as plain text.
+            fix: row
+                .status
+                .needs_fix()
+                .then(|| (spec.fix.replace('`', ""), spec.fix_url)),
+        }
+    }
+}
 
 /// The zones the dashboard offers. UTC first because it is the unambiguous
 /// choice and the one a reader of the stored value expects; the rest are the
@@ -220,6 +280,7 @@ impl Dashboard {
             csp_nonce: String::new(),
             operator_email: String::new(),
             rules_text: String::new(),
+            ip_binding: IpBinding::Off,
             rules_load_failed: false,
             starts_at: {
                 let tz = state.starts_at_timezone.as_deref().unwrap_or("UTC");
@@ -244,6 +305,7 @@ impl Dashboard {
                 .clone()
                 .unwrap_or_else(|| crate::DEFAULT_TIMEZONE.to_owned()),
             timezones: OFFERED_TIMEZONES.to_vec(),
+            readiness: Vec::new(),
         }
     }
 }
@@ -297,6 +359,97 @@ mod tests {
         assert!(html.contains(">active<"));
         assert!(html.contains("Doors open at noon"));
         assert!(html.contains("500"));
+    }
+
+    fn readiness_row(
+        check: crate::readiness::CheckId,
+        status: crate::readiness::Status,
+        detail: &str,
+    ) -> ReadinessRow {
+        ReadinessRow::from(&crate::readiness::Row {
+            check,
+            status,
+            detail: detail.to_owned(),
+        })
+    }
+
+    #[test]
+    fn the_readiness_panel_sits_above_current_state_and_shows_measured_values() {
+        use crate::readiness::{CheckId, Status};
+        let mut view = Dashboard::from_state(&state(), 0);
+        view.readiness = vec![readiness_row(
+            CheckId::DynamoDbLimits,
+            Status::Pass,
+            "table write 100,000 / read 40,000 units/s",
+        )];
+        let html = view.render().unwrap();
+
+        let panel = html.find("<h2>Readiness</h2>").unwrap();
+        let current = html.find("<h2>Current state</h2>").unwrap();
+        assert!(
+            panel < current,
+            "the readiness panel must render above Current state"
+        );
+        assert!(html.contains("DynamoDB throughput quotas"));
+        assert!(html.contains("<code>O2</code>"));
+        assert!(html.contains("table write 100,000 / read 40,000 units/s"));
+        assert!(html.contains(r#"<span class="status status-success">pass</span>"#));
+        // A passing row has nothing to fix.
+        assert!(!html.contains("servicequotas"), "{html}");
+    }
+
+    #[test]
+    fn a_failing_readiness_row_names_its_requirement_and_links_its_fix() {
+        use crate::readiness::{CheckId, Status};
+        let mut view = Dashboard::from_state(&state(), 0);
+        view.readiness = vec![readiness_row(
+            CheckId::AssignPositionConcurrency,
+            Status::Fail,
+            "unreserved: shares the account's unreserved pool",
+        )];
+        let html = view.render().unwrap();
+
+        assert!(html.contains(r#"<span class="status status-error">fail</span>"#));
+        assert!(html.contains("<code>N9</code>"));
+        assert!(html.contains(
+            r#"href="https://docs.aws.amazon.com/lambda/latest/dg/configuration-concurrency.html""#
+        ));
+        // Catalogue Markdown is stripped for the panel.
+        assert!(html.contains("Set assign_position_reserved_concurrency in the core module"));
+    }
+
+    #[test]
+    fn an_in_page_fix_link_stays_in_the_page() {
+        use crate::readiness::{CheckId, Status};
+        let mut view = Dashboard::from_state(&state(), 0);
+        view.readiness = vec![readiness_row(CheckId::GateRuleset, Status::Warn, "dormant")];
+        let html = view.render().unwrap();
+        assert!(html.contains(r##"<a href="#protection-rules">"##), "{html}");
+        assert!(html.contains(r#"id="protection-rules""#));
+    }
+
+    #[test]
+    fn a_readiness_row_that_could_not_be_read_says_so_without_a_fix() {
+        use crate::readiness::{CheckId, Status};
+        let mut view = Dashboard::from_state(&state(), 0);
+        view.readiness = vec![readiness_row(
+            CheckId::ApiGatewayThrottle,
+            Status::NotEvaluable,
+            "could not evaluate: timed out after 3s",
+        )];
+        let html = view.render().unwrap();
+        assert!(html.contains("could not evaluate: timed out after 3s"));
+        assert!(html.contains(r#"<span class="status status-inactive">not evaluable</span>"#));
+        assert!(!html.contains("How to fix"));
+    }
+
+    #[test]
+    fn the_readiness_panel_stays_out_of_the_polled_json() {
+        use crate::readiness::{CheckId, Status};
+        let mut view = Dashboard::from_state(&state(), 0);
+        view.readiness = vec![readiness_row(CheckId::GateRuleset, Status::Pass, "2 rules")];
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(!json.contains("readiness"), "{json}");
     }
 
     #[test]
@@ -461,6 +614,23 @@ mod tests {
         assert!(html.contains("action=\"/admin/rules\""));
         assert!(html.contains("p /checkout"));
         assert!(!html.contains("Could not read the current ruleset"));
+    }
+
+    #[test]
+    fn the_ip_binding_state_and_its_toggle_are_rendered() {
+        let mut view = Dashboard::from_state(&state(), 0);
+        let off = view.render().unwrap();
+        assert!(off.contains("action=\"/admin/ip_binding\""));
+        assert!(off.contains("IP binding: <strong>off</strong>"));
+        assert!(off.contains(r#"name="binding" value="on""#));
+
+        view.ip_binding = IpBinding::On;
+        let on = view.render().unwrap();
+        assert!(on.contains("IP binding: <strong>on</strong>"));
+        assert!(on.contains(r#"name="binding" value="off""#));
+
+        view.rules_load_failed = true;
+        assert!(!view.render().unwrap().contains("/admin/ip_binding"));
     }
 
     #[test]

@@ -95,11 +95,13 @@ function loadGate({ event_id, session_cookie_name, waiting_path, kvs, now } = {}
     verify: (credential, secret) => ctx.verify(credential, secret),
     /** Calls the shipped matches(rule, request) directly. */
     matches: (rule, request) => ctx.matches(rule, request),
+    /** Calls the shipped ipTag(secret, ip) directly (issue #61). */
+    ipTag: (secret, ip) => ctx.ipTag(secret, ip),
   };
 }
 
 /** A viewer-request event object in the shape CloudFront passes a function. */
-function event(uri, { headers, cookies } = {}) {
+function event(uri, { headers, cookies, viewerIp } = {}) {
   const hdrs = {};
   for (const [k, v] of Object.entries(headers || {})) {
     hdrs[k] = { value: v };
@@ -111,7 +113,7 @@ function event(uri, { headers, cookies } = {}) {
   return {
     version: "1.0",
     context: { eventType: "viewer-request" },
-    viewer: { ip: "203.0.113.9" },
+    viewer: { ip: viewerIp ?? "203.0.113.9" },
     request: { method: "GET", uri, querystring: {}, headers: hdrs, cookies: cks },
   };
 }

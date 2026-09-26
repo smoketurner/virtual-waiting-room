@@ -57,6 +57,15 @@ visible fairness failure at 1,000,000 people. Tests are the primary evidence.
   change; the committed file drifting from the generator fails CI. `node:vm` exercises Node's
   `Buffer`/HMAC/base64url, not CloudFront's — it is a proxy for what was measured against a real
   CloudFront Function while ADR-0021 was being decided, not a replacement for it.
+- **Proof of possession (ADR-0035, issue #62)** — a `request_id` without its secret, with the
+  wrong one, or with one in the query string mints nothing and reveals no position; the
+  admission claim copies the digest so a pre-queue member's second call still verifies; a join
+  without a well-formed digest consumes no position; the browser's digest equals
+  `PossessionSecret::digest` (a fixed vector on each side).
+- **IP binding (ADR-0036, issue #61)** — the session's network tag is conformance-tested Rust vs
+  gate (`ip_tags` vectors, including IPv6 /64 equivalence); with binding on, a mismatched or
+  missing tag is refused with reason `ip`, and with it off the tag is never consulted; the
+  waiting page re-mints once and stops on a second refusal inside a minute.
 - **Edge gate decision-tree branches (ADR-0021)** — `infra/modules/edge/tests/gate.decision-tree.test.js`
   covers every branch against the shipped function: dormancy (`r: []`), `enforce_from` pending,
   `fail_open_until` active and lapsed, each refusal reason (`none`/`signature`/`event`/`expired`),

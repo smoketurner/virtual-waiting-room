@@ -11,6 +11,7 @@ locals {
       "admin",
       "controller",
       "generate_token",
+      "nojs",
     ] : crate => "${path.module}/../../../.artifacts/${crate}/bootstrap/bootstrap.zip"
   }
 

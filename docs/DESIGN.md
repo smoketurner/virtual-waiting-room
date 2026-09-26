@@ -559,14 +559,15 @@ releases and releasing more to cover the gap.
 | `/status` | 1 s | path only | none | Phase, serving position, admission rate, operator message, adaptive poll policy ([#69](https://github.com/smoketurner/virtual-waiting-room/issues/69), ADR-0023); after T−0 also `shuffle_seed`, `participant_count`, `prequeue_offsets` |
 | `/queue_num` | 1 s | path + `event_id`, `request_id` | none | Own position; 404 means re-join |
 | `/join` | uncached | — | none | Join the queue or pre-queue |
-| `/generate_token` | uncached | — | none | Exchange a served position for the CloudFront admission cookies |
+| `/generate_token` | uncached | — | none | Exchange a served position (and the possession secret, ADR-0035) for the session cookie |
+| `/enter`, `/wait` | uncached | — | none | The queue without JavaScript: a form post that joins, and a self-refreshing page that admits (ADR-0037) |
 
 ### Cache behaviours
 
 | Behaviour | Path pattern | Caching | Cookies | Origin |
 |---|---|---|---|---|
 | Polled | `/status`, `/queue_num` | Min TTL 1 s | none | API Gateway |
-| Write | `/join`, `/generate_token` | disabled | none | API Gateway |
+| Write | `/join`, `/generate_token`, `/enter`, `/wait` | disabled | all (Set-Cookie survives) except `/join` | API Gateway |
 | Protected origin | `/*` (default) | disabled | session cookie forwarded | Operator origin, gated by a CloudFront Function at viewer-request (ADR-0021, issue #71) |
 | Waiting page | `/_wr/*` | cached | none | S3, deliberately ungated — this is what a refused visitor sees |
 
@@ -601,12 +602,13 @@ One credential ([ADR-0011](adr/0011-session-cookie-after-token.md), [ADR-0024](a
   `generate_token` once a visitor's position is reached and checked by the edge gate. It is
   signed under a key derived from the deployment secret rather than the secret itself, so a
   future second credential kind cannot validate as a session. The admission token that used to
-  precede it was removed with the origin authorizer (ADR-0032). It is a bearer credential until
-  it expires: it carries no visitor binding, is scoped by `event_id`
-  ([#61](https://github.com/smoketurner/virtual-waiting-room/issues/61), closed for the
-  event-scoping half — the gate refuses a credential minted for another event), and cannot be
-  revoked ([#63](https://github.com/smoketurner/virtual-waiting-room/issues/63), still open — no
-  design chosen).
+  precede it was removed with the origin authorizer (ADR-0032). It is scoped by `event_id` (the
+  gate refuses a credential minted for another event), carries a keyed tag of the visitor's
+  network that the gate enforces while the operator has IP binding on (ADR-0036,
+  [#61](https://github.com/smoketurner/virtual-waiting-room/issues/61)), and cannot be revoked
+  ([#63](https://github.com/smoketurner/virtual-waiting-room/issues/63), no design chosen).
+  `generate_token` mints it only for a caller holding the possession secret the `request_id`
+  joined with (ADR-0035, [#62](https://github.com/smoketurner/virtual-waiting-room/issues/62)).
 
 The signing key is per-deployment, held in an SSM Parameter Store SecureString (a SecureString is free where a Secrets Manager secret is $0.40/mo, which N1 does not allow). Its compromise permits minting
 admission for every event in that deployment.

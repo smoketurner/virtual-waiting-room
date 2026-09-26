@@ -1,9 +1,8 @@
 // The admission gate, at viewer-request on the protected behaviour only
 // (issue #71). Decides locally: no backend call, no network access.
 //
-// Source bytes are a hard deployment limit here (10,240, not adjustable), so
-// comments are kept to what stops a specific bug being reintroduced. The
-// reasoning lives in docs/adr/0021-edge-function-gate.md.
+// Source bytes are a hard limit (10,240), so comments are kept to what stops
+// a specific bug being reintroduced; the reasoning is in ADR-0021.
 import cf from 'cloudfront';
 import crypto from 'crypto';
 
@@ -14,239 +13,258 @@ var WAITING_PATH = '${waiting_path}';
 
 // The protected behaviour forwards allViewer, so a visitor can send these.
 function stripSpoofableHeaders(request) {
-    delete request.headers['x-wr-gate'];
-    delete request.headers['x-wr-gate-failed'];
+  delete request.headers['x-wr-gate'];
+  delete request.headers['x-wr-gate-failed'];
 }
 
 // No timing-safe compare here: HMAC both digests and compare those.
 function macEquals(secret, a, b) {
-    var ha = crypto.createHmac('sha256', secret);
-    ha.update(a);
-    var hb = crypto.createHmac('sha256', secret);
-    hb.update(b);
-    return ha.digest('base64url') === hb.digest('base64url');
+  var ha = crypto.createHmac('sha256', secret);
+  ha.update(a);
+  var hb = crypto.createHmac('sha256', secret);
+  hb.update(b);
+  return ha.digest('base64url') === hb.digest('base64url');
 }
 
-// wr_common::crypto derives a key per credential kind, so a token cannot
-// validate as a session. This function only ever checks sessions.
-function sessionKey(secret) {
-    var h = crypto.createHmac('sha256', secret);
-    h.update('vwr/jws/session/v1');
-    return h.digest();
+// Keys derived per use, as wr_common::crypto::SigningKey does.
+function derive(secret, label) {
+  var h = crypto.createHmac('sha256', secret);
+  h.update(label);
+  return h.digest();
+}
+
+// #61: keyed tag of the viewer's IPv4, or IPv6 /64. Mirrors SigningKey::ip_tag.
+function ipTag(secret, ip) {
+  var n = ip;
+  if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) {
+    if (ip.indexOf(':') < 0) {
+      return null;
+    }
+    var p = ip.split('::'), a = p[0] ? p[0].split(':') : [], b = p[1] ? p[1].split(':') : [];
+    while (p.length > 1 && a.length + b.length < 8) {
+      a.push('0');
+    }
+    a = a.concat(b).slice(0, 4);
+    for (var i = 0; i < 4; i++) {
+      a[i] = parseInt(a[i], 16).toString(16);
+    }
+    n = a.join(':');
+  }
+  var h = crypto.createHmac('sha256', derive(secret, 'vwr/ip/v1'));
+  h.update(n);
+  return h.digest('base64url').slice(0, 22);
 }
 
 var BASE64URL_RE = /^[A-Za-z0-9_-]+$/;
 
 function decodeJson(segment) {
-    try {
-        return JSON.parse(Buffer.from(segment, 'base64url').toString('utf8'));
-    } catch (e) {
-        return null;
-    }
+  try {
+    return JSON.parse(Buffer.from(segment, 'base64url').toString('utf8'));
+  } catch (e) {
+    return null;
+  }
 }
 
-// Verifies a compact JWS (RFC 7515) and returns its claims. The signature
-// covers the ASCII "header.payload".
-//
-// "alg" is read only to be compared against the one value this deployment
-// issues, never to select a verifier, so alg:none and a downgrade are refused.
-// Matching the encoded header as a literal string would be smaller but ties
-// the gate to the exact field order the Rust side's JWT library emits.
+// Verifies a compact JWS (RFC 7515) over the ASCII "header.payload". "alg" is
+// compared to the one value issued, never used to pick a verifier: alg:none
+// and downgrades are refused.
 function verify(credential, secret) {
-    var parts = credential.split('.');
-    if (parts.length !== 3) {
-        return null;
-    }
-    if (!BASE64URL_RE.test(parts[1]) || !BASE64URL_RE.test(parts[2])) {
-        return null;
-    }
-    var header = decodeJson(parts[0]);
-    if (!header || header.alg !== 'HS256') {
-        return null;
-    }
+  var parts = credential.split('.');
+  if (parts.length !== 3) {
+    return null;
+  }
+  if (!BASE64URL_RE.test(parts[1]) || !BASE64URL_RE.test(parts[2])) {
+    return null;
+  }
+  var header = decodeJson(parts[0]);
+  if (!header || header.alg !== 'HS256') {
+    return null;
+  }
 
-    var mac = crypto.createHmac('sha256', sessionKey(secret));
-    mac.update(parts[0] + '.' + parts[1]);
-    if (!macEquals(secret, mac.digest('base64url'), parts[2])) {
-        return null;
-    }
+  var mac = crypto.createHmac('sha256', derive(secret, 'vwr/jws/session/v1'));
+  mac.update(parts[0] + '.' + parts[1]);
+  if (!macEquals(secret, mac.digest('base64url'), parts[2])) {
+    return null;
+  }
 
-    var claims = decodeJson(parts[1]);
-    if (!claims || typeof claims.aud !== 'string' || typeof claims.exp !== 'number') {
-        return null;
-    }
-    return { eventId: claims.aud, expiresAt: claims.exp };
+  var claims = decodeJson(parts[1]);
+  if (!claims || typeof claims.aud !== 'string' || typeof claims.exp !== 'number') {
+    return null;
+  }
+  return { eventId: claims.aud, expiresAt: claims.exp, ip: claims.cip };
 }
 
 // Own-property only: a rule named "constructor" would otherwise be truthy
 // with no .value, throwing and passing every request through.
 function ownProperty(obj, key) {
-    return Object.prototype.hasOwnProperty.call(obj, key) ? obj[key] : undefined;
+  return Object.prototype.hasOwnProperty.call(obj, key) ? obj[key] : undefined;
 }
 
 // CloudFront sends the raw path to the origin, so a rule must not be evaded
 // by an encoding the origin treats as equivalent. Not a full RFC 3986
 // resolver: ".." segments are deliberately not resolved.
 function hexVal(c) {
-    return c >= 48 && c <= 57 ? c - 48
-         : c >= 65 && c <= 70 ? c - 55
-         : c >= 97 && c <= 102 ? c - 87
-         : -1;
+  return c >= 48 && c <= 57 ? c - 48
+     : c >= 65 && c <= 70 ? c - 55
+     : c >= 97 && c <= 102 ? c - 87
+     : -1;
 }
-// Per-byte percent-decode, mirroring wr_common::rules::percent_decode: a
-// valid %XX is decoded to its byte, a '%' not followed by two hex digits is
-// left literal. Not decodeURIComponent: that throws on one malformed escape
-// and reverts the whole URI, so a valid escape in a PathPrefix plus a
-// malformed one later evaded the rule (PR #120).
+// Per-byte, as wr_common::rules::percent_decode; a malformed %XX stays literal.
+// Not decodeURIComponent: one bad escape threw and reverted the whole URI,
+// evading a PathPrefix (PR #120).
 function percentDecode(uri) {
-    var out = '';
-    for (var i = 0; i < uri.length; ) {
-        if (uri.charCodeAt(i) === 0x25 && i + 2 < uri.length) {
-            var h = hexVal(uri.charCodeAt(i + 1)), l = hexVal(uri.charCodeAt(i + 2));
-            if (h >= 0 && l >= 0) {
-                out += String.fromCharCode(h * 16 + l);
-                i += 3;
-                continue;
-            }
-        }
-        out += uri.charAt(i);
-        i += 1;
+  var out = '';
+  for (var i = 0; i < uri.length; ) {
+    if (uri.charCodeAt(i) === 0x25 && i + 2 < uri.length) {
+      var h = hexVal(uri.charCodeAt(i + 1)), l = hexVal(uri.charCodeAt(i + 2));
+      if (h >= 0 && l >= 0) {
+        out += String.fromCharCode(h * 16 + l);
+        i += 3;
+        continue;
+      }
     }
-    return out;
+    out += uri.charAt(i);
+    i += 1;
+  }
+  return out;
 }
 // Collapse '//', drop '.' segments, until stable. Mirrors normalized_path.
 function normalizedPath(uri) {
-    var p = percentDecode(uri), q;
-    while ((q = p.replace(/\/\/+/g, '/').replace(/\/\.\//g, '/')) !== p) p = q;
-    return p.replace(/\/\.$/, '/').toLowerCase();
+  var p = percentDecode(uri), q;
+  while ((q = p.replace(/\/\/+/g, '/').replace(/\/\.\//g, '/')) !== p) p = q;
+  return p.replace(/\/\.$/, '/').toLowerCase();
 }
 
 function queryString(qs) {
-    var parts = [];
-    for (var key in qs) {
-        if (Object.prototype.hasOwnProperty.call(qs, key) && qs[key] && typeof qs[key].value === 'string') {
-            parts.push(encodeURIComponent(key) + '=' + encodeURIComponent(qs[key].value));
-        }
+  var parts = [];
+  for (var key in qs) {
+    if (Object.prototype.hasOwnProperty.call(qs, key) && qs[key] && typeof qs[key].value === 'string') {
+      parts.push(encodeURIComponent(key) + '=' + encodeURIComponent(qs[key].value));
     }
-    return parts.length ? '?' + parts.join('&') : '';
+  }
+  return parts.length ? '?' + parts.join('&') : '';
 }
 
 // ["p",prefix] | ["h",name,value] | ["c",name] | ["u",substring]. Mirrors
 // wr_common::rules::ProtectionRule::matches; vectors prove they agree.
 function matches(rule, request) {
-    var headers = request.headers || {};
-    var cookies = request.cookies || {};
-    if (rule[0] === 'p') {
-        return normalizedPath(request.uri).indexOf(rule[1].toLowerCase()) === 0;
-    }
-    if (rule[0] === 'h') {
-        var h = ownProperty(headers, rule[1].toLowerCase());
-        return !!h && typeof h.value === 'string' && h.value.toLowerCase() === rule[2].toLowerCase();
-    }
-    if (rule[0] === 'c') {
-        return ownProperty(cookies, rule[1]) !== undefined;
-    }
-    if (rule[0] === 'u') {
-        var ua = ownProperty(headers, 'user-agent');
-        return !!ua && typeof ua.value === 'string' && ua.value.indexOf(rule[1]) >= 0;
-    }
-    return false;
+  var headers = request.headers || {};
+  var cookies = request.cookies || {};
+  if (rule[0] === 'p') {
+    return normalizedPath(request.uri).indexOf(rule[1].toLowerCase()) === 0;
+  }
+  if (rule[0] === 'h') {
+    var h = ownProperty(headers, rule[1].toLowerCase());
+    return !!h && typeof h.value === 'string' && h.value.toLowerCase() === rule[2].toLowerCase();
+  }
+  if (rule[0] === 'c') {
+    return ownProperty(cookies, rule[1]) !== undefined;
+  }
+  if (rule[0] === 'u') {
+    var ua = ownProperty(headers, 'user-agent');
+    return !!ua && typeof ua.value === 'string' && ua.value.indexOf(rule[1]) >= 0;
+  }
+  return false;
 }
 
 function wantsHtml(request) {
-    var headers = request.headers || {};
-    var mode = headers['sec-fetch-mode'];
-    if (mode && mode.value !== 'navigate') {
-        return false;
-    }
-    var accept = headers['accept'];
-    return !accept || accept.value.indexOf('text/html') >= 0;
+  var headers = request.headers || {};
+  var mode = headers['sec-fetch-mode'];
+  if (mode && mode.value !== 'navigate') {
+    return false;
+  }
+  var accept = headers['accept'];
+  return !accept || accept.value.indexOf('text/html') >= 0;
 }
 
 // XHR gets 403 JSON (#72), navigation a 302; both carry a reason (#73).
 function refuse(request, reason) {
-    if (wantsHtml(request)) {
-        var destination = request.uri + queryString(request.querystring);
-        var next = '&next=' + encodeURIComponent(destination);
-        return {
-            statusCode: 302,
-            statusDescription: 'Found',
-            headers: {
-                'location': { value: WAITING_PATH + '?r=' + reason + next },
-                'cache-control': { value: 'no-store' },
-                'x-wr-reason': { value: reason }
-            }
-        };
-    }
+  if (wantsHtml(request)) {
+    var destination = request.uri + queryString(request.querystring);
+    var next = '&next=' + encodeURIComponent(destination);
     return {
-        statusCode: 403,
-        statusDescription: 'Forbidden',
-        headers: {
-            'content-type': { value: 'application/json' },
-            'cache-control': { value: 'no-store' },
-            'x-wr-reason': { value: reason },
-            'x-wr-waiting-room': { value: WAITING_PATH },
-            'access-control-expose-headers': { value: 'x-wr-reason,x-wr-waiting-room' }
-        },
-        body: '{"queued":true,"reason":"' + reason + '","waitingRoom":"' + WAITING_PATH + '"}'
+      statusCode: 302,
+      statusDescription: 'Found',
+      headers: {
+        'location': { value: WAITING_PATH + '?r=' + reason + next },
+        'cache-control': { value: 'no-store' },
+        'x-wr-reason': { value: reason }
+      }
     };
+  }
+  return {
+    statusCode: 403,
+    statusDescription: 'Forbidden',
+    headers: {
+      'content-type': { value: 'application/json' },
+      'cache-control': { value: 'no-store' },
+      'x-wr-reason': { value: reason },
+      'x-wr-waiting-room': { value: WAITING_PATH },
+      'access-control-expose-headers': { value: 'x-wr-reason,x-wr-waiting-room' }
+    },
+    body: '{"queued":true,"reason":"' + reason + '","waitingRoom":"' + WAITING_PATH + '"}'
+  };
 }
 
 async function handler(event) {
-    var request = event.request;
-    stripSpoofableHeaders(request);
-    try {
-        // cfg.r === [] is dormancy (#60): every request matches no rule.
-        var cfg = await kvs.get('c', { format: 'json' });
-        if (cfg.v !== 1) {
-            throw new Error('unrecognized gate config version');
-        }
-
-        var protectedByRule = false;
-        for (var i = 0; i < cfg.r.length; i++) {
-            if (matches(cfg.r[i], request)) {
-                protectedByRule = true;
-                break;
-            }
-        }
-        if (!protectedByRule) {
-            return request;
-        }
-
-        var now = Math.floor(Date.now() / 1000);
-
-        // enforce_from: one scheduled instant on every edge, not a window.
-        if (cfg.s && now < cfg.s) {
-            request.headers['x-wr-gate'] = { value: 'pending' };
-            return request;
-        }
-        // fail_open_until: skew can only delay relief, never shorten it.
-        if (cfg.f && now < cfg.f) {
-            request.headers['x-wr-gate'] = { value: 'failopen' };
-            return request;
-        }
-
-        var cookie = (request.cookies || {})[SESSION_COOKIE];
-        if (!cookie) {
-            return refuse(request, 'none');
-        }
-
-        var secret = await kvs.get('k', { format: 'string' });
-        var session = verify(cookie.value, secret);
-        if (!session) {
-            return refuse(request, 'signature');
-        }
-        if (session.eventId !== EVENT_ID) {
-            return refuse(request, 'event');
-        }
-        if (now >= session.expiresAt) {
-            return refuse(request, 'expired');
-        }
-        return request;
-    } catch (e) {
-        // The gate being broken, not #58: no network calls happen here.
-        console.log('gate threw: ' + e);
-        request.headers['x-wr-gate-failed'] = { value: 'true' };
-        return request;
+  var request = event.request;
+  stripSpoofableHeaders(request);
+  try {
+    // cfg.r === [] is dormancy (#60): every request matches no rule.
+    var cfg = await kvs.get('c', { format: 'json' });
+    if (cfg.v !== 1) {
+      throw new Error('unrecognized gate config version');
     }
+
+    var protectedByRule = false;
+    for (var i = 0; i < cfg.r.length; i++) {
+      if (matches(cfg.r[i], request)) {
+        protectedByRule = true;
+        break;
+      }
+    }
+    if (!protectedByRule) {
+      return request;
+    }
+
+    var now = Math.floor(Date.now() / 1000);
+
+    // enforce_from: one scheduled instant on every edge, not a window.
+    if (cfg.s && now < cfg.s) {
+      request.headers['x-wr-gate'] = { value: 'pending' };
+      return request;
+    }
+    // fail_open_until: skew can only delay relief, never shorten it.
+    if (cfg.f && now < cfg.f) {
+      request.headers['x-wr-gate'] = { value: 'failopen' };
+      return request;
+    }
+
+    var cookie = (request.cookies || {})[SESSION_COOKIE];
+    if (!cookie) {
+      return refuse(request, 'none');
+    }
+
+    var secret = await kvs.get('k', { format: 'string' });
+    var session = verify(cookie.value, secret);
+    if (!session) {
+      return refuse(request, 'signature');
+    }
+    if (session.eventId !== EVENT_ID) {
+      return refuse(request, 'event');
+    }
+    if (now >= session.expiresAt) {
+      return refuse(request, 'expired');
+    }
+    // #61, operator-enabled: a session redeemed from another network.
+    if (cfg.b && session.ip !== ipTag(secret, event.viewer.ip)) {
+      return refuse(request, 'ip');
+    }
+    return request;
+  } catch (e) {
+    // The gate being broken, not #58: no network calls happen here.
+    console.log('gate threw: ' + e);
+    request.headers['x-wr-gate-failed'] = { value: 'true' };
+    return request;
+  }
 }

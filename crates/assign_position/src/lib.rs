@@ -60,7 +60,7 @@ use std::collections::HashSet;
 use std::future::Future;
 
 use serde::Deserialize;
-use wr_common::{Assignment, Counters, Phase, Shard};
+use wr_common::{Assignment, Counters, Phase, SecretDigest, Shard};
 
 pub mod dynamo;
 
@@ -69,6 +69,9 @@ pub mod dynamo;
 pub struct JoinMessage {
     pub request_id: String,
     pub event_id: String,
+    /// The digest of the visitor's possession secret (issue #62). Validated by
+    /// its own deserializer, so a join without a well-formed one is `BadShape`.
+    pub h: SecretDigest,
 }
 
 /// One record from the SQS batch: the message id (for failure reporting), the
@@ -86,6 +89,7 @@ pub struct BatchRecord {
 pub struct PositionWrite {
     pub request_id: String,
     pub position: u64,
+    pub digest: SecretDigest,
 }
 
 /// A pre-queue registration write to attempt: the request, the `(shard, local
@@ -95,6 +99,7 @@ pub struct PreQueueWrite {
     pub request_id: String,
     pub shard: Shard,
     pub local_index: u64,
+    pub digest: SecretDigest,
 }
 
 /// The persistence port the batch logic drives.
@@ -417,6 +422,7 @@ async fn process_live_batch<S: Store>(
     for (offset, (message_id, msg)) in valid.into_iter().enumerate() {
         let write = PositionWrite {
             request_id: msg.request_id,
+            digest: msg.h,
             // Saturating for the same reason `start` itself is: a wrapped
             // position is indistinguishable from a valid low one, never a
             // harmless gap.
@@ -492,6 +498,7 @@ async fn process_prequeue_batch<S: Store>(
     for (offset, (message_id, msg)) in group.into_iter().enumerate() {
         let write = PreQueueWrite {
             request_id: msg.request_id,
+            digest: msg.h,
             shard,
             // Saturating: a wrapped local index would be a duplicate global
             // index, not a gap, which is what the shard claim's own
@@ -588,6 +595,7 @@ async fn fixup_stragglers<S: Store>(store: &S, event_id: &str, written: Vec<PreQ
         let position_write = PositionWrite {
             request_id: write.request_id,
             position: start.saturating_add(offset as u64),
+            digest: write.digest,
         };
         if let Err(err) = store.put_position(&position_write).await {
             tracing::error!(error = %err, "straggler position write failed; leaving to self-heal");
@@ -607,6 +615,8 @@ mod tests {
     use super::*;
 
     const VALID_ID: &str = "018f3a2b-7c9d-7e1f-abcd-0123456789ab";
+    /// A well-formed possession digest (issue #62); its value is irrelevant here.
+    const DIGEST: &str = "DwBzhbb51LfusnSGBa_hqYSgo7-j8BTQnip4TOnlzRo";
     const BAD_SHAPE_ID: &str = "not-a-uuid";
 
     fn shard(n: usize) -> Shard {
@@ -793,7 +803,7 @@ mod tests {
     fn rec(message_id: &str, request_id: &str) -> BatchRecord {
         BatchRecord {
             message_id: message_id.to_owned(),
-            body: format!(r#"{{"request_id":"{request_id}","event_id":"evt-1"}}"#),
+            body: format!(r#"{{"request_id":"{request_id}","event_id":"evt-1","h":"{DIGEST}"}}"#),
         }
     }
 
@@ -893,6 +903,29 @@ mod tests {
         // Only the one valid record claimed a position: counter incremented by 1.
         assert_eq!(*store.counter.lock().unwrap(), 1);
         assert_eq!(store.writes.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_join_without_a_well_formed_possession_digest_is_dropped() {
+        // Issue #62: a row without a digest can never be admitted, so it must
+        // not consume a position either.
+        let store = FakeStore::default();
+        let body = |h: &str| BatchRecord {
+            message_id: "m".to_owned(),
+            body: format!(r#"{{"request_id":"{VALID_ID}","event_id":"evt-1"{h}}}"#),
+        };
+        let records = vec![body(""), body(r#","h":"short""#), body(r#","h":null"#)];
+        let outcome = run_open(&store, &records).await;
+        assert!(outcome.failures.is_empty());
+        assert_eq!(*store.counter.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_digest_is_carried_onto_the_row() {
+        let store = FakeStore::default();
+        run_open(&store, &[rec("m1", VALID_ID)]).await;
+        let writes = store.writes.lock().unwrap();
+        assert_eq!(writes[0].digest.as_str(), DIGEST);
     }
 
     #[tokio::test]

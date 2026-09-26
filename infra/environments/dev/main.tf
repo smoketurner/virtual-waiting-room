@@ -21,6 +21,7 @@ module "core" {
   admin_artifact_path           = local.artifact["admin"]
   controller_artifact_path      = local.artifact["controller"]
   generate_token_artifact_path  = local.artifact["generate_token"]
+  nojs_artifact_path            = local.artifact["nojs"]
   lambda_architecture           = var.lambda_architecture
   event_id                      = var.event_id
 
@@ -87,6 +88,10 @@ module "edge" {
   gate_kvs_arn        = module.core.gate_kvs_arn
   event_id            = var.event_id
   session_cookie_name = var.session_cookie_name
+
+  # Where the distribution's facts are published for the admin's readiness
+  # panel (issue #70). core names it; edge writes it.
+  readiness_parameter_name = module.core.edge_readiness_parameter_name
 
   # The customer's own hostname, or empty for the *.cloudfront.net default.
   aliases             = var.aliases

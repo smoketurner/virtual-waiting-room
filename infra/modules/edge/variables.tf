@@ -105,6 +105,18 @@ variable "event_id" {
   }
 }
 
+# --- Readiness panel (issue #70) --------------------------------------------
+
+variable "readiness_parameter_name" {
+  description = "Name of the SSM parameter this module writes the distribution id, the gate function's ARN and the polled /status path to (modules/core's edge_readiness_parameter_name output). The admin Lambda's readiness panel reads it; core names it because edge depends on core, not the reverse."
+  type        = string
+
+  validation {
+    condition     = startswith(var.readiness_parameter_name, "/")
+    error_message = "readiness_parameter_name must be a hierarchical SSM name starting with '/'."
+  }
+}
+
 # --- Custom domain ------------------------------------------------------------
 
 variable "aliases" {

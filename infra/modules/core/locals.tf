@@ -40,6 +40,7 @@ locals {
   admin_name           = "${var.name_prefix}-admin"
   controller_name      = "${var.name_prefix}-controller"
   generate_token_name  = "${var.name_prefix}-generate-token"
+  nojs_name            = "${var.name_prefix}-nojs"
 
   # warm_throughput is omitted from the table entirely when both units are 0, so
   # an un-warmed table stays at the on-demand cold baseline (idle default, no
@@ -56,11 +57,30 @@ locals {
     admin           = var.admin_artifact_path
     controller      = var.controller_artifact_path
     generate_token  = var.generate_token_artifact_path
+    nojs            = var.nojs_artifact_path
   }
 
   lambda_hash = { for name, path in local.lambda_zip : name => filebase64sha256(path) }
 
   lambda_runtime_arch = var.lambda_architecture
+
+  # Where the edge module publishes the facts the admin's readiness panel
+  # (issue #70) needs about the distribution: its id, the gate function's ARN
+  # and the polled /status path. Named here and handed to edge through an
+  # output, because edge already depends on core (it consumes gate_kvs_arn):
+  # core reading edge's distribution id directly would be a module cycle.
+  # core knows only the name, edge writes the value, and the admin reads it at
+  # request time, so it is absent only between core's and edge's halves of the
+  # first apply -- which the panel reports as "not configured".
+  edge_readiness_parameter_name = "/${var.name_prefix}/edge/readiness"
+
+  # The four tables the readiness panel describes for applied warm throughput.
+  readiness_table_arns = [
+    aws_dynamodb_table.counters.arn,
+    aws_dynamodb_table.prequeue.arn,
+    aws_dynamodb_table.positions.arn,
+    aws_dynamodb_table.tokens.arn,
+  ]
 }
 
 locals {

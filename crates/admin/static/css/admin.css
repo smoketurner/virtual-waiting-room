@@ -533,3 +533,52 @@ button.danger:hover {
   border-color: var(--vouch-accent);
   font-weight: 600;
 }
+
+/* --- Readiness panel (issue #70) ------------------------------------------ */
+
+.readiness {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.readiness th,
+.readiness td {
+  text-align: left;
+  vertical-align: top;
+  padding: 10px 12px 10px 0;
+  border-bottom: 1px solid var(--vouch-border);
+}
+
+.readiness thead th {
+  font-size: 12px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--gray-500);
+}
+
+.readiness tbody th {
+  font-weight: 500;
+  color: var(--gray-200);
+  white-space: nowrap;
+}
+
+.readiness .status {
+  white-space: nowrap;
+}
+
+.readiness .help {
+  display: block;
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--gray-500);
+}
+
+.readiness a {
+  color: var(--vouch-accent);
+}
+
+.readiness-wrap {
+  overflow-x: auto;
+}

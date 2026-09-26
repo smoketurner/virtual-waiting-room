@@ -77,6 +77,22 @@ variable "generate_token_artifact_path" {
   type        = string
 }
 
+variable "nojs_artifact_path" {
+  description = "Path to the nojs Lambda bootstrap zip (the queue for visitors without JavaScript, issue #67)."
+  type        = string
+}
+
+variable "nojs_reserved_concurrency" {
+  description = "Reserved concurrency on the nojs Lambda (issue #67). It is the one path where a visitor's join runs compute, so it is capped: a flood of form posts throttles here instead of taking capacity from generate_token or the burst path. Visitors without JavaScript are few; 5 serves them."
+  type        = number
+  default     = 5
+
+  validation {
+    condition     = var.nojs_reserved_concurrency >= 1
+    error_message = "nojs_reserved_concurrency must be at least 1, or the no-JavaScript path refuses everyone."
+  }
+}
+
 variable "session_ttl_seconds" {
   description = "How long an admission session credential stays valid. Long enough to complete a purchase, short enough that a leaked cookie is not a standing bypass."
   type        = number

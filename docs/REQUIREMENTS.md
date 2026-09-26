@@ -147,8 +147,8 @@ Contractual deliverables. Without these the capacity requirements in §2 are not
 
 | ID | Requirement | Acceptance |
 |---|---|---|
-| O1 | DynamoDB tables MUST be pre-warmed before each event. | Warm throughput ≥ the event's target write rate, verified before T−0. On the readiness checklist in [RUNBOOK.md](RUNBOOK.md). |
-| O2 | Service quota increases MUST be filed with lead time. | API Gateway RPS and DynamoDB per-table write request units (WRU) confirmed raised before T−0. On the readiness checklist in [RUNBOOK.md](RUNBOOK.md). |
+| O1 | DynamoDB tables MUST be pre-warmed before each event. | Warm throughput ≥ the event's target write rate, verified before T−0. Measured by the dashboard's Readiness panel, which generates the readiness checklist in [RUNBOOK.md](RUNBOOK.md). |
+| O2 | Service quota increases MUST be filed with lead time. | API Gateway RPS and DynamoDB per-table write request units (WRU) confirmed raised before T−0. The limits in force are shown by the dashboard's Readiness panel, which generates the readiness checklist in [RUNBOOK.md](RUNBOOK.md). |
 | O3 | A load test at the event's target rate MUST be executed before the event. | Report produced and reviewed with the client. On the readiness checklist in [RUNBOOK.md](RUNBOOK.md); the harness itself is not built. |
 | O4 | The operator MUST be able to adjust admission rate, hold, or stop mid-event. | Every control is a form on the dashboard, and [RUNBOOK.md](RUNBOOK.md) documents what each does and what a waiting visitor sees. Not yet exercised in a rehearsal. |
 | O5 | New WAF rules MUST be observed in Count mode before being promoted to Block. | No rule enters Block without one event's worth of Count data. |

@@ -1,4 +1,4 @@
-//! Signed session cookies.
+//! Signed session cookies, and the proof of possession behind a request id.
 //!
 //! Both are JSON Web Signatures in compact serialization — a JWT — signed
 //! `HS256` under a per-deployment key. An origin, a proxy or an operator can
@@ -39,6 +39,10 @@ struct Claims {
     exp: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     iat: Option<u64>,
+    /// The viewer's network tag at minting ([`SigningKey::ip_tag`], issue
+    /// #61). Private claim; absent when the viewer address was unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cip: Option<String>,
 }
 
 /// A credential kind. Each signs under its own derived key, so kinds are
@@ -75,15 +79,43 @@ impl Kind {
 /// one with at apply time.
 pub struct SigningKey {
     session: [u8; 32],
+    ip: [u8; 32],
 }
 
+/// The derivation label for the key that tags a viewer's network (issue #61).
+/// Not a [`Kind`]: it signs no credential, so nothing can be presented as it.
+const IP_TAG_LABEL: &[u8] = b"vwr/ip/v1";
+
+/// Characters of base64url kept from the IP tag's HMAC: 132 bits, enough that
+/// guessing another network's tag is hopeless, short enough for a cookie.
+const IP_TAG_LEN: usize = 22;
+
 impl SigningKey {
-    /// Derives both per-kind keys from the deployment secret.
+    /// Derives the per-kind keys, and the IP-tag key, from the deployment
+    /// secret.
     #[must_use]
     pub fn new(secret: &[u8]) -> Self {
         Self {
-            session: derive(secret, Kind::Session),
+            session: derive(secret, Kind::Session.label()),
+            ip: derive(secret, IP_TAG_LABEL),
         }
+    }
+
+    /// A keyed tag of the viewer's network (issue #61, ADR-0036): the full
+    /// address for IPv4, the /64 for IPv6 (privacy addresses rotate inside
+    /// it). Keyed so a cookie never carries something an IPv4 address can be
+    /// brute-forced back out of. `None` for anything that is not an address.
+    #[must_use]
+    pub fn ip_tag(&self, ip: &str) -> Option<String> {
+        use base64::Engine as _;
+        let network = ip_network(ip)?;
+        let tag = hmac::sign(
+            &hmac::Key::new(hmac::HMAC_SHA256, &self.ip),
+            network.as_bytes(),
+        );
+        let mut out = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(tag.as_ref());
+        out.truncate(IP_TAG_LEN);
+        Some(out)
     }
 
     const fn for_kind(&self, kind: Kind) -> &[u8; 32] {
@@ -93,11 +125,26 @@ impl SigningKey {
     }
 }
 
+/// The network an IP tag binds to: the dotted address for IPv4, and for IPv6
+/// the first four hextets in lowercase hex without leading zeros, joined by
+/// `:` (`2001:db8:0:1`). The gate computes the same string; conformance
+/// vectors pin that they agree.
+#[must_use]
+pub fn ip_network(ip: &str) -> Option<String> {
+    match ip.parse::<std::net::IpAddr>().ok()? {
+        std::net::IpAddr::V4(v4) => Some(v4.to_string()),
+        std::net::IpAddr::V6(v6) => {
+            let s = v6.segments();
+            Some(format!("{:x}:{:x}:{:x}:{:x}", s[0], s[1], s[2], s[3]))
+        }
+    }
+}
+
 /// `HMAC-SHA256(secret, label)`. One pass is enough for a full-entropy secret
-/// and a fixed label; the labels are distinct constants, so the two outputs
+/// and a fixed label; the labels are distinct constants, so the outputs
 /// cannot collide.
-fn derive(secret: &[u8], kind: Kind) -> [u8; 32] {
-    let tag = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, secret), kind.label());
+fn derive(secret: &[u8], label: &[u8]) -> [u8; 32] {
+    let tag = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, secret), label);
     let mut out = [0u8; 32];
     out.copy_from_slice(tag.as_ref());
     out
@@ -124,6 +171,9 @@ pub struct Session {
     pub issued_at: u64,
     /// Epoch-seconds hard expiry (the cap; a sliding window re-issues).
     pub expires_at: u64,
+    /// [`SigningKey::ip_tag`] of the viewer that redeemed it. The gate
+    /// compares it only while the operator has IP binding on (issue #61).
+    pub ip_tag: Option<String>,
 }
 
 /// Why a credential string did not validate. Deliberately coarse: a caller
@@ -166,6 +216,7 @@ impl Session {
                 sub: self.request_id.clone(),
                 exp: self.expires_at,
                 iat: Some(self.issued_at),
+                cip: self.ip_tag.clone(),
             },
         )
     }
@@ -188,6 +239,7 @@ impl Session {
             request_id: claims.sub,
             issued_at: claims.iat.ok_or(VerifyError::Malformed)?,
             expires_at: claims.exp,
+            ip_tag: claims.cip,
         })
     }
 }
@@ -221,12 +273,163 @@ fn verify_claims(key: &SigningKey, kind: Kind, credential: &str) -> Result<Claim
     })
 }
 
+/// The length of a [`PossessionSecret`] and of a [`SecretDigest`]: 32 bytes as
+/// unpadded base64url.
+const POSSESSION_B64_LEN: usize = 43;
+
+fn is_b64url_32(s: &str) -> bool {
+    s.len() == POSSESSION_B64_LEN
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// The visitor's proof that a `request_id` is theirs (issue #62, ADR-0035):
+/// 32 random bytes, generated in the browser next to the `request_id` and
+/// never sent anywhere but `/v1/generate_token`. The join carries only its
+/// [`SecretDigest`], so the value that appears in URLs, caches and logs — the
+/// `request_id` — is no longer enough to be admitted as its holder.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PossessionSecret(String);
+
+/// Deliberately opaque: the secret is a credential.
+impl std::fmt::Debug for PossessionSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PossessionSecret(..)")
+    }
+}
+
+/// A string that is not 32 bytes of unpadded base64url.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("not 32 bytes of unpadded base64url")]
+pub struct MalformedPossession;
+
+impl PossessionSecret {
+    /// # Errors
+    ///
+    /// [`MalformedPossession`] unless `s` is 43 unpadded base64url characters.
+    pub fn parse(s: &str) -> Result<Self, MalformedPossession> {
+        if is_b64url_32(s) {
+            Ok(Self(s.to_owned()))
+        } else {
+            Err(MalformedPossession)
+        }
+    }
+
+    /// The secret itself, for the one place that must hand it back to the
+    /// visitor who owns it: the no-JavaScript entry's `HttpOnly` cookie (issue
+    /// #67). Named so that every other use stands out in review.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    /// `base64url(SHA-256(secret))`, over the secret's ASCII form, which is
+    /// what the browser hashes with `crypto.subtle.digest`.
+    #[must_use]
+    pub fn digest(&self) -> SecretDigest {
+        use base64::Engine as _;
+        let d = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, self.0.as_bytes());
+        SecretDigest(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(d.as_ref()))
+    }
+}
+
+/// What a join stores in place of the secret: `base64url(SHA-256(secret))`.
+/// Stored on the `PreQueue` or `Positions` row as `h`, one letter because it is
+/// billed on every row, one row per visitor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct SecretDigest(String);
+
+impl SecretDigest {
+    /// # Errors
+    ///
+    /// [`MalformedPossession`] unless `s` is 43 unpadded base64url characters.
+    pub fn parse(s: &str) -> Result<Self, MalformedPossession> {
+        if is_b64url_32(s) {
+            Ok(Self(s.to_owned()))
+        } else {
+            Err(MalformedPossession)
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Whether `secret` hashes to this digest, compared in constant time.
+    #[must_use]
+    pub fn is_digest_of(&self, secret: &PossessionSecret) -> bool {
+        aws_lc_rs::constant_time::verify_slices_are_equal(
+            self.0.as_bytes(),
+            secret.digest().0.as_bytes(),
+        )
+        .is_ok()
+    }
+}
+
+impl TryFrom<String> for SecretDigest {
+    type Error = MalformedPossession;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        Self::parse(&s)
+    }
+}
+
+impl From<SecretDigest> for String {
+    fn from(d: SecretDigest) -> Self {
+        d.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
 
     use super::*;
     use proptest::prelude::*;
+
+    /// A fixed vector, so a change of hash, encoding or input form (bytes of
+    /// the ASCII secret, not the decoded 32 bytes) fails here and not only in
+    /// the browser. Computed independently: `printf %s <secret> | sha256sum`.
+    #[test]
+    fn possession_digest_is_sha256_of_the_ascii_secret_as_base64url() {
+        let secret =
+            PossessionSecret::parse("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
+        assert_eq!(secret.digest().as_str(), POSSESSION_VECTOR_DIGEST);
+    }
+
+    const POSSESSION_VECTOR_DIGEST: &str = "DwBzhbb51LfusnSGBa_hqYSgo7-j8BTQnip4TOnlzRo";
+
+    #[test]
+    fn a_digest_matches_only_its_own_secret() {
+        let secret =
+            PossessionSecret::parse("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
+        let other = PossessionSecret::parse("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB").unwrap();
+        let digest = secret.digest();
+        assert!(digest.is_digest_of(&secret));
+        assert!(!digest.is_digest_of(&other));
+    }
+
+    #[test]
+    fn possession_values_must_be_32_bytes_of_unpadded_base64url() {
+        for bad in [
+            "",
+            "AAAA",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        ] {
+            assert!(PossessionSecret::parse(bad).is_err(), "{bad:?}");
+            assert!(SecretDigest::parse(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_secret_never_prints() {
+        let secret =
+            PossessionSecret::parse("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
+        assert!(!format!("{secret:?}").contains("AAAA"));
+    }
 
     fn key() -> SigningKey {
         SigningKey::new(b"a-32-byte-test-signing-key-value")
@@ -238,7 +441,44 @@ mod tests {
             request_id: "018f3a2b-7c9d-7e1f-abcd-0123456789ab".to_owned(),
             issued_at: 1_000_000_000,
             expires_at: 2_000_000_000,
+            ip_tag: None,
         }
+    }
+
+    #[test]
+    fn the_ip_tag_rides_in_the_credential_and_round_trips() {
+        let k = key();
+        let mut t = session();
+        t.ip_tag = k.ip_tag("198.51.100.7");
+        assert!(t.ip_tag.is_some());
+        let back = Session::verify(&t.sign(&k).unwrap(), &k, 1_500_000_000).unwrap();
+        assert_eq!(back.ip_tag, t.ip_tag);
+    }
+
+    #[test]
+    fn an_ipv6_tag_binds_the_64_not_the_address() {
+        let k = key();
+        let a = k.ip_tag("2001:db8:0:1:aaaa:bbbb:cccc:dddd");
+        assert_eq!(a, k.ip_tag("2001:0db8:0000:0001::1"));
+        assert_ne!(a, k.ip_tag("2001:db8:0:2::1"));
+        assert_eq!(ip_network("2001:0DB8::1").as_deref(), Some("2001:db8:0:0"));
+    }
+
+    #[test]
+    fn distinct_networks_get_distinct_tags_and_garbage_gets_none() {
+        let k = key();
+        assert_ne!(k.ip_tag("198.51.100.7"), k.ip_tag("198.51.100.8"));
+        assert_eq!(k.ip_tag("198.51.100.7").unwrap().len(), IP_TAG_LEN);
+        for bad in ["", "not-an-ip", "198.51.100.7:443", "1.2.3"] {
+            assert_eq!(k.ip_tag(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_ip_tag_does_not_depend_only_on_the_address() {
+        // Keyed: another deployment cannot precompute this one's tags.
+        let other = SigningKey::new(b"another-deployment-secret");
+        assert_ne!(key().ip_tag("198.51.100.7"), other.ip_tag("198.51.100.7"));
     }
 
     #[test]
@@ -274,6 +514,7 @@ mod tests {
                 out.copy_from_slice(SECRET);
                 out
             },
+            ip: derived.ip,
         };
         let signed = session().sign(&underived).unwrap();
         assert_eq!(
@@ -368,6 +609,7 @@ mod tests {
                 request_id,
                 issued_at: expires_at - 1,
                 expires_at,
+                ip_tag: None,
             };
             let signed = t.sign(&k).unwrap();
             let back = Session::verify(&signed, &k, expires_at - 1).unwrap();

@@ -10,6 +10,8 @@ dependencies = [
  "askama",
  "aws-config",
  "aws-lc-rs",
+ "aws-sdk-apigateway",
+ "aws-sdk-cloudfront",
  "aws-sdk-cloudfrontkeyvaluestore",
  "aws-sdk-dynamodb",
  "aws-sdk-lambda",
@@ -283,6 +285,58 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-apigateway"
+version = "1.115.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16a5e4a46d9a10401f641db55efba4e8009bec6d209320b07a433fe0403c497d"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.5.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
+name = "aws-sdk-cloudfront"
+version = "1.130.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0439bc3170591c53c0a1aa2313a2359fbeebbeb74057a8dc4095d7fb0922bc2"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
+ "aws-smithy-types",
+ "aws-smithy-xml",
+ "aws-types",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.5.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-cloudfrontkeyvaluestore"
 version = "1.104.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -368,6 +422,32 @@ name = "aws-sdk-scheduler"
 version = "1.109.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ceeb0086b9e915dd01c5fd50a9a9c0236e4ad1a5fac0f8de20004abac0fbfece"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.5.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
+name = "aws-sdk-sqs"
+version = "1.109.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f7d3bb146e70822f9b4ddc49f2d54873ade9c2954427029310473a1537a6ae8"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -2180,6 +2260,28 @@ name = "multiversion_no_op"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
+
+[[package]]
+name = "nojs"
+version = "0.1.0"
+dependencies = [
+ "askama",
+ "aws-config",
+ "aws-lc-rs",
+ "aws-sdk-dynamodb",
+ "aws-sdk-sqs",
+ "aws-sdk-ssm",
+ "base64 0.23.1",
+ "generate_token",
+ "lambda_http",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "wr-common",
+]
 
 [[package]]
 name = "num-bigint-dig"

@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    {% if let Some(secs) = refresh %}<meta http-equiv="refresh" content="{{ secs }}" />{% endif %}
+    <title>{{ title }}</title>
+    <link rel="stylesheet" href="/_wr/waiting.css" />
+  </head>
+  <body>
+    <main class="room">
+      <header class="head">
+        <p class="eyebrow">Virtual Waiting Room</p>
+        <h1>{{ title }}</h1>
+        <p class="sub">{{ sub }}</p>
+      </header>
+      {% if let Some(q) = queued %}
+      <dl class="card">
+        <div class="stat">
+          <dt class="label">Your number in line</dt>
+          <dd class="value">{{ q.position }}</dd>
+        </div>
+        <div class="stat">
+          <dt class="label">People ahead of you</dt>
+          <dd class="value">{{ q.ahead }}</dd>
+        </div>
+      </dl>
+      {% endif %}
+      {% if show_form %}
+      <form method="post" action="/v1/enter?next={{ next_encoded }}">
+        <button type="submit">Join the line</button>
+      </form>
+      {% endif %}
+      {% if refresh.is_some() %}
+      <p class="note">This page updates itself. Keep it open; closing it keeps your place for a day.</p>
+      {% endif %}
+    </main>
+  </body>
+</html>

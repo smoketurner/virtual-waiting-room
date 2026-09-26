@@ -23,6 +23,8 @@ variables {
   demo_origin_domain_name = "demo.s3.example.com"
   gate_kvs_arn            = "arn:aws:cloudfront::123456789012:key-value-store/test"
   event_id                = "smoke"
+
+  readiness_parameter_name = "/test/edge/readiness"
 }
 
 run "no_alias_serves_the_default_certificate" {

@@ -12,10 +12,13 @@
 use std::env;
 
 use generate_token::dynamo::DynamoStore;
-use generate_token::{AdmissionClaim, DEFAULT_SESSION_TTL_SECS, Denied, Store, decide};
+use generate_token::{
+    Admission, DEFAULT_SESSION_TTL_SECS, Denied, Minting, Store, admit, session_set_cookie,
+    viewer_ip,
+};
 use lambda_http::{Body, Error, Request, RequestExt, Response, run, service_fn};
-use tracing::{error, info};
-use wr_common::{Session, SigningKey};
+use tracing::info;
+use wr_common::{PossessionSecret, SigningKey};
 
 /// Resolved once at cold start and shared across invocations. Parameterized
 /// over [`Store`] so the handler's branching — what it loads, and in what
@@ -99,117 +102,57 @@ async fn handle<S: Store>(state: &AppState<S>, req: Request) -> Result<Response<
     let Some(request_id) = request_id(&req) else {
         return json(400, &serde_json::json!({ "error": "request_id required" }));
     };
-
-    let Some(counters) = state.store.load_counters(&state.event_id).await? else {
-        return json(404, &serde_json::json!({ "error": "event not found" }));
+    let Some(secret) = possession_secret(&req) else {
+        return json(400, &serde_json::json!({ "error": "secret required" }));
     };
 
-    // A live-join row is the authoritative position when one exists, so it is
-    // read first and the pre-queue lookup is skipped when it answers.
-    let position_row = state.store.load_position(&request_id).await?;
-    let prequeue = if position_row.is_none() {
-        state.store.load_prequeue(&request_id).await?
-    } else {
-        None
-    };
-
+    let viewer = req
+        .headers()
+        .get("cloudfront-viewer-address")
+        .and_then(|v| v.to_str().ok())
+        .and_then(viewer_ip);
     let now = now_secs();
-    let grant = match decide(&counters, prequeue.as_ref(), position_row, now) {
-        Ok(grant) => grant,
-        Err(denied) => return refusal(&denied),
-    };
-
-    // Claim the visitor's one admission, so their arrival is counted once
-    // however many times they call (issue #62). `request_id` travels in a URL
-    // and the waiting page polls, so a reload, a second tab or a retried
-    // request all arrive here again; `record_arrival` is an unconditional
-    // `ADD`, and a second one tells the controller more people showed up than
-    // it released, understating the no-show rate and under-releasing for the
-    // rest of the event.
-    //
-    // A failed claim leaves it unknown whether the arrival has been counted, so
-    // it is counted: over-counting understates the no-show rate and releases
-    // fewer people, while missing it releases more than the origin agreed to
-    // serve. Neither refuses the visitor -- the claim governs the count, not
-    // admission.
-    let claim = match state
-        .store
-        .claim_admission(&request_id, grant.position, now)
-        .await
-    {
-        Ok(claim) => claim,
-        Err(e) => {
-            error!(error = %e, event = "admission_claim_failed", "could not claim the admission; counting the arrival and admitting anyway");
-            AdmissionClaim::First
+    let admission = admit(
+        &state.store,
+        &Minting {
+            key: &state.key,
+            event_id: &state.event_id,
+            session_ttl_secs: state.session_ttl_secs,
+        },
+        &request_id,
+        &secret,
+        viewer,
+        now,
+    )
+    .await?;
+    let (position, expires_at, credential) = match admission {
+        Admission::Admitted {
+            position,
+            expires_at,
+            credential,
+        } => (position, expires_at, credential),
+        Admission::EventNotFound => {
+            return json(404, &serde_json::json!({ "error": "event not found" }));
+        }
+        Admission::Refused(denied) => return refusal(&denied),
+        Admission::SignFailed => {
+            return json(
+                500,
+                &serde_json::json!({ "admitted": false, "error": "try again" }),
+            );
         }
     };
-
-    match claim {
-        // The shard is drawn at random per admission (issue #59) rather than
-        // hashed from `request_id`, so it is drawn here rather than by
-        // `decide`, which stays a pure function of the queue state. A draw
-        // failure is logged and swallowed for the same reason a record failure
-        // is: the controller tolerates a missed arrival better than the visitor
-        // tolerates being refused at their turn.
-        AdmissionClaim::First => match wr_common::Shard::random() {
-            Ok(shard) => {
-                if let Err(e) = state.store.record_arrival(&state.event_id, shard).await {
-                    // Non-fatal for this visitor: the controller tolerates a
-                    // missed arrival better than the visitor tolerates being
-                    // refused at their turn. Logged at error with a stable event
-                    // name because the damage is cumulative and silent — every
-                    // uncounted arrival inflates the measured no-show rate, and
-                    // the controller answers that by releasing more people than
-                    // the origin agreed to serve. The metric filter and alarm on
-                    // `arrival_record_failed` live in modules/core/logging.tf.
-                    error!(error = %e, event = "arrival_record_failed", "failed to record arrival; admitting anyway");
-                }
-            }
-            Err(e) => {
-                error!(error = %e, event = "arrival_shard_draw_failed", "failed to draw a random shard; admitting without recording arrival");
-            }
-        },
-        // Already counted. The visitor still gets their session below.
-        AdmissionClaim::Repeat => {}
-    }
-
-    let expires_at = now.saturating_add(state.session_ttl_secs);
-    let session = Session {
-        event_id: state.event_id.clone(),
-        request_id: request_id.clone(),
-        issued_at: now,
-        expires_at,
-    };
-    // A signing failure must not become an empty cookie. An empty string is
-    // not a well-formed JWS, so the gate would refuse it and the visitor would
-    // bounce between the origin and the waiting page — while the response that
-    // sent them there said `admitted: true`. Refusing is the honest answer, and
-    // it is retryable: the position is still theirs, and the next poll tries
-    // again.
-    //
-    // The arrival was already counted above, which is the right order for the
-    // reason given there: a visitor counted but not admitted understates the
-    // no-show rate, which under-releases. The opposite mistake over-releases.
-    let Ok(credential) = session.sign(&state.key) else {
-        error!(
-            event = "session_sign_failed",
-            "could not sign the session credential; refusing rather than issuing an empty cookie"
-        );
-        return json(
-            500,
-            &serde_json::json!({ "admitted": false, "error": "try again" }),
-        );
-    };
-    let set_cookie = format!(
-        "{}={}; Path=/; Max-Age={}; Secure; HttpOnly; SameSite=Lax",
-        state.session_cookie_name, credential, state.session_ttl_secs
+    let set_cookie = session_set_cookie(
+        &state.session_cookie_name,
+        &credential,
+        state.session_ttl_secs,
     );
 
-    info!(position = grant.position, "admitted");
+    info!(position, "admitted");
 
     let body = serde_json::to_string(&serde_json::json!({
         "admitted": true,
-        "position": grant.position,
+        "position": position,
         "expires_at": expires_at,
     }))?;
     Ok(Response::builder()
@@ -236,6 +179,16 @@ fn request_id(req: &Request) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The possession secret (issue #62), from the JSON body only: a query string
+/// is written to access logs and browser history, which is exactly where the
+/// `request_id` it protects already leaks.
+fn possession_secret(req: &Request) -> Option<PossessionSecret> {
+    let body = std::str::from_utf8(req.body()).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
+    let raw = parsed.get("secret").and_then(serde_json::Value::as_str)?;
+    PossessionSecret::parse(raw).ok()
+}
+
 /// Maps a refusal to a status the waiting page can act on: 425 means "keep
 /// polling", everything else means "stop and show why".
 fn refusal(denied: &Denied) -> Result<Response<Body>, Error> {
@@ -243,6 +196,7 @@ fn refusal(denied: &Denied) -> Result<Response<Body>, Error> {
         Denied::StillQueued { .. } => 425,
         Denied::NotAdmitting | Denied::NotOpen => 409,
         Denied::NotRegistered => 404,
+        Denied::NotHolder => 403,
         Denied::Corrupt => 500,
     };
     let mut payload = serde_json::json!({
@@ -272,7 +226,7 @@ mod tests {
     use std::sync::Mutex;
 
     use generate_token::{AdmissionClaim, StoreError};
-    use wr_common::{Counters, Phase, PositionStatus, PreQueueItem, SHARDS, Shard};
+    use wr_common::{Counters, Phase, PositionStatus, PreQueueItem, SHARDS, Session, Shard};
 
     use super::*;
 
@@ -280,7 +234,7 @@ mod tests {
     /// "admitted and counted" from "admitted without counting".
     struct FakeStore {
         counters: Counters,
-        position: Option<(u64, PositionStatus)>,
+        position: Option<generate_token::PositionRow>,
         prequeue: Option<PreQueueItem>,
         /// How many times the admission has already been claimed. The first
         /// claim wins, mirroring the conditional write.
@@ -309,7 +263,7 @@ mod tests {
                     fail_open_until: 0,
                     starts_at: None,
                 },
-                position: Some((3, PositionStatus::Issued)),
+                position: Some(row(3)),
                 prequeue: None,
                 claims: Mutex::new(0),
                 arrivals: Mutex::new(0),
@@ -342,15 +296,17 @@ mod tests {
         fn load_position(
             &self,
             _request_id: &str,
-        ) -> impl std::future::Future<Output = Result<Option<(u64, PositionStatus)>, StoreError>> + Send
-        {
-            std::future::ready(Ok(self.position))
+        ) -> impl std::future::Future<
+            Output = Result<Option<generate_token::PositionRow>, StoreError>,
+        > + Send {
+            std::future::ready(Ok(self.position.clone()))
         }
 
         fn claim_admission(
             &self,
             _request_id: &str,
             _position: u64,
+            _digest: &wr_common::SecretDigest,
             _now: u64,
         ) -> impl std::future::Future<Output = Result<AdmissionClaim, StoreError>> + Send {
             let result = if self.claim_fails {
@@ -391,7 +347,19 @@ mod tests {
     /// The request id travels in the body here; the query-string form needs the
     /// Lambda request context the runtime attaches.
     fn request() -> Request {
-        Request::new(Body::from(r#"{"request_id":"r1"}"#))
+        Request::new(Body::from(format!(
+            r#"{{"request_id":"r1","secret":"{SECRET}"}}"#
+        )))
+    }
+
+    const SECRET: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    fn row(position: u64) -> generate_token::PositionRow {
+        generate_token::PositionRow {
+            position,
+            status: PositionStatus::Issued,
+            digest: Some(PossessionSecret::parse(SECRET).unwrap().digest()),
+        }
     }
 
     #[tokio::test]
@@ -438,7 +406,7 @@ mod tests {
         // the queue leaves no row behind and no arrival counted -- otherwise
         // polling would count an arrival for everyone waiting.
         let mut store = FakeStore::admitting();
-        store.position = Some((70, PositionStatus::Issued));
+        store.position = Some(row(70));
         let state = state(store);
 
         let response = handle(&state, request()).await.unwrap();
@@ -446,5 +414,69 @@ mod tests {
         assert_eq!(response.status(), 425);
         assert_eq!(*state.store.claims.lock().unwrap(), 0);
         assert_eq!(state.store.arrivals(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_request_id_alone_mints_nothing() {
+        // Issue #62: a request id read from a log or a shared URL, presented
+        // with no secret or with the wrong one, gets no cookie, no claim, and
+        // no position in the answer.
+        let state = state(FakeStore::admitting());
+        for body in [
+            r#"{"request_id":"r1"}"#.to_owned(),
+            r#"{"request_id":"r1","secret":"short"}"#.to_owned(),
+            format!(r#"{{"request_id":"r1","secret":"{}"}}"#, "B".repeat(43)),
+        ] {
+            let response = handle(&state, Request::new(Body::from(body.clone())))
+                .await
+                .unwrap();
+            assert!(
+                matches!(response.status().as_u16(), 400 | 403),
+                "{body}: {}",
+                response.status()
+            );
+            assert!(!response.headers().contains_key("set-cookie"), "{body}");
+            let text = std::str::from_utf8(response.body()).unwrap();
+            assert!(!text.contains("position"), "{body}: {text}");
+        }
+        assert_eq!(*state.store.claims.lock().unwrap(), 0);
+        assert_eq!(state.store.arrivals(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_secret_in_the_query_string_is_not_accepted() {
+        // Accepting it there would put the credential back in access logs.
+        let request =
+            Request::new(Body::from(r#"{"request_id":"r1"}"#)).with_query_string_parameters(
+                std::collections::HashMap::from([("secret".to_owned(), SECRET.to_owned())]),
+            );
+        let response = handle(&state(FakeStore::admitting()), request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn the_session_is_tagged_with_the_viewer_network() {
+        let state = state(FakeStore::admitting());
+        let mut req = request();
+        req.headers_mut().insert(
+            "cloudfront-viewer-address",
+            "198.51.100.7:46532".parse().unwrap(),
+        );
+        let response = handle(&state, req).await.unwrap();
+        let cookie = response.headers()["set-cookie"].to_str().unwrap();
+        let credential = cookie.split(';').next().unwrap().split_once('=').unwrap().1;
+        let session = Session::verify(credential, &state.key, 1).unwrap();
+        assert_eq!(session.ip_tag, state.key.ip_tag("198.51.100.7"));
+
+        // No header (a request that bypassed CloudFront): minted untagged.
+        let response = handle(&state, request()).await.unwrap();
+        let cookie = response.headers()["set-cookie"].to_str().unwrap();
+        let credential = cookie.split(';').next().unwrap().split_once('=').unwrap().1;
+        assert_eq!(
+            Session::verify(credential, &state.key, 1).unwrap().ip_tag,
+            None
+        );
     }
 }

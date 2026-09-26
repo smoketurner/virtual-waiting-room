@@ -62,7 +62,7 @@ Throwaway code. Measures what documentation cannot settle.
 - [x] Deploy-time signing key into an SSM SecureString parameter, generated and rotated out of band so the key never lands in the repo or in Terraform state. Not Secrets Manager: a standard SecureString is free where a secret is $0.40/mo, which N1 (idle cost) does not allow
 - [x] `/v1/generate_token` — the `generate_token` Lambda checks the position against `serving_counter` (resolved from `StoredControl` + `fail_open_until`, issue #71), claims the admission with one conditional write so the arrival is counted once per visitor (ADR-0033), records it, and mints an HMAC-SHA256 session cookie (`wr_common::crypto::Session`) [F3.3, F3.8, ADR-0021]
 - [x] **The gate is a CloudFront Function** (issue #71, supersedes the trusted-key-group gate, ADR-0020): `infra/modules/edge/functions/gate.js.tftpl`, associated at viewer-request with the protected behaviour only, reads its ruleset and the signing secret from one CloudFront KeyValueStore (`modules/core`'s `gate_kvs_arn`, consumed by `modules/edge`). `event_id` and the session cookie name are templated into the function's own source [F3.4, ADR-0021]
-- [x] Gate scope and lifetime: the session credential is scoped by `event_id` — the gate refuses a credential minted for another event — closing the event-isolation half of [#61](https://github.com/smoketurner/virtual-waiting-room/issues/61); transferability is still open. [#63](https://github.com/smoketurner/virtual-waiting-room/issues/63) (revocation) remains open; no design chosen (ADR-0021 §5.2)
+- [x] Gate scope and lifetime: the session credential is scoped by `event_id` — the gate refuses a credential minted for another event — closing the event-isolation half of [#61](https://github.com/smoketurner/virtual-waiting-room/issues/61); an operator-enabled IP binding closes transferability across networks (ADR-0036). [#63](https://github.com/smoketurner/virtual-waiting-room/issues/63) (revocation) remains open; no design chosen (ADR-0021 §5.2)
 - [x] Cross-language credential and rule conformance: `crates/wr-common/tests/vectors.rs` generates vectors (positives minted by the real `Session::sign`, negatives minted the same way then tampered byte-wise, `(rule, request) → bool` cases); `infra/modules/edge/tests/gate.conformance.test.js` checks the **shipped** function against them under `node:vm` [ADR-0021 §6]
 - Origin authorizer decision tree — removed (ADR-0032). The edge gate implements session cookie → protection match → 302, sharing `wr_common::rules::ProtectionRule` with the config writer [F3.4]
 - [x] Session cookie set after token validation (ADR-0011), signed over different inputs from the token, scoped per event, token stripped from the URL [F3.5, F3.6]
@@ -191,14 +191,12 @@ Reliability — the waiting room must not be the reason the site is down:
       `/admin/fail_open`; nothing trips it automatically (see F4.1 above).
 - [x] [#60](https://github.com/smoketurner/virtual-waiting-room/issues/60) Standby mode unreachable through the CloudFront gate [F0.4, F0.5, F0.7] — folded into #71: an empty ruleset passes every request through (dormancy)
 - [x] [#64](https://github.com/smoketurner/virtual-waiting-room/issues/64) Origin 403s replaced by the waiting page — folded into #71: no `custom_error_response`; the gate shapes its own refusals
-- [ ] [#67](https://github.com/smoketurner/virtual-waiting-room/issues/67) Visitors without JavaScript can never join
-      `Partial:` the waiting page tells a visitor with JavaScript off, or whose script
-      failed to load, that they are not in line and what to enable. There is no no-JS join path.
+- [x] [#67](https://github.com/smoketurner/virtual-waiting-room/issues/67) Visitors without JavaScript can never join — the waiting page's `<noscript>` form (and, when the script fails to load, a revealed one) posts to `/v1/enter`; `/v1/wait` is a server-rendered, self-refreshing page that admits through `generate_token`'s own path (ADR-0037)
 - [ ] [#68](https://github.com/smoketurner/virtual-waiting-room/issues/68) Single-region failure domain undocumented and untested
       `Partial:` documented: ADR-0034, the availability posture in `docs/DEPLOY.md`, and a
       break-glass fail-open written straight to the KeyValueStore in `docs/RUNBOOK.md`. Not
       rehearsed against a real deployment.
-- [ ] [#70](https://github.com/smoketurner/virtual-waiting-room/issues/70) Pre-event readiness as a diagnostics panel in the admin UI, not a command [O1, O2, N7] — the manual checklist now exists in `docs/RUNBOOK.md`; what is missing is a panel that asserts the same rows against live deployed state, and the checklist being generated from that list so the two cannot drift
+- [x] [#70](https://github.com/smoketurner/virtual-waiting-room/issues/70) Pre-event readiness as a diagnostics panel in the admin UI, not a command [O1, O2, N7] — a read-only Readiness panel above Current state checks warm throughput on all four tables, DynamoDB and API Gateway account limits, `assign_position` reserved concurrency, the open and controller schedules, the gate ruleset (dormant or not, and any fail-open window), the `/v1/status` cache behaviour and the gate's association, each naming its requirement with a fix link. The checks are one catalogue in `crates/admin/src/readiness.rs`, and `docs/RUNBOOK.md`'s automated checklist is generated from it (a test fails on drift). Out of scope by decision: a WAF row (no web ACL is created, N7) and a CloudFront pricing-plan row. Not built: GovCloud "not applicable" rows, since nothing deploys to GovCloud (N4); reserved-concurrency rows for the other functions, which reserve none by design.
 
 Fairness and abuse — nothing bounds how many places one visitor takes:
 
@@ -206,8 +204,8 @@ Fairness and abuse — nothing bounds how many places one visitor takes:
       `Partial:` server-drawn shards and the reload dedupe are built. Entry tickets were
       removed (ADR-0028) and the join telemetry with open-time demotion (ADR-0030). Nothing
       bounds volume; see the unchecked items in §1g.
-- [ ] [#61](https://github.com/smoketurner/virtual-waiting-room/issues/61) Admission cookies wildcard-scoped and transferable
-- [ ] [#62](https://github.com/smoketurner/virtual-waiting-room/issues/62) `request_id` is both a public cache key and the bearer credential
+- [x] [#61](https://github.com/smoketurner/virtual-waiting-room/issues/61) Admission cookies wildcard-scoped and transferable — event-scoped by #71; optional IP binding of the session (ADR-0036)
+- [x] [#62](https://github.com/smoketurner/virtual-waiting-room/issues/62) `request_id` is both a public cache key and the bearer credential — redeemed only with the possession secret it joined with (ADR-0035)
 - [ ] [#63](https://github.com/smoketurner/virtual-waiting-room/issues/63) No way to revoke an admission
       `Partial:` folded into #71 and closed there; no revocation design exists (ADR-0021 §5.2).
 

@@ -98,3 +98,8 @@ output "open_schedule_name" {
   description = "Name of the one-time open schedule (issue #128). Terraform creates it disabled; the admin Lambda sets its expression and state, and scripts/reset-env.py disables it so a reset cannot leave an open armed for a cohort it just deleted."
   value       = aws_scheduler_schedule.open.name
 }
+
+output "edge_readiness_parameter_name" {
+  description = "Name of the SSM parameter the edge module writes its distribution id, gate function ARN and polled /status path to. The admin Lambda's readiness panel (issue #70) reads it; passing the name this way keeps edge -> core the only module dependency."
+  value       = local.edge_readiness_parameter_name
+}

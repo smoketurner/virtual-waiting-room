@@ -30,6 +30,10 @@ locals {
     queue_num = { parent = "v1", path_part = "queue_num", method = "GET", auth = "NONE", required_query = ["request_id"] }
     # Public write under /v1: exchanges a reached position for admission cookies.
     generate_token = { parent = "v1", path_part = "generate_token", method = "POST", auth = "NONE" }
+    # The queue for a visitor without JavaScript (issue #67): a form post that
+    # joins, and a server-rendered page that waits and admits.
+    enter = { parent = "v1", path_part = "enter", method = "POST", auth = "NONE" }
+    wait  = { parent = "v1", path_part = "wait", method = "GET", auth = "NONE" }
 
     # Admin control plane, unversioned. Auth is NONE at API Gateway because the
     # admin Lambda enforces access via an OIDC login session (ADR-0016).
@@ -170,7 +174,9 @@ resource "aws_api_gateway_integration" "endpoint" {
   # control plane. Admin routing keys on the endpoint being an admin one, not on
   # its auth type (auth is NONE — the Lambda enforces the session).
   uri = contains(["status", "queue_num"], each.key) ? aws_lambda_function.read.invoke_arn : (
-    each.key == "generate_token" ? aws_lambda_function.generate_token.invoke_arn : aws_lambda_function.admin.invoke_arn
+    each.key == "generate_token" ? aws_lambda_function.generate_token.invoke_arn : (
+      contains(["enter", "wait"], each.key) ? aws_lambda_function.nojs.invoke_arn : aws_lambda_function.admin.invoke_arn
+    )
   )
 }
 

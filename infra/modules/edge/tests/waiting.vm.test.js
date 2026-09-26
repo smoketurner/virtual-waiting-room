@@ -376,6 +376,15 @@ test("a successful redemption falls back to / when next is absent", async () => 
   assert.equal(client.win.location.replacedTo, "/");
 });
 
+test("a successful redemption rejects a backslash next= that browsers treat as //", async () => {
+  const client = loadClient({
+    route: admittedRoute(),
+    locationSearch: "?next=" + encodeURIComponent("/\\evil.example/phish"),
+  });
+  await client.flush();
+  assert.equal(client.win.location.replacedTo, "/");
+});
+
 test("a successful redemption rejects a next= that would navigate off-site", async () => {
   const client = loadClient({
     route: admittedRoute(),
@@ -383,6 +392,99 @@ test("a successful redemption rejects a next= that would navigate off-site", asy
   });
   await client.flush();
   assert.equal(client.win.location.replacedTo, "/");
+});
+
+// --- issue #62: the request id is not enough on its own ------------------
+
+const nodeCrypto = require("node:crypto");
+const b64url = (buf) => Buffer.from(buf).toString("base64url");
+
+test("the join carries SHA-256 of the secret, and only redemption carries the secret", async () => {
+  const client = loadClient({ route: admittedRoute() });
+  await client.flush();
+
+  const join = client.calls.find((c) => c.url.startsWith("/v1/join"));
+  const redeem = client.calls.find((c) => c.url.startsWith("/v1/generate_token"));
+  const joinBody = JSON.parse(join.opts.body);
+  const redeemBody = JSON.parse(redeem.opts.body);
+
+  assert.match(redeemBody.secret, /^[A-Za-z0-9_-]{43}$/);
+  assert.equal(joinBody.secret, undefined, "the secret never goes to the join");
+  assert.equal(
+    joinBody.h,
+    b64url(nodeCrypto.createHash("sha256").update(redeemBody.secret).digest()),
+    "h is base64url(SHA-256(secret)), as wr_common::PossessionSecret::digest computes it"
+  );
+  assert.equal(joinBody.request_id, redeemBody.request_id);
+  for (const call of client.calls) {
+    assert.ok(!call.url.includes(redeemBody.secret), `secret in a URL: ${call.url}`);
+    if (!call.url.startsWith("/v1/generate_token") && call.opts && call.opts.body) {
+      assert.ok(!call.opts.body.includes(redeemBody.secret), `secret sent to ${call.url}`);
+    }
+  }
+});
+
+test("the id and its secret are stored together, and a bare legacy id is replaced", async () => {
+  const legacy = "018f3a2b-7c9d-7e1f-abcd-0123456789ab";
+  const client = loadClient({ route: admittedRoute() });
+  client.win.localStorage.setItem("vwr_request_id", legacy);
+  await client.flush();
+
+  const stored = client.win.localStorage.getItem("vwr_identity");
+  assert.match(stored, /^[0-9a-f-]{36}\.[A-Za-z0-9_-]{43}$/);
+  const join = JSON.parse(client.calls.find((c) => c.url.startsWith("/v1/join")).opts.body);
+  assert.equal(join.request_id, stored.split(".")[0]);
+});
+
+test("the identity cookie is scoped to the waiting room, not sent to the origin", async () => {
+  const client = loadClient({ route: admittedRoute(), storageFails: ["local"] });
+  await client.flush();
+  const write = client.cookieWrites.find((w) => w.startsWith("vwr_identity="));
+  assert.ok(write, "the cookie tier holds the identity when localStorage fails");
+  assert.match(write, /;path=\/_wr\/;/);
+});
+
+test("a redemption refused as not the holder stops, rather than polling forever", async () => {
+  const admitted = admittedRoute();
+  const client = loadClient({
+    route: (url) =>
+      url.startsWith("/v1/generate_token")
+        ? jsonResponse(403, { admitted: false, error: "not the holder of this place in line" })
+        : admitted(url),
+  });
+  await client.flush();
+  assert.equal(client.win.location.replacedTo, undefined);
+  assert.equal(client.lastTimer(), undefined, "nothing left scheduled");
+  assert.match(client.elements.headline.textContent, /couldn't confirm/);
+});
+
+// --- issue #61: re-minting a session refused for another network ----------
+
+test("a visitor sent back for another network is re-admitted straight through", async () => {
+  const client = loadClient({
+    route: admittedRoute(),
+    locationSearch: "?r=ip&next=%2Fcheckout",
+  });
+  await client.flush();
+  assert.equal(client.win.location.replacedTo, "/checkout");
+});
+
+test("a second ip refusal within a minute stops instead of looping", async () => {
+  const first = loadClient({ route: admittedRoute(), locationSearch: "?r=ip&next=%2Fcheckout" });
+  await first.flush();
+  const stamp = first.win.localStorage.getItem("vwr_ip_rebind");
+  assert.ok(stamp, "the re-mint is recorded");
+
+  const second = loadClient({
+    route: admittedRoute(),
+    locationSearch: "?r=ip&next=%2Fcheckout",
+    now: first.clock.now + 5_000,
+  });
+  second.win.localStorage.setItem("vwr_ip_rebind", stamp);
+  second.win.localStorage.setItem("vwr_identity", first.win.localStorage.getItem("vwr_identity"));
+  await second.flush();
+  assert.equal(second.win.location.replacedTo, undefined, "no second bounce");
+  assert.match(second.elements.headline.textContent, /keeps changing/);
 });
 
 test("a redemption that fails in flight is retried, not abandoned", async () => {
@@ -450,7 +552,7 @@ test("the progress baseline survives a reload", async () => {
 
   const second = loadClient({ route: route(() => activeStatus({ serving_position: 600 }), 1000) });
   second.win.localStorage.setItem("vwr_ahead_at_start", started);
-  second.win.localStorage.setItem("vwr_request_id", first.win.localStorage.getItem("vwr_request_id"));
+  second.win.localStorage.setItem("vwr_identity", first.win.localStorage.getItem("vwr_identity"));
   await second.flush();
 
   const width = parseFloat(second.elements.fill.style.width);

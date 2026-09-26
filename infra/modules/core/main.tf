@@ -362,13 +362,16 @@ resource "aws_api_gateway_model" "join" {
     "$schema"            = "http://json-schema.org/draft-04/schema#"
     title                = "JoinRequest"
     type                 = "object"
-    required             = ["request_id", "event_id"]
+    required             = ["request_id", "event_id", "h"]
     additionalProperties = false
     properties = {
       request_id = { type = "string", minLength = 1, maxLength = 36 } # canonical UUID length
       # The only value a legitimate join carries: the client reads it from
       # /status and assign_position discards anything else.
       event_id = { type = "string", minLength = 1, maxLength = length(var.event_id) }
+      # base64url(SHA-256(secret)) (issue #62, ADR-0035). The secret itself
+      # never comes here; only /v1/generate_token sees it.
+      h = { type = "string", minLength = 43, maxLength = 43, pattern = "^[A-Za-z0-9_-]{43}$" }
     }
   })
 }

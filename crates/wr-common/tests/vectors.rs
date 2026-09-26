@@ -73,9 +73,23 @@ struct RuleVector {
     matches: bool,
 }
 
+/// A viewer address, the network it binds to, and the tag the deployment key
+/// makes of it (issue #61). The gate computes the tag from `event.viewer.ip`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct IpTagVector {
+    name: String,
+    key_hex: String,
+    ip: String,
+    /// `None` for an input that is not an address: no tag, so a bound session
+    /// cannot be satisfied by it.
+    network: Option<String>,
+    tag: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct Vectors {
     positives: Vec<PositiveVector>,
+    ip_tags: Vec<IpTagVector>,
     negatives: Vec<NegativeVector>,
     rules: Vec<RuleVector>,
 }
@@ -120,6 +134,7 @@ fn positives() -> Vec<PositiveVector> {
             request_id: request_id.to_owned(),
             issued_at,
             expires_at,
+            ip_tag: None,
         };
         PositiveVector {
             name: name.to_owned(),
@@ -184,6 +199,7 @@ fn negatives() -> Vec<NegativeVector> {
         request_id: "r1".to_owned(),
         issued_at: 1000,
         expires_at: 2000,
+        ip_tag: None,
     };
     let real = session.sign(&key).expect("real session signs");
 
@@ -478,9 +494,36 @@ fn rules_by_header() -> Vec<RuleVector> {
     ]
 }
 
+fn ip_tags() -> Vec<IpTagVector> {
+    let key_hex = to_hex(b"a-32-byte-test-signing-key-value");
+    let key = SigningKey::new(&key_bytes(&key_hex));
+    [
+        ("ipv4", "198.51.100.7"),
+        ("ipv4_neighbour", "198.51.100.8"),
+        ("ipv6_full", "2001:0db8:0000:0001:aaaa:bbbb:cccc:dddd"),
+        ("ipv6_compressed_same_64", "2001:db8:0:1::1"),
+        ("ipv6_leading_compression", "::1"),
+        ("ipv6_uppercase", "2001:DB8:AB::"),
+        ("ipv6_other_64", "2001:db8:0:2::1"),
+        ("ipv4_mapped_ipv6", "::ffff:198.51.100.7"),
+        ("not_an_address", "not-an-ip"),
+        ("empty", ""),
+    ]
+    .into_iter()
+    .map(|(name, ip)| IpTagVector {
+        name: name.to_owned(),
+        key_hex: key_hex.clone(),
+        ip: ip.to_owned(),
+        network: wr_common::ip_network(ip),
+        tag: key.ip_tag(ip),
+    })
+    .collect()
+}
+
 fn build_vectors() -> Vectors {
     Vectors {
         positives: positives(),
+        ip_tags: ip_tags(),
         negatives: negatives(),
         rules: rules(),
     }

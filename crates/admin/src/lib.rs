@@ -16,6 +16,8 @@ pub mod dynamo;
 pub mod edge;
 pub mod oidc;
 pub mod opener;
+pub mod probe;
+pub mod readiness;
 pub mod scheduler;
 pub mod security;
 pub mod sessions;
@@ -46,6 +48,13 @@ pub struct GateConfig {
     pub fail_open_until: u64,
     #[serde(rename = "r")]
     pub rules: Vec<ProtectionRule>,
+    /// Whether the gate refuses a session redeemed from another network
+    /// (issue #61, ADR-0036). Off by default: it throws out visitors whose
+    /// address changes mid-session. A document without it reads as off.
+    /// Omitted while off, so the default document is byte-identical to the
+    /// Terraform seed and costs nothing against the value ceiling.
+    #[serde(rename = "b", default, skip_serializing_if = "std::ops::Not::not")]
+    pub bind_ip: bool,
 }
 
 /// The 1 KB `KeyValueStore` value ceiling (ADR-0021 §2) leaves room for roughly
@@ -441,6 +450,8 @@ pub enum AdminAction {
     ClearStartTime,
     /// Opens the event immediately rather than waiting for the schedule.
     OpenNow,
+    /// Turns the gate's session IP binding on or off (issue #61).
+    SetIpBinding,
 }
 
 impl AdminAction {
@@ -459,6 +470,7 @@ impl AdminAction {
             Self::SetRules => "set_rules",
             Self::SetStartTime => "set_start_time",
             Self::OpenNow => "open_now",
+            Self::SetIpBinding => "set_ip_binding",
             Self::ClearStartTime => "clear_start_time",
         }
     }
@@ -1160,6 +1172,46 @@ pub async fn apply_open_now<S: Store, O: Opener>(
     Ok(outcome)
 }
 
+/// Turns the edge gate's session IP binding on or off (issue #61, ADR-0036).
+/// While on, the gate refuses a session whose network tag does not match the
+/// viewer's, and the waiting page re-mints it for a visitor still in line.
+///
+/// Write order matches [`apply_set_rules`]: the `KeyValueStore` is
+/// authoritative, so it is written first and the audit stamp describes a
+/// change that happened. A failed stamp is logged under the same alarm as a
+/// ruleset's (`rules_audit_failed`): the gate changed, its record did not.
+///
+/// # Errors
+///
+/// [`ActionError::NotFound`] if the event is missing; store and edge-store
+/// errors otherwise.
+pub async fn apply_ip_binding<S: Store, E: EdgeConfigStore>(
+    store: &S,
+    edge: &E,
+    event_id: &str,
+    on: bool,
+    actor: &str,
+    now: ArrivalTime,
+) -> Result<(), ApplyError> {
+    if store.load(event_id).await?.is_none() {
+        return Err(ActionError::NotFound.into());
+    }
+    edge_read_modify_write(edge, |cfg| cfg.bind_ip = on)
+        .await
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+    if let Err(e) = store
+        .stamp_action(event_id, AdminAction::SetIpBinding, actor, now)
+        .await
+    {
+        tracing::error!(
+            error = %e,
+            event = "rules_audit_failed",
+            "IP binding was changed but the audit stamp failed"
+        );
+    }
+    Ok(())
+}
+
 /// Replaces the edge gate's ruleset (issue #71). The `KeyValueStore` is the
 /// sole store for `rules` — this reads the current config, keeps
 /// `enforce_from` and `fail_open_until` exactly as they were, replaces only
@@ -1551,6 +1603,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 cfg: Mutex::new(GateConfig {
+                    bind_ip: false,
                     v: 1,
                     enforce_from: 0,
                     fail_open_until: 0,
@@ -2722,6 +2775,66 @@ mod tests {
         );
     }
 
+    // --- issue #61: IP binding ----------------------------------------------
+
+    #[tokio::test]
+    async fn ip_binding_flips_only_its_own_field_and_is_audited() {
+        let store = FakeStore::with_phase(Phase::Active);
+        let edge = FakeEdgeStore::default();
+        apply_fail_open(&store, &edge, "evt", "5", "op@x", ts(1_000))
+            .await
+            .unwrap();
+        let before = edge.cfg.lock().unwrap().clone();
+
+        apply_ip_binding(&store, &edge, "evt", true, "op@x", ts(9_000))
+            .await
+            .unwrap();
+        let after = edge.cfg.lock().unwrap().clone();
+        assert!(after.bind_ip);
+        assert_eq!(
+            after.fail_open_until, before.fail_open_until,
+            "fail-open untouched"
+        );
+        assert_eq!(after.rules, before.rules, "rules untouched");
+        assert_eq!(
+            store.last_action.lock().unwrap().as_deref(),
+            Some("set_ip_binding")
+        );
+
+        apply_ip_binding(&store, &edge, "evt", false, "op@x", ts(20_000))
+            .await
+            .unwrap();
+        assert!(!edge.cfg.lock().unwrap().bind_ip);
+    }
+
+    #[tokio::test]
+    async fn ip_binding_on_a_missing_event_writes_nothing() {
+        let store = FakeStore {
+            missing: true,
+            ..FakeStore::default()
+        };
+        let edge = FakeEdgeStore::default();
+        let err = apply_ip_binding(&store, &edge, "missing", true, "op@x", ts(1))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ApplyError::Action(ActionError::NotFound)),
+            "{err:?}"
+        );
+        assert!(!edge.cfg.lock().unwrap().bind_ip);
+    }
+
+    #[test]
+    fn a_config_written_before_ip_binding_reads_as_off() {
+        // The Terraform seed and every document written before issue #61 has
+        // no `b`: it must decode, and decode as off.
+        let cfg: GateConfig = serde_json::from_str(r#"{"v":1,"s":0,"f":0,"r":[]}"#).unwrap();
+        assert!(!cfg.bind_ip);
+        let mut on = cfg;
+        on.bind_ip = true;
+        assert!(encode_gate_config(&on).unwrap().contains(r#""b":true"#));
+    }
+
     #[tokio::test]
     async fn set_rules_does_not_regress_a_newer_concurrent_anchor() {
         // Bug (sibling of #186, audit-only row): `apply_set_rules` performs the
@@ -3247,6 +3360,7 @@ mod tests {
         let store = FakeStore::with_phase(Phase::Active);
         let edge = FakeEdgeStore::default();
         let concurrent = GateConfig {
+            bind_ip: false,
             v: 1,
             enforce_from: 0,
             fail_open_until: 0,
@@ -3286,6 +3400,7 @@ mod tests {
         let store = FakeStore::with_phase(Phase::Active);
         let edge = FakeEdgeStore::default();
         let concurrent_fail_open = GateConfig {
+            bind_ip: false,
             v: 1,
             enforce_from: 0,
             fail_open_until: 9_000,
@@ -3323,6 +3438,7 @@ mod tests {
         edge.cfg.lock().unwrap().fail_open_until = 5_000;
         let concurrent_rules = vec![ProtectionRule::PathPrefix("/concurrent".to_owned())];
         *edge.inject_on_next_write.lock().unwrap() = Some(GateConfig {
+            bind_ip: false,
             v: 1,
             enforce_from: 0,
             fail_open_until: 5_000,
@@ -3400,6 +3516,7 @@ mod tests {
         // this ruleset up front, before either write.
         let rules = ruleset_between_the_two_ceilings();
         let probe_cfg = GateConfig {
+            bind_ip: false,
             v: 1,
             enforce_from: 0,
             fail_open_until: 0,
@@ -3700,6 +3817,7 @@ mod tests {
 
     fn empty_config() -> GateConfig {
         GateConfig {
+            bind_ip: false,
             v: 1,
             enforce_from: 0,
             fail_open_until: 0,

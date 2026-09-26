@@ -8,11 +8,12 @@ use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
 use aws_sdk_dynamodb::types::AttributeValue;
 use wr_common::expr::{
     Condition, ENTRY_TIME_ATTR, Key, POSITION_TTL_SECS, POSITIONS_KEY_ATTR, POSITIONS_TTL_ATTR,
-    QUEUE_POSITION_ATTR, SHARD_COUNT_ATTR, SHARD_INDEX_ATTR, STATUS_ATTR, Update,
+    POSSESSION_DIGEST_ATTR, QUEUE_POSITION_ATTR, SHARD_COUNT_ATTR, SHARD_INDEX_ATTR, STATUS_ATTR,
+    Update,
 };
-use wr_common::{Counters, PositionStatus, PreQueueItem, Shard};
+use wr_common::{Counters, PositionStatus, PreQueueItem, SecretDigest, Shard};
 
-use crate::{AdmissionClaim, Store, StoreError};
+use crate::{AdmissionClaim, PositionRow, Store, StoreError};
 
 /// A live store bound to the three tables the admission check reads.
 pub struct DynamoStore {
@@ -74,10 +75,7 @@ impl Store for DynamoStore {
         }
     }
 
-    async fn load_position(
-        &self,
-        request_id: &str,
-    ) -> Result<Option<(u64, PositionStatus)>, StoreError> {
+    async fn load_position(&self, request_id: &str) -> Result<Option<PositionRow>, StoreError> {
         let out = self
             .client
             .get_item()
@@ -95,6 +93,7 @@ impl Store for DynamoStore {
         &self,
         request_id: &str,
         position: u64,
+        digest: &SecretDigest,
         now: u64,
     ) -> Result<AdmissionClaim, StoreError> {
         // One `UpdateItem` serves both populations. A live joiner already has
@@ -116,6 +115,12 @@ impl Store for DynamoStore {
             )
             .set(QUEUE_POSITION_ATTR, AttributeValue::N(position.to_string()))
             .set_if_not_exists(ENTRY_TIME_ATTR, AttributeValue::N(now.to_string()))
+            // A live joiner's row has the digest already; a pre-queue member's
+            // is created here, and its later calls read this row first.
+            .set_if_not_exists(
+                POSSESSION_DIGEST_ATTR,
+                AttributeValue::S(digest.as_str().to_owned()),
+            )
             .set(
                 POSITIONS_TTL_ATTR,
                 AttributeValue::N(now.saturating_add(POSITION_TTL_SECS).to_string()),
@@ -212,7 +217,7 @@ fn status_of(wire: &str) -> Option<PositionStatus> {
 /// Reads the position and status off a `Positions` item. Both must be present
 /// and well-formed; a row missing either is treated as no row rather than
 /// admitting on a default.
-fn position_from_item(item: &HashMap<String, AttributeValue>) -> Option<(u64, PositionStatus)> {
+fn position_from_item(item: &HashMap<String, AttributeValue>) -> Option<PositionRow> {
     let position = item
         .get(QUEUE_POSITION_ATTR)
         .and_then(|v| v.as_n().ok())
@@ -221,11 +226,23 @@ fn position_from_item(item: &HashMap<String, AttributeValue>) -> Option<(u64, Po
         .get(STATUS_ATTR)
         .and_then(|v| v.as_s().ok())
         .and_then(|s| status_of(s))?;
-    Some((position, status))
+    // A missing or malformed digest is not "no row": the row still answers
+    // the position, and the admission check refuses it as NotHolder.
+    let digest = item
+        .get(POSSESSION_DIGEST_ATTR)
+        .and_then(|v| v.as_s().ok())
+        .and_then(|s| SecretDigest::parse(s).ok());
+    Some(PositionRow {
+        position,
+        status,
+        digest,
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    #![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
+
     use super::*;
 
     fn position_item(position: &str, status: &str) -> HashMap<String, AttributeValue> {
@@ -252,7 +269,11 @@ mod tests {
             assert_eq!(status_of(&wire), Some(status), "{wire} did not round-trip");
             assert_eq!(
                 position_from_item(&position_item("7", &wire)),
-                Some((7, status))
+                Some(PositionRow {
+                    position: 7,
+                    status,
+                    digest: None
+                })
             );
         }
     }
@@ -270,5 +291,20 @@ mod tests {
         assert_eq!(position_from_item(&no_status), None);
 
         assert_eq!(position_from_item(&position_item("7", "nonsense")), None);
+    }
+
+    #[test]
+    fn the_digest_is_read_back_and_a_malformed_one_is_none() {
+        let mut item = position_item("7", "issued");
+        item.insert(
+            POSSESSION_DIGEST_ATTR.to_owned(),
+            AttributeValue::S("DwBzhbb51LfusnSGBa_hqYSgo7-j8BTQnip4TOnlzRo".to_owned()),
+        );
+        assert!(position_from_item(&item).unwrap().digest.is_some());
+        item.insert(
+            POSSESSION_DIGEST_ATTR.to_owned(),
+            AttributeValue::S("short".to_owned()),
+        );
+        assert_eq!(position_from_item(&item).unwrap().digest, None);
     }
 }

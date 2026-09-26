@@ -19,6 +19,8 @@ variables {
   demo_origin_domain_name = "demo.s3.example.com"
   gate_kvs_arn            = "arn:aws:cloudfront::123456789012:key-value-store/test"
   event_id                = "smoke"
+
+  readiness_parameter_name = "/test/edge/readiness"
 }
 
 run "default_behaviour_carries_the_gate" {
@@ -77,5 +79,52 @@ run "the_join_policy_whitelists_content_type" {
       "content-type"
     )
     error_message = "the join origin request policy must whitelist content-type, or API Gateway cannot parse the join body"
+  }
+}
+
+# Issue #61: generate_token tags the session with the viewer's network, which
+# it can only read from CloudFront-Viewer-Address (API Gateway sees the edge).
+# Cookies must still be forwarded or CloudFront strips the Set-Cookie that is
+# the whole point of the path; Host must not be, or API Gateway rejects it.
+run "generate_token_receives_the_viewer_address_and_keeps_its_set_cookie" {
+  command = plan
+
+  assert {
+    condition = contains(
+      aws_cloudfront_origin_request_policy.generate_token.headers_config[0].headers[0].items,
+      "CloudFront-Viewer-Address"
+    )
+    error_message = "generate_token needs CloudFront-Viewer-Address to tag the session for IP binding"
+  }
+
+  assert {
+    condition     = aws_cloudfront_origin_request_policy.generate_token.cookies_config[0].cookie_behavior == "all"
+    error_message = "a behaviour that forwards no cookies has its Set-Cookie stripped"
+  }
+
+  assert {
+    condition = !contains(
+      [for h in aws_cloudfront_origin_request_policy.generate_token.headers_config[0].headers[0].items : lower(h)],
+      "host"
+    )
+    error_message = "forwarding Host to API Gateway makes it reject the request"
+  }
+}
+
+# The admin's readiness panel (issue #70) finds this distribution, its gate
+# and its polled /status behaviour through the parameter core names. Written
+# under any other name, every CloudFront row reads "not configured" on a
+# deployment that is in fact complete.
+run "the_readiness_parameter_is_written_where_core_reads_it" {
+  command = plan
+
+  assert {
+    condition     = aws_ssm_parameter.readiness.name == var.readiness_parameter_name
+    error_message = "the readiness parameter must be written under the name core gives the admin Lambda"
+  }
+
+  assert {
+    condition     = aws_ssm_parameter.readiness.type == "String" && aws_ssm_parameter.readiness.tier == "Standard"
+    error_message = "a Standard String parameter bills nothing between events (N1); an Advanced one does"
   }
 }
