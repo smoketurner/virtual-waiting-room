@@ -79,8 +79,9 @@ visible fairness failure at 1,000,000 people. Tests are the primary evidence.
 Listed so they are not rediscovered late. Each is unbuilt today; do not write the test before
 the mechanism exists.
 
-- **One position per identity** (#59) — N registrations under one verified identifier yield one
-  position.
+- **Bounded registration volume** (#59) — no mechanism is chosen: the identity-based one was
+  retired (ADR-0028), so there is no identifier to test "one position per identity" against.
+  Write the test once #59 records which bound it adopts.
 - **Concurrency control** (#65) — with injected session durations an order of magnitude apart,
   measured active sessions converge on the ceiling in both cases.
 - **Revocation** (#63) — no design exists yet (ADR-0021 §5.2); do not write a test against a

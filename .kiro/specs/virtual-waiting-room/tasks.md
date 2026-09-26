@@ -62,7 +62,7 @@ Throwaway code. Measures what documentation cannot settle.
 - [x] Deploy-time signing key into an SSM SecureString parameter, generated and rotated out of band so the key never lands in the repo or in Terraform state. Not Secrets Manager: a standard SecureString is free where a secret is $0.40/mo, which N1 (idle cost) does not allow
 - [x] `/v1/generate_token` — the `generate_token` Lambda checks the position against `serving_counter` (resolved from `StoredControl` + `fail_open_until`, issue #71), claims the admission with one conditional write so the arrival is counted once per visitor (ADR-0033), records it, and mints an HMAC-SHA256 session cookie (`wr_common::crypto::Session`) [F3.3, F3.8, ADR-0021]
 - [x] **The gate is a CloudFront Function** (issue #71, supersedes the trusted-key-group gate, ADR-0020): `infra/modules/edge/functions/gate.js.tftpl`, associated at viewer-request with the protected behaviour only, reads its ruleset and the signing secret from one CloudFront KeyValueStore (`modules/core`'s `gate_kvs_arn`, consumed by `modules/edge`). `event_id` and the session cookie name are templated into the function's own source [F3.4, ADR-0021]
-- [x] Gate scope and lifetime: the session credential is scoped by `event_id` — the gate refuses a credential minted for another event — closing [#61](https://github.com/smoketurner/virtual-waiting-room/issues/61) on the CloudFront path. [#63](https://github.com/smoketurner/virtual-waiting-room/issues/63) (revocation) remains open; no design chosen (ADR-0021 §5.2)
+- [x] Gate scope and lifetime: the session credential is scoped by `event_id` — the gate refuses a credential minted for another event — closing the event-isolation half of [#61](https://github.com/smoketurner/virtual-waiting-room/issues/61); transferability is still open. [#63](https://github.com/smoketurner/virtual-waiting-room/issues/63) (revocation) remains open; no design chosen (ADR-0021 §5.2)
 - [x] Cross-language credential and rule conformance: `crates/wr-common/tests/vectors.rs` generates vectors (positives minted by the real `Session::sign`, negatives minted the same way then tampered byte-wise, `(rule, request) → bool` cases); `infra/modules/edge/tests/gate.conformance.test.js` checks the **shipped** function against them under `node:vm` [ADR-0021 §6]
 - Origin authorizer decision tree — removed (ADR-0032). The edge gate implements session cookie → protection match → 302, sharing `wr_common::rules::ProtectionRule` with the config writer [F3.4]
 - [x] Session cookie set after token validation (ADR-0011), signed over different inputs from the token, scoped per event, token stripped from the URL [F3.5, F3.6]
@@ -187,10 +187,17 @@ operator can run an event on.
 Reliability — the waiting room must not be the reason the site is down:
 
 - [ ] [#58](https://github.com/smoketurner/virtual-waiting-room/issues/58) Gate fails closed: no fail-open path [F4.1]
-- [ ] [#60](https://github.com/smoketurner/virtual-waiting-room/issues/60) Standby mode unreachable through the CloudFront gate [F0.4, F0.5, F0.7]
-- [ ] [#64](https://github.com/smoketurner/virtual-waiting-room/issues/64) Origin 403s replaced by the waiting page
+      `Partial:` folded into #71, which built the `fail_open_until` mechanism and
+      `/admin/fail_open`; nothing trips it automatically (see F4.1 above).
+- [x] [#60](https://github.com/smoketurner/virtual-waiting-room/issues/60) Standby mode unreachable through the CloudFront gate [F0.4, F0.5, F0.7] — folded into #71: an empty ruleset passes every request through (dormancy)
+- [x] [#64](https://github.com/smoketurner/virtual-waiting-room/issues/64) Origin 403s replaced by the waiting page — folded into #71: no `custom_error_response`; the gate shapes its own refusals
 - [ ] [#67](https://github.com/smoketurner/virtual-waiting-room/issues/67) Visitors without JavaScript can never join
+      `Partial:` the waiting page tells a visitor with JavaScript off, or whose script
+      failed to load, that they are not in line and what to enable. There is no no-JS join path.
 - [ ] [#68](https://github.com/smoketurner/virtual-waiting-room/issues/68) Single-region failure domain undocumented and untested
+      `Partial:` documented: ADR-0034, the availability posture in `docs/DEPLOY.md`, and a
+      break-glass fail-open written straight to the KeyValueStore in `docs/RUNBOOK.md`. Not
+      rehearsed against a real deployment.
 - [ ] [#70](https://github.com/smoketurner/virtual-waiting-room/issues/70) Pre-event readiness as a diagnostics panel in the admin UI, not a command [O1, O2, N7] — the manual checklist now exists in `docs/RUNBOOK.md`; what is missing is a panel that asserts the same rows against live deployed state, and the checklist being generated from that list so the two cannot drift
 
 Fairness and abuse — nothing bounds how many places one visitor takes:
@@ -202,12 +209,13 @@ Fairness and abuse — nothing bounds how many places one visitor takes:
 - [ ] [#61](https://github.com/smoketurner/virtual-waiting-room/issues/61) Admission cookies wildcard-scoped and transferable
 - [ ] [#62](https://github.com/smoketurner/virtual-waiting-room/issues/62) `request_id` is both a public cache key and the bearer credential
 - [ ] [#63](https://github.com/smoketurner/virtual-waiting-room/issues/63) No way to revoke an admission
+      `Partial:` folded into #71 and closed there; no revocation design exists (ADR-0021 §5.2).
 
 Control and cost:
 
 - [ ] [#65](https://github.com/smoketurner/virtual-waiting-room/issues/65) Outflow control has no concurrency term [F3.10]
-- [ ] [#66](https://github.com/smoketurner/virtual-waiting-room/issues/66) Per-request protection rules unavailable at the gate [F0.6]
-- [ ] [#69](https://github.com/smoketurner/virtual-waiting-room/issues/69) Adaptive poll interval — the dominant cost driver [O6]
+- [x] [#66](https://github.com/smoketurner/virtual-waiting-room/issues/66) Per-request protection rules unavailable at the gate [F0.6] — folded into #71: the CloudFront Function evaluates the ruleset per request
+- [x] [#69](https://github.com/smoketurner/virtual-waiting-room/issues/69) Adaptive poll interval — the dominant cost driver [O6] — #98, ADR-0023
 
 ---
 

@@ -55,6 +55,11 @@ resource "aws_dynamodb_table" "counters" {
 # deliberately absent: the open writes those, and their absence is what
 # "not yet open" means.
 #
+# The phase is pre_queue when starts_at is set, because that also arms the
+# open schedule (lambdas.tf), and the open only runs from pre_queue: seeded
+# idle, the scheduled open was refused as wrong-phase (#213) and nobody
+# registered during the countdown. Unset, idle is right -- nothing is scheduled.
+#
 # ignore_changes on the whole item because the control plane owns it from here:
 # the admin Lambda moves the phase, the rate and the message, the open writes
 # the seed and offsets, and the controller advances serving_counter. Terraform
@@ -65,7 +70,7 @@ resource "aws_dynamodb_table_item" "event" {
 
   item = jsonencode({
     event_id          = { S = "EVT#${var.event_id}" }
-    phase             = { S = "idle" }
+    phase             = { S = var.starts_at == "" ? "idle" : "pre_queue" }
     admission_control = { S = "open" }
     queue_counter     = { N = "0" }
     serving_counter   = { N = "0" }
@@ -307,6 +312,18 @@ resource "aws_lambda_event_source_mapping" "join" {
   batch_size                         = 100
   maximum_batching_window_in_seconds = 1
   function_response_types            = ["ReportBatchItemFailures"]
+
+  # Capped at the function's reserved concurrency. Uncapped, the SQS poller
+  # scales past it during a join burst, the excess invocations are throttled,
+  # and each throttled batch goes back on the queue with its receive count
+  # raised: five of those and accepted joins land in the DLQ. The cap makes
+  # the poller hold messages instead. 2..1000 is the range Lambda accepts.
+  dynamic "scaling_config" {
+    for_each = var.assign_position_reserved_concurrency >= 2 ? [1] : []
+    content {
+      maximum_concurrency = min(var.assign_position_reserved_concurrency, 1000)
+    }
+  }
 }
 
 # --- API Gateway REST -> SQS (ingest, no Lambda in the burst path) ------------
