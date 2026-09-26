@@ -98,6 +98,7 @@ variables {
   admin_artifact_path           = "tests/fixtures/bootstrap.zip"
   controller_artifact_path      = "tests/fixtures/bootstrap.zip"
   generate_token_artifact_path  = "tests/fixtures/bootstrap.zip"
+  nojs_artifact_path            = "tests/fixtures/bootstrap.zip"
 
   warm_throughput_write_units = 10000
   warm_throughput_read_units  = 12000

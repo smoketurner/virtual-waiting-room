@@ -200,6 +200,7 @@ conditions the system would otherwise survive in silence.
 | `admission_control_unreadable` | The stored admission control could not be parsed, so the controller is holding admission | The queue has stopped moving. Pause and Resume to rewrite the attribute |
 | `rules_audit_failed` | The gate's ruleset changed but the audit stamp did not | The gate is correct; the dashboard's "last changed by" is stale. No visitor impact |
 | `fail_open_audit_lost` | Fail-open was engaged or cleared but the audit stamp lost a race to a newer writer | The fail-open change took effect; the dashboard's "last changed by" is stale. No visitor impact |
+| `nojs_join_failed` | A visitor without JavaScript pressed "Join the line" and the join was not enqueued | They were told and can press again. If it is continuous, nobody without JavaScript can join: check the nojs function's logs and its SQS grant |
 | `open_event_error` | The open failed: most often the schedule fired while the event was not in the pre-queue phase, so nothing was opened | Check the event's phase. The scheduler retries for up to 10 minutes; once the phase is pre-queue a retry opens the event, or use **Open now** |
 | `open-dlq-not-empty` | A scheduled open failed on every retry and was given up | The event is **not open**, and the one-time schedule has been used. Fix the cause (usually the phase), then **Open now** |
 

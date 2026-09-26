@@ -191,9 +191,7 @@ Reliability — the waiting room must not be the reason the site is down:
       `/admin/fail_open`; nothing trips it automatically (see F4.1 above).
 - [x] [#60](https://github.com/smoketurner/virtual-waiting-room/issues/60) Standby mode unreachable through the CloudFront gate [F0.4, F0.5, F0.7] — folded into #71: an empty ruleset passes every request through (dormancy)
 - [x] [#64](https://github.com/smoketurner/virtual-waiting-room/issues/64) Origin 403s replaced by the waiting page — folded into #71: no `custom_error_response`; the gate shapes its own refusals
-- [ ] [#67](https://github.com/smoketurner/virtual-waiting-room/issues/67) Visitors without JavaScript can never join
-      `Partial:` the waiting page tells a visitor with JavaScript off, or whose script
-      failed to load, that they are not in line and what to enable. There is no no-JS join path.
+- [x] [#67](https://github.com/smoketurner/virtual-waiting-room/issues/67) Visitors without JavaScript can never join — the waiting page's `<noscript>` form (and, when the script fails to load, a revealed one) posts to `/v1/enter`; `/v1/wait` is a server-rendered, self-refreshing page that admits through `generate_token`'s own path (ADR-0037)
 - [ ] [#68](https://github.com/smoketurner/virtual-waiting-room/issues/68) Single-region failure domain undocumented and untested
       `Partial:` documented: ADR-0034, the availability posture in `docs/DEPLOY.md`, and a
       break-glass fail-open written straight to the KeyValueStore in `docs/RUNBOOK.md`. Not

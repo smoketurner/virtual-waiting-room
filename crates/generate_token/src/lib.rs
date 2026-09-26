@@ -284,6 +284,14 @@ pub async fn admit<S: Store>(
     })
 }
 
+/// The `Set-Cookie` that carries a minted session. `Path=/` because the gate
+/// checks it on every protected request; `HttpOnly` because no page script
+/// needs it.
+#[must_use]
+pub fn session_set_cookie(name: &str, credential: &str, ttl_secs: u64) -> String {
+    format!("{name}={credential}; Path=/; Max-Age={ttl_secs}; Secure; HttpOnly; SameSite=Lax")
+}
+
 /// The address part of a `CloudFront-Viewer-Address` header, which is
 /// `ip:port` with no brackets around an IPv6 address — so the port is
 /// whatever follows the last `:` (issue #61). `None` for a header with no

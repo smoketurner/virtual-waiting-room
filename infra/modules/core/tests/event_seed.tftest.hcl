@@ -24,6 +24,7 @@ variables {
   admin_artifact_path           = "tests/fixtures/bootstrap.zip"
   controller_artifact_path      = "tests/fixtures/bootstrap.zip"
   generate_token_artifact_path  = "tests/fixtures/bootstrap.zip"
+  nojs_artifact_path            = "tests/fixtures/bootstrap.zip"
 
   oidc_client_id      = "test-client"
   oidc_redirect_uri   = "https://example.invalid/admin/callback"

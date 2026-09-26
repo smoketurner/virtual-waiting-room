@@ -21,6 +21,7 @@ module "core" {
   admin_artifact_path           = local.artifact["admin"]
   controller_artifact_path      = local.artifact["controller"]
   generate_token_artifact_path  = local.artifact["generate_token"]
+  nojs_artifact_path            = local.artifact["nojs"]
   lambda_architecture           = var.lambda_architecture
   event_id                      = var.event_id
 

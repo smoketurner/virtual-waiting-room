@@ -66,18 +66,26 @@
 
       <noscript>
         <p class="note error">
-          You are not in line yet. This waiting room needs JavaScript to take
-          your place in line and let you through when it's your turn. Turn on
-          JavaScript for this site, then reload this page.
+          You are not in line yet. Join below: it works without JavaScript,
+          on a page that refreshes itself while you wait.
         </p>
+        <form method="post" action="/v1/enter">
+          <button type="submit">Join the line</button>
+        </form>
       </noscript>
+
+      <!-- Shown by the script tag's onerror: JavaScript is on, but the
+           waiting room's own script did not load. -->
+      <form id="nojs-join" method="post" action="/v1/enter" hidden>
+        <button type="submit">Join the line without the script</button>
+      </form>
     </main>
 
     <!-- A script that is blocked or fails to download would otherwise leave
          "Getting your place in line…" on screen forever with no join sent. -->
     <script
       src="/_wr/waiting.js"
-      onerror="document.getElementById('headline').textContent='You are not in line yet';document.getElementById('subhead').textContent='This page could not load the script that takes your place in line. Check that nothing is blocking scripts on this site, then reload this page.';document.getElementById('note').hidden=true"
+      onerror="document.getElementById('headline').textContent='You are not in line yet';document.getElementById('subhead').textContent='This page could not load the script that takes your place in line. Reload to try again, or join below without it.';document.getElementById('note').hidden=true;document.getElementById('nojs-join').hidden=false"
     ></script>
   </body>
 </html>

@@ -376,6 +376,15 @@ test("a successful redemption falls back to / when next is absent", async () => 
   assert.equal(client.win.location.replacedTo, "/");
 });
 
+test("a successful redemption rejects a backslash next= that browsers treat as //", async () => {
+  const client = loadClient({
+    route: admittedRoute(),
+    locationSearch: "?next=" + encodeURIComponent("/\\evil.example/phish"),
+  });
+  await client.flush();
+  assert.equal(client.win.location.replacedTo, "/");
+});
+
 test("a successful redemption rejects a next= that would navigate off-site", async () => {
   const client = loadClient({
     route: admittedRoute(),

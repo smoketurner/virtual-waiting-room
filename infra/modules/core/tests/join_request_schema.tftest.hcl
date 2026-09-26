@@ -23,6 +23,7 @@ variables {
   admin_artifact_path           = "tests/fixtures/bootstrap.zip"
   controller_artifact_path      = "tests/fixtures/bootstrap.zip"
   generate_token_artifact_path  = "tests/fixtures/bootstrap.zip"
+  nojs_artifact_path            = "tests/fixtures/bootstrap.zip"
 
   # The admin Lambda's preconditions refuse a stack whose control plane cannot
   # start, so a test harness has to describe a deployable configuration.

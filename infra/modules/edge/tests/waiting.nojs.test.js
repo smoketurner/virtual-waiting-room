@@ -15,11 +15,12 @@ const HTML = fs.readFileSync(
   "utf8",
 );
 
-test("with JavaScript off, the page says the visitor is not in line", () => {
+test("with JavaScript off, the page says the visitor is not in line and offers the form", () => {
   const bodyNotice = HTML.match(/<main[\s\S]*<noscript>([\s\S]*?)<\/noscript>/);
   assert.ok(bodyNotice, "the body carries a <noscript> notice");
   assert.match(bodyNotice[1], /not in line/);
-  assert.match(bodyNotice[1], /Turn on\s+JavaScript/);
+  // Issue #67: a plain form into the server-rendered queue, no script needed.
+  assert.match(bodyNotice[1], /<form method="post" action="\/v1\/enter">/);
 });
 
 test("with JavaScript off, the let-through promise is hidden", () => {
@@ -37,10 +38,13 @@ test("a script that fails to load replaces the headline", () => {
     headline: { textContent: "Getting your place in line…" },
     subhead: { textContent: "Keep this page open." },
     note: { hidden: false },
+    "nojs-join": { hidden: true },
   };
   const document = { getElementById: (id) => nodes[id] };
   vm.runInNewContext(onerror[1], { document });
   assert.equal(nodes.headline.textContent, "You are not in line yet");
-  assert.match(nodes.subhead.textContent, /reload this page/);
+  assert.match(nodes.subhead.textContent, /Reload to try again, or join below/);
   assert.equal(nodes.note.hidden, true);
+  assert.equal(nodes["nojs-join"].hidden, false, "the script-free form is offered instead");
+  assert.match(HTML, /<form id="nojs-join" method="post" action="\/v1\/enter" hidden>/);
 });

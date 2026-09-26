@@ -45,7 +45,9 @@ locals {
   # own behaviour below (issue #59) because it alone needs the CloudFront-
   # generated viewer headers, which are not viewer headers the managed
   # AllViewerExceptHostHeader policy forwards.
-  write_paths = ["/v1/generate_token"]
+  # The no-JavaScript queue (issue #67) mints the same session through the
+  # same admission path, so it needs what generate_token needs.
+  write_paths = ["/v1/generate_token", "/v1/enter", "/v1/wait"]
   join_path   = "/v1/join"
 
   # Admin control plane (ADR-0016): the operator dashboard + OIDC login, plus its

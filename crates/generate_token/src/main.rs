@@ -13,7 +13,8 @@ use std::env;
 
 use generate_token::dynamo::DynamoStore;
 use generate_token::{
-    Admission, DEFAULT_SESSION_TTL_SECS, Denied, Minting, Store, admit, viewer_ip,
+    Admission, DEFAULT_SESSION_TTL_SECS, Denied, Minting, Store, admit, session_set_cookie,
+    viewer_ip,
 };
 use lambda_http::{Body, Error, Request, RequestExt, Response, run, service_fn};
 use tracing::info;
@@ -141,9 +142,10 @@ async fn handle<S: Store>(state: &AppState<S>, req: Request) -> Result<Response<
             );
         }
     };
-    let set_cookie = format!(
-        "{}={}; Path=/; Max-Age={}; Secure; HttpOnly; SameSite=Lax",
-        state.session_cookie_name, credential, state.session_ttl_secs
+    let set_cookie = session_set_cookie(
+        &state.session_cookie_name,
+        &credential,
+        state.session_ttl_secs,
     );
 
     info!(position, "admitted");

@@ -35,6 +35,7 @@ crates/                       Rust workspace — one crate per Lambda + shared l
   open_event/                 T−0 conditional open
   read/                       /v1/status, /v1/queue_num
   generate_token/             Admission check + signed session cookie minting (issue #71)
+  nojs/                       The queue without JavaScript: form join + server-rendered wait page (ADR-0037)
   controller/                 Outflow control
   admin/                      Axum operator UI and /admin/* actions, including the edge gate's
                               KeyValueStore writer (edge.rs)

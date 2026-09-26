@@ -40,6 +40,7 @@ locals {
   admin_name           = "${var.name_prefix}-admin"
   controller_name      = "${var.name_prefix}-controller"
   generate_token_name  = "${var.name_prefix}-generate-token"
+  nojs_name            = "${var.name_prefix}-nojs"
 
   # warm_throughput is omitted from the table entirely when both units are 0, so
   # an un-warmed table stays at the on-demand cold baseline (idle default, no
@@ -56,6 +57,7 @@ locals {
     admin           = var.admin_artifact_path
     controller      = var.controller_artifact_path
     generate_token  = var.generate_token_artifact_path
+    nojs            = var.nojs_artifact_path
   }
 
   lambda_hash = { for name, path in local.lambda_zip : name => filebase64sha256(path) }

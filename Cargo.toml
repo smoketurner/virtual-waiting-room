@@ -6,6 +6,7 @@ members = [
     "crates/controller",
     "crates/generate_token",
     "crates/harness",
+    "crates/nojs",
     "crates/read",
     "crates/open_event",
     "crates/wr-common",
@@ -29,6 +30,7 @@ aws-sdk-cloudfrontkeyvaluestore = { version = "=1.104.0", default-features = fal
 aws-sdk-dynamodb = { version = "=1.124.0", default-features = false }
 aws-sdk-lambda = { version = "=1.144.0", default-features = false }
 aws-sdk-scheduler = { version = "=1.109.0", default-features = false }
+aws-sdk-sqs = { version = "=1.109.0", default-features = false }
 aws-sdk-ssm = { version = "=1.122.0", default-features = false }
 aws_lambda_events = { version = "=1.2.0", default-features = false }
 axum = { version = "=0.8.9", default-features = false }
@@ -55,6 +57,7 @@ tower-http = { version = "=0.7.1", default-features = false }
 tracing = { version = "=0.1.44", default-features = false }
 tracing-subscriber = { version = "=0.3.23", default-features = false }
 uuid = { version = "=1.26.1", default-features = false }
+generate_token = { path = "crates/generate_token", version = "=0.1.0" }
 wr-common = { path = "crates/wr-common", version = "=0.1.0" }
 
 [workspace.lints.clippy]

@@ -315,6 +315,14 @@ impl PossessionSecret {
         }
     }
 
+    /// The secret itself, for the one place that must hand it back to the
+    /// visitor who owns it: the no-JavaScript entry's `HttpOnly` cookie (issue
+    /// #67). Named so that every other use stands out in review.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
     /// `base64url(SHA-256(secret))`, over the secret's ASCII form, which is
     /// what the browser hashes with `crypto.subtle.digest`.
     #[must_use]

@@ -559,14 +559,15 @@ releases and releasing more to cover the gap.
 | `/status` | 1 s | path only | none | Phase, serving position, admission rate, operator message, adaptive poll policy ([#69](https://github.com/smoketurner/virtual-waiting-room/issues/69), ADR-0023); after T−0 also `shuffle_seed`, `participant_count`, `prequeue_offsets` |
 | `/queue_num` | 1 s | path + `event_id`, `request_id` | none | Own position; 404 means re-join |
 | `/join` | uncached | — | none | Join the queue or pre-queue |
-| `/generate_token` | uncached | — | none | Exchange a served position for the CloudFront admission cookies |
+| `/generate_token` | uncached | — | none | Exchange a served position (and the possession secret, ADR-0035) for the session cookie |
+| `/enter`, `/wait` | uncached | — | none | The queue without JavaScript: a form post that joins, and a self-refreshing page that admits (ADR-0037) |
 
 ### Cache behaviours
 
 | Behaviour | Path pattern | Caching | Cookies | Origin |
 |---|---|---|---|---|
 | Polled | `/status`, `/queue_num` | Min TTL 1 s | none | API Gateway |
-| Write | `/join`, `/generate_token` | disabled | none | API Gateway |
+| Write | `/join`, `/generate_token`, `/enter`, `/wait` | disabled | all (Set-Cookie survives) except `/join` | API Gateway |
 | Protected origin | `/*` (default) | disabled | session cookie forwarded | Operator origin, gated by a CloudFront Function at viewer-request (ADR-0021, issue #71) |
 | Waiting page | `/_wr/*` | cached | none | S3, deliberately ungated — this is what a refused visitor sees |
 

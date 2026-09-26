@@ -336,7 +336,8 @@
     } catch (e) {
       return "/";
     }
-    if (next.charAt(0) !== "/" || next.charAt(1) === "/") {
+    // A browser reads "/\host" as "//host", which leaves the site.
+    if (next.charAt(0) !== "/" || next.charAt(1) === "/" || next.charAt(1) === "\\") {
       return "/";
     }
     return next;

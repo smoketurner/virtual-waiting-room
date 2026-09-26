@@ -40,6 +40,7 @@ One record per decision. Each states the context, the decision, and its conseque
 | [0034](0034-single-region-failure-domain.md) | The waiting room is single-region, and fails open around a regional impairment |
 | [0035](0035-request-id-proof-of-possession.md) | A request id is redeemed only with the secret it joined with (amends 0010) |
 | [0036](0036-optional-session-ip-binding.md) | Sessions can be bound to the visitor's network, off by default |
+| [0037](0037-no-javascript-queue.md) | A visitor without JavaScript queues through a small server-rendered path |
 
 ## Open
 

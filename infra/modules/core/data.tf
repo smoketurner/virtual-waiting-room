@@ -388,6 +388,19 @@ data "aws_iam_policy_document" "scheduler_assume_role" {
 
 # generate_token: read the counters and the visitor's position, claim the
 # admission, count the arrival, and read the signing key.
+# nojs (issue #67): generate_token's grants, because it admits through the
+# same code, plus SendMessage on the join queue its form post joins through.
+data "aws_iam_policy_document" "nojs" {
+  source_policy_documents = [data.aws_iam_policy_document.generate_token.json]
+
+  statement {
+    sid       = "Join"
+    effect    = "Allow"
+    actions   = ["sqs:SendMessage"]
+    resources = [aws_sqs_queue.join.arn]
+  }
+}
+
 data "aws_iam_policy_document" "generate_token" {
   statement {
     sid     = "ReadQueueState"

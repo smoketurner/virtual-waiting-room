@@ -89,12 +89,14 @@ resource "aws_cloudfront_origin_request_policy" "join" {
   }
 }
 
-# --- Origin request policy (/v1/generate_token) -------------------------------
+# --- Origin request policy (/v1/generate_token, /v1/enter, /v1/wait) ----------
 # Cookies, because a behaviour that forwards none has its Set-Cookie response
-# headers stripped, and minting the session cookie is this path's whole job.
+# headers stripped, and minting the session cookie is these paths' whole job.
 # CloudFront-Viewer-Address, because the session is tagged with the viewer's
 # network for optional IP binding (issue #61, ADR-0036) and API Gateway
-# otherwise sees only the edge's address. No Host: API Gateway rejects it.
+# otherwise sees only the edge's address. Referer, because the waiting page's
+# no-JavaScript form (issue #67) cannot copy its own next= into the post. No
+# Host: API Gateway rejects it.
 resource "aws_cloudfront_origin_request_policy" "generate_token" {
   name    = "${var.name_prefix}-generate-token"
   comment = "POST /v1/generate_token: cookies (Set-Cookie survives), the viewer address, the body type."
@@ -105,7 +107,7 @@ resource "aws_cloudfront_origin_request_policy" "generate_token" {
   headers_config {
     header_behavior = "whitelist"
     headers {
-      items = ["content-type", "CloudFront-Viewer-Address"]
+      items = ["content-type", "referer", "CloudFront-Viewer-Address"]
     }
   }
   query_strings_config {
