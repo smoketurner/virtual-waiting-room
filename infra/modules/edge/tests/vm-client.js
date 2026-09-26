@@ -12,6 +12,7 @@
 
 "use strict";
 
+const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
@@ -79,6 +80,8 @@ function loadClient({
   // tier is failing, writes are silently dropped — which is exactly why
   // storeDurable reads back rather than trusting that no exception was thrown.
   const jar = new Map();
+  // Every raw assignment, attributes included, so a test can see the path.
+  const cookieWrites = [];
   if (cookie) {
     for (const pair of String(cookie).split(";")) {
       const [k, ...rest] = pair.trim().split("=");
@@ -93,6 +96,16 @@ function loadClient({
     sessionStorage: storageOf("session"),
     crypto: {
       getRandomValues: (a) => a.fill(7),
+      // Real SHA-256 (the page hashes its possession secret, issue #62), but
+      // settled as a microtask: webcrypto's own digest runs on the thread
+      // pool, which flush() does not wait for.
+      subtle: {
+        digest: (alg, data) => {
+          assert.equal(alg, "SHA-256");
+          const out = require("node:crypto").createHash("sha256").update(data).digest();
+          return Promise.resolve(out.buffer.slice(out.byteOffset, out.byteOffset + out.length));
+        },
+      },
     },
     location: {
       search: locationSearch || "",
@@ -118,6 +131,7 @@ function loadClient({
       return [...jar.entries()].map(([k, v]) => `${k}=${v}`).join("; ");
     },
     set cookie(value) {
+      cookieWrites.push(String(value));
       const [pair] = String(value).split(";");
       const [k, ...rest] = pair.trim().split("=");
       if (!k) {
@@ -183,6 +197,7 @@ function loadClient({
     doc,
     clock,
     calls,
+    cookieWrites,
     timers,
     elements,
     /** Live (uncancelled) timers, oldest first. */

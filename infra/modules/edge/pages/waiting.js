@@ -5,8 +5,10 @@
 // thing a visitor must never lose is their position.
 //
 // The flow:
-//   1. mint or recover a request id, persisted in localStorage
-//   2. POST it to /v1/join once, so a position is claimed
+//   1. mint or recover a request id and its possession secret (issue #62),
+//      persisted together across the storage chain below
+//   2. POST the id and SHA-256(secret) to /v1/join once, so a position is
+//      claimed; the secret itself goes only to /v1/generate_token
 //   3. poll /v1/status and /v1/queue_num
 //   4. once the position is reached, POST /v1/generate_token to collect the
 //      admission cookies, then reload onto the origin
@@ -14,7 +16,12 @@
 (function () {
   "use strict";
 
-  var STORAGE_KEY = "vwr_request_id";
+  // "<request_id>.<secret>" as one value, so the id is never recovered
+  // without the secret that proves it (issue #62). Replaces vwr_request_id,
+  // which held the id alone and is cleared on sight.
+  var IDENTITY_KEY = "vwr_identity";
+  var LEGACY_ID_KEY = "vwr_request_id";
+  var IDENTITY_RE = /^([0-9a-f-]{36})\.([A-Za-z0-9_-]{43})$/;
   var JOINED_KEY = "vwr_joined";
   var AHEAD_AT_START_KEY = "vwr_ahead_at_start";
 
@@ -180,13 +187,21 @@
     return null;
   }
 
+  // The identity's cookie is scoped to the waiting room's own path: at "/"
+  // the browser would send the secret to the origin on every request.
+  function cookiePath(name) {
+    return name === IDENTITY_KEY ? "/_wr/" : "/";
+  }
+
   function cookieSet(name, value) {
     try {
       document.cookie =
         name +
         "=" +
         encodeURIComponent(value) +
-        ";path=/;max-age=86400;SameSite=Lax;Secure";
+        ";path=" +
+        cookiePath(name) +
+        ";max-age=86400;SameSite=Lax;Secure";
       return cookieGet(name) === value;
     } catch (e) {
       return false;
@@ -228,7 +243,8 @@
       /* tier unavailable */
     }
     try {
-      document.cookie = key + "=;path=/;max-age=0;SameSite=Lax;Secure";
+      document.cookie =
+        key + "=;path=" + cookiePath(key) + ";max-age=0;SameSite=Lax;Secure";
     } catch (e) {
       /* tier unavailable */
     }
@@ -236,17 +252,60 @@
   }
 
   var requestId = null;
+  var secret = null;
 
-  // Resolves the identity this page queues under, before the first poll. The id
-  // survives a reload through the storage chain above; a visitor whose every
-  // tier fails mints a fresh one and so takes a new place rather than
-  // recovering their old one.
-  function resolveIdentity() {
-    requestId = readStored(STORAGE_KEY);
-    if (!requestId) {
-      requestId = uuidv7();
-      writeStored(STORAGE_KEY, requestId);
+  function base64url(bytes) {
+    var abc = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    var out = "";
+    for (var i = 0; i < bytes.length; i += 3) {
+      var n = (bytes[i] << 16) | ((bytes[i + 1] || 0) << 8) | (bytes[i + 2] || 0);
+      out += abc[(n >> 18) & 63] + abc[(n >> 12) & 63];
+      if (i + 1 < bytes.length) {
+        out += abc[(n >> 6) & 63];
+      }
+      if (i + 2 < bytes.length) {
+        out += abc[n & 63];
+      }
     }
+    return out;
+  }
+
+  // Resolves the identity this page queues under, before the first poll. The
+  // id and its secret survive a reload together through the storage chain
+  // above; a visitor whose every tier fails mints a fresh pair and so takes a
+  // new place rather than recovering their old one. A legacy bare id cannot
+  // be redeemed (it has no secret behind it), so it is replaced, not reused.
+  function resolveIdentity() {
+    var match = IDENTITY_RE.exec(readStored(IDENTITY_KEY) || "");
+    if (match) {
+      requestId = match[1];
+      secret = match[2];
+      return;
+    }
+    removeStored(LEGACY_ID_KEY);
+    var bytes = new Uint8Array(32);
+    crypto.getRandomValues(bytes);
+    requestId = uuidv7();
+    secret = base64url(bytes);
+    writeStored(IDENTITY_KEY, requestId + "." + secret);
+  }
+
+  // base64url(SHA-256(secret)) over the secret's ASCII, which is what
+  // /v1/join stores and wr_common::PossessionSecret::digest recomputes.
+  var digestPromise = null;
+  function secretDigest() {
+    if (!digestPromise) {
+      var ascii = new Uint8Array(secret.length);
+      for (var i = 0; i < secret.length; i++) {
+        ascii[i] = secret.charCodeAt(i);
+      }
+      digestPromise = crypto.subtle
+        .digest("SHA-256", ascii)
+        .then(function (buf) {
+          return base64url(new Uint8Array(buf));
+        });
+    }
+    return digestPromise;
   }
 
   // Learned from /status. The join request is validated at the edge against a
@@ -366,9 +425,20 @@
       );
       return Promise.resolve();
     }
+    if (!crypto.subtle) {
+      // Only an insecure (http) page lacks it, and the join cannot be made
+      // without the digest.
+      giveUp("This page must be opened over https to hold your place in line.");
+      return Promise.resolve();
+    }
     joinAttempts += 1;
-    var body = { request_id: requestId, event_id: eventId };
-    return postJSON("/v1/join", body).then(function (res) {
+    return secretDigest().then(function (h) {
+      return postJSON("/v1/join", {
+        request_id: requestId,
+        event_id: eventId,
+        h: h,
+      });
+    }).then(function (res) {
       // Only a request the ingest accepted claims a place. postJSON resolves
       // for any status, so recording unconditionally marks a rejected join as
       // done and leaves the visitor polling a position nothing will ever write.
@@ -705,6 +775,7 @@
     return postJSON("/v1/generate_token", {
       request_id: requestId,
       event_id: eventId,
+      secret: secret,
     }).then(function (res) {
       if (res.status === 200 && res.body.admitted) {
         say("You're through", "Taking you to the site…");
@@ -715,10 +786,12 @@
       // Not admitted after all: the cursor moved back, the position expired, or
       // the operator paused. Fall back to polling rather than hammering.
       admitting = false;
-      if (res.status === 410) {
+      if (res.status === 403) {
+        // The secret this browser holds is not the one the place was taken
+        // with (issue #62). Nothing on this page can recover that.
         say(
-          "Your place expired",
-          "You waited longer than the hold allows. Reload to take a new place in line."
+          "We couldn't confirm this place is yours",
+          "Open the waiting room again from the link you were given to take a new place."
         );
         stop();
       }

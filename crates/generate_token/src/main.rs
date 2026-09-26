@@ -15,7 +15,7 @@ use generate_token::dynamo::DynamoStore;
 use generate_token::{AdmissionClaim, DEFAULT_SESSION_TTL_SECS, Denied, Store, decide};
 use lambda_http::{Body, Error, Request, RequestExt, Response, run, service_fn};
 use tracing::{error, info};
-use wr_common::{Session, SigningKey};
+use wr_common::{PossessionSecret, Session, SigningKey};
 
 /// Resolved once at cold start and shared across invocations. Parameterized
 /// over [`Store`] so the handler's branching — what it loads, and in what
@@ -99,6 +99,9 @@ async fn handle<S: Store>(state: &AppState<S>, req: Request) -> Result<Response<
     let Some(request_id) = request_id(&req) else {
         return json(400, &serde_json::json!({ "error": "request_id required" }));
     };
+    let Some(secret) = possession_secret(&req) else {
+        return json(400, &serde_json::json!({ "error": "secret required" }));
+    };
 
     let Some(counters) = state.store.load_counters(&state.event_id).await? else {
         return json(404, &serde_json::json!({ "error": "event not found" }));
@@ -114,7 +117,13 @@ async fn handle<S: Store>(state: &AppState<S>, req: Request) -> Result<Response<
     };
 
     let now = now_secs();
-    let grant = match decide(&counters, prequeue.as_ref(), position_row, now) {
+    let grant = match decide(
+        &counters,
+        prequeue.as_ref(),
+        position_row.as_ref(),
+        &secret,
+        now,
+    ) {
         Ok(grant) => grant,
         Err(denied) => return refusal(&denied),
     };
@@ -134,7 +143,7 @@ async fn handle<S: Store>(state: &AppState<S>, req: Request) -> Result<Response<
     // admission.
     let claim = match state
         .store
-        .claim_admission(&request_id, grant.position, now)
+        .claim_admission(&request_id, grant.position, &grant.digest, now)
         .await
     {
         Ok(claim) => claim,
@@ -236,6 +245,16 @@ fn request_id(req: &Request) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The possession secret (issue #62), from the JSON body only: a query string
+/// is written to access logs and browser history, which is exactly where the
+/// `request_id` it protects already leaks.
+fn possession_secret(req: &Request) -> Option<PossessionSecret> {
+    let body = std::str::from_utf8(req.body()).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
+    let raw = parsed.get("secret").and_then(serde_json::Value::as_str)?;
+    PossessionSecret::parse(raw).ok()
+}
+
 /// Maps a refusal to a status the waiting page can act on: 425 means "keep
 /// polling", everything else means "stop and show why".
 fn refusal(denied: &Denied) -> Result<Response<Body>, Error> {
@@ -243,6 +262,7 @@ fn refusal(denied: &Denied) -> Result<Response<Body>, Error> {
         Denied::StillQueued { .. } => 425,
         Denied::NotAdmitting | Denied::NotOpen => 409,
         Denied::NotRegistered => 404,
+        Denied::NotHolder => 403,
         Denied::Corrupt => 500,
     };
     let mut payload = serde_json::json!({
@@ -280,7 +300,7 @@ mod tests {
     /// "admitted and counted" from "admitted without counting".
     struct FakeStore {
         counters: Counters,
-        position: Option<(u64, PositionStatus)>,
+        position: Option<generate_token::PositionRow>,
         prequeue: Option<PreQueueItem>,
         /// How many times the admission has already been claimed. The first
         /// claim wins, mirroring the conditional write.
@@ -309,7 +329,7 @@ mod tests {
                     fail_open_until: 0,
                     starts_at: None,
                 },
-                position: Some((3, PositionStatus::Issued)),
+                position: Some(row(3)),
                 prequeue: None,
                 claims: Mutex::new(0),
                 arrivals: Mutex::new(0),
@@ -342,15 +362,17 @@ mod tests {
         fn load_position(
             &self,
             _request_id: &str,
-        ) -> impl std::future::Future<Output = Result<Option<(u64, PositionStatus)>, StoreError>> + Send
-        {
-            std::future::ready(Ok(self.position))
+        ) -> impl std::future::Future<
+            Output = Result<Option<generate_token::PositionRow>, StoreError>,
+        > + Send {
+            std::future::ready(Ok(self.position.clone()))
         }
 
         fn claim_admission(
             &self,
             _request_id: &str,
             _position: u64,
+            _digest: &wr_common::SecretDigest,
             _now: u64,
         ) -> impl std::future::Future<Output = Result<AdmissionClaim, StoreError>> + Send {
             let result = if self.claim_fails {
@@ -391,7 +413,19 @@ mod tests {
     /// The request id travels in the body here; the query-string form needs the
     /// Lambda request context the runtime attaches.
     fn request() -> Request {
-        Request::new(Body::from(r#"{"request_id":"r1"}"#))
+        Request::new(Body::from(format!(
+            r#"{{"request_id":"r1","secret":"{SECRET}"}}"#
+        )))
+    }
+
+    const SECRET: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    fn row(position: u64) -> generate_token::PositionRow {
+        generate_token::PositionRow {
+            position,
+            status: PositionStatus::Issued,
+            digest: Some(PossessionSecret::parse(SECRET).unwrap().digest()),
+        }
     }
 
     #[tokio::test]
@@ -438,7 +472,7 @@ mod tests {
         // the queue leaves no row behind and no arrival counted -- otherwise
         // polling would count an arrival for everyone waiting.
         let mut store = FakeStore::admitting();
-        store.position = Some((70, PositionStatus::Issued));
+        store.position = Some(row(70));
         let state = state(store);
 
         let response = handle(&state, request()).await.unwrap();
@@ -446,5 +480,45 @@ mod tests {
         assert_eq!(response.status(), 425);
         assert_eq!(*state.store.claims.lock().unwrap(), 0);
         assert_eq!(state.store.arrivals(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_request_id_alone_mints_nothing() {
+        // Issue #62: a request id read from a log or a shared URL, presented
+        // with no secret or with the wrong one, gets no cookie, no claim, and
+        // no position in the answer.
+        let state = state(FakeStore::admitting());
+        for body in [
+            r#"{"request_id":"r1"}"#.to_owned(),
+            r#"{"request_id":"r1","secret":"short"}"#.to_owned(),
+            format!(r#"{{"request_id":"r1","secret":"{}"}}"#, "B".repeat(43)),
+        ] {
+            let response = handle(&state, Request::new(Body::from(body.clone())))
+                .await
+                .unwrap();
+            assert!(
+                matches!(response.status().as_u16(), 400 | 403),
+                "{body}: {}",
+                response.status()
+            );
+            assert!(!response.headers().contains_key("set-cookie"), "{body}");
+            let text = std::str::from_utf8(response.body()).unwrap();
+            assert!(!text.contains("position"), "{body}: {text}");
+        }
+        assert_eq!(*state.store.claims.lock().unwrap(), 0);
+        assert_eq!(state.store.arrivals(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_secret_in_the_query_string_is_not_accepted() {
+        // Accepting it there would put the credential back in access logs.
+        let request =
+            Request::new(Body::from(r#"{"request_id":"r1"}"#)).with_query_string_parameters(
+                std::collections::HashMap::from([("secret".to_owned(), SECRET.to_owned())]),
+            );
+        let response = handle(&state(FakeStore::admitting()), request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400);
     }
 }

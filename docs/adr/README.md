@@ -14,7 +14,7 @@ One record per decision. Each states the context, the decision, and its conseque
 | [0007](0007-single-tenant-deployment.md) | Deploy single-tenant into the client's account |
 | [0008](0008-partition-isolation-not-shuffle-sharding.md) | Isolate concurrent events by partition, not shuffle sharding |
 | [0009](0009-fail-open.md) | Fail open when the waiting room is unavailable |
-| [0010](0010-client-supplied-request-id.md) | Client supplies the request identifier |
+| [0010](0010-client-supplied-request-id.md) | Client supplies the request identifier (amended by 0035) |
 | [0011](0011-session-cookie-after-token.md) | Establish a session after validating the admission token (amended by 0032) |
 | [0012](0012-anti-ddos-count-mode.md) | Ship the anti-DDoS rule group in Count mode |
 | [0013](0013-cache-behaviour-separation.md) | Separate cache behaviours to preserve request collapsing |
@@ -38,6 +38,7 @@ One record per decision. Each states the context, the decision, and its conseque
 | [0032](0032-remove-the-origin-authorizer.md) | Remove the origin authorizer: nothing invoked it, and as wired it forwarded every request |
 | [0033](0033-admission-claimed-once-per-visitor.md) | Admission is claimed once per visitor, and a repeat still admits |
 | [0034](0034-single-region-failure-domain.md) | The waiting room is single-region, and fails open around a regional impairment |
+| [0035](0035-request-id-proof-of-possession.md) | A request id is redeemed only with the secret it joined with (amends 0010) |
 
 ## Open
 

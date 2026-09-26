@@ -14,7 +14,8 @@
 use std::future::Future;
 
 use wr_common::{
-    Counters, Phase, PositionStatus, PreQueueItem, ResolveError, ResolvedPosition, Shard,
+    Counters, Phase, PositionStatus, PossessionSecret, PreQueueItem, ResolveError,
+    ResolvedPosition, SecretDigest, Shard,
 };
 
 pub mod dynamo;
@@ -43,12 +44,12 @@ pub trait Store {
         request_id: &str,
     ) -> impl Future<Output = Result<Option<PreQueueItem>, StoreError>> + Send;
 
-    /// Reads a live joiner's `Positions` row: the claimed position and its
-    /// current status.
+    /// Reads a visitor's `Positions` row: the claimed position, its current
+    /// status, and the possession digest it was written with.
     fn load_position(
         &self,
         request_id: &str,
-    ) -> impl Future<Output = Result<Option<(u64, PositionStatus)>, StoreError>> + Send;
+    ) -> impl Future<Output = Result<Option<PositionRow>, StoreError>> + Send;
 
     /// Claims this visitor's one admission, reporting whether this call was the
     /// one that claimed it.
@@ -58,10 +59,15 @@ pub trait Store {
     /// exactly once: `record_arrival` is an unconditional `ADD`, and
     /// `request_id` travels in a URL, so without a claim a reloaded page counts
     /// a second arrival against one release.
+    ///
+    /// `digest` is the one the presented secret was verified against. It is
+    /// written onto a row this claim creates, so a pre-queue member's later
+    /// calls — which read `Positions` first — still have one to verify.
     fn claim_admission(
         &self,
         request_id: &str,
         position: u64,
+        digest: &SecretDigest,
         now: u64,
     ) -> impl Future<Output = Result<AdmissionClaim, StoreError>> + Send;
 
@@ -72,6 +78,16 @@ pub trait Store {
         event_id: &str,
         shard: Shard,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
+}
+
+/// A `Positions` row as the admission check reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PositionRow {
+    pub position: u64,
+    pub status: PositionStatus,
+    /// Absent only on a row written before issue #62, which cannot be
+    /// redeemed.
+    pub digest: Option<SecretDigest>,
 }
 
 /// Whether an admission claim was this call's to make.
@@ -106,6 +122,10 @@ pub enum Denied {
     /// The stored registration is corrupt.
     #[error("corrupt registration")]
     Corrupt,
+    /// The caller does not hold the secret this `request_id` joined with
+    /// (issue #62): knowing the id is not enough to be admitted as it.
+    #[error("not the holder of this place in line")]
+    NotHolder,
 }
 
 /// An admitted visitor: the position that was reached. The arrival shard is no
@@ -115,6 +135,8 @@ pub enum Denied {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Grant {
     pub position: u64,
+    /// The digest the secret was verified against, for the admission claim.
+    pub digest: SecretDigest,
 }
 
 /// Decides whether the visitor may be admitted.
@@ -131,10 +153,25 @@ pub struct Grant {
 pub fn decide(
     counters: &Counters,
     prequeue: Option<&PreQueueItem>,
-    position_row: Option<(u64, PositionStatus)>,
+    position_row: Option<&PositionRow>,
+    presented: &PossessionSecret,
     now: u64,
 ) -> Result<Grant, Denied> {
     use wr_common::AdmissionControl;
+
+    // Possession first (issue #62): a caller who only knows the request id
+    // learns nothing further here -- not the queue state, not the position.
+    // The row that would answer the position is the row whose digest counts.
+    let stored = match (position_row, prequeue) {
+        (Some(row), _) => row.digest.as_ref(),
+        (None, Some(row)) => row.h.as_ref(),
+        (None, None) => return Err(Denied::NotRegistered),
+    };
+    let digest = match stored {
+        Some(d) if d.is_digest_of(presented) => d.clone(),
+        Some(_) | None => return Err(Denied::NotHolder),
+    };
+
     match wr_common::resolve(counters.stored_control, counters.fail_open_until, now) {
         AdmissionControl::Open => {}
         AdmissionControl::Paused | AdmissionControl::FailOpen => return Err(Denied::NotAdmitting),
@@ -152,7 +189,7 @@ pub fn decide(
         });
     }
 
-    Ok(Grant { position })
+    Ok(Grant { position, digest })
 }
 
 /// The visitor's position, from whichever path registered them. A live-join
@@ -162,9 +199,12 @@ pub fn decide(
 fn resolve_position(
     counters: &Counters,
     prequeue: Option<&PreQueueItem>,
-    position_row: Option<(u64, PositionStatus)>,
+    position_row: Option<&PositionRow>,
 ) -> Result<u64, Denied> {
-    if let Some((position, status)) = position_row {
+    if let Some(&PositionRow {
+        position, status, ..
+    }) = position_row
+    {
         return match status {
             // An already-admitted row is still a valid claim on the position.
             // Refusing one would strand a visitor whose first response never
@@ -223,16 +263,46 @@ mod tests {
 
     const REQ: &str = "018f3a2b-7c9d-7e1f-abcd-0123456789ab";
 
+    fn secret() -> PossessionSecret {
+        PossessionSecret::parse("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap()
+    }
+
+    fn digest() -> SecretDigest {
+        secret().digest()
+    }
+
+    fn row(position: u64, status: PositionStatus) -> PositionRow {
+        PositionRow {
+            position,
+            status,
+            digest: Some(digest()),
+        }
+    }
+
     #[test]
     fn a_reached_position_is_admitted() {
         // Live joiner holding position 3, cursor past it.
-        let grant = decide(&counters(10), None, Some((3, PositionStatus::Issued)), 0).unwrap();
+        let grant = decide(
+            &counters(10),
+            None,
+            Some(&row(3, PositionStatus::Issued)),
+            &secret(),
+            0,
+        )
+        .unwrap();
         assert_eq!(grant.position, 3);
     }
 
     #[test]
     fn a_position_not_yet_reached_is_refused() {
-        let err = decide(&counters(3), None, Some((7, PositionStatus::Issued)), 0).unwrap_err();
+        let err = decide(
+            &counters(3),
+            None,
+            Some(&row(7, PositionStatus::Issued)),
+            &secret(),
+            0,
+        )
+        .unwrap_err();
         assert_eq!(
             err,
             Denied::StillQueued {
@@ -247,8 +317,26 @@ mod tests {
         // serving_counter is the count released, so position N is admitted only
         // once the cursor has passed it. Off by one here admits one visitor too
         // many on every interval.
-        assert!(decide(&counters(5), None, Some((4, PositionStatus::Issued)), 0,).is_ok());
-        assert!(decide(&counters(5), None, Some((5, PositionStatus::Issued)), 0,).is_err());
+        assert!(
+            decide(
+                &counters(5),
+                None,
+                Some(&row(4, PositionStatus::Issued)),
+                &secret(),
+                0
+            )
+            .is_ok()
+        );
+        assert!(
+            decide(
+                &counters(5),
+                None,
+                Some(&row(5, PositionStatus::Issued)),
+                &secret(),
+                0
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -256,7 +344,14 @@ mod tests {
         let mut c = counters(10);
         c.stored_control = StoredControl::Paused;
         assert_eq!(
-            decide(&c, None, Some((3, PositionStatus::Issued)), 0).unwrap_err(),
+            decide(
+                &c,
+                None,
+                Some(&row(3, PositionStatus::Issued)),
+                &secret(),
+                0
+            )
+            .unwrap_err(),
             Denied::NotAdmitting
         );
     }
@@ -269,11 +364,27 @@ mod tests {
         let mut c = counters(10);
         c.fail_open_until = 1000;
         assert_eq!(
-            decide(&c, None, Some((3, PositionStatus::Issued)), 500).unwrap_err(),
+            decide(
+                &c,
+                None,
+                Some(&row(3, PositionStatus::Issued)),
+                &secret(),
+                500
+            )
+            .unwrap_err(),
             Denied::NotAdmitting
         );
         // Once the epoch lapses, the stored Open control governs again.
-        assert!(decide(&c, None, Some((3, PositionStatus::Issued)), 1000).is_ok());
+        assert!(
+            decide(
+                &c,
+                None,
+                Some(&row(3, PositionStatus::Issued)),
+                &secret(),
+                1000
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -287,7 +398,14 @@ mod tests {
             let mut c = counters(10);
             c.phase = phase;
             assert_eq!(
-                decide(&c, None, Some((3, PositionStatus::Issued)), 0).unwrap_err(),
+                decide(
+                    &c,
+                    None,
+                    Some(&row(3, PositionStatus::Issued)),
+                    &secret(),
+                    0
+                )
+                .unwrap_err(),
                 Denied::NotAdmitting
             );
         }
@@ -302,8 +420,11 @@ mod tests {
         // that is the claim's job, not this one's.
         for status in [PositionStatus::Issued, PositionStatus::Admitted] {
             assert_eq!(
-                decide(&counters(10), None, Some((3, status)), 0).unwrap(),
-                Grant { position: 3 }
+                decide(&counters(10), None, Some(&row(3, status)), &secret(), 0).unwrap(),
+                Grant {
+                    position: 3,
+                    digest: digest()
+                }
             );
         }
     }
@@ -311,7 +432,7 @@ mod tests {
     #[test]
     fn an_unregistered_visitor_is_refused() {
         assert_eq!(
-            decide(&counters(10), None, None, 0).unwrap_err(),
+            decide(&counters(10), None, None, &secret(), 0).unwrap_err(),
             Denied::NotRegistered
         );
     }
@@ -324,8 +445,9 @@ mod tests {
             s: 3,
             l: 1,
             t: 1_788_000_000,
+            h: Some(digest()),
         };
-        let grant = decide(&c, Some(&row), None, 0).unwrap();
+        let grant = decide(&c, Some(&row), None, &secret(), 0).unwrap();
         // Inside the cohort.
         assert!(grant.position < c.participant_count.unwrap());
     }
@@ -341,9 +463,10 @@ mod tests {
             s: 0,
             l: 0,
             t: 1_788_000_000,
+            h: Some(digest()),
         };
         assert_eq!(
-            decide(&c, Some(&row), None, 0).unwrap_err(),
+            decide(&c, Some(&row), None, &secret(), 0).unwrap_err(),
             Denied::NotOpen
         );
     }
@@ -351,19 +474,87 @@ mod tests {
     #[test]
     fn a_live_join_row_wins_over_a_pre_queue_row() {
         // A straggler has both rows; the claimed live position is authoritative.
-        let row = PreQueueItem {
+        let pq = PreQueueItem {
             r: REQ.to_owned(),
             s: 0,
             l: 0,
             t: 1_788_000_000,
+            h: Some(digest()),
         };
         let grant = decide(
             &counters(100),
-            Some(&row),
-            Some((42, PositionStatus::Issued)),
+            Some(&pq),
+            Some(&row(42, PositionStatus::Issued)),
+            &secret(),
             0,
         )
         .unwrap();
         assert_eq!(grant.position, 42);
+    }
+
+    // --- issue #62: knowing the request id is not enough ----------------------
+
+    #[test]
+    fn the_wrong_secret_is_refused_before_anything_about_the_queue_is_said() {
+        let wrong = PossessionSecret::parse("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB").unwrap();
+        // Even at a reached position, and even while paused (which would
+        // otherwise answer NotAdmitting): possession is checked first.
+        let mut paused = counters(10);
+        paused.stored_control = StoredControl::Paused;
+        for c in [counters(10), counters(3), paused] {
+            assert_eq!(
+                decide(&c, None, Some(&row(3, PositionStatus::Issued)), &wrong, 0).unwrap_err(),
+                Denied::NotHolder
+            );
+        }
+    }
+
+    #[test]
+    fn a_pre_queue_registrant_needs_their_secret_too() {
+        let wrong = PossessionSecret::parse("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB").unwrap();
+        let pq = PreQueueItem {
+            r: REQ.to_owned(),
+            s: 3,
+            l: 1,
+            t: 1_788_000_000,
+            h: Some(digest()),
+        };
+        assert_eq!(
+            decide(&counters(u64::MAX), Some(&pq), None, &wrong, 0).unwrap_err(),
+            Denied::NotHolder
+        );
+    }
+
+    #[test]
+    fn a_row_without_a_digest_cannot_be_redeemed() {
+        let legacy = PositionRow {
+            position: 3,
+            status: PositionStatus::Issued,
+            digest: None,
+        };
+        assert_eq!(
+            decide(&counters(10), None, Some(&legacy), &secret(), 0).unwrap_err(),
+            Denied::NotHolder
+        );
+    }
+
+    #[test]
+    fn the_positions_row_digest_is_the_one_that_counts() {
+        // Once admitted, a pre-queue member's Positions row answers first, so
+        // it must carry the digest (the claim copies it); a PreQueue digest is
+        // not consulted behind it.
+        let pq = PreQueueItem {
+            r: REQ.to_owned(),
+            s: 0,
+            l: 0,
+            t: 1_788_000_000,
+            h: Some(digest()),
+        };
+        let mut admitted = row(3, PositionStatus::Admitted);
+        admitted.digest = None;
+        assert_eq!(
+            decide(&counters(10), Some(&pq), Some(&admitted), &secret(), 0).unwrap_err(),
+            Denied::NotHolder
+        );
     }
 }

@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use aws_sdk_dynamodb::types::AttributeValue;
 use serde::{Deserialize, Serialize};
 
+use crate::crypto::SecretDigest;
 use crate::expr::STARTS_AT_ATTR;
 use crate::ids::{Phase, StoredControl};
 use crate::permutation::{Assignment, CohortOffsets, SHARDS, Seed};
@@ -49,6 +50,11 @@ pub struct PreQueueItem {
     pub l: u64,
     /// Registration timestamp, epoch seconds.
     pub t: u64,
+    /// The digest of the visitor's possession secret (issue #62, ADR-0035).
+    /// Optional on read only so a row from before it existed still decodes;
+    /// `generate_token` refuses a row without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h: Option<SecretDigest>,
 }
 
 /// A `Positions` row.
@@ -70,6 +76,12 @@ pub struct PositionItem {
     /// guaranteed to be present.
     pub entry_time: u64,
     pub status: PositionStatus,
+    /// The digest of the visitor's possession secret (issue #62, ADR-0035),
+    /// written at a live join, or copied from the `PreQueue` row when the
+    /// admission claim creates this row for a pre-queue member. Optional on
+    /// read for the same reason as [`PreQueueItem::h`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h: Option<SecretDigest>,
     /// Post-event storage reclamation only, never an admission deadline
     /// (ADR-0031). A deadline set when the position is issued would expire
     /// people for waiting the length of the queue they are waiting in, so
@@ -393,6 +405,9 @@ mod tests {
             s: 7,
             l: 42,
             t: 1_788_000_000,
+            h: Some(
+                crate::SecretDigest::parse("DwBzhbb51LfusnSGBa_hqYSgo7-j8BTQnip4TOnlzRo").unwrap(),
+            ),
         };
         let av: std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue> =
             serde_dynamo::to_item(&item).unwrap();
@@ -408,6 +423,7 @@ mod tests {
             entry_time: 1_788_000_000,
             status: PositionStatus::Issued,
             ttl: 1_900_000_000,
+            h: None,
         };
         let av: std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue> =
             serde_dynamo::to_item(&item).unwrap();
@@ -422,6 +438,53 @@ mod tests {
     }
 
     #[test]
+    fn a_row_from_before_the_digest_still_decodes_without_one() {
+        // Rows written before issue #62 carry no `h`; the read path must still
+        // decode them (generate_token is what refuses them).
+        use aws_sdk_dynamodb::types::AttributeValue;
+        let av = std::collections::HashMap::from([
+            ("r".to_owned(), AttributeValue::S("req-1".to_owned())),
+            ("s".to_owned(), AttributeValue::N("1".to_owned())),
+            ("l".to_owned(), AttributeValue::N("2".to_owned())),
+            ("t".to_owned(), AttributeValue::N("3".to_owned())),
+        ]);
+        let row: PreQueueItem = serde_dynamo::from_item(av).unwrap();
+        assert_eq!(row.h, None);
+    }
+
+    #[test]
+    fn the_digest_is_stored_under_the_attribute_readers_name() {
+        // generate_token decodes Positions rows by attribute name, not serde.
+        let mut item = PositionItem {
+            request_id: "req-1".to_owned(),
+            queue_position: 1,
+            entry_time: 1,
+            status: PositionStatus::Issued,
+            ttl: 1,
+            h: None,
+        };
+        item.h = Some(
+            crate::SecretDigest::parse("DwBzhbb51LfusnSGBa_hqYSgo7-j8BTQnip4TOnlzRo").unwrap(),
+        );
+        let av: std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue> =
+            serde_dynamo::to_item(&item).unwrap();
+        assert!(av.contains_key(crate::expr::POSSESSION_DIGEST_ATTR));
+    }
+
+    #[test]
+    fn a_malformed_digest_does_not_decode() {
+        use aws_sdk_dynamodb::types::AttributeValue;
+        let av = std::collections::HashMap::from([
+            ("r".to_owned(), AttributeValue::S("req-1".to_owned())),
+            ("s".to_owned(), AttributeValue::N("1".to_owned())),
+            ("l".to_owned(), AttributeValue::N("2".to_owned())),
+            ("t".to_owned(), AttributeValue::N("3".to_owned())),
+            ("h".to_owned(), AttributeValue::S("short".to_owned())),
+        ]);
+        assert!(serde_dynamo::from_item::<_, PreQueueItem>(av).is_err());
+    }
+
+    #[test]
     fn position_and_entry_time_are_separate_numeric_attributes() {
         // The position must not ride in entry_time: a reader looking for a
         // timestamp would parse a queue position, and a reader looking for a
@@ -433,6 +496,7 @@ mod tests {
             entry_time: 1_788_000_000,
             status: PositionStatus::Issued,
             ttl: 1_900_000_000,
+            h: None,
         };
         let av: std::collections::HashMap<String, AttributeValue> =
             serde_dynamo::to_item(&item).unwrap();
@@ -509,6 +573,7 @@ mod tests {
             s,
             l,
             t: 0,
+            h: None,
         }
     }
 

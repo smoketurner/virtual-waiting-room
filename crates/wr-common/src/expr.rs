@@ -90,6 +90,10 @@ pub const STATUS_ATTR: &str = "status";
 /// The position a `Positions` row holds.
 pub const QUEUE_POSITION_ATTR: &str = "queue_position";
 
+/// The possession digest a `PreQueue` or `Positions` row holds (issue #62).
+/// Must match the `h` field name on `PreQueueItem` and `PositionItem`.
+pub const POSSESSION_DIGEST_ATTR: &str = "h";
+
 /// The server-stamped time a `Positions` row was created, epoch seconds.
 pub const ENTRY_TIME_ATTR: &str = "entry_time";
 

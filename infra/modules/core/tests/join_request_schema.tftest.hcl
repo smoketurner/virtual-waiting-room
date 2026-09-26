@@ -51,3 +51,25 @@ run "event_id_is_bounded_by_the_deployment_it_must_match" {
     error_message = "event_id must be capped at the length of this deployment's own event id, which is the only value a legitimate join can carry"
   }
 }
+
+# Issue #62: a join without the possession digest is refused at the edge. A
+# row without one can never be redeemed, so letting it through would burn a
+# position for nobody.
+run "a_join_must_carry_the_possession_digest" {
+  command = plan
+
+  assert {
+    condition     = contains(jsondecode(aws_api_gateway_model.join.schema).required, "h")
+    error_message = "the join schema must require h, the digest of the visitor's possession secret"
+  }
+
+  assert {
+    condition     = jsondecode(aws_api_gateway_model.join.schema).properties.h.pattern == "^[A-Za-z0-9_-]{43}$"
+    error_message = "h is 32 bytes of unpadded base64url"
+  }
+
+  assert {
+    condition     = !contains(keys(jsondecode(aws_api_gateway_model.join.schema).properties), "secret")
+    error_message = "the secret itself must never be accepted by the join"
+  }
+}

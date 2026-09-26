@@ -1,4 +1,4 @@
-//! Signed session cookies.
+//! Signed session cookies, and the proof of possession behind a request id.
 //!
 //! Both are JSON Web Signatures in compact serialization — a JWT — signed
 //! `HS256` under a per-deployment key. An origin, a proxy or an operator can
@@ -221,12 +221,155 @@ fn verify_claims(key: &SigningKey, kind: Kind, credential: &str) -> Result<Claim
     })
 }
 
+/// The length of a [`PossessionSecret`] and of a [`SecretDigest`]: 32 bytes as
+/// unpadded base64url.
+const POSSESSION_B64_LEN: usize = 43;
+
+fn is_b64url_32(s: &str) -> bool {
+    s.len() == POSSESSION_B64_LEN
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// The visitor's proof that a `request_id` is theirs (issue #62, ADR-0035):
+/// 32 random bytes, generated in the browser next to the `request_id` and
+/// never sent anywhere but `/v1/generate_token`. The join carries only its
+/// [`SecretDigest`], so the value that appears in URLs, caches and logs — the
+/// `request_id` — is no longer enough to be admitted as its holder.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PossessionSecret(String);
+
+/// Deliberately opaque: the secret is a credential.
+impl std::fmt::Debug for PossessionSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PossessionSecret(..)")
+    }
+}
+
+/// A string that is not 32 bytes of unpadded base64url.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("not 32 bytes of unpadded base64url")]
+pub struct MalformedPossession;
+
+impl PossessionSecret {
+    /// # Errors
+    ///
+    /// [`MalformedPossession`] unless `s` is 43 unpadded base64url characters.
+    pub fn parse(s: &str) -> Result<Self, MalformedPossession> {
+        if is_b64url_32(s) {
+            Ok(Self(s.to_owned()))
+        } else {
+            Err(MalformedPossession)
+        }
+    }
+
+    /// `base64url(SHA-256(secret))`, over the secret's ASCII form, which is
+    /// what the browser hashes with `crypto.subtle.digest`.
+    #[must_use]
+    pub fn digest(&self) -> SecretDigest {
+        use base64::Engine as _;
+        let d = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, self.0.as_bytes());
+        SecretDigest(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(d.as_ref()))
+    }
+}
+
+/// What a join stores in place of the secret: `base64url(SHA-256(secret))`.
+/// Stored on the `PreQueue` or `Positions` row as `h`, one letter because it is
+/// billed on every row, one row per visitor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct SecretDigest(String);
+
+impl SecretDigest {
+    /// # Errors
+    ///
+    /// [`MalformedPossession`] unless `s` is 43 unpadded base64url characters.
+    pub fn parse(s: &str) -> Result<Self, MalformedPossession> {
+        if is_b64url_32(s) {
+            Ok(Self(s.to_owned()))
+        } else {
+            Err(MalformedPossession)
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Whether `secret` hashes to this digest, compared in constant time.
+    #[must_use]
+    pub fn is_digest_of(&self, secret: &PossessionSecret) -> bool {
+        aws_lc_rs::constant_time::verify_slices_are_equal(
+            self.0.as_bytes(),
+            secret.digest().0.as_bytes(),
+        )
+        .is_ok()
+    }
+}
+
+impl TryFrom<String> for SecretDigest {
+    type Error = MalformedPossession;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        Self::parse(&s)
+    }
+}
+
+impl From<SecretDigest> for String {
+    fn from(d: SecretDigest) -> Self {
+        d.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
 
     use super::*;
     use proptest::prelude::*;
+
+    /// A fixed vector, so a change of hash, encoding or input form (bytes of
+    /// the ASCII secret, not the decoded 32 bytes) fails here and not only in
+    /// the browser. Computed independently: `printf %s <secret> | sha256sum`.
+    #[test]
+    fn possession_digest_is_sha256_of_the_ascii_secret_as_base64url() {
+        let secret =
+            PossessionSecret::parse("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
+        assert_eq!(secret.digest().as_str(), POSSESSION_VECTOR_DIGEST);
+    }
+
+    const POSSESSION_VECTOR_DIGEST: &str = "DwBzhbb51LfusnSGBa_hqYSgo7-j8BTQnip4TOnlzRo";
+
+    #[test]
+    fn a_digest_matches_only_its_own_secret() {
+        let secret =
+            PossessionSecret::parse("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
+        let other = PossessionSecret::parse("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB").unwrap();
+        let digest = secret.digest();
+        assert!(digest.is_digest_of(&secret));
+        assert!(!digest.is_digest_of(&other));
+    }
+
+    #[test]
+    fn possession_values_must_be_32_bytes_of_unpadded_base64url() {
+        for bad in [
+            "",
+            "AAAA",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        ] {
+            assert!(PossessionSecret::parse(bad).is_err(), "{bad:?}");
+            assert!(SecretDigest::parse(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_secret_never_prints() {
+        let secret =
+            PossessionSecret::parse("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap();
+        assert!(!format!("{secret:?}").contains("AAAA"));
+    }
 
     fn key() -> SigningKey {
         SigningKey::new(b"a-32-byte-test-signing-key-value")

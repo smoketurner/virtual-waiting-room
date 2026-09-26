@@ -259,6 +259,7 @@ mod tests {
             entry_time: 1_788_000_000,
             status: PositionStatus::Issued,
             ttl: 1_788_086_700,
+            h: None,
         };
         let item: std::collections::HashMap<String, AttributeValue> =
             serde_dynamo::to_item(&written).unwrap();

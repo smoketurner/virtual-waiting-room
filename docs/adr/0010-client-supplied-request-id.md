@@ -1,6 +1,6 @@
 # ADR-0010: Client supplies the request identifier
 
-**Status:** Accepted
+**Status:** Accepted. Amended by [ADR-0035](0035-request-id-proof-of-possession.md): the id is redeemed only with the secret it joined with.
 
 ## Context
 

@@ -47,6 +47,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import json
 import os
 import secrets
@@ -96,6 +98,15 @@ def uuid_v7() -> str:
     b[8] = (b[8] & 0x3F) | 0x80  # variant
     h = b.hex()
     return f"{h[0:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
+
+
+def join_body(rid: str, event_id: str) -> dict:
+    """A join as the waiting page sends it (issue #62): the id and
+    base64url(SHA-256(secret)). The smoke test never redeems, so the secret
+    itself is discarded."""
+    secret = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=")
+    h = base64.urlsafe_b64encode(hashlib.sha256(secret).digest()).rstrip(b"=")
+    return {"request_id": rid, "event_id": event_id, "h": h.decode()}
 
 
 def api_get(api_url: str, path: str) -> dict:
@@ -168,7 +179,7 @@ def main() -> int:
     say("3. Pre-queue registration: POST /v1/join for a small cohort during pre_queue")
     ids: list[str] = [uuid_v7() for _ in range(COHORT)]
     for rid in ids:
-        api_post(api_url, "/v1/join", {"request_id": rid, "event_id": event_id})
+        api_post(api_url, "/v1/join", join_body(rid, event_id))
     print(
         f"posted {len(ids)} pre-queue joins; waiting for assign_position to drain the batch"
     )
@@ -243,7 +254,7 @@ def main() -> int:
 
     say("6. Live join: POST /join, then confirm a Positions row is written")
     live_rid = uuid_v7()
-    api_post(api_url, "/v1/join", {"request_id": live_rid, "event_id": event_id})
+    api_post(api_url, "/v1/join", join_body(live_rid, event_id))
     print(
         f"posted live join {live_rid}; waiting for assign_position to drain the batch"
     )
@@ -264,7 +275,7 @@ def main() -> int:
     # misrouted or uncached join surfaces here and nowhere else.
     cdn_rid = uuid_v7()
     api_post(
-        f"https://{cf_host}", "/v1/join", {"request_id": cdn_rid, "event_id": event_id}
+        f"https://{cf_host}", "/v1/join", join_body(cdn_rid, event_id)
     )
     print(f"posted {cdn_rid} via CloudFront; waiting for the row")
     cdn_item: dict = {}
