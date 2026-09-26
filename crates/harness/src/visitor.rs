@@ -312,20 +312,36 @@ pub async fn run<F, Fut>(
         // `waiting.js`'s closed branch calls `forgetPosition()` then `return
         // schedule()` — it clears `knownPosition` and asks no `/v1/queue_num`
         // that tick, so the next running poll re-asks. Clearing `held_position`
-        // here is the forget; the `!closed` ask gate below is the skip. Together
-        // they force the same re-ask on the first running tick after a
-        // `closed → running` reopen, where without this `held_position` would
-        // stay `Some(stale)` and the ask gate would stay false forever.
-        if closed {
+        // here is the forget; the `!closed` ask gate on `HoldPosition`/`Backoff`
+        // below is the skip. Together they force the same re-ask on the first
+        // running tick after a `closed → running` reopen, where without this
+        // `held_position` would stay `Some(stale)` and the ask gate would stay
+        // false forever.
+        //
+        // `DerivePosition` is exempt from both: its defining `/v1/queue_num`
+        // ask is timed to land *during* the closed countdown (`first_ask_after`
+        // above deliberately omits `countdown_ms`), and it holds that one fetch
+        // forever — the registration row exists from the moment it lands, not
+        // from the open. Forgetting on every closed tick would re-open the ask
+        // gate each poll and re-fetch on every tick instead of fetching once.
+        if closed && !matches!(settings.polling, Polling::DerivePosition) {
             held_position = None;
         }
 
         let ask = match settings.polling {
             // The old client asked on every tick and knew nothing of a spread.
             // `!closed` mirrors the client's `return schedule()` in the closed
-            // branch: a closed tick asks no `/v1/queue_num`, whatever the mode.
+            // branch: a closed tick asks no `/v1/queue_num`.
             Polling::EveryTick => !closed && started.elapsed() >= first_ask_after,
-            Polling::HoldPosition | Polling::DerivePosition | Polling::Backoff => {
+            // Not gated on `!closed`: the defining ask lands during the closed
+            // countdown, and the closed-tick clearing above is exempted so the
+            // single fetch sticks. Both halves of the exemption are coupled —
+            // removing either alone either blocks the ask entirely or re-asks
+            // every closed tick.
+            Polling::DerivePosition => {
+                held_position.is_none() && started.elapsed() >= first_ask_after
+            }
+            Polling::HoldPosition | Polling::Backoff => {
                 !closed && held_position.is_none() && started.elapsed() >= first_ask_after
             }
         };
@@ -899,6 +915,80 @@ mod tests {
             "expected one /v1/queue_num ask before the close and one after the reopen per visitor; \
              harness only made {queue_num} (the after-reopen re-ask is missing — held_position is \
              not cleared on a closed tick)"
+        );
+    }
+
+    // --- DerivePosition: ask once *during* the closed countdown ---------------
+
+    #[tokio::test(start_paused = true)]
+    async fn derive_position_asks_once_per_visitor_during_a_permanently_closed_countdown() {
+        // `Polling::DerivePosition`'s defining `/v1/queue_num` ask is timed to
+        // land *during* the closed countdown — `first_ask_after` deliberately
+        // omits `countdown_ms` (see the match above), unlike `HoldPosition`/
+        // `Backoff` whose ask cannot exist before the open. The countdown is
+        // served under `serving_state: "closed"`, so a `!closed` gate on the
+        // ask and an unconditional `held_position = None` clearing on every
+        // closed tick both break the mode. The gate alone blocks every
+        // during-countdown ask (zero asks); lifting only the gate leaves the
+        // clearing re-triggering the ask on every closed tick (one per poll,
+        // not one per visitor). Both halves must be exempted together.
+        //
+        // The origin is permanently `"closed"` and answers `/v1/queue_num` 200,
+        // so every ask that fires is a during-countdown ask; with `spread_ms =
+        // 0` and `Arrival::Uniform`, `first_ask_after == arrives_at < countdown`
+        // deterministically, and the ask fires on each visitor's first poll.
+        // Expected: exactly `VISITORS` asks. HEAD makes 0; a gate-only fix
+        // makes one per closed tick (far more than `VISITORS`).
+        const VISITORS: u64 = 10;
+        const RUN_SECS: u64 = 60;
+        const COUNTDOWN_MS: u64 = 30_000;
+
+        let edge = Arc::new(Edge::new(Duration::from_secs(10), RUN_SECS));
+        let tally = Arc::new(VisitorTally::default());
+        let origin = Arc::new(|path: String| async move {
+            if path.starts_with("/v1/status") {
+                (
+                    200,
+                    r#"{"serving_state":"closed","serving_position":0}"#.to_owned(),
+                )
+            } else {
+                (200, r#"{"position":100000000,"live_join":true}"#.to_owned())
+            }
+        });
+        let settings = RunSettings {
+            polling: Polling::DerivePosition,
+            spread_ms: 0,
+            countdown_ms: COUNTDOWN_MS,
+            arrival: Arrival::Uniform,
+            deadline: tokio::time::Instant::now() + Duration::from_secs(RUN_SECS),
+            target_rate: 5,
+        };
+
+        let mut tasks = Vec::with_capacity(VISITORS as usize);
+        for n in 0..VISITORS {
+            tasks.push(tokio::spawn(run(
+                Arc::clone(&edge),
+                format!("req-{n}"),
+                n + 1,
+                settings,
+                Arc::clone(&origin),
+                Arc::clone(&tally),
+            )));
+        }
+        #[expect(
+            clippy::unwrap_used,
+            reason = "a panicked visitor task is a test bug, not an expected outcome"
+        )]
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        let queue_num = tally.queue_num_requests.load(Ordering::Relaxed);
+        assert_eq!(
+            queue_num, VISITORS,
+            "DerivePosition must ask /v1/queue_num once per visitor during the closed countdown; \
+             got {queue_num} (0 ⇒ the !closed gate blocks the ask while closed; >VISITORS ⇒ the \
+             held_position clearing re-triggers the ask every closed tick)"
         );
     }
 
