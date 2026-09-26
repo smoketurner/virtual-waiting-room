@@ -2,8 +2,13 @@
 //! 10 pre-queue shard counts, folds them into prefix offsets and the cohort
 //! size, generates the permutation seed, and writes all four plus the active
 //! phase and the live-join counter's starting value in one conditional update
-//! guarded by the seed's absence — so a retry or a double-fire opens exactly
-//! once.
+//! guarded by the seed's absence AND the `pre_queue` phase — so a retry or a
+//! double-fire opens exactly once, and an open from any other phase is
+//! rejected rather than seeding a cohort of 0 and forfeiting the pre-queue
+//! stage. The guard's two failure modes (already open, wrong phase) collapse
+//! to one `ConditionalCheckFailedException`; [`open_event`] disambiguates
+//! them with [`Store::is_already_open`] so a wrong-phase rejection surfaces as
+//! an error rather than being misreported as already-open.
 //!
 //! The open is also where `queue_counter` starts behind the cohort, so live
 //! joiners are numbered behind every pre-queue position instead of colliding
@@ -50,12 +55,30 @@ pub trait Store {
     ) -> impl Future<Output = Result<[u64; SHARDS], StoreError>> + Send;
 
     /// Writes the open values, starts `queue_counter` at the cohort size, and
-    /// flips the phase to active, guarded by `attribute_not_exists(shuffle_seed)`.
-    /// Returns `false` if the guard rejected the write (already open).
+    /// flips the phase to active, guarded by `attribute_not_exists(shuffle_seed)
+    /// AND phase = pre_queue`. Returns `false` if the guard rejected the write
+    /// — either the seed already exists (already open) or the phase is not
+    /// `pre_queue` (wrong phase). The two causes collapse to one `false`;
+    /// [`Store::is_already_open`] disambiguates them, so a caller must not
+    /// assume `false` means already-open.
     fn write_open(
         &self,
         event_id: &str,
         values: &OpenValues,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send;
+
+    /// Whether the event's `shuffle_seed` is present — the single authoritative
+    /// "already open" signal, since the open writes it and nothing else does.
+    ///
+    /// Used to disambiguate a [`Store::write_open`] `false`: `true` means the
+    /// guard failed because the event was already open (a double-fire or
+    /// retry); `false` means the guard failed because the phase was not
+    /// `pre_queue` — a wrong-phase rejection, which wrote nothing and must
+    /// surface as an error rather than be misreported as already-open. Reading
+    /// the seed alone keeps the disambiguating read to one attribute.
+    fn is_already_open(
+        &self,
+        event_id: &str,
     ) -> impl Future<Output = Result<bool, StoreError>> + Send;
 }
 
@@ -96,8 +119,26 @@ pub async fn open_event<S: Store>(
         open_values(counts, seed).map_err(|e| StoreError(format!("fold shard counts: {e}")))?;
 
     if !store.write_open(event_id, &values).await? {
-        tracing::info!(event_id, "event already open; no-op");
-        return Ok(OpenResult::AlreadyOpen);
+        // The guard rejects both a double-fire (the seed already exists) and
+        // an open from the wrong phase (phase != pre_queue) with the same
+        // `false`, so the seed's presence is the disambiguator. An already-open
+        // event is a benign no-op a retry or a double-fire lands on; a
+        // wrong-phase rejection wrote nothing and the event is still unopened,
+        // which must surface as an error so EventBridge retries (and eventually
+        // dead-letters) rather than recording a silent success — which is what
+        // happened when this branch assumed every `false` meant already-open.
+        if store.is_already_open(event_id).await? {
+            tracing::info!(event_id, "event already open; no-op");
+            return Ok(OpenResult::AlreadyOpen);
+        }
+        tracing::error!(
+            event_id,
+            event = "open_rejected_wrong_phase",
+            "scheduled open rejected: event not in pre_queue phase"
+        );
+        return Err(StoreError(
+            "open rejected: event not in pre_queue phase".to_owned(),
+        ));
     }
     tracing::info!(
         event_id,
@@ -130,6 +171,11 @@ mod tests {
     struct FakeStore {
         counts: [u64; SHARDS],
         already_open: bool,
+        /// The phase the open guard conditions on. Defaults to `PreQueue` so a
+        /// `FakeStore::new` models the only phase a real open succeeds from;
+        /// tests set this to `Idle` (or any other phase) to exercise the
+        /// wrong-phase rejection the real `DynamoDB` guard produces.
+        phase: Phase,
         written: Mutex<Option<OpenValues>>,
     }
 
@@ -138,6 +184,7 @@ mod tests {
             Self {
                 counts,
                 already_open,
+                phase: Phase::PreQueue,
                 written: Mutex::new(None),
             }
         }
@@ -156,13 +203,23 @@ mod tests {
             _event_id: &str,
             values: &OpenValues,
         ) -> impl Future<Output = Result<bool, StoreError>> + Send {
-            let wrote = if self.already_open {
+            // Mirrors the real open_guard: the guard rejects (Ok(false)) when
+            // the seed already exists OR the phase is not pre_queue, the two
+            // causes a ConditionalCheckFailedException collapses into one.
+            let wrote = if self.already_open || self.phase != Phase::PreQueue {
                 false
             } else {
                 *self.written.lock().unwrap() = Some(values.clone());
                 true
             };
             std::future::ready(Ok(wrote))
+        }
+
+        fn is_already_open(
+            &self,
+            _event_id: &str,
+        ) -> impl Future<Output = Result<bool, StoreError>> + Send {
+            std::future::ready(Ok(self.already_open))
         }
     }
 
@@ -189,12 +246,97 @@ mod tests {
 
     #[tokio::test]
     async fn second_open_is_noop() {
-        // The guard rejected the write, so nothing was reseeded: a double-fire
-        // or a retry must not hand the cohort a second permutation.
+        // The guard rejected the write, and is_already_open confirms the seed
+        // already exists, so the disambiguation returns AlreadyOpen rather than
+        // an error: a double-fire or a retry must not hand the cohort a second
+        // permutation, and must not retry forever on an event that is already
+        // open.
         let store = FakeStore::new([1; SHARDS], true);
         let result = open_event(&store, "evt-1", [9u8; 32]).await.unwrap();
         assert_eq!(result, OpenResult::AlreadyOpen);
         assert!(store.written.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_wrong_phase_rejection_is_surfaced_as_an_error_not_already_open() {
+        // The narrowed open_guard rejects an open from any phase other than
+        // pre_queue with the same `false` it rejects a double-fire with. That
+        // false must not collapse to AlreadyOpen: nothing was written and the
+        // event is still unopened, so the rejection must surface as an error
+        // the scheduler retries (and eventually dead-letters), not a silent
+        // no-op EventBridge would record as success.
+        let mut store = FakeStore::new([0; SHARDS], false);
+        store.phase = Phase::Idle;
+        let result = open_event(&store, "evt-1", [9u8; 32]).await;
+        assert!(
+            result.is_err(),
+            "wrong-phase rejection must surface as Err, not AlreadyOpen: {result:?}"
+        );
+        assert!(
+            store.written.lock().unwrap().is_none(),
+            "a rejected open wrote nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wrong_phase_rejection_from_every_non_pre_queue_phase_is_an_error() {
+        // The guard's phase clause admits only pre_queue, so every other phase
+        // the lifecycle has must reject — not just idle. This pins the
+        // disambiguation against a regression that re-admits one of them by
+        // special-casing a single phase instead of `!= PreQueue`.
+        for phase in [
+            Phase::Idle,
+            Phase::Active,
+            Phase::PostEvent,
+            Phase::Maintenance,
+        ] {
+            let mut store = FakeStore::new([0; SHARDS], false);
+            store.phase = phase;
+            let result = open_event(&store, "evt-1", [9u8; 32]).await;
+            assert!(
+                result.is_err(),
+                "open from {phase:?} must reject as Err, not AlreadyOpen: {result:?}"
+            );
+            assert!(
+                store.written.lock().unwrap().is_none(),
+                "open from {phase:?} wrote nothing"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_is_already_open_failure_propagates_as_an_error_not_already_open() {
+        // The disambiguating read can itself fail (a transient DynamoDB error)
+        // and must not be swallowed into AlreadyOpen, or a wrong-phase
+        // rejection whose follow-up read failed would be misreported the same
+        // way the original bug misreported it.
+        struct ReadFails;
+        impl Store for ReadFails {
+            fn read_shard_counts(
+                &self,
+                _event_id: &str,
+            ) -> impl Future<Output = Result<[u64; SHARDS], StoreError>> + Send {
+                std::future::ready(Ok([0; SHARDS]))
+            }
+            fn write_open(
+                &self,
+                _event_id: &str,
+                _values: &OpenValues,
+            ) -> impl Future<Output = Result<bool, StoreError>> + Send {
+                std::future::ready(Ok(false))
+            }
+            fn is_already_open(
+                &self,
+                _event_id: &str,
+            ) -> impl Future<Output = Result<bool, StoreError>> + Send {
+                std::future::ready(Err(StoreError("get_item shuffle_seed: boom".to_owned())))
+            }
+        }
+        let result = open_event(&ReadFails, "evt-1", [9u8; 32]).await;
+        assert!(
+            matches!(result, Err(ref e) if e.to_string().contains("shuffle_seed")),
+            "an is_already_open failure must propagate, not become AlreadyOpen: {result:?}"
+        );
     }
 
     #[tokio::test]

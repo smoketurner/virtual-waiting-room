@@ -78,6 +78,37 @@ run "filters_key_on_the_event_names_the_crates_emit" {
   }
 }
 
+run "the_open_event_error_filter_keys_on_the_top_level_level_field" {
+  command = plan
+
+  # The open_event Lambda's tracing-subscriber JSON formatter (no
+  # flatten_event) nests user fields like `event` under a `fields` object but
+  # serializes `level` at the root as uppercase "ERROR" (tracing-serde). So a
+  # filter keying on `$.event` would match nothing; this one deliberately keys
+  # on `$.level = "ERROR"` to actually match the open_event log group's output
+  # and alarm on the wrong-phase rejection (and any future open_event error).
+  # The pattern is pinned here so a regression that re-keyed it on the nested
+  # `event` field would fail loudly rather than silently disarm the alarm.
+  assert {
+    condition = strcontains(
+      aws_cloudwatch_log_metric_filter.event["open_event_error"].pattern,
+      "$.level = \"ERROR\""
+    )
+    error_message = "the open_event error filter must key on the top-level `level` field (uppercase ERROR); keying on the nested `$.event` would never match the formatter's output"
+  }
+
+  # The filter must watch the open_event Lambda's own log group, not one of the
+  # others; the for_each over local.log_metrics plan-fails on an unknown log_group
+  # key, but this also pins the resolved name against a wrong-key regression.
+  assert {
+    condition = (
+      aws_cloudwatch_log_metric_filter.event["open_event_error"].log_group_name
+      == "/aws/lambda/${aws_lambda_function.open_event.function_name}"
+    )
+    error_message = "the open_event error filter must watch the open_event Lambda's log group"
+  }
+}
+
 run "a_quiet_system_publishes_zero_rather_than_nothing" {
   command = plan
 
@@ -109,5 +140,10 @@ run "every_alarm_fires_on_a_single_occurrence" {
   assert {
     condition     = aws_cloudwatch_metric_alarm.join_dlq_not_empty.threshold == 0
     error_message = "one message on the dead-letter queue is one join accepted from a visitor and then lost"
+  }
+
+  assert {
+    condition     = aws_cloudwatch_metric_alarm.open_dlq_not_empty.threshold == 0
+    error_message = "one message on the open dead-letter queue is one scheduled open retried to exhaustion and lost"
   }
 }
