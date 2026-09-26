@@ -376,8 +376,59 @@ fn rules() -> Vec<RuleVector> {
             matches: false,
         },
     ];
+    all.extend(rules_by_path_form());
     all.extend(rules_by_header());
     all
+}
+
+/// Path forms an origin treats as equivalent to a rule's prefix: stacked,
+/// encoded and mid-path dot segments and doubled slashes. Split from [`rules`]
+/// only to keep each function under the line ceiling.
+fn rules_by_path_form() -> Vec<RuleVector> {
+    vec![
+        RuleVector {
+            name: "path_prefix_matches_stacked_dot_segments".into(),
+            rule: serde_json::json!(["p", "/checkout"]),
+            request: req("/././checkout", &[], &[]),
+            matches: true,
+        },
+        RuleVector {
+            name: "path_prefix_matches_dot_then_doubled_slash".into(),
+            rule: serde_json::json!(["p", "/checkout"]),
+            request: req("/.//checkout", &[], &[]),
+            matches: true,
+        },
+        RuleVector {
+            name: "path_prefix_matches_encoded_dot_segments".into(),
+            rule: serde_json::json!(["p", "/checkout"]),
+            request: req("/%2e/%2E/checkout", &[], &[]),
+            matches: true,
+        },
+        RuleVector {
+            name: "path_prefix_matches_interior_doubled_slash".into(),
+            rule: serde_json::json!(["p", "/shop/checkout"]),
+            request: req("/shop//checkout", &[], &[]),
+            matches: true,
+        },
+        RuleVector {
+            name: "path_prefix_matches_interior_dot_segment".into(),
+            rule: serde_json::json!(["p", "/shop/checkout"]),
+            request: req("/shop/./checkout", &[], &[]),
+            matches: true,
+        },
+        RuleVector {
+            name: "path_prefix_matches_trailing_dot_segment".into(),
+            rule: serde_json::json!(["p", "/checkout/"]),
+            request: req("/checkout/.", &[], &[]),
+            matches: true,
+        },
+        RuleVector {
+            name: "path_prefix_leaves_dot_prefixed_segment_alone".into(),
+            rule: serde_json::json!(["p", "/shop/checkout"]),
+            request: req("/shop/.checkout", &[], &[]),
+            matches: false,
+        },
+    ]
 }
 
 /// The user-agent, cookie and header matchers. Split from [`rules`] only to

@@ -101,22 +101,39 @@ fn percent_decode(s: &str) -> Vec<u8> {
 
 /// Normalizes a path the same way `gate.js.tftpl`'s `normalizedPath` does:
 /// per-byte percent-decoded (a malformed `%XX` is left literal, never thrown
-/// on), case-folded, with a leading run of `/` collapsed to one and a
-/// leading `/./` stripped. Defence in depth against a `PathPrefix` rule
-/// being evaded by an encoding an origin would treat as equivalent to the
-/// rule's own prefix — not a full RFC 3986 path resolver, so `..`-segment
+/// on), every run of `/` collapsed to one and every `.` segment removed —
+/// repeated until neither changes anything, so a stacked form such as
+/// `/././checkout` or `/.//checkout` cannot survive one pass — then
+/// case-folded. Defence in depth against a `PathPrefix` rule being evaded by
+/// a path an origin would treat as equivalent to the rule's own prefix,
+/// anywhere in the path (`/shop//checkout` under a `/shop/checkout` rule), not
+/// just at its start. Not a full RFC 3986 path resolver: `..`-segment
 /// resolution is deliberately not attempted.
 fn normalized_path(path: &str) -> String {
-    let decoded = String::from_utf8_lossy(&percent_decode(path)).into_owned();
-    let collapsed = if let Some(rest) = decoded.strip_prefix('/') {
-        format!("/{}", rest.trim_start_matches('/'))
-    } else {
-        decoded
-    };
-    let deslashed = collapsed
-        .strip_prefix("/./")
-        .map_or_else(|| collapsed.clone(), |rest| format!("/{rest}"));
-    deslashed.to_ascii_lowercase()
+    let mut p = String::from_utf8_lossy(&percent_decode(path)).into_owned();
+    loop {
+        let next = collapse_slashes(&p).replace("/./", "/");
+        if next == p {
+            break;
+        }
+        p = next;
+    }
+    if let Some(stem) = p.strip_suffix("/.") {
+        p = format!("{stem}/");
+    }
+    p.to_ascii_lowercase()
+}
+
+/// Collapses every run of `/` to a single `/`.
+fn collapse_slashes(p: &str) -> String {
+    let mut out = String::with_capacity(p.len());
+    for c in p.chars() {
+        if c == '/' && out.ends_with('/') {
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Whether any rule protects this request.
@@ -330,6 +347,36 @@ mod tests {
             assert!(rule.matches(&req(evasion)), "evaded via {evasion:?}");
         }
         assert!(!rule.matches(&req("/other")));
+    }
+
+    #[test]
+    fn path_prefix_evasions_by_stacked_or_interior_segments_are_caught() {
+        // One pass of "strip a leading /./" let a second one through, and
+        // nothing looked past the first segment.
+        let rule = ProtectionRule::PathPrefix("/shop/checkout".to_owned());
+        for evasion in [
+            "/././shop/checkout",
+            "/.//shop/checkout",
+            "//.//shop/checkout",
+            "/%2e/%2e/shop/checkout",
+            "/shop//checkout",
+            "/shop/./checkout",
+            "/shop/././/checkout/pay",
+            "/shop/checkout/.",
+        ] {
+            assert!(rule.matches(&req(evasion)), "evaded via {evasion:?}");
+        }
+        for other in ["/shop/checkin", "/shop/../checkout", "/shop/.checkout"] {
+            assert!(!rule.matches(&req(other)), "over-matched {other:?}");
+        }
+    }
+
+    #[test]
+    fn normalized_path_keeps_a_trailing_slash() {
+        assert_eq!(normalized_path("/checkout/"), "/checkout/");
+        assert_eq!(normalized_path("/checkout/."), "/checkout/");
+        assert_eq!(normalized_path("/"), "/");
+        assert_eq!(normalized_path("/."), "/");
     }
 
     #[test]

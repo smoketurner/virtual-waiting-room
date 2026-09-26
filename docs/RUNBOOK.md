@@ -131,6 +131,32 @@ Nothing trips fail-open automatically, on purpose: the gate makes no network cal
 observe the origin, and an alarm wired to open the gate would dump the entire queue onto the
 origin the first time it flapped.
 
+### If the AWS region is impaired
+
+The queue, the API and the dashboard all live in the deployment region; the gate does not
+([ADR-0034](adr/0034-single-region-failure-domain.md)). Visitors already admitted keep going, but
+nobody new is let through, and **Fail open** on the dashboard is unreachable because the dashboard
+is in the impaired region too.
+
+Engage fail-open by writing the gate's config directly. This goes through CloudFront's global
+control plane, not the region. The AWS CLI needs `awscrt` for the KeyValueStore's SigV4A signing
+(`pip install awscrt`, or the CLI v2 installer, which bundles it).
+
+```bash
+KVS_ARN=$(terraform -chdir=infra/environments/dev output -raw gate_kvs_arn)
+ETAG=$(aws cloudfront-keyvaluestore describe-key-value-store --kvs-arn "$KVS_ARN" --query ETag --output text)
+aws cloudfront-keyvaluestore get-key --kvs-arn "$KVS_ARN" --key c --query Value --output text
+# → {"v":1,"s":0,"f":0,"r":[...]}  Keep v, s and r exactly as printed; change only f.
+UNTIL=$(( $(date +%s) + 30 * 60 ))  # 30 minutes; keep it bounded
+aws cloudfront-keyvaluestore put-key --kvs-arn "$KVS_ARN" --if-match "$ETAG" --key c \
+  --value '{"v":1,"s":0,"f":'"$UNTIL"',"r":[...the r array as printed...]}'
+```
+
+The window expires on its own. To end it early, put the document back with `"f":0`. The
+dashboard does not show a fail-open engaged this way, and needs no cleanup afterwards. If the
+region is still impaired when the window ends, write a new deadline. Queue state survives the
+impairment: once the region returns, visitors whose pages stayed open keep their places.
+
 ### Opening early
 
 **Open now** closes the pre-queue and opens the event immediately. It is the same operation the
@@ -155,6 +181,8 @@ conditions the system would otherwise survive in silence.
 | `admission_control_unreadable` | The stored admission control could not be parsed, so the controller is holding admission | The queue has stopped moving. Pause and Resume to rewrite the attribute |
 | `rules_audit_failed` | The gate's ruleset changed but the audit stamp did not | The gate is correct; the dashboard's "last changed by" is stale. No visitor impact |
 | `fail_open_audit_lost` | Fail-open was engaged or cleared but the audit stamp lost a race to a newer writer | The fail-open change took effect; the dashboard's "last changed by" is stale. No visitor impact |
+| `open_event_error` | The open failed: most often the schedule fired while the event was not in the pre-queue phase, so nothing was opened | Check the event's phase. The scheduler retries for up to 10 minutes; once the phase is pre-queue a retry opens the event, or use **Open now** |
+| `open-dlq-not-empty` | A scheduled open failed on every retry and was given up | The event is **not open**, and the one-time schedule has been used. Fix the cause (usually the phase), then **Open now** |
 
 ---
 
@@ -173,6 +201,8 @@ conditions the system would otherwise survive in silence.
 Stated here so it is not discovered mid-event:
 
 - **Nothing trips fail-open automatically.** See above.
+- **Nothing fails over to another region.** A regional impairment freezes the queue; fail-open
+  from the command line is the way around it. See above.
 - **Nothing moves the phase on its own** except the open, which runs at the scheduled time.
 - **Sessions are not renewed.** A visitor still on the origin when `session_ttl_seconds` lapses
   is returned to the queue. Set it longer than the worst realistic time on the origin; there is

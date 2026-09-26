@@ -5,6 +5,17 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>You're in line</title>
     <link rel="stylesheet" href="/_wr/waiting.css" />
+    <noscript>
+      <!-- Without the script nothing joins or polls, so the copy promising
+           an automatic let-through would be false. Hide it; the notice in
+           the body replaces it. -->
+      <style>
+        .head,
+        #note {
+          display: none;
+        }
+      </style>
+    </noscript>
   </head>
   <body>
     <main class="room">
@@ -55,12 +66,18 @@
 
       <noscript>
         <p class="note error">
-          This waiting room needs JavaScript to hold your place in line and let
-          you through when it's your turn.
+          You are not in line yet. This waiting room needs JavaScript to take
+          your place in line and let you through when it's your turn. Turn on
+          JavaScript for this site, then reload this page.
         </p>
       </noscript>
     </main>
 
-    <script src="/_wr/waiting.js"></script>
+    <!-- A script that is blocked or fails to download would otherwise leave
+         "Getting your place in line…" on screen forever with no join sent. -->
+    <script
+      src="/_wr/waiting.js"
+      onerror="document.getElementById('headline').textContent='You are not in line yet';document.getElementById('subhead').textContent='This page could not load the script that takes your place in line. Check that nothing is blocking scripts on this site, then reload this page.';document.getElementById('note').hidden=true"
+    ></script>
   </body>
 </html>

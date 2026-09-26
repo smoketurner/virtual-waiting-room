@@ -722,6 +722,12 @@
         );
         stop();
       }
+    }, function (err) {
+      // Failed in flight (a network error, or an error page that is not
+      // JSON). Clear the flag before tick()'s catch retries, or every later
+      // redeem() returns early and nothing is ever scheduled again.
+      admitting = false;
+      throw err;
     });
   }
 

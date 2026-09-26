@@ -92,7 +92,7 @@ override the file, so the file stays the single source of truth. Copy
 | `client_origin_domain_name` | *(empty)*   | Bare domain of the protected origin CloudFront fronts. Host only — no scheme, no path. Empty protects the built-in demo origin instead, which is a working stack that guards nothing real. |
 | `admission_rate`            | `5`         | Visitors per second, seeded onto the event item. Zero would release nobody, forever, so this has a real default. Changed live from the dashboard. |
 | `gate_rules`                | *(empty)*   | Which requests the gate covers, one rule per line — same grammar as the dashboard's Set rules form. Empty is dormant: every request passes through. |
-| `starts_at`                 | *(empty)*   | When the event opens, local date-time with no zone. Empty leaves the schedule disabled — the event then opens when an operator presses **Open now** on the dashboard, or never. |
+| `starts_at`                 | *(empty)*   | When the event opens, local date-time with no zone. Set, the first apply seeds the event in the pre-queue phase so visitors register and the scheduled open can run; the waiting page shows no countdown until the operator also sets the time on the dashboard. Empty leaves the schedule disabled and the event idle — it then opens when an operator presses **Open now** on the dashboard, or never. |
 | `starts_at_timezone`        | `UTC`       | IANA zone `starts_at` is evaluated in. |
 | `aliases`                   | `[]`        | The hostnames viewers actually use, e.g. `["waiting.example.com"]`. Empty deploys on the distribution's own `*.cloudfront.net` name. |
 | `acm_certificate_arn`       | *(empty)*   | ACM certificate in **us-east-1** covering every name in `aliases`. Set with `aliases` or not at all — the pair is validated together. |
@@ -200,6 +200,17 @@ one that existed lived in the origin authorizer, which was removed (ADR-0032), s
 the whole of the policy. Set `session_ttl_seconds` comfortably longer than the worst realistic time on the
 protected origin — cart to confirmation, not the median — or a visitor can lose their admission to
 nothing more than a slow checkout.
+
+## Availability
+
+A deployment lives in one region ([ADR-0034](adr/0034-single-region-failure-domain.md)). The
+queue is only as available as that region's DynamoDB, SQS, API Gateway and Lambda. There is no
+replica and no automatic failover, and one cannot be added as a setting: the queue's sequences
+need a single writer. The gate runs at the edge, so during a regional impairment admitted visitors
+keep their access. The operator can open the origin to everyone else by writing a fail-open window
+straight to the gate's KeyValueStore (`docs/RUNBOOK.md`, "If the AWS region is impaired"). A hosted
+waiting room would carry this risk for you; here it is yours, and that procedure is how you
+manage it.
 
 ## Tear down
 

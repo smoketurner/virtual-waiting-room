@@ -281,6 +281,97 @@
       "matches": false
     },
     {
+      "name": "path_prefix_matches_stacked_dot_segments",
+      "rule": [
+        "p",
+        "/checkout"
+      ],
+      "request": {
+        "path": "/././checkout",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": true
+    },
+    {
+      "name": "path_prefix_matches_dot_then_doubled_slash",
+      "rule": [
+        "p",
+        "/checkout"
+      ],
+      "request": {
+        "path": "/.//checkout",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": true
+    },
+    {
+      "name": "path_prefix_matches_encoded_dot_segments",
+      "rule": [
+        "p",
+        "/checkout"
+      ],
+      "request": {
+        "path": "/%2e/%2E/checkout",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": true
+    },
+    {
+      "name": "path_prefix_matches_interior_doubled_slash",
+      "rule": [
+        "p",
+        "/shop/checkout"
+      ],
+      "request": {
+        "path": "/shop//checkout",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": true
+    },
+    {
+      "name": "path_prefix_matches_interior_dot_segment",
+      "rule": [
+        "p",
+        "/shop/checkout"
+      ],
+      "request": {
+        "path": "/shop/./checkout",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": true
+    },
+    {
+      "name": "path_prefix_matches_trailing_dot_segment",
+      "rule": [
+        "p",
+        "/checkout/"
+      ],
+      "request": {
+        "path": "/checkout/.",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": true
+    },
+    {
+      "name": "path_prefix_leaves_dot_prefixed_segment_alone",
+      "rule": [
+        "p",
+        "/shop/checkout"
+      ],
+      "request": {
+        "path": "/shop/.checkout",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": false
+    },
+    {
       "name": "user_agent_substring",
       "rule": [
         "u",

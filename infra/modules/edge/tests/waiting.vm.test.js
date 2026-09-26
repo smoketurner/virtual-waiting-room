@@ -385,6 +385,34 @@ test("a successful redemption rejects a next= that would navigate off-site", asy
   assert.equal(client.win.location.replacedTo, "/");
 });
 
+test("a redemption that fails in flight is retried, not abandoned", async () => {
+  // A network error, or an error page that is not JSON, rejects the
+  // generate_token call. Left set, the in-flight flag turned every later
+  // redeem() into a no-op that scheduled nothing, and the visitor sat on
+  // "Letting you through" with no timer running.
+  let attempts = 0;
+  const admitted = admittedRoute();
+  const client = loadClient({
+    route: (url) => {
+      if (url.startsWith("/v1/generate_token") && attempts++ === 0) {
+        return Promise.reject(new TypeError("Failed to fetch"));
+      }
+      return admitted(url);
+    },
+  });
+  await client.flush();
+  assert.equal(attempts, 1);
+  assert.equal(client.win.location.replacedTo, undefined);
+
+  for (let i = 0; i < 3 && client.win.location.replacedTo === undefined; i++) {
+    assert.ok(client.lastTimer(), "a retry is scheduled after the failed redemption");
+    client.fireLastTimer();
+    await client.flush();
+  }
+  assert.equal(attempts, 2, "the redemption is attempted again");
+  assert.equal(client.win.location.replacedTo, "/");
+});
+
 test("the status timestamp is stamped from the clock once a position is known", async () => {
   const client = loadClient({
     route: route(() => activeStatus({ serving_position: 10 }), 500),

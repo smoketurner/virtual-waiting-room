@@ -97,8 +97,7 @@ function hexVal(c) {
 // valid %XX is decoded to its byte, a '%' not followed by two hex digits is
 // left literal. Not decodeURIComponent: that throws on one malformed escape
 // and reverts the whole URI, so a valid escape in a PathPrefix plus a
-// malformed one later evaded the rule (PR #120). Conformance vectors in
-// crates/wr-common/tests/vectors/session.json pin the mixed case.
+// malformed one later evaded the rule (PR #120).
 function percentDecode(uri) {
     var out = '';
     for (var i = 0; i < uri.length; ) {
@@ -115,10 +114,11 @@ function percentDecode(uri) {
     }
     return out;
 }
+// Collapse '//', drop '.' segments, until stable. Mirrors normalized_path.
 function normalizedPath(uri) {
-    var decoded = percentDecode(uri);
-    decoded = decoded.replace(/^\/+/, '/').replace(/^\/\.\//, '/');
-    return decoded.toLowerCase();
+    var p = percentDecode(uri), q;
+    while ((q = p.replace(/\/\/+/g, '/').replace(/\/\.\//g, '/')) !== p) p = q;
+    return p.replace(/\/\.$/, '/').toLowerCase();
 }
 
 function queryString(qs) {

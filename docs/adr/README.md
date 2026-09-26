@@ -37,6 +37,7 @@ One record per decision. Each states the context, the decision, and its conseque
 | [0031](0031-remove-controller-driven-expiry.md) | Remove controller-driven expiry: an unbounded Scan six times a minute that could not see the pre-queue cohort |
 | [0032](0032-remove-the-origin-authorizer.md) | Remove the origin authorizer: nothing invoked it, and as wired it forwarded every request |
 | [0033](0033-admission-claimed-once-per-visitor.md) | Admission is claimed once per visitor, and a repeat still admits |
+| [0034](0034-single-region-failure-domain.md) | The waiting room is single-region, and fails open around a regional impairment |
 
 ## Open
 
