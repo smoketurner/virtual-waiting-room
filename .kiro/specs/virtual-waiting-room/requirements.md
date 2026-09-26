@@ -307,11 +307,11 @@ Contractual deliverables. Without these the capacity requirements are not met.
 
 **O1** — As an operator, I want tables pre-warmed so that write throughput is ready at start.
 - THE SYSTEM SHALL have DynamoDB tables pre-warmed before each event.
-- Acceptance: Warm throughput ≥ the event's target write rate, verified before T−0. On the readiness checklist in `docs/RUNBOOK.md`; set through `warm_throughput_write_units`.
+- Acceptance: Warm throughput ≥ the event's target write rate, verified before T−0. Measured against the running deployment by the admin dashboard's Readiness panel, whose checks generate the readiness checklist in `docs/RUNBOOK.md`; set through `warm_throughput_write_units`.
 
 **O2** — As an operator, I want quota increases filed early so that limits are not hit at start.
 - THE SYSTEM SHALL have service quota increases filed with lead time.
-- Acceptance: API Gateway RPS and DynamoDB per-table write request units (WRU) confirmed raised before T−0. On the readiness checklist in `docs/RUNBOOK.md`.
+- Acceptance: API Gateway RPS and DynamoDB per-table write request units (WRU) confirmed raised before T−0. The limits in force are shown by the admin dashboard's Readiness panel, whose checks generate the readiness checklist in `docs/RUNBOOK.md`.
 
 **O3** — As an operator, I want a load test before the event so that capacity is proven.
 - THE SYSTEM SHALL have a load test at the event's target rate executed before the event.

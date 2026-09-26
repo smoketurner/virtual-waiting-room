@@ -19,6 +19,8 @@ variables {
   demo_origin_domain_name = "demo.s3.example.com"
   gate_kvs_arn            = "arn:aws:cloudfront::123456789012:key-value-store/test"
   event_id                = "smoke"
+
+  readiness_parameter_name = "/test/edge/readiness"
 }
 
 run "default_behaviour_carries_the_gate" {
@@ -106,5 +108,23 @@ run "generate_token_receives_the_viewer_address_and_keeps_its_set_cookie" {
       "host"
     )
     error_message = "forwarding Host to API Gateway makes it reject the request"
+  }
+}
+
+# The admin's readiness panel (issue #70) finds this distribution, its gate
+# and its polled /status behaviour through the parameter core names. Written
+# under any other name, every CloudFront row reads "not configured" on a
+# deployment that is in fact complete.
+run "the_readiness_parameter_is_written_where_core_reads_it" {
+  command = plan
+
+  assert {
+    condition     = aws_ssm_parameter.readiness.name == var.readiness_parameter_name
+    error_message = "the readiness parameter must be written under the name core gives the admin Lambda"
+  }
+
+  assert {
+    condition     = aws_ssm_parameter.readiness.type == "String" && aws_ssm_parameter.readiness.tier == "Standard"
+    error_message = "a Standard String parameter bills nothing between events (N1); an Advanced one does"
   }
 }

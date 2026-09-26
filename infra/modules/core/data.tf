@@ -243,6 +243,73 @@ data "aws_iam_policy_document" "admin" {
     }
   }
 
+  # --- Readiness panel (issue #70) -------------------------------------------
+  # Read-only. Every statement below is a Describe/Get the dashboard's
+  # readiness panel makes; none of them can change what it reads.
+
+  statement {
+    sid       = "ReadinessDescribeTables"
+    effect    = "Allow"
+    actions   = ["dynamodb:DescribeTable"]
+    resources = local.readiness_table_arns
+  }
+
+  # DescribeLimits is an account-level action with no resource type, so it
+  # cannot be scoped below "*".
+  statement {
+    sid       = "ReadinessDynamoDbLimits"
+    effect    = "Allow"
+    actions   = ["dynamodb:DescribeLimits"]
+    resources = ["*"]
+  }
+
+  # API Gateway's GetAccount is authorised as a GET on the /account resource.
+  statement {
+    sid       = "ReadinessApiGatewayAccount"
+    effect    = "Allow"
+    actions   = ["apigateway:GET"]
+    resources = ["arn:${local.aws_partition}:apigateway:${local.aws_region}::/account"]
+  }
+
+  statement {
+    sid       = "ReadinessReservedConcurrency"
+    effect    = "Allow"
+    actions   = ["lambda:GetFunctionConcurrency"]
+    resources = [aws_lambda_function.assign_position.arn]
+  }
+
+  # The open schedule's GetSchedule is already granted above.
+  statement {
+    sid       = "ReadinessControllerSchedule"
+    effect    = "Allow"
+    actions   = ["scheduler:GetSchedule"]
+    resources = [aws_scheduler_schedule.controller.arn]
+  }
+
+  statement {
+    sid       = "ReadinessEdgeParameter"
+    effect    = "Allow"
+    actions   = ["ssm:GetParameter"]
+    resources = ["arn:${local.aws_partition}:ssm:${local.aws_region}:${local.aws_account_id}:parameter${local.edge_readiness_parameter_name}"]
+  }
+
+  # The distribution and its cache policies are created by the edge module,
+  # which depends on this one, so their ids cannot be referenced here without
+  # a module cycle. Scoped to this account's distributions and cache policies
+  # rather than "*"; both actions only read configuration.
+  statement {
+    sid    = "ReadinessDistribution"
+    effect = "Allow"
+    actions = [
+      "cloudfront:GetDistributionConfig",
+      "cloudfront:GetCachePolicy",
+    ]
+    resources = [
+      "arn:${local.aws_partition}:cloudfront::${local.aws_account_id}:distribution/*",
+      "arn:${local.aws_partition}:cloudfront::${local.aws_account_id}:cache-policy/*",
+    ]
+  }
+
   # "Open now" starts the event without waiting for the schedule, by invoking
   # the function the schedule invokes. The same grant the scheduler's own role
   # holds, on the same one function.

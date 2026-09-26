@@ -19,6 +19,8 @@ anyhow = { workspace = true, features = ["std"] }
 askama = { workspace = true, features = ["std", "derive", "config"] }
 aws-config = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 aws-lc-rs = { workspace = true, features = ["aws-lc-sys"] }
+aws-sdk-apigateway = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+aws-sdk-cloudfront = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 aws-sdk-cloudfrontkeyvaluestore = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio", "sigv4a"] }
 aws-sdk-dynamodb = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 aws-sdk-lambda = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
@@ -39,7 +41,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_dynamo = { workspace = true, features = ["aws-sdk-dynamodb+1"] }
 serde_json = { workspace = true, features = ["std"] }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 tower = { workspace = true }
 tower-http = { workspace = true, features = ["normalize-path"] }
 tracing = { workspace = true, default-features = true }

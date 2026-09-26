@@ -17,6 +17,8 @@ use admin::dynamo::DynamoStore;
 use admin::edge::KvsStore;
 use admin::oidc::{self, OidcClient, OidcConfig};
 use admin::opener::LambdaOpener;
+use admin::probe::{AwsProbe, Clients, Names, TableNames};
+use admin::readiness::{self, WarmTargets};
 use admin::scheduler::SchedulerStore;
 use admin::sessions::{AdminSession, PendingLogin, SessionStore};
 use admin::templates::Dashboard;
@@ -64,6 +66,11 @@ struct AppState {
     /// Opens the event on demand, by invoking the same function the schedule
     /// invokes.
     opener: LambdaOpener,
+    /// Read-only access to the deployment for the readiness panel (issue #70).
+    probe: AwsProbe,
+    /// The warm throughput Terraform configured, which the panel compares the
+    /// applied values against.
+    warm_targets: WarmTargets,
     sessions: SessionStore,
     oidc: OidcClient,
     http: reqwest::Client,
@@ -122,6 +129,15 @@ async fn main() -> Result<(), Error> {
     let lambda = aws_sdk_lambda::Client::new(&config);
     let event_id = std::env::var("EVENT_ID")?;
 
+    let (probe, warm_targets) = readiness_from_env(Clients {
+        dynamodb: dynamo.clone(),
+        apigateway: aws_sdk_apigateway::Client::new(&config),
+        lambda: lambda.clone(),
+        scheduler: scheduler.clone(),
+        cloudfront: aws_sdk_cloudfront::Client::new(&config),
+        ssm,
+    })?;
+
     let state = Arc::new(AppState {
         store: DynamoStore::new(dynamo.clone(), std::env::var("COUNTERS_TABLE")?),
         edge: KvsStore::new(kvs, std::env::var("EDGE_KVS_ARN")?),
@@ -131,6 +147,8 @@ async fn main() -> Result<(), Error> {
             std::env::var("OPEN_EVENT_FUNCTION_NAME")?,
             event_id.clone(),
         ),
+        probe,
+        warm_targets,
         sessions: SessionStore::new(dynamo, std::env::var("TOKENS_TABLE")?),
         oidc,
         http,
@@ -181,6 +199,31 @@ async fn main() -> Result<(), Error> {
     let app = tower_http::normalize_path::NormalizePathLayer::trim_trailing_slash().layer(app);
 
     lambda_http::run(app).await
+}
+
+/// The readiness panel's probe (issue #70) and the warm-throughput targets it
+/// compares against, from the environment Terraform sets.
+fn readiness_from_env(clients: Clients) -> Result<(AwsProbe, WarmTargets), Error> {
+    let probe = AwsProbe::new(
+        clients,
+        Names {
+            tables: TableNames {
+                counters: std::env::var("COUNTERS_TABLE")?,
+                prequeue: std::env::var("PREQUEUE_TABLE")?,
+                positions: std::env::var("POSITIONS_TABLE")?,
+                tokens: std::env::var("TOKENS_TABLE")?,
+            },
+            assign_position_function: std::env::var("ASSIGN_POSITION_FUNCTION_NAME")?,
+            open_schedule: std::env::var("OPEN_SCHEDULE_NAME")?,
+            controller_schedule: std::env::var("CONTROLLER_SCHEDULE_NAME")?,
+            edge_parameter: std::env::var("EDGE_READINESS_PARAM")?,
+        },
+    );
+    let warm_targets = WarmTargets {
+        write_units: std::env::var("WARM_THROUGHPUT_WRITE_UNITS")?.parse()?,
+        read_units: std::env::var("WARM_THROUGHPUT_READ_UNITS")?.parse()?,
+    };
+    Ok((probe, warm_targets))
 }
 
 /// Response middleware: stamp the hardening + no-cache headers on every response
@@ -396,7 +439,22 @@ async fn dashboard(State(state): State<Shared>, headers: HeaderMap, now: Arrival
             // logged and the rules form is hidden rather than shown empty:
             // an empty textarea is indistinguishable from a real dormant
             // ruleset, and submitting it would overwrite the real one.
-            match state.edge.read_config().await {
+            //
+            // The readiness panel (issue #70) runs alongside it. It cannot
+            // fail: a check that errors or times out renders as a row saying
+            // so.
+            let (rules, rows) = tokio::join!(
+                state.edge.read_config(),
+                readiness::run_checks(
+                    &state.probe,
+                    &state.edge,
+                    state.warm_targets,
+                    now.epoch_seconds(),
+                    readiness::PER_CHECK_TIMEOUT,
+                ),
+            );
+            view.readiness = rows.iter().map(Into::into).collect();
+            match rules {
                 Ok((cfg, _etag)) => {
                     view.rules_text = format_rules(&cfg.rules);
                     view.ip_binding = admin::templates::IpBinding::from_enabled(cfg.bind_ip);

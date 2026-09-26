@@ -393,3 +393,22 @@ resource "aws_cloudfront_distribution" "this" {
 
   tags = var.tags
 }
+
+# --- Readiness facts (issue #70) ---------------------------------------------
+# What the admin's readiness panel needs to find and judge this distribution.
+# The admin lives in core, which edge depends on, so it cannot reference the
+# distribution directly; core names this parameter and edge writes it. A
+# Standard-tier String parameter bills nothing, so it holds N1.
+resource "aws_ssm_parameter" "readiness" {
+  name        = var.readiness_parameter_name
+  description = "Distribution facts for the admin readiness panel (issue #70)."
+  type        = "String"
+  tier        = "Standard"
+  value = jsonencode({
+    distribution_id   = aws_cloudfront_distribution.this.id
+    gate_function_arn = aws_cloudfront_function.gate.arn
+    status_path       = local.polled_status_path
+  })
+
+  tags = var.tags
+}

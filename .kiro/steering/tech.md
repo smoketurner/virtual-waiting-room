@@ -37,7 +37,7 @@ only in the member crate that uses them):
 | Lambda runtime | `lambda_runtime`, `lambda_http`, `aws_lambda_events` |
 | Web framework (admin UI) | `axum`, `tower`, `tower-http` |
 | Async runtime | `tokio` |
-| AWS SDK | `aws-config`, `aws-sdk-dynamodb`, `aws-sdk-ssm`, `aws-smithy-types`, `aws-sdk-cloudfrontkeyvaluestore` (admin only — writes the edge gate's config, issue #71), `aws-sdk-scheduler` (admin only — sets the open schedule's time, issue #128) |
+| AWS SDK | `aws-config`, `aws-sdk-dynamodb`, `aws-sdk-ssm`, `aws-smithy-types`, `aws-sdk-cloudfrontkeyvaluestore` (admin only — writes the edge gate's config, issue #71), `aws-sdk-scheduler` (admin only — sets the open schedule's time, issue #128), `aws-sdk-apigateway` and `aws-sdk-cloudfront` (admin only — read-only calls for the readiness panel, issue #70) |
 | Templating + static assets (admin UI) | `askama`, `rust-embed`, `mime_guess` |
 | Admin OIDC login (ADR-0016) | `openidconnect`, `jsonwebtoken`, `reqwest`, `rustls`, `cookie` |
 | Serialization | `serde`, `serde_json`, `serde_dynamo`, `base64` |

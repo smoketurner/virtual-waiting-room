@@ -198,7 +198,7 @@ Reliability — the waiting room must not be the reason the site is down:
       `Partial:` documented: ADR-0034, the availability posture in `docs/DEPLOY.md`, and a
       break-glass fail-open written straight to the KeyValueStore in `docs/RUNBOOK.md`. Not
       rehearsed against a real deployment.
-- [ ] [#70](https://github.com/smoketurner/virtual-waiting-room/issues/70) Pre-event readiness as a diagnostics panel in the admin UI, not a command [O1, O2, N7] — the manual checklist now exists in `docs/RUNBOOK.md`; what is missing is a panel that asserts the same rows against live deployed state, and the checklist being generated from that list so the two cannot drift
+- [x] [#70](https://github.com/smoketurner/virtual-waiting-room/issues/70) Pre-event readiness as a diagnostics panel in the admin UI, not a command [O1, O2, N7] — a read-only Readiness panel above Current state checks warm throughput on all four tables, DynamoDB and API Gateway account limits, `assign_position` reserved concurrency, the open and controller schedules, the gate ruleset (dormant or not, and any fail-open window), the `/v1/status` cache behaviour and the gate's association, each naming its requirement with a fix link. The checks are one catalogue in `crates/admin/src/readiness.rs`, and `docs/RUNBOOK.md`'s automated checklist is generated from it (a test fails on drift). Out of scope by decision: a WAF row (no web ACL is created, N7) and a CloudFront pricing-plan row. Not built: GovCloud "not applicable" rows, since nothing deploys to GovCloud (N4); reserved-concurrency rows for the other functions, which reserve none by design.
 
 Fairness and abuse — nothing bounds how many places one visitor takes:
 

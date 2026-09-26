@@ -88,6 +88,10 @@ module "edge" {
   event_id            = var.event_id
   session_cookie_name = var.session_cookie_name
 
+  # Where the distribution's facts are published for the admin's readiness
+  # panel (issue #70). core names it; edge writes it.
+  readiness_parameter_name = module.core.edge_readiness_parameter_name
+
   # The customer's own hostname, or empty for the *.cloudfront.net default.
   aliases             = var.aliases
   acm_certificate_arn = var.acm_certificate_arn
