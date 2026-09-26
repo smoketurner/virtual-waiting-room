@@ -37,6 +37,15 @@ resource "aws_cloudwatch_log_group" "lambda" {
 # Each keys on a stable `event` name the Rust already emits. The code comments
 # that used to say "attach a metric filter to this" are gone; this is the filter
 # they meant.
+#
+# Every Lambda logs through `tracing_subscriber::fmt().json()` without
+# `flatten_event`, which nests the event's own fields under a `fields` object and
+# puts only `level` at the root:
+#
+#   {"level":"WARN","fields":{"message":"...","event":"join_dropped","total":3}}
+#
+# So a pattern or value names `$.fields.<name>`. A bare `$.event` matches nothing,
+# and a filter that matches nothing publishes zero forever with its alarm green.
 
 locals {
   # `log_group` is the function that emits the event; `pattern` keys on the
@@ -49,8 +58,8 @@ locals {
     # T-0.
     join_dropped = {
       log_group = local.assign_position_name
-      pattern   = "{ $.event = \"join_dropped\" }"
-      value     = "$.total"
+      pattern   = "{ $.fields.event = \"join_dropped\" }"
+      value     = "$.fields.total"
     }
 
     # The arrival went unrecorded, so the controller measures a no-show that
@@ -59,7 +68,7 @@ locals {
     # the origin agreed to serve.
     arrival_record_failed = {
       log_group = local.generate_token_name
-      pattern   = "{ $.event = \"arrival_record_failed\" }"
+      pattern   = "{ $.fields.event = \"arrival_record_failed\" }"
       value     = "1"
     }
 
@@ -67,7 +76,7 @@ locals {
     # the arrival against.
     arrival_shard_draw_failed = {
       log_group = local.generate_token_name
-      pattern   = "{ $.event = \"arrival_shard_draw_failed\" }"
+      pattern   = "{ $.fields.event = \"arrival_shard_draw_failed\" }"
       value     = "1"
     }
 
@@ -80,7 +89,7 @@ locals {
     # Visitors keep being admitted throughout, so nothing else reports it.
     admission_claim_failed = {
       log_group = local.generate_token_name
-      pattern   = "{ $.event = \"admission_claim_failed\" }"
+      pattern   = "{ $.fields.event = \"admission_claim_failed\" }"
       value     = "1"
     }
 
@@ -92,7 +101,7 @@ locals {
     # nothing to release, and the queue simply stops moving.
     admission_control_unreadable = {
       log_group = local.controller_name
-      pattern   = "{ $.event = \"admission_control_unreadable\" }"
+      pattern   = "{ $.fields.event = \"admission_control_unreadable\" }"
       value     = "1"
     }
 
@@ -102,7 +111,7 @@ locals {
     # management events, so this log line is the only trail it leaves.
     rules_audit_failed = {
       log_group = local.admin_name
-      pattern   = "{ $.event = \"rules_audit_failed\" }"
+      pattern   = "{ $.fields.event = \"rules_audit_failed\" }"
       value     = "1"
     }
 
@@ -118,7 +127,7 @@ locals {
     # alarms at threshold zero like `rules_audit_failed`.
     fail_open_audit_lost = {
       log_group = local.admin_name
-      pattern   = "{ $.event = \"fail_open_audit_lost\" }"
+      pattern   = "{ $.fields.event = \"fail_open_audit_lost\" }"
       value     = "1"
     }
 
@@ -132,13 +141,8 @@ locals {
     # alarms on the first occurrence so a misfire is surfaced even when the
     # retries that follow it eventually succeed.
     #
-    # Keys on the top-level `level` field rather than `$.event` because the
-    # Lambda's tracing-subscriber JSON formatter
-    # (tracing_subscriber::fmt().json(), no flatten_event) nests user fields
-    # like `event` under a `fields` object, while `level` serializes at the
-    # root as uppercase "ERROR" (tracing-serde). The other filters in this map
-    # key on `$.event` and share a separate latent gap; this one is keyed to
-    # actually match the open_event log group's output.
+    # Keys on the root `level` ("ERROR", uppercase) rather than one event name,
+    # so any future open_event error alarms too, not just the wrong-phase one.
     open_event_error = {
       log_group = local.open_event_name
       pattern   = "{ $.level = \"ERROR\" }"

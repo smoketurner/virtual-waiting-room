@@ -58,7 +58,9 @@ run "filters_key_on_the_event_names_the_crates_emit" {
 
   # These strings are `event = "..."` literals in the Rust. If a crate renames
   # one without renaming it here, the filter matches nothing and the alarm stays
-  # green through exactly the failure it exists to catch.
+  # green through exactly the failure it exists to catch. The path is
+  # `$.fields.event` because the JSON formatter nests the event's fields under
+  # `fields`; a bare `$.event` is the same match-nothing failure.
   assert {
     condition = alltrue([
       for name in [
@@ -71,10 +73,16 @@ run "filters_key_on_the_event_names_the_crates_emit" {
         "fail_open_audit_lost",
         ] : strcontains(
         aws_cloudwatch_log_metric_filter.event[name].pattern,
-        "$.event = \"${name}\""
+        "$.fields.event = \"${name}\""
       )
     ])
     error_message = "each filter must key on the stable event name its crate logs"
+  }
+
+  # join_dropped publishes the batch's drop count, which is nested the same way.
+  assert {
+    condition     = aws_cloudwatch_log_metric_filter.event["join_dropped"].metric_transformation[0].value == "$.fields.total"
+    error_message = "join_dropped must publish $.fields.total; a bare $.total resolves to nothing"
   }
 }
 
