@@ -879,7 +879,7 @@ mod tests {
             rec("m3", "018f3a2b-7c9d-7e1f-8003-0123456789ab"),
         ];
         let outcome = run_open(&store, &records).await;
-        assert!(outcome.failures.is_empty());
+        assert_eq!(outcome.failures, Vec::<String>::new());
         let writes = store.writes.lock().unwrap();
         let mut positions: Vec<u64> = writes.iter().map(|w| w.position).collect();
         positions.sort_unstable();
@@ -899,7 +899,7 @@ mod tests {
         ];
         let outcome = run_open(&store, &records).await;
         // Rejected records are dropped, not retried or dead-lettered.
-        assert!(outcome.failures.is_empty());
+        assert_eq!(outcome.failures, Vec::<String>::new());
         // Only the one valid record claimed a position: counter incremented by 1.
         assert_eq!(*store.counter.lock().unwrap(), 1);
         assert_eq!(store.writes.lock().unwrap().len(), 1);
@@ -916,7 +916,7 @@ mod tests {
         };
         let records = vec![body(""), body(r#","h":"short""#), body(r#","h":null"#)];
         let outcome = run_open(&store, &records).await;
-        assert!(outcome.failures.is_empty());
+        assert_eq!(outcome.failures, Vec::<String>::new());
         assert_eq!(*store.counter.lock().unwrap(), 0);
     }
 
@@ -936,7 +936,7 @@ mod tests {
             body: "garbage".to_owned(),
         }];
         let outcome = run_open(&store, &records).await;
-        assert!(outcome.failures.is_empty());
+        assert_eq!(outcome.failures, Vec::<String>::new());
         assert_eq!(*store.counter.lock().unwrap(), 0);
     }
 
@@ -987,7 +987,7 @@ mod tests {
             rec("m2", "018f3a2b-7c9d-7e1f-8002-0123456789ab"),
         ];
         let outcome = run_open(&store, &records).await;
-        assert!(outcome.failures.is_empty());
+        assert_eq!(outcome.failures, Vec::<String>::new());
         let writes = store.writes.lock().unwrap();
         let mut positions: Vec<u64> = writes.iter().map(|w| w.position).collect();
         positions.sort_unstable();
@@ -1016,7 +1016,7 @@ mod tests {
             rec("m3", "018f3a2b-7c9d-7e1f-8003-0123456789ab"),
         ];
         let outcome = run_open(&store, &records).await;
-        assert!(outcome.failures.is_empty());
+        assert_eq!(outcome.failures, Vec::<String>::new());
         let writes = store.writes.lock().unwrap();
         for write in writes.iter() {
             assert!(
@@ -1034,7 +1034,7 @@ mod tests {
         // Same id twice in one batch: second write is a Duplicate, not a failure.
         let records = vec![rec("m1", dup), rec("m2", dup)];
         let outcome = run_open(&store, &records).await;
-        assert!(outcome.failures.is_empty());
+        assert_eq!(outcome.failures, Vec::<String>::new());
         assert_eq!(store.writes.lock().unwrap().len(), 1);
     }
 
@@ -1053,7 +1053,7 @@ mod tests {
         };
         let records = vec![rec("m1", VALID_ID)];
         let outcome = run_open(&store, &records).await;
-        assert!(outcome.failures.is_empty());
+        assert_eq!(outcome.failures, Vec::<String>::new());
         assert_eq!(store.prequeue_writes.lock().unwrap().len(), 1);
     }
 
@@ -1069,7 +1069,7 @@ mod tests {
         *store.counters_sequence.lock().unwrap() = VecDeque::from([Some(counters)]);
         let records = vec![rec("m1", VALID_ID)];
         let outcome = run_open(&store, &records).await;
-        assert!(outcome.failures.is_empty());
+        assert_eq!(outcome.failures, Vec::<String>::new());
         assert_eq!(store.writes.lock().unwrap().len(), 1);
         assert!(store.prequeue_writes.lock().unwrap().is_empty());
     }
@@ -1190,7 +1190,7 @@ mod tests {
         // so no collision with any cohort member's `prp` image.
         let post_open = vec![rec("m4", "018f3a2b-7c9d-7e1f-8004-0123456789ab")];
         let outcome = run_open(&store, &post_open).await;
-        assert!(outcome.failures.is_empty());
+        assert_eq!(outcome.failures, Vec::<String>::new());
         let writes = store.writes.lock().unwrap();
         assert_eq!(writes.len(), 1);
         assert_eq!(
@@ -1210,7 +1210,7 @@ mod tests {
         let store = FakeStore::default();
         let records = vec![rec("m1", VALID_ID)]; // rec() hardcodes event_id "evt-1"
         let outcome = process_batch(&store, "evt-other", shard(0), &records).await;
-        assert!(outcome.failures.is_empty());
+        assert_eq!(outcome.failures, Vec::<String>::new());
         assert_eq!(*store.counter.lock().unwrap(), 0);
     }
 
@@ -1270,7 +1270,7 @@ mod tests {
             rec("m2", "018f3a2b-7c9d-7e1f-8002-0123456789ab"),
         ];
         let outcome = run_open(&store, &records).await;
-        assert!(outcome.failures.is_empty());
+        assert_eq!(outcome.failures, Vec::<String>::new());
         assert_eq!(store.prequeue_writes.lock().unwrap().len(), 3);
         assert!(store.writes.lock().unwrap().is_empty());
     }
@@ -1287,7 +1287,7 @@ mod tests {
             rec("m3", "018f3a2b-7c9d-7e1f-8003-0123456789ab"),
         ];
         let outcome = process_batch(&store, "evt-1", shard(4), &records).await;
-        assert!(outcome.failures.is_empty());
+        assert_eq!(outcome.failures, Vec::<String>::new());
 
         let writes = store.prequeue_writes.lock().unwrap();
         assert_eq!(writes.len(), 4);
@@ -1380,7 +1380,7 @@ mod tests {
             .push_back(Some(opened_counters(counts, Phase::Active)));
 
         let outcome = run_open(&store, &records).await;
-        assert!(outcome.failures.is_empty());
+        assert_eq!(outcome.failures, Vec::<String>::new());
         assert_eq!(
             store.prequeue_writes.lock().unwrap().len(),
             1,
@@ -1410,7 +1410,7 @@ mod tests {
 
         let records = vec![rec("m1", &id)];
         let outcome = run_open(&store, &records).await;
-        assert!(outcome.failures.is_empty());
+        assert_eq!(outcome.failures, Vec::<String>::new());
         assert!(store.prequeue_writes.lock().unwrap().is_empty());
         assert_eq!(store.shard_counters.lock().unwrap()[0], 0);
     }
@@ -1426,7 +1426,7 @@ mod tests {
         };
         let records = vec![rec("m1", VALID_ID)];
         let outcome = run_open(&store, &records).await;
-        assert!(outcome.failures.is_empty());
+        assert_eq!(outcome.failures, Vec::<String>::new());
         assert_eq!(store.prequeue_writes.lock().unwrap().len(), 1);
         assert!(store.writes.lock().unwrap().is_empty());
     }
@@ -1453,7 +1453,7 @@ mod tests {
             .push_back(Some(opened_counters(counts, Phase::Active)));
 
         let outcome = run_open(&store, &records).await;
-        assert!(outcome.failures.is_empty());
+        assert_eq!(outcome.failures, Vec::<String>::new());
         assert_eq!(store.prequeue_writes.lock().unwrap().len(), 2);
 
         let live_writes = store.writes.lock().unwrap();

@@ -3681,7 +3681,7 @@ mod tests {
             ApplyError::Action(ActionError::InvalidRules(_))
         ));
         // Nothing written: the store's config is still the default empty one.
-        assert!(edge.cfg.lock().unwrap().rules.is_empty());
+        assert_eq!(edge.cfg.lock().unwrap().rules, Vec::<ProtectionRule>::new());
         assert!(store.rules_audit.lock().unwrap().is_none());
     }
 
@@ -3724,7 +3724,7 @@ mod tests {
         apply_set_rules(&store, &edge, "evt", vec![], "op@x", ts(0))
             .await
             .unwrap();
-        assert!(edge.cfg.lock().unwrap().rules.is_empty());
+        assert_eq!(edge.cfg.lock().unwrap().rules, Vec::<ProtectionRule>::new());
     }
 
     // --- rules form parsing (issue #71) -----------------------------------
