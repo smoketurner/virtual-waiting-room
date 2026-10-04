@@ -44,7 +44,7 @@ target, so the binaries cannot be built for a different architecture than the fu
 deployed with. `ARCH=` still overrides it for a one-off build.
 
 CI runs the same checks: `.github/workflows/rust-ci.yml` (fmt, clippy, test, cargo-deny,
-pinned to Rust 1.98.0) and `terraform-ci.yml` (fmt -check, init -backend=false, validate).
+pinned to Rust 1.99.0) and `terraform-ci.yml` (fmt -check, init -backend=false, validate).
 
 ## Architecture
 

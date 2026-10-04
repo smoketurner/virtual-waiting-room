@@ -1515,7 +1515,7 @@ mod tests {
     fn every_check_names_a_requirement_and_a_fix() {
         for check in CheckId::ALL {
             let spec = check.spec();
-            assert!(!spec.name.is_empty());
+            assert_ne!(spec.name, "");
             assert!(
                 spec.fix_url.starts_with("https://") || spec.fix_url.starts_with('#'),
                 "{check:?}: {}",
