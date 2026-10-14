@@ -193,8 +193,8 @@ resource "aws_cloudfront_distribution" "this" {
   comment             = "Virtual Waiting Room - ${var.name_prefix}"
   price_class         = var.price_class
 
-  # The edge web ACL (waf.tf, ADR-0038), when enabled. A distribution on a
-  # CloudFront flat-rate plan must have one and cannot shed it while subscribed.
+  # The edge web ACL (waf.tf, ADR-0038), on a flat-rate plan only. A subscribed
+  # distribution must have one and cannot shed it until the plan lapses.
   web_acl_id = local.waf_enabled ? aws_wafv2_web_acl.this[0].arn : null
 
   # Empty deploys on the *.cloudfront.net name. A real event fronts the

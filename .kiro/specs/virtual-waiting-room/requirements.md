@@ -289,7 +289,7 @@ pre-event preparation in the Operational section.
 - THE SYSTEM SHALL answer API requests from its own distribution only: every REST API method requires an API key held by CloudFront alone.
 - WHERE the deployment is on a CloudFront flat-rate plan, THE SYSTEM SHALL attach the edge web ACL: a WAF token from a browser challenge on every JavaScript API call, rate limits per token and per IP (escalating to CAPTCHA), and AWS managed rules in Count until promoted (O5).
 - THE SYSTEM SHALL NOT create a WAFv2 web ACL by default: on pay-as-you-go it bills between events, against N1.
-- Acceptance: The gate runs at viewer-request on the protected behaviour and the join burst reaches SQS with no compute in the path. A request straight to `execute-api` is refused with 403. With `waf_enabled`, a join without a WAF token is challenged rather than enqueued, and the no-JavaScript queue is never challenged (ADR-0037, ADR-0038).
+- Acceptance: The gate runs at viewer-request on the protected behaviour and the join burst reaches SQS with no compute in the path. A request straight to `execute-api` is refused with 403. With `flat_rate_plan_tier` set, a join without a WAF token is challenged rather than enqueued, and the no-JavaScript queue is never challenged (ADR-0037, ADR-0038).
 
 **N8** — As an integrator, I want an OpenAPI spec so that client and admin surfaces are generated.
 - THE SYSTEM SHALL document the API as an OpenAPI specification.

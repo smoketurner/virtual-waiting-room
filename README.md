@@ -54,10 +54,10 @@ rate, plus standby across the rest of the site for visitors who hit the homepage
 The edge gate is a CloudFront Function at viewer-request that refuses every request
 without a valid session before the origin is touched, and the REST API answers only
 CloudFront: every method requires an API key the distribution alone holds. A deployment
-on a CloudFront flat-rate plan, which bundles WAF, turns on the edge web ACL
-(`waf_enabled`): a silent browser challenge makes each place in the queue cost a solve,
-with rate limits per token and per IP. It is off by default because on pay-as-you-go it
-bills between events. See [`DESIGN.md`](./docs/DESIGN.md) §8 and
+on a CloudFront flat-rate plan (`flat_rate_plan_tier`), which bundles WAF, gets the
+edge web ACL: a silent browser challenge makes each place in the queue cost a solve,
+with rate limits per token and per IP. Pay-as-you-go, with no web ACL, is the default, because
+a plan and the ACL both bill between events. See [`DESIGN.md`](./docs/DESIGN.md) §8 and
 [ADR-0038](./docs/adr/0038-edge-web-acl-on-flat-rate-plan.md).
 
 Admission is a signed token, validated once and exchanged for a session cookie, so the

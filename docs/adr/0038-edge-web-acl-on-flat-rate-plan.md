@@ -51,10 +51,10 @@ operators.
 The key is unconditional, with no opt-in. It costs nothing and closes the bypass on every
 deployment, flat-rate or not.
 
-### The web ACL (opt-in, `waf_enabled`)
+### The web ACL (with a flat-rate plan, `flat_rate_plan_tier`)
 
-The web ACL is opt-in. A deployment on a flat-rate plan turns it on. On pay-as-you-go it bills
-between events, so the default is off.
+The web ACL exists only on a flat-rate plan, which requires it. On pay-as-you-go it bills
+between events, so the default is neither.
 
 - **The token.** Every JavaScript API path requires an `aws-waf-token`. The paths are listed
   explicitly and a Terraform test checks them against the paths `waiting.js` calls. Without a
@@ -98,9 +98,10 @@ of our own, 13–14 rules against its 50.
   distribution is subscribed, AWS refuses to delete it or remove its web ACL, even after
   cancellation, until the billing cycle ends. A stack that was torn down after each event
   (ADR-0008) now waits for month end.
-- **Subscribing is manual.** The Terraform provider cannot create the subscription yet
-  (terraform-provider-aws#45450, PR #49235), so it is a console step after `apply`
-  (`docs/DEPLOY.md`).
+- **Subscribing is part of the apply.** `aws_pricingplanmanager_subscription` subscribes the
+  distribution, the web ACL and the gate's KeyValueStore with immediate approval: setting the
+  tier and confirming the apply is the decision to pay. Only Business and Premium are accepted,
+  because Free and Pro have no JavaScript challenge and Free cannot cover a KeyValueStore.
 - **Browsers that refuse cookies cannot queue on the JavaScript path.** The token is a cookie.
   The page detects a token that won't stick and says so instead of reloading in a loop. The
   no-JavaScript path doesn't need the token.

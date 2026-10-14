@@ -50,7 +50,7 @@ Decisions deferred until measurement or a client engagement supplies the input.
 | Question | Resolves how |
 |---|---|
 | Bot Control Common versus Targeted | Run Targeted in Count mode during a real event and measure what it catches that Common does not. Ten times the per-request cost, and a flat-rate plan cannot carry it at all (ADR-0038). |
-| Flat-rate versus pay-as-you-go CloudFront pricing | Flat-rate is the path for an event that runs the edge web ACL: the plan bundles its cost ([ADR-0038](0038-edge-web-acl-on-flat-rate-plan.md)). The Terraform provider cannot create the subscription yet ([#45450](https://github.com/hashicorp/terraform-provider-aws/issues/45450), PR #49235), so it is a console step after apply. PAYG stays the default for a deployment without the web ACL; the crossover is otherwise non-monotonic in event size, poll interval and Bot Control tier. |
+| Flat-rate versus pay-as-you-go CloudFront pricing | Flat-rate is the path for an event that runs the edge web ACL: the plan bundles its cost ([ADR-0038](0038-edge-web-acl-on-flat-rate-plan.md)). `flat_rate_plan_tier` creates the subscription. PAYG stays the default for a deployment without the web ACL; the crossover is otherwise non-monotonic in event size, poll interval and Bot Control tier. |
 | Signing key rotation | Compromise permits minting admission for every event in the deployment. |
 | Standby inflow measurement placement | Authorizer-local versus centrally aggregated. |
 | No-show controller tuning | Smoothing window and correction bounds need a real event's data. |

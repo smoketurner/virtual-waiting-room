@@ -82,6 +82,11 @@ output "open_schedule_name" {
 }
 
 output "web_acl_arn" {
-  description = "ARN of the edge web ACL, or null when waf_enabled is off. Subscribe it with the distribution to a CloudFront flat-rate plan (docs/DEPLOY.md)."
+  description = "ARN of the edge web ACL, or null on pay-as-you-go."
   value       = module.edge.web_acl_arn
+}
+
+output "flat_rate_plan_status" {
+  description = "Status of the CloudFront flat-rate plan subscription, or null on pay-as-you-go."
+  value       = module.edge.flat_rate_plan_status
 }

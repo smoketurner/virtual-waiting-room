@@ -752,8 +752,8 @@ not bill it. This is unconditional ([ADR-0038](../../../docs/adr/0038-edge-web-a
 It is not a public API key: a key on a page served to browsers ships in client-side JavaScript,
 and this one never leaves the distribution's configuration.
 
-**The edge web ACL is opt-in, for a deployment on a CloudFront flat-rate plan** (`waf_enabled`,
-`modules/edge/waf.tf`). On pay-as-you-go WAF bills $0.60 per million requests inspected against
+**The edge web ACL comes with a CloudFront flat-rate plan** (`flat_rate_plan_tier`,
+`modules/edge/waf.tf` and `plan.tf`). On pay-as-you-go WAF bills $0.60 per million requests inspected against
 the same request count CloudFront serves, mostly the system's own polling. At 1M visitors that
 exceeds the CloudFront bill (§12), and the ACL bills a monthly fee per ACL and per rule between
 events, which N1 does not allow. A flat-rate plan (Business and above) bundles the ACL, its rules,
@@ -778,10 +778,10 @@ reads `waiting.js` and fails if it calls a `/v1` path the token rule does not co
 
 Only rules a flat-rate plan accepts are used: individual rules, no rule groups of our own, no
 Targeted Bot Control, no ATP/ACFP. Thirteen rules (fourteen with the no-JS queue closed), within
-the Business plan's fifty. Autonomous System Number (ASN) matching is not built. Subscribing
-the distribution is a console step until the provider supports it
-(terraform-provider-aws#45450), and a subscribed distribution cannot be deleted or shed its web
-ACL until the billing cycle ends.
+the Business plan's fifty. Autonomous System Number (ASN) matching is not built. Terraform
+subscribes the distribution, the web ACL and the gate's KeyValueStore to the plan, approved at
+apply. A subscribed distribution cannot be deleted or shed its web ACL until the billing cycle
+in which the plan is cancelled ends.
 
 What this does not do is bind a place to a person. It raises the price of a place from nothing to
 a browser session. A farm running real browsers through residential proxies still wins places,
@@ -983,8 +983,8 @@ pay-as-you-go (PAYG) pricing, and Bot Control Common versus Targeted. Both are r
 open in the repository's `docs/adr/README.md`.
 
 On a flat-rate plan the WAF row is bundled: the Business plan covers the edge web ACL, its rules,
-AWS managed rules (Bot Control common included) and request fees, which is why the ACL is opt-in
-behind `waf_enabled` for a subscribed deployment (ADR-0038). The subscription is monthly and pins
+AWS managed rules (Bot Control common included) and request fees, which is why the ACL exists
+only with `flat_rate_plan_tier`, which also subscribes the distribution (ADR-0038). The subscription is monthly and pins
 the distribution until the billing cycle ends.
 
 ---
