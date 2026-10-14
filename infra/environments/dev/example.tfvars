@@ -81,14 +81,14 @@ admission_rate = 5
 # not tightly around the average.
 session_ttl_seconds = 3600
 
-# --- Edge protection (ADR-0038) ----------------------------------------------
-# The WAF web ACL: a WAF token, earned through a silent JavaScript challenge,
-# required on every API call the waiting page makes, rate limits per token and per IP,
-# and AWS managed rules. Its cost is bundled into a CloudFront flat-rate plan
-# (Business or above), which also requires it; on pay-as-you-go it bills every
-# month, so leave it off there. Subscribing the distribution to the plan is a
-# console step for now (docs/DEPLOY.md).
-waf_enabled = false
+# --- Flat-rate plan and edge protection (ADR-0038) ---------------------------
+# null stays on pay-as-you-go. "BUSINESS" ($200/month) or "PREMIUM" subscribes
+# the distribution to a CloudFront flat-rate plan and attaches the WAF web ACL
+# it bundles: a WAF token, earned through a silent JavaScript challenge, on
+# every API call the waiting page makes, rate limits per token and per IP, and
+# AWS managed rules. The plan bills monthly, and the distribution cannot be
+# deleted until a cancelled plan's billing period ends (docs/DEPLOY.md).
+flat_rate_plan_tier = null
 
 # Managed and anonymous-IP rules observe ("count") until one event's worth of
 # data says they can act ("enforce"), per O5.

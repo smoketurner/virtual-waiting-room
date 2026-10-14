@@ -169,15 +169,15 @@ variable "session_ttl_seconds" {
   default     = 3600
 }
 
-# --- Edge protection (ADR-0038) ----------------------------------------------
-# The WAF web ACL is priced into a CloudFront flat-rate plan and required by
-# one. Turn it on for a deployment that will be subscribed; on pay-as-you-go it
-# bills every month whether or not an event is running.
+# --- Flat-rate plan and edge protection (ADR-0038) ---------------------------
+# Pay-as-you-go unless a tier is set. A plan bundles the WAF web ACL and
+# requires one; on pay-as-you-go the ACL bills every month whether or not an
+# event is running, so it exists only with a plan.
 
-variable "waf_enabled" {
-  description = "Attach the edge web ACL: a WAF token on the JavaScript API, per-token and per-IP rate limits, and AWS managed rules. For a flat-rate plan deployment."
-  type        = bool
-  default     = false
+variable "flat_rate_plan_tier" {
+  description = "CloudFront flat-rate plan for the distribution (BUSINESS or PREMIUM), which also attaches the edge web ACL: a WAF token on the JavaScript API, per-token and per-IP rate limits, and AWS managed rules. null stays on pay-as-you-go with no web ACL. Billed monthly; the distribution cannot be deleted until a cancelled plan's billing period ends."
+  type        = string
+  default     = null
 }
 
 variable "waf_managed_rules_mode" {
@@ -193,7 +193,7 @@ variable "waf_join_ip_limit" {
 }
 
 variable "nojs_enabled" {
-  description = "Whether the no-JavaScript queue stays open when the web ACL is on. false closes it at the edge for an event where it is being abused."
+  description = "Whether the no-JavaScript queue stays open on a flat-rate plan. false closes it at the edge for an event where it is being abused."
   type        = bool
   default     = true
 }

@@ -130,10 +130,8 @@ Throwaway code. Measures what documentation cannot settle.
   Note VPC origins require an internet gateway present but unused, forbid Lambda@Edge
   origin triggers, and are unavailable in GovCloud (DESIGN §12)
 - `var.enable_vpc` for ATO-constrained clients — design the seam now, do not retrofit
-- Flat-rate plan subscription [O6] — the better fit for a large planned event, but the
-  AWS provider cannot create a flat-rate distribution yet (terraform-provider-aws#45450).
-  Default PAYG until it lands; document manual per-event selection + post-event cancellation.
-  The web ACL a plan requires is built behind `waf_enabled` (ADR-0038)
+- Flat-rate plan subscription [O6] — done: `flat_rate_plan_tier` subscribes the
+  distribution with the web ACL it requires (ADR-0038). Default PAYG
 - CloudWatch alarms and a shipped dashboard — the metrics an operator acts on, not
   every metric available
 - Publish the OpenAPI specification for public and admin surfaces [N8]

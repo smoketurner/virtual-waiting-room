@@ -659,8 +659,8 @@ not bill it. This is unconditional ([ADR-0038](adr/0038-edge-web-acl-on-flat-rat
 It is not a public API key: a key on a page served to browsers ships in client-side JavaScript,
 and this one never leaves the distribution's configuration.
 
-**The edge web ACL is opt-in, for a deployment on a CloudFront flat-rate plan** (`waf_enabled`,
-`modules/edge/waf.tf`). On pay-as-you-go WAF bills $0.60 per million requests inspected against
+**The edge web ACL comes with a CloudFront flat-rate plan** (`flat_rate_plan_tier`,
+`modules/edge/waf.tf` and `plan.tf`). On pay-as-you-go WAF bills $0.60 per million requests inspected against
 the same request count CloudFront serves, mostly the system's own polling. At 1M visitors that
 exceeds the CloudFront bill (§12), and the ACL bills a monthly fee per ACL and per rule between
 events, which N1 does not allow. A flat-rate plan (Business and above) bundles the ACL, its rules,
@@ -685,10 +685,10 @@ reads `waiting.js` and fails if it calls a `/v1` path the token rule does not co
 
 Only rules a flat-rate plan accepts are used: individual rules, no rule groups of our own, no
 Targeted Bot Control, no ATP/ACFP. Thirteen rules (fourteen with the no-JS queue closed), within
-the Business plan's fifty. Autonomous System Number (ASN) matching is not built. Subscribing
-the distribution is a console step until the provider supports it
-(terraform-provider-aws#45450), and a subscribed distribution cannot be deleted or shed its web
-ACL until the billing cycle ends.
+the Business plan's fifty. Autonomous System Number (ASN) matching is not built. Terraform
+subscribes the distribution, the web ACL and the gate's KeyValueStore to the plan, approved at
+apply. A subscribed distribution cannot be deleted or shed its web ACL until the billing cycle
+in which the plan is cancelled ends.
 
 What this does not do is bind a place to a person. It raises the price of a place from nothing to
 a browser session. A farm running real browsers through residential proxies still wins places,
@@ -922,10 +922,7 @@ concern raised against an earlier version of this design
 CloudFront's Business and Premium plans bundle **self-identifying bots only** in their flat
 Bot Control allowance — a crawler that announces itself. The "$1,230 Targeted" figure below is
 for **advanced, obfuscated bot detection**, which is Custom-pricing only and cannot be purchased
-on a plan at any tier; only WAF's own charge is bundled by the plans. Re-verify
-[hashicorp/terraform-provider-aws#45450](https://github.com/hashicorp/terraform-provider-aws/issues/45450)
-before restating the PAYG-only caveat below rather than carrying it forward on trust — it was
-open as of this writing but its status is exactly the kind of external fact that goes stale.
+on a plan at any tier; only WAF's own charge is bundled by the plans.
 
 Recomputed against the model above at the foreground-only bound (215M baseline requests), the
 rate PAYG CloudFront charges for HTTPS requests
@@ -957,18 +954,16 @@ open in [`adr/README.md`](adr/README.md).
 
 For a large planned event a **CloudFront flat-rate plan is often the better fit** — a
 predictable monthly charge over the event window is usually cheaper than PAYG at the request
-volumes a full waiting room drives, and it caps cost exposure. It is **not the default today**
-for a mechanical reason: the Terraform AWS provider cannot yet create a distribution on a
-flat-rate plan ([hashicorp/terraform-provider-aws#45450](https://github.com/hashicorp/terraform-provider-aws/issues/45450)
-— configurable in the console, not in the provider). Until that lands (PR #49235), deployments
-are PAYG; a flat-rate plan is selected manually per event and cancelled afterwards (the O4
-runbook covers post-event cancellation).
+volumes a full waiting room drives, and it caps cost exposure. It is **not the default**,
+because it is monthly: an idle deployment on PAYG stays under N1, and one on a plan does not.
+`flat_rate_plan_tier` subscribes the distribution for an event; `make destroy` cancels it, and
+the O4 runbook covers the billing cycle that follows.
 
 **On a flat-rate plan the WAF rows above are bundled.** The Business plan ($200/month) covers
 the edge web ACL, its rules, AWS managed rules (Bot Control at the common level included) and
 WAF request fees, and requests WAF blocks do not count against its 125M allowance
-([ADR-0038](adr/0038-edge-web-acl-on-flat-rate-plan.md)). That is why the web ACL is opt-in
-behind `waf_enabled` and meant for a subscribed deployment: on PAYG the same ACL bills per
+([ADR-0038](adr/0038-edge-web-acl-on-flat-rate-plan.md)). That is why the web ACL exists
+only with `flat_rate_plan_tier`: on PAYG the same ACL bills per
 request inspected during an event and per ACL and rule every month between events. Two costs
 follow from the subscription rather than the traffic: it is monthly, and a subscribed
 distribution cannot be deleted until the billing cycle ends, so the stack outlives the event

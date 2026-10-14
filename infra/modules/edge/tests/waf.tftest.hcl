@@ -1,9 +1,11 @@
 # Asserts the edge web ACL (ADR-0038) is wired the way the design depends on.
 #
-# The ACL is opt-in because it bills monthly on pay-as-you-go (N1), so the
-# default must create nothing. When it is on, three things fail silently if
-# they drift and are checked here instead:
+# The ACL exists only with a flat-rate plan, because it bills monthly on
+# pay-as-you-go (N1), so the default must create nothing. On a plan, four
+# things fail silently if they drift and are checked here instead:
 #
+#   - the plan must cover the KeyValueStore the gate reads, or every protected
+#     request bills it pay-as-you-go beside a plan meant to bundle it;
 #   - the distribution must actually carry it; a web ACL that exists but is
 #     not associated protects nothing and still bills;
 #   - every JavaScript API path the waiting page calls must require a WAF
@@ -38,8 +40,23 @@ run "off_by_default_creates_nothing" {
 
   assert {
     condition     = aws_cloudfront_distribution.this.web_acl_id == null
-    error_message = "with waf_enabled off the distribution must carry no web ACL"
+    error_message = "on pay-as-you-go the distribution must carry no web ACL"
   }
+
+  assert {
+    condition     = length(aws_pricingplanmanager_subscription.this) == 0
+    error_message = "a flat-rate plan bills monthly; the default must stay on pay-as-you-go"
+  }
+}
+
+run "tiers_without_a_javascript_challenge_are_refused" {
+  command = plan
+
+  variables {
+    flat_rate_plan_tier = "PRO"
+  }
+
+  expect_failures = [var.flat_rate_plan_tier]
 }
 
 run "the_api_origin_carries_the_origin_key" {
@@ -60,7 +77,7 @@ run "enabled_attaches_a_cloudfront_scoped_acl" {
   command = plan
 
   variables {
-    waf_enabled = true
+    flat_rate_plan_tier = "BUSINESS"
   }
 
   # The ARN is computed, so a plan knows it only when the mock supplies it.
@@ -83,11 +100,51 @@ run "enabled_attaches_a_cloudfront_scoped_acl" {
   }
 }
 
+run "the_plan_covers_the_distribution_its_web_acl_and_the_gate_store" {
+  command = plan
+
+  variables {
+    flat_rate_plan_tier = "BUSINESS"
+  }
+
+  override_resource {
+    target          = aws_wafv2_web_acl.this
+    override_during = plan
+    values = {
+      arn = "arn:aws:wafv2:us-east-1:123456789012:global/webacl/test-edge/00000000-0000-0000-0000-000000000000"
+    }
+  }
+
+  override_resource {
+    target          = aws_cloudfront_distribution.this
+    override_during = plan
+    values = {
+      arn = "arn:aws:cloudfront::123456789012:distribution/TEST"
+    }
+  }
+
+  assert {
+    condition     = aws_pricingplanmanager_subscription.this[0].plan_family == "CloudFront" && aws_pricingplanmanager_subscription.this[0].plan_tier == "BUSINESS"
+    error_message = "the subscription must be a CloudFront plan at the configured tier"
+  }
+
+  assert {
+    condition = (
+      toset(aws_pricingplanmanager_subscription.this[0].resource_arns) == toset([
+        aws_cloudfront_distribution.this.arn,
+        aws_wafv2_web_acl.this[0].arn,
+        var.gate_kvs_arn,
+      ])
+    )
+    error_message = "the plan must cover the distribution, its web ACL, and the gate's KeyValueStore"
+  }
+}
+
 run "every_path_the_waiting_page_calls_requires_a_token" {
   command = plan
 
   variables {
-    waf_enabled = true
+    flat_rate_plan_tier = "BUSINESS"
   }
 
   # Read from the page itself, so a new endpoint waiting.js starts calling is
@@ -110,7 +167,7 @@ run "the_no_javascript_queue_is_never_challenged" {
   command = plan
 
   variables {
-    waf_enabled = true
+    flat_rate_plan_tier = "BUSINESS"
   }
 
   assert {
@@ -138,8 +195,8 @@ run "closing_the_no_javascript_queue_blocks_both_paths" {
   command = plan
 
   variables {
-    waf_enabled  = true
-    nojs_enabled = false
+    flat_rate_plan_tier = "BUSINESS"
+    nojs_enabled        = false
   }
 
   assert {
@@ -157,7 +214,7 @@ run "managed_rules_observe_until_promoted" {
   command = plan
 
   variables {
-    waf_enabled = true
+    flat_rate_plan_tier = "BUSINESS"
   }
 
   assert {

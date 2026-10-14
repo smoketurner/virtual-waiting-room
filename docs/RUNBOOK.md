@@ -78,8 +78,8 @@ if the two differ — regenerate with `cargo test -p admin -- --ignored regenera
       The pre-queue path is one write however large the cohort, so what needs testing is the
       live-join path and `/status` under polling load.
 - [ ] **Cost modelled for this event** (O6), including the CloudFront plan tier.
-- [ ] **Edge protection matches the plan** (N7, ADR-0038). On a flat-rate plan, `waf_enabled` is
-      on and the distribution is subscribed. Load the waiting page in a private window, see the
+- [ ] **Edge protection matches the plan** (N7, ADR-0038). On a flat-rate plan,
+      `terraform output flat_rate_plan_status` is `ACTIVE`. Load the waiting page in a private window, see the
       brief browser check on `/_wr/verify.html`, and confirm the join goes through. Decide before the event whether
       the managed rules stay in Count or were promoted after the last event's review.
 
@@ -237,9 +237,9 @@ conditions the system would otherwise survive in silence.
 3. **Review the web ACL's Count metrics** if it was on. The managed and anonymous-IP rules
    publish per-rule CloudWatch metrics under `<name_prefix>-*`. This event's data is what decides
    whether they are promoted to `enforce` for the next one (O5).
-4. **`make destroy`.** The deployment exists for one event. On a flat-rate plan, cancel the plan
-   first and destroy after the billing cycle ends: AWS refuses to delete a subscribed
-   distribution until then (`docs/DEPLOY.md`, Tear down).
+4. **`make destroy`.** The deployment exists for one event. On a flat-rate plan the first run
+   cancels the plan and then fails on the distribution, which AWS refuses to delete until the
+   billing cycle ends. Run it again after that (`docs/DEPLOY.md`, Tear down).
 
 ---
 

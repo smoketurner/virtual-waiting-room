@@ -24,17 +24,16 @@
 #      anonymous IPs) run in Count until an event's worth of data says
 #      otherwise (O5, ADR-0012).
 #
-# Opt-in. The web ACL is priced into a CloudFront flat-rate plan, which is how
-# it is meant to be run; on pay-as-you-go it bills a monthly fee per ACL and
-# per rule between events, which N1 does not allow. The plan also requires a
-# web ACL, so turning this on is the first step of subscribing.
+# Exists only with a flat-rate plan (plan.tf), which bundles its cost and
+# requires it; on pay-as-you-go it bills per ACL and per rule between events,
+# which N1 does not allow.
 #
 # Only rules the flat-rate plans accept are used: no rule groups of our own,
 # no Targeted Bot Control, no ATP/ACFP. The Business plan's 50-rule allowance
 # covers everything here.
 
 locals {
-  waf_enabled = var.waf_enabled
+  waf_enabled = var.flat_rate_plan_tier != null
 
   # The token WAF issues after a challenge or CAPTCHA, as a first-party cookie
   # on the viewer's host. Rate limits keyed on it bound what one solve buys.

@@ -98,9 +98,9 @@ module "edge" {
   aliases             = var.aliases
   acm_certificate_arn = var.acm_certificate_arn
 
-  # Edge protection (ADR-0038). Off unless this deployment is on a CloudFront
-  # flat-rate plan, which bundles the web ACL's cost.
-  waf_enabled            = var.waf_enabled
+  # Pay-as-you-go unless a flat-rate plan is set; the plan brings the web ACL
+  # (ADR-0038), whose cost it bundles.
+  flat_rate_plan_tier    = var.flat_rate_plan_tier
   waf_managed_rules_mode = var.waf_managed_rules_mode
   waf_join_ip_limit      = var.waf_join_ip_limit
   nojs_enabled           = var.nojs_enabled

@@ -203,8 +203,8 @@ admission path mints and verifies with `aws-lc-rs`.
 **The REST API answers only CloudFront** (ADR-0038). Every method sets `api_key_required`; the key
 (`core/origin_key.tf`) is sent only by the distribution, as an `x-api-key` origin custom header, so
 a request straight to `execute-api` is refused unbilled. A new method must require it too — a
-terraform test fails otherwise. `edge/waf.tf` is the **opt-in edge web ACL** (`waf_enabled`), meant
-for a deployment on a CloudFront flat-rate plan, which bundles its cost: a WAF challenge token on
+terraform test fails otherwise. `edge/waf.tf` is the **edge web ACL**, created only with a CloudFront
+flat-rate plan (`flat_rate_plan_tier`, `edge/plan.tf` subscribes it), which bundles its cost: a WAF challenge token on
 every JavaScript API path (listed explicitly, and checked against the paths `waiting.js` calls),
 rate limits per token and per IP, managed rules in Count until promoted. The no-JavaScript paths
 must never be challenged, and neither may `waiting.html`, which carries their form: the challenge

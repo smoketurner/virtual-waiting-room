@@ -4,7 +4,7 @@ output "distribution_id" {
 }
 
 output "distribution_arn" {
-  description = "CloudFront distribution ARN. What a CloudFront flat-rate plan subscription names (ADR-0038)."
+  description = "CloudFront distribution ARN."
   value       = aws_cloudfront_distribution.this.arn
 }
 
@@ -28,6 +28,11 @@ output "distribution_hosted_zone_id" {
 }
 
 output "web_acl_arn" {
-  description = "ARN of the edge web ACL (ADR-0038), or null when waf_enabled is off. A flat-rate plan subscription names it alongside the distribution."
+  description = "ARN of the edge web ACL (ADR-0038), or null on pay-as-you-go."
   value       = local.waf_enabled ? aws_wafv2_web_acl.this[0].arn : null
+}
+
+output "flat_rate_plan_status" {
+  description = "Status of the CloudFront flat-rate plan subscription (ACTIVE once billing has started), or null on pay-as-you-go."
+  value       = local.waf_enabled ? aws_pricingplanmanager_subscription.this[0].status : null
 }

@@ -142,15 +142,19 @@ variable "acm_certificate_arn" {
   }
 }
 
-# --- WAF web ACL (ADR-0038) ---------------------------------------------------
-# Opt-in: priced into a CloudFront flat-rate plan (which also requires a web
-# ACL), and billed per ACL and per rule every month on pay-as-you-go, which N1
-# does not allow for an idle deployment.
+# --- Flat-rate plan and WAF web ACL (ADR-0038) --------------------------------
+# Pay-as-you-go unless a tier is set. The plan bundles the web ACL and requires
+# one; on pay-as-you-go the ACL bills per rule every month, which N1 does not allow.
 
-variable "waf_enabled" {
-  description = "Attach the edge web ACL (ADR-0038): a WAF token on every JavaScript API path, rate limits per token and per IP, and AWS managed rules. Turn on for a deployment subscribed to a CloudFront flat-rate plan (Business or above), which bundles its cost and requires a web ACL. Leave off on pay-as-you-go, where it bills between events."
-  type        = bool
-  default     = false
+variable "flat_rate_plan_tier" {
+  description = "CloudFront flat-rate plan to subscribe the distribution to, with the edge web ACL (ADR-0038) the plan bundles and requires: a WAF token on every JavaScript API path, rate limits per token and per IP, and AWS managed rules. null stays on pay-as-you-go with no web ACL. BUSINESS or PREMIUM, the tiers with the JavaScript challenge the ACL depends on. Billed monthly: a cancelled plan runs to the end of its billing period, and the distribution cannot be deleted until then."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.flat_rate_plan_tier == null || contains(["BUSINESS", "PREMIUM"], coalesce(var.flat_rate_plan_tier, "-"))
+    error_message = "flat_rate_plan_tier must be null, \"BUSINESS\" or \"PREMIUM\": the free and Pro plans have no JavaScript challenge, and the free plan cannot cover the gate's KeyValueStore."
+  }
 }
 
 variable "waf_managed_rules_mode" {
@@ -220,7 +224,7 @@ variable "waf_nojs_ip_limit" {
 }
 
 variable "nojs_enabled" {
-  description = "Whether the no-JavaScript queue (/v1/enter, /v1/wait, ADR-0037) is open. Only takes effect with waf_enabled: false blocks both paths at the edge for an event where it is being abused, at the cost of visitors without JavaScript being unable to queue."
+  description = "Whether the no-JavaScript queue (/v1/enter, /v1/wait, ADR-0037) is open. Only takes effect on a flat-rate plan: false blocks both paths at the edge for an event where it is being abused, at the cost of visitors without JavaScript being unable to queue."
   type        = bool
   default     = true
 }
