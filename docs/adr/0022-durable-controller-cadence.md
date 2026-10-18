@@ -1,13 +1,16 @@
 # ADR-0022: Build the controller's 10-second cadence from durable waits
 
-> **Not yet delivering this in the deployed stack.** The durable configuration is applied and the
-> code uses `ctx.wait`, but `vwr-dev-controller` bills ~50 seconds per invocation: all six passes
-> run under one RequestId, so the waits are not suspending. The cause is the schedule, not this
-> decision — EventBridge Scheduler's templated Lambda target invokes synchronously, and a
-> synchronous durable invocation is held open for the whole execution. The target ARN is also
-> unqualified, which the durable functions documentation forbids. Tracked and diagnosed in
-> [#76](https://github.com/smoketurner/virtual-waiting-room/issues/76); the reasoning below stands
-> once that is fixed.
+> **Delivering in the deployed stack since 2026-09-10.** For a while it was not: the durable
+> configuration was applied and the code used `ctx.wait`, but all six passes ran under one
+> RequestId and `vwr-dev-controller` billed ~50 seconds per invocation, because EventBridge
+> Scheduler's *templated* Lambda target calls `Invoke` with no `InvocationType` — so Lambda
+> defaults to `RequestResponse`, and a synchronous durable invocation is held open for the whole
+> execution, waits included. The target ARN was also unqualified, which durable functions forbid.
+> The fix, in `infra/modules/core/lambdas.tf`, is the universal target
+> (`arn:aws:scheduler:::aws-sdk:lambda:invoke`) with `InvocationType = Event` and a qualified
+> `FunctionName`. Measured in dev afterwards: each pass is its own invocation resuming the same
+> `executionArn`, and billed duration per minute of cadence went from ~50,000 ms to ~600 ms.
+> Diagnosed and closed in [#76](https://github.com/smoketurner/virtual-waiting-room/issues/76).
 
 **Status:** Accepted. The SDK it depends on is an experimental preview (§5).
 
@@ -116,3 +119,42 @@ crate whose pure logic remains AWS-free and covered by its existing tests, and r
 restoring a sleep loop that is a dozen lines.
 
 Revisit when the SDK reaches GA.
+
+## 6. Revisited 2026-10-13: the operation limit went up, and the cadence stays
+
+Lambda [raised the durable operation ceiling from 3,000 to 30,000 per execution and the
+checkpoint payload from 256 KB to 1 MB](https://aws.amazon.com/about-aws/whats-new/2026/10/aws-lambda-durable-gen-limit-increase/).
+§3 cites checkpoint accumulation as a reason executions stay short, so the increase invites the
+obvious question: drop the `rate(1 minute)` schedule and run one long-lived execution, re-armed
+hourly or daily. The answer is no, and the operation ceiling turns out to be the least of the
+reasons.
+
+**The per-minute schedule is the recovery mechanism.** The retry strategy is
+`RetryDecision::Stop`: a failed pass ends the execution, and §3 justifies that by "the next
+scheduled one starts a clean minute." Stretch the re-arm to an hour and a single failed
+`UpdateItem` stops admission for an hour; stretch it to a day and the queue stops moving for a
+day. For the admission rate limiter that is a far worse failure mode than the one being
+optimised away, and it would have to be replaced with in-execution error handling that
+`AtMostOncePerRetry` plus a non-idempotent pass makes deliberately awkward.
+
+**It saves no durable operations.** Operations are per pass, not per execution: ~2 per pass
+(`ctx.step` + `ctx.wait`) at 6 passes a minute is ~17,280 a day either way. The only thing a
+longer execution removes is Scheduler invocations — 1,440 a day, at $1.00 per million, about
+four cents a month. Replay cost moves the wrong way: every resume re-runs the handler from the
+beginning and returns completed steps from their checkpoints, so per-resume replay grows with
+the number of completed steps. Six steps is trivial; thousands, re-read every ten seconds, is
+not.
+
+**Long executions make deploys worse.** §4 notes that a change to `PassOutcome`'s shape "cannot
+strand an in-flight execution for long" *because* executions live about a minute, that enabling
+`durable_config` forces a function replacement, and that destroying a durable function stops
+in-flight executions over as much as an hour. The schedule comment in `lambdas.tf` makes the
+same point about `$LATEST`: a mid-flight execution may fail to replay against changed code, and
+"the window is one minute of cadence."
+
+The 1 MB checkpoint payload is not load-bearing here — `PassOutcome` is a handful of integers.
+It does remove any future constraint on what a checkpointed outcome can carry.
+
+What would actually change this decision is a sub-minute scheduler, which is the constraint §1
+starts from, or SDK GA making in-execution retry safe enough to give up the clean-minute
+restart.
