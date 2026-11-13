@@ -228,8 +228,7 @@ impl DynamoStore {
         let items = out
             .responses()
             .and_then(|r| r.get(&self.counters_table))
-            .map(Vec::as_slice)
-            .unwrap_or_default();
+            .map_or_default(Vec::as_slice);
         let arrivals = arrivals_from_shard_items(items)?;
         // An incomplete batch under-counts arrivals, which reads as a higher
         // no-show rate and releases more. Better to skip the pass than to

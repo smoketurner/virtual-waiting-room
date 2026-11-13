@@ -362,10 +362,7 @@ async fn callback(
     };
 
     let subject = claims.subject().as_str().to_string();
-    let email = claims
-        .email()
-        .map(|e| e.as_str().to_string())
-        .unwrap_or_default();
+    let email = claims.email().map_or_default(|e| e.as_str().to_string());
 
     // Operator allowlist: only configured emails may hold an admin session.
     // Empty allowlist = deny all (fail closed).

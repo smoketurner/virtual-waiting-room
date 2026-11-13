@@ -15,7 +15,6 @@ name = "open_event"
 path = "src/lib.rs"
 
 [dependencies]
-anyhow = { workspace = true, features = ["std"] }
 aws-config = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 aws-lc-rs = { workspace = true, features = ["aws-lc-sys"] }
 aws-sdk-dynamodb = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }

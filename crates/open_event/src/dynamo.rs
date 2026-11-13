@@ -100,8 +100,7 @@ impl Store for DynamoStore {
         let items = out
             .responses()
             .and_then(|r| r.get(&self.counters_table))
-            .map(Vec::as_slice)
-            .unwrap_or_default();
+            .map_or_default(Vec::as_slice);
         counts_from_shard_items(items)
     }
 

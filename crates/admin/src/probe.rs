@@ -233,8 +233,7 @@ impl ReadinessProbe for AwsProbe {
 
         let behaviours = config
             .cache_behaviors()
-            .map(aws_sdk_cloudfront::types::CacheBehaviors::items)
-            .unwrap_or_default();
+            .map_or_default(aws_sdk_cloudfront::types::CacheBehaviors::items);
         let mut gate_elsewhere = Vec::new();
         let mut status = None;
         for b in behaviours {

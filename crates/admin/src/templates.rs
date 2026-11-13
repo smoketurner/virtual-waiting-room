@@ -246,7 +246,7 @@ impl Dashboard {
             participant_count: dash(state.participant_count.map(|n| n.to_string())),
             opened: state.participant_count.is_some(),
             target_rate: dash(state.target_rate.map(|n| n.to_string())),
-            target_rate_raw: state.target_rate.map(|n| n.to_string()).unwrap_or_default(),
+            target_rate_raw: state.target_rate.map_or_default(|n| n.to_string()),
             message: dash(state.message.clone()),
             message_raw: state.message.clone().unwrap_or_default(),
             admission_control: resolved.as_wire_str().to_owned(),

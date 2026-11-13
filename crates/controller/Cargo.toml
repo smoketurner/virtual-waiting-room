@@ -15,7 +15,6 @@ name = "controller"
 path = "src/lib.rs"
 
 [dependencies]
-anyhow = { workspace = true, features = ["std"] }
 aws-config = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 aws-durable-execution-sdk = { workspace = true }
 aws-sdk-dynamodb = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
