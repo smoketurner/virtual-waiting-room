@@ -173,8 +173,7 @@ mod tests {
     fn csp(headers: &HeaderMap) -> String {
         headers
             .get("content-security-policy")
-            .map(|v| v.to_str().unwrap_or("").to_owned())
-            .unwrap_or_default()
+            .map_or_default(|v| v.to_str().unwrap_or("").to_owned())
     }
 
     #[test]

@@ -15,7 +15,6 @@ name = "read"
 path = "src/lib.rs"
 
 [dependencies]
-anyhow = { workspace = true, features = ["std"] }
 aws-config = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 aws-sdk-dynamodb = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 hex = { workspace = true, features = ["alloc"] }
