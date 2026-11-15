@@ -1,0 +1,25 @@
+name: Actions lock
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions: {}
+
+jobs:
+  verify:
+    name: Verify lockfile
+    runs-on: ubuntu-slim
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - run: gh extension install github/gh-actions-lock --pin v0.4.1
+      # Unfiltered by path: a locked pin can stop verifying upstream without
+      # any workflow here changing.
+      - run: gh actions-lock --verify

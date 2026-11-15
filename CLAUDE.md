@@ -240,8 +240,10 @@ most often:
   the only thing that produces the third value, `FailOpen`, so it can
   never be written to storage as a string — the storage codec has two values where the display
   type has three, and that asymmetry is the invariant. Exhaustive `match` with no `_` arms.
-- Pin GitHub Actions to a SHA with a version comment, set `persist-credentials: false`, and
-  run `actionlint` and `zizmor` before committing.
+- GitHub Actions are referenced by exact version tag and locked to a commit in
+  `.github/workflows/actions.lock`. After touching any `uses:`, run `gh actions-lock` and commit
+  the lockfile — the `Actions lock` workflow fails on drift. Set `persist-credentials: false`,
+  and run `actionlint` and `zizmor` before committing.
 
 ## Testing
 
