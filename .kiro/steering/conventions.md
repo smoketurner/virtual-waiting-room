@@ -83,8 +83,9 @@ means you cannot silently `#[allow]` it — justify it or remove the cause.
   `destroy` unless explicitly asked — they create and delete real AWS resources.
 - No resource-count ceiling (N6 retired). Judge a new resource by what it costs while no
   event is running (N1, idle cost under $5/month), not by how many blocks it takes.
-- Pin GitHub Actions to SHA with a version comment; `persist-credentials: false`; scan with
-  `zizmor` and `actionlint` before committing.
+- Reference GitHub Actions by exact version tag, locked to a commit in
+  `.github/workflows/actions.lock` (`gh actions-lock` after touching any `uses:`);
+  `persist-credentials: false`; scan with `zizmor` and `actionlint` before committing.
 
 ## Code quality
 
