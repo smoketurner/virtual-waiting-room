@@ -609,7 +609,7 @@ pub fn parse_start_time(
     // earlier of the two -- the event opens at the first 18:30, not the
     // second.
     let zoned = tz
-        .to_ambiguous_zoned(civil)
+        .to_ambiguous_zoned_datetime(civil)
         .compatible()
         .map_err(|_| ActionError::InvalidStartTime)?;
 
@@ -645,7 +645,9 @@ pub fn parse_start_time(
 pub fn format_start_time(epoch_secs: u64, timezone: &str) -> Option<String> {
     let tz = jiff::tz::TimeZone::get(timezone).ok()?;
     let secs = i64::try_from(epoch_secs).ok()?;
-    let zoned = jiff::Timestamp::from_second(secs).ok()?.to_zoned(tz);
+    let zoned = jiff::Timestamp::from_second(secs)
+        .ok()?
+        .to_zoned_datetime(tz);
     // datetime-local round-trips minutes, not seconds.
     Some(format!("{}", zoned.datetime().strftime("%Y-%m-%dT%H:%M")))
 }

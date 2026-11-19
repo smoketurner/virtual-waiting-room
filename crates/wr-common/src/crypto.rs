@@ -246,12 +246,9 @@ impl Session {
 
 /// Signs `kind || payload` and returns `base64url(payload).base64url(mac)`.
 fn sign_claims(key: &SigningKey, kind: Kind, claims: &Claims) -> Result<String, SignError> {
-    jsonwebtoken::encode(
-        &Header::new(Algorithm::HS256),
-        claims,
-        &EncodingKey::from_secret(key.for_kind(kind)),
-    )
-    .map_err(|_| SignError)
+    let encoding_key = EncodingKey::from_secret(key.for_kind(kind)).map_err(|_| SignError)?;
+    jsonwebtoken::encode(&Header::new(Algorithm::HS256), claims, &encoding_key)
+        .map_err(|_| SignError)
 }
 
 /// Verifies a compact JWS and returns its claims. Errors are collapsed to
@@ -261,16 +258,15 @@ fn sign_claims(key: &SigningKey, kind: Kind, claims: &Claims) -> Result<String, 
 fn verify_claims(key: &SigningKey, kind: Kind, credential: &str) -> Result<Claims, VerifyError> {
     use jsonwebtoken::errors::ErrorKind;
 
-    jsonwebtoken::decode::<Claims>(
-        credential,
-        &DecodingKey::from_secret(key.for_kind(kind)),
-        &validation(),
-    )
-    .map(|data| data.claims)
-    .map_err(|e| match e.kind() {
-        ErrorKind::InvalidSignature => VerifyError::BadSignature,
-        _ => VerifyError::Malformed,
-    })
+    DecodingKey::from_secret(key.for_kind(kind))
+        .and_then(|decoding_key| {
+            jsonwebtoken::decode::<Claims>(credential, &decoding_key, &validation())
+        })
+        .map(|data| data.claims)
+        .map_err(|e| match e.kind() {
+            ErrorKind::InvalidSignature => VerifyError::BadSignature,
+            _ => VerifyError::Malformed,
+        })
 }
 
 /// The length of a [`PossessionSecret`] and of a [`SecretDigest`]: 32 bytes as
