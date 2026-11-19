@@ -18,6 +18,12 @@ ignore = [
   # askama 0.16.1 is the latest release, so no upgrade removes it. Revisit when
   # askama moves to `toml`.
   { id = "RUSTSEC-2026-0374", reason = "unmaintained, compile-time only via askama_derive; no askama release drops it" },
+  # RUSTSEC-2026-0543 — `chrono` is unmaintained, not vulnerable. It is pulled in
+  # by `oauth2` and `openidconnect` for token-expiry arithmetic on admin's OIDC
+  # login; no admission-path crate resolves it. oauth2 5.0.0 and openidconnect
+  # 4.1.0 are the latest releases, so no upgrade removes it. Revisit when they
+  # move off `chrono`.
+  { id = "RUSTSEC-2026-0543", reason = "unmaintained, admin OIDC login only via oauth2/openidconnect; no release drops it" },
 ]
 
 [licenses]

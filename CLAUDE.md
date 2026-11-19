@@ -86,7 +86,7 @@ Admission is closed-loop: `controller` runs six passes per `rate(1 minute)` exec
 EWMA, and advances `serving_counter` by a bounded correction. It is a **Lambda durable
 function** (ADR-0022): each pass is a checkpointed durable step and each 10 s gap a durable
 wait that suspends the execution instead of holding the invocation open, so the waiting is not
-billed. The SDK (`aws-durable-execution-sdk`) is an experimental preview, pinned exactly. It does
+billed. The SDK (`aws-durable-execution-sdk`) is generally available and pinned exactly. It does
 not expire positions: a row lives until its DynamoDB TTL reclaims it (ADR-0031), and the no-show
 correction is what compensates for absentees.
 

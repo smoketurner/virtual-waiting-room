@@ -12,7 +12,8 @@
 > `executionArn`, and billed duration per minute of cadence went from ~50,000 ms to ~600 ms.
 > Diagnosed and closed in [#76](https://github.com/smoketurner/virtual-waiting-room/issues/76).
 
-**Status:** Accepted. The SDK it depends on is an experimental preview (§5).
+**Status:** Accepted. The SDK it depends on was an experimental preview when adopted (§5) and is
+generally available as of 1.0.0 (§7).
 
 ## 1. Context
 
@@ -158,3 +159,19 @@ It does remove any future constraint on what a checkpointed outcome can carry.
 What would actually change this decision is a sub-minute scheduler, which is the constraint §1
 starts from, or SDK GA making in-execution retry safe enough to give up the clean-minute
 restart.
+
+## 7. Revisited 2026-11-19: the SDK reached GA
+
+AWS [announced general availability of the Rust SDK](https://aws.amazon.com/about-aws/whats-new/2026/11/lambda-durable-execution-sdk-rust/)
+and published `aws-durable-execution-sdk` 1.0.0, which the controller now pins. The risk §5
+accepted — a preview labelled not for production use, on a runtime AWS did not list — no longer
+applies: the announcement names `provided.al2023` and `cargo lambda` as the supported path. The
+pin stays exact, as every workspace dependency's is.
+
+The move from 0.2.0 needed no change to the controller. `durable::run`, `ctx.step`, `ctx.wait`,
+`StepSemantics::AtMostOncePerRetry` and `RetryDecision::Stop` are unchanged in signature and
+behaviour; the differences between the two releases are internal to checkpoint batching and
+replay.
+
+GA does not reopen §6. The clean-minute restart is kept because a pass is not idempotent, which
+is a property of the controller and not of the SDK's maturity.

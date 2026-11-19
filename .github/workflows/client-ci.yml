@@ -33,10 +33,9 @@ jobs:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v7.0.0
+      - uses: actions/setup-node@v7.1.0
         with:
-          node-version: "24.21.0"
-      # Name the files rather than the directory: a bare directory argument is
-      # only searched by newer Node than the version pinned above, which loads
-      # it as a module and fails.
+          node-version: "26.13.1"
+      # Name the files rather than the directory, as the pre-commit hook does:
+      # Node 20, the local floor, loads a bare directory as a module and fails.
       - run: node --test infra/modules/edge/tests/*.test.js

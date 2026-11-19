@@ -576,7 +576,7 @@ pub fn at_epoch(expression: &str, timezone: &str) -> Option<i64> {
     let inner = expression.strip_prefix("at(")?.strip_suffix(')')?;
     let civil: jiff::civil::DateTime = inner.parse().ok()?;
     let tz = jiff::tz::TimeZone::get(timezone).ok()?;
-    let zoned = tz.to_ambiguous_zoned(civil).compatible().ok()?;
+    let zoned = tz.to_ambiguous_zoned_datetime(civil).compatible().ok()?;
     Some(zoned.timestamp().as_second())
 }
 
