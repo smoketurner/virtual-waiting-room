@@ -82,6 +82,39 @@ struct AppState {
 
 type Shared = Arc<AppState>;
 
+/// The console's own origin, from the redirect URI the OIDC client is
+/// configured with: `CloudFront` does not forward `Host` to this origin, so the
+/// request itself cannot say where it was served from.
+fn console_origin() -> Arc<Option<String>> {
+    Arc::new(
+        std::env::var("OIDC_REDIRECT_URI")
+            .ok()
+            .and_then(|uri| admin::security::origin_of(&uri).map(str::to_owned)),
+    )
+}
+
+/// Refuses a state-changing request another site sent (issue #243), before any
+/// handler runs.
+async fn refuse_cross_site_writes(
+    State(own_origin): State<Arc<Option<String>>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if admin::security::is_cross_site_write(
+        request.method(),
+        request.headers(),
+        own_origin.as_deref(),
+    ) {
+        tracing::warn!(
+            event = "admin_cross_site_write_refused",
+            path = request.uri().path(),
+            "refused a state-changing admin request from another site"
+        );
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    next.run(request).await
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     tracing_subscriber::fmt()
@@ -163,6 +196,8 @@ async fn main() -> Result<(), Error> {
             .collect(),
     });
 
+    let own_origin = console_origin();
+
     let app = Router::new()
         .route("/admin", get(dashboard))
         .route("/admin/state", get(state_json))
@@ -183,6 +218,13 @@ async fn main() -> Result<(), Error> {
         .route("/admin/ip_binding", post(set_ip_binding))
         .route("/static/{*path}", get(static_asset))
         .with_state(state)
+        // Refuses a state-changing request another site sent (issue #243),
+        // before any handler runs. Inside the hardening layer so the refusal
+        // carries the same headers as every other response.
+        .layer(axum::middleware::from_fn_with_state(
+            own_origin,
+            refuse_cross_site_writes,
+        ))
         // Security-headers middleware: apply the hardening + no-cache headers to
         // every response. The dashboard handler sets its own nonce'd CSP first;
         // apply_hardening leaves an existing CSP intact, so this adds the policy

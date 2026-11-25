@@ -185,14 +185,14 @@ pub async fn admit<S: Store>(
         return Ok(Admission::EventNotFound);
     };
 
-    // A live-join row is the authoritative position when one exists, so it is
-    // read first and the pre-queue lookup is skipped when it answers.
+    // Both rows are read, because which one answers depends on both: a
+    // pre-queue row inside its shard's opened count is the visitor's place
+    // whatever `Positions` holds (issue #238), and only a live joiner or a
+    // straggler is answered by their `Positions` row. This is the same order
+    // `read` resolves `/v1/queue_num` in, so the number a visitor is shown is
+    // the number they are admitted at.
     let position_row = store.load_position(request_id).await?;
-    let prequeue = if position_row.is_none() {
-        store.load_prequeue(request_id).await?
-    } else {
-        None
-    };
+    let prequeue = store.load_prequeue(request_id).await?;
 
     let grant = match decide(
         &counters,
@@ -325,10 +325,12 @@ pub fn decide(
     // Possession first (issue #62): a caller who only knows the request id
     // learns nothing further here -- not the queue state, not the position.
     // The row that would answer the position is the row whose digest counts.
-    let stored = match (position_row, prequeue) {
-        (Some(row), _) => row.digest.as_ref(),
-        (None, Some(row)) => row.h.as_ref(),
-        (None, None) => return Err(Denied::NotRegistered),
+    let stored = match (cohort_position(counters, prequeue), position_row, prequeue) {
+        // A counted cohort member: the digest they registered with, never one
+        // a later join for the same id wrote onto a `Positions` row.
+        (Some(_), _, Some(row)) | (_, None, Some(row)) => row.h.as_ref(),
+        (_, Some(row), _) => row.digest.as_ref(),
+        (_, None, None) => return Err(Denied::NotRegistered),
     };
     let digest = match stored {
         Some(d) if d.is_digest_of(presented) => d.clone(),
@@ -355,15 +357,43 @@ pub fn decide(
     Ok(Grant { position, digest })
 }
 
-/// The visitor's position, from whichever path registered them. A live-join
-/// row wins over a pre-queue row: it is the position actually claimed from the
-/// counter, whereas a pre-queue row that raced the open only reports the base
-/// the live sequence counts from.
+/// The cohort position of a pre-queue row that the open counted, if it is one.
+///
+/// `None` for no row, an unopened event, a straggler (a local index at or past
+/// its shard's opened count) or a corrupt shard -- every case in which the
+/// pre-queue row does not, by itself, say where the visitor stands.
+fn cohort_position(counters: &Counters, prequeue: Option<&PreQueueItem>) -> Option<u64> {
+    match counters.resolve_prequeue(prequeue?) {
+        Ok(ResolvedPosition::PreQueue(position)) => Some(position),
+        Ok(ResolvedPosition::LiveJoin) | Err(ResolveError::NotOpen | ResolveError::BadShard) => {
+            None
+        }
+    }
+}
+
+/// The visitor's position, from whichever path registered them.
+///
+/// A pre-queue row the open counted wins over a `Positions` row (issue #238).
+/// A cohort member has no `Positions` row until they are admitted, so a join
+/// for their id that is processed after the open -- an SQS redelivery across
+/// T-0, or a client retrying a join whose response was lost -- passes the live
+/// path's `attribute_not_exists` guard and mints a position behind the whole
+/// cohort. Letting that row answer would demote a visitor who is shown their
+/// cohort position by `/v1/queue_num`, which resolves the pre-queue row first.
+/// The row an admission claim writes carries the same cohort position, so for
+/// every other cohort member the two agree anyway.
+///
+/// A `Positions` row answers for a live joiner and for a straggler, whose
+/// pre-queue row raced the open and holds no position of its own.
 fn resolve_position(
     counters: &Counters,
     prequeue: Option<&PreQueueItem>,
     position_row: Option<&PositionRow>,
 ) -> Result<u64, Denied> {
+    if let Some(position) = cohort_position(counters, prequeue) {
+        return Ok(position);
+    }
+
     if let Some(&PositionRow {
         position, status, ..
     }) = position_row
@@ -635,12 +665,14 @@ mod tests {
     }
 
     #[test]
-    fn a_live_join_row_wins_over_a_pre_queue_row() {
-        // A straggler has both rows; the claimed live position is authoritative.
+    fn a_live_join_row_answers_for_a_straggler() {
+        // A straggler has both rows: its pre-queue index is at or past the
+        // shard's opened count (2 here), so it holds no cohort position and
+        // the claimed live position is the authoritative one.
         let pq = PreQueueItem {
             r: REQ.to_owned(),
             s: 0,
-            l: 0,
+            l: 2,
             t: 1_788_000_000,
             h: Some(digest()),
         };
@@ -655,7 +687,55 @@ mod tests {
         assert_eq!(grant.position, 42);
     }
 
-    // --- issue #62: knowing the request id is not enough ----------------------
+    #[test]
+    fn a_counted_cohort_member_is_not_demoted_by_a_stray_live_row() {
+        // Issue #238: a join for a cohort member's id processed after the open
+        // (a redelivery across T-0, a retried join) mints a live position
+        // behind the cohort. The pre-queue row the open counted still answers,
+        // so the visitor is admitted at the position /v1/queue_num shows them.
+        let c = counters(20);
+        let pq = PreQueueItem {
+            r: REQ.to_owned(),
+            s: 0,
+            l: 1,
+            t: 1_788_000_000,
+            h: Some(digest()),
+        };
+        let cohort_only = decide(&c, Some(&pq), None, &secret(), 0).unwrap();
+        let with_stray = decide(
+            &c,
+            Some(&pq),
+            Some(&row(5_000, PositionStatus::Issued)),
+            &secret(),
+            0,
+        )
+        .unwrap();
+        assert_eq!(with_stray.position, cohort_only.position);
+        assert!(with_stray.position < c.participant_count.unwrap());
+    }
+
+    #[test]
+    fn a_stray_live_row_cannot_replace_a_cohort_members_secret() {
+        // The stray row carries whatever digest the later join sent. A caller
+        // who knows only the request id must not be able to lock the holder
+        // out, or take the place, by joining again under it.
+        let pq = PreQueueItem {
+            r: REQ.to_owned(),
+            s: 0,
+            l: 1,
+            t: 1_788_000_000,
+            h: Some(digest()),
+        };
+        let other = PossessionSecret::parse("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB").unwrap();
+        let mut stray = row(5_000, PositionStatus::Issued);
+        stray.digest = Some(other.digest());
+        let c = counters(20);
+        assert!(decide(&c, Some(&pq), Some(&stray), &secret(), 0).is_ok());
+        assert_eq!(
+            decide(&c, Some(&pq), Some(&stray), &other, 0).unwrap_err(),
+            Denied::NotHolder
+        );
+    }
 
     #[test]
     fn the_wrong_secret_is_refused_before_anything_about_the_queue_is_said() {
@@ -703,13 +783,12 @@ mod tests {
 
     #[test]
     fn the_positions_row_digest_is_the_one_that_counts() {
-        // Once admitted, a pre-queue member's Positions row answers first, so
-        // it must carry the digest (the claim copies it); a PreQueue digest is
-        // not consulted behind it.
+        // For a straggler the Positions row answers, so it must carry the
+        // digest; the PreQueue digest is not consulted behind it.
         let pq = PreQueueItem {
             r: REQ.to_owned(),
             s: 0,
-            l: 0,
+            l: 2,
             t: 1_788_000_000,
             h: Some(digest()),
         };

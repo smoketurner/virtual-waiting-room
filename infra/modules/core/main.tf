@@ -426,6 +426,13 @@ resource "aws_api_gateway_integration" "join_sqs" {
     "integration.request.header.Content-Type" = "'application/x-www-form-urlencoded'"
   }
 
+  # Issue #240: the model and the template below are both keyed on
+  # application/json. Left at the default (WHEN_NO_MATCH), a request with any
+  # other Content-Type matches neither: it skips the schema validator and its
+  # body is handed to SQS as the query itself, so the caller chooses the action
+  # and its parameters. NEVER answers an unmatched type with a 415 instead.
+  passthrough_behavior = "NEVER"
+
   request_templates = {
     "application/json" = "Action=SendMessage&MessageBody=$util.urlEncode($input.body)"
   }

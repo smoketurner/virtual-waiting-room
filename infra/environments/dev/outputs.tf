@@ -61,6 +61,12 @@ output "waiting_room_page_url" {
   value       = "https://${module.edge.viewer_domain_name}/_wr/waiting.html"
 }
 
+output "client_origin_secret" {
+  description = "The value CloudFront sends the client origin in the x-wr-origin-verify header (issue #241). Configure the origin to refuse requests without it. Read with `terraform output -raw client_origin_secret`."
+  value       = module.core.client_origin_secret
+  sensitive   = true
+}
+
 output "gate_kvs_arn" {
   description = "ARN of the edge gate's CloudFront KeyValueStore (issue #71)."
   value       = module.core.gate_kvs_arn

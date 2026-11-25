@@ -336,6 +336,14 @@
     } catch (e) {
       return "/";
     }
+    // A browser strips tabs and newlines out of a URL before resolving it, so
+    // "/<tab>/host" navigates to "//host" while its second character here is
+    // the tab (issue #244). No path this page is sent back to carries a raw
+    // control character, so one anywhere refuses the whole value -- the same
+    // rule the no-JavaScript path applies (crates/nojs safe_next).
+    if (/[\x00-\x1f\x7f]/.test(next)) {
+      return "/";
+    }
     // A browser reads "/\host" as "//host", which leaves the site.
     if (next.charAt(0) !== "/" || next.charAt(1) === "/" || next.charAt(1) === "\\") {
       return "/";

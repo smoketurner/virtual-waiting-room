@@ -77,6 +77,7 @@ module "edge" {
 
   api_gateway_domain_name   = module.core.api_gateway_domain_name
   api_origin_key            = module.core.api_origin_key
+  client_origin_secret      = module.core.client_origin_secret
   env                       = var.env
   client_origin_domain_name = var.client_origin_domain_name
 

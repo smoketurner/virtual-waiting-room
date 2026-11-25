@@ -57,7 +57,7 @@ the full shape. The values you will normally set:
 | `name_prefix` | `vwr-dev` | Prefix for every resource name. Change it to run a second deployment in one account. |
 | `event_id` | `default` | The one event this deployment serves. Must not contain `#`. |
 | `lambda_architecture` | `arm64` | `arm64` or `x86_64`. Must match the built binaries (see `ARCH` below). |
-| `client_origin_domain_name` | `""` | Bare host of the protected origin, no scheme or path. Empty protects the built-in demo origin, which guards nothing real. |
+| `client_origin_domain_name` | `""` | Bare host of the protected origin, no scheme or path. Empty protects the built-in demo origin, which guards nothing real. See [Locking the origin to the distribution](#locking-the-origin-to-the-distribution). |
 | `aliases`, `acm_certificate_arn` | `[]`, `""` | Hostnames viewers use, and a **us-east-1** ACM certificate covering them. Set both or neither. Empty uses the `*.cloudfront.net` name. |
 | `oidc_issuer` | `https://us.vouch.sh` | OIDC issuer for the admin login. |
 | `oidc_client_id`, `oidc_redirect_uri`, `oidc_allowed_emails` | `""` | **Required; the plan fails without them.** See [OIDC](#oidc-the-one-sequencing-step). The client secret goes in SSM, not here. |
@@ -79,6 +79,25 @@ dashboard owns them.
 `terraform.tfvars` (falling back to `arm64`), so the build and the deployed functions agree by
 default. `make build ARCH=x86_64` against an `arm64` deployment applies cleanly and fails at
 first invoke; use it only for a one-off build.
+
+### Locking the origin to the distribution
+
+The gate only protects requests that pass through CloudFront. An origin that also answers on its
+own hostname can be reached directly, skipping the queue, and that hostname is discoverable from
+certificate transparency logs and DNS history.
+
+CloudFront sends every request to the client origin an `x-wr-origin-verify` header carrying a
+secret generated at apply. A viewer cannot supply it: CloudFront overwrites a header of that name.
+Read the value with:
+
+```bash
+terraform -chdir=infra/environments/dev output -raw client_origin_secret
+```
+
+Configure the origin (its load balancer, web server or application) to refuse any request whose
+`x-wr-origin-verify` does not equal that value. The stack cannot do this for you, and until it is
+done the header protects nothing. Restricting the origin's network to the
+`com.amazonaws.global.cloudfront.origin-facing` prefix list as well is stronger still.
 
 ## First deploy
 

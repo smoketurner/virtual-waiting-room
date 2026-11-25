@@ -221,8 +221,10 @@ after its last write, and the no-show correction compensates for absentees
 ### 7.2 Minting the session
 
 `POST /v1/generate_token` takes `request_id` and the possession `secret`. `generate_token::admit`,
-which `nojs` also calls, reads `Positions` first and `PreQueue` only when no row answers, then
-decides:
+which `nojs` also calls, reads both `PreQueue` and `Positions`. A `PreQueue` row inside its
+shard's opened count is the visitor's place whatever `Positions` holds, the same order
+`/v1/queue_num` resolves in; a `Positions` row answers only for a live joiner or a straggler
+([#238](https://github.com/smoketurner/virtual-waiting-room/issues/238)). It then decides:
 
 | Check, in order | Refusal |
 |---|---|

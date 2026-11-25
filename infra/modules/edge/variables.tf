@@ -22,6 +22,13 @@ variable "api_origin_key" {
   sensitive   = true
 }
 
+variable "client_origin_secret" {
+  description = "Sent to the client origin as the x-wr-origin-verify origin custom header (modules/core's client_origin_secret output, issue #241), so the origin can refuse requests that did not come through this distribution. Empty sends no header."
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
 variable "env" {
   description = "Deployment environment. It is the REST API stage name, so it is the API origin's origin_path: a viewer request for /v1/status is forwarded to /<env>/v1/status."
   type        = string

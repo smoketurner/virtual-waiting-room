@@ -394,6 +394,19 @@ test("a successful redemption rejects a next= that would navigate off-site", asy
   assert.equal(client.win.location.replacedTo, "/");
 });
 
+// Issue #244: browsers drop tabs and newlines from a URL, so "/\t/host" is
+// "//host" by the time it navigates.
+for (const ws of ["\t", "\n", "\r"]) {
+  test(`a successful redemption rejects a next= hiding // behind ${JSON.stringify(ws)}`, async () => {
+    const client = loadClient({
+      route: admittedRoute(),
+      locationSearch: "?next=" + encodeURIComponent("/" + ws + "/evil.example/phish"),
+    });
+    await client.flush();
+    assert.equal(client.win.location.replacedTo, "/");
+  });
+}
+
 // --- issue #62: the request id is not enough on its own ------------------
 
 const nodeCrypto = require("node:crypto");

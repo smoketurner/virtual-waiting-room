@@ -231,8 +231,6 @@ pub fn compute_release(
         .serving_counter
         .saturating_sub(inputs.last_serving_counter.max(1));
 
-    let target = target_release_per_interval(inputs.target_rate);
-
     // The prior open pass is *fresh* exactly when it was the immediately
     // preceding interval — the cadence's `now - last == INTERVAL_SECS` sits
     // comfortably below [`STALE_OPEN_PASS_SECS`], so the small jitter in the
@@ -250,6 +248,29 @@ pub fn compute_release(
     // nothing off `0/0`.
     let prior_open_pass_is_stale =
         now.saturating_sub(inputs.last_open_pass_at) >= STALE_OPEN_PASS_SECS;
+
+    // The release covers the time since the last open pass, not a fixed
+    // interval (issue #236). On the regular cadence that is `INTERVAL_SECS`
+    // and nothing changes. But a pass releases whenever it runs, and the
+    // `serving_counter = :expected` guard only stops two passes writing at
+    // once, not two executions whose passes interleave: at a fixed amount per
+    // pass, an overlapping execution doubles the admission rate for as long as
+    // it overlaps. Paying out elapsed time makes the total released a function
+    // of the wall clock alone -- an extra pass releases only the seconds since
+    // the one before it, zero if it ran in the same second, and a pass that
+    // ran a few seconds late makes those seconds up.
+    //
+    // A stale prior pass (a hold, a missed minute) or none at all releases one
+    // interval's worth: the gap is not owed, or it would bank a burst. A clock
+    // that reads behind the last pass does the same, because there is no
+    // elapsed time to trust.
+    let elapsed = now.checked_sub(inputs.last_open_pass_at);
+    let target = match elapsed {
+        Some(secs) if inputs.last_open_pass_at != 0 && !prior_open_pass_is_stale => {
+            u64::from(inputs.target_rate).saturating_mul(secs)
+        }
+        Some(_) | None => target_release_per_interval(inputs.target_rate),
+    };
 
     let (release, smoothed) = if released_last == 0 || prior_open_pass_is_stale {
         // No release last interval, or the prior open pass is stale: nothing
@@ -984,15 +1005,14 @@ mod tests {
             fail_open_until: 0,
             // A cursor well into the event, with a release already behind it,
             // so the no-show measurement has something to measure. The pass's
-            // `last_open_pass_at` is set to the same `now` the `run_pass`
-            // tests pass (1_000_000), so the cadence reads as fresh
-            // (`now - last_open_pass_at = 0 < STALE_OPEN_PASS_SECS`) and the
-            // measurement proceeds — i.e. these tests exercise the
+            // `last_open_pass_at` is one interval before the `now` the
+            // `run_pass` tests pass (1_000_000), so the cadence reads as fresh
+            // and a full interval is owed — i.e. these tests exercise the
             // measurement path, not the staleness fall-back.
             inputs: {
                 let mut i = inputs(250, 0, 20_000, 19_500, 50);
                 i.queue_counter = u64::MAX;
-                i.last_open_pass_at = 1_000_000;
+                i.last_open_pass_at = 1_000_000 - INTERVAL_SECS;
                 i
             },
             prev_no_show: None,
@@ -1707,7 +1727,59 @@ mod tests {
             "1.5-interval jitter should not fire the staleness check, got {:e}",
             d.no_show.smoothed_rate
         );
-        assert_eq!(d.release, 588);
+        // Fifteen seconds are owed, not ten: 750 / (1 - 0.15) = 882.35 -> 882.
+        assert_eq!(d.release, 882);
+    }
+
+    // --- Elapsed-time release (issue #236) -------------------------------------
+
+    #[test]
+    fn a_pass_in_the_same_second_as_the_last_releases_nobody() {
+        // An overlapping execution's pass lands on top of the regular one.
+        // Nothing has elapsed, so nothing is owed: the cursor does not move.
+        let mut i = inputs(500, 0, 1000, 500, 50);
+        i.last_open_pass_at = 1_000_000;
+        let d = compute_release(i, Some(NoShowState { smoothed_rate: 0.0 }), 1_000_000);
+        assert_eq!(d.release, 0);
+        assert_eq!(d.next_serving_counter, 1000);
+    }
+
+    #[test]
+    fn a_pass_half_an_interval_after_the_last_releases_half_an_interval() {
+        let mut i = inputs(500, 0, 1000, 500, 50);
+        i.last_open_pass_at = 1_000_000;
+        let d = compute_release(i, Some(NoShowState { smoothed_rate: 0.0 }), 1_000_005);
+        assert_eq!(d.release, 250); // 50/s * 5 s
+    }
+
+    #[test]
+    fn interleaved_executions_release_what_one_cadence_would() {
+        // Two executions five seconds out of phase run twelve passes in the
+        // minute one would run six in. Every visitor arrives, so the no-show
+        // correction stays at zero and the total is the rate times the clock.
+        let rate = 50u32;
+        let start = 1_000_000u64;
+        let mut i = inputs(0, 0, 1, 1, rate);
+        i.last_open_pass_at = start;
+        let mut prev = Some(NoShowState { smoothed_rate: 0.0 });
+        let mut released = 0u64;
+        for step in 1..=12u64 {
+            let d = compute_release(i, prev, start + step * 5);
+            released += d.release;
+            let mut arrivals = [0u64; SHARDS];
+            arrivals[0] = d.next_serving_counter - 1;
+            i = ReleaseInputs {
+                arrivals,
+                last_arrivals_total: d.arrivals_total,
+                last_serving_counter: d.previous_serving_counter,
+                serving_counter: d.next_serving_counter,
+                queue_counter: u64::MAX,
+                target_rate: rate,
+                last_open_pass_at: d.last_open_pass_at,
+            };
+            prev = Some(d.no_show);
+        }
+        assert_eq!(released, u64::from(rate) * 60);
     }
 
     #[test]

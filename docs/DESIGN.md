@@ -334,8 +334,12 @@ The controller is a Lambda durable function: Scheduler starts one execution a mi
 six checkpointed passes separated by 10 s durable waits. A wait suspends the execution, so it is
 not billed, and a replayed pass returns its checkpoint rather than advancing `serving_counter`
 twice ([ADR-0022](adr/0022-durable-controller-cadence.md)). A pass advances only while the phase
-is `active` and the resolved control is `Open`; after a gap of two intervals or more it releases
-exactly `target_rate`. All arithmetic is checked or saturating.
+is `active` and the resolved control is `Open`. Its target is `target_rate` times the seconds
+since the last open pass, so the total released follows the wall clock however many passes run:
+an overlapping execution's extra pass releases only the seconds since the one before it
+([#236](https://github.com/smoketurner/virtual-waiting-room/issues/236)). After a gap of two
+intervals or more it releases one interval's worth and does not make up the gap. All arithmetic
+is checked or saturating.
 
 **Arrivals** are counted by `generate_token`, once per visitor (ADR-0033), across ten shard items
 (60,000 admissions a minute would otherwise hit the 1,000 writes/s item ceiling). Reading them is
@@ -369,7 +373,10 @@ behaviour only, because a Function bills per invocation.
 
 Served by `admin` (Axum, askama templates) behind an OIDC Authorization Code + PKCE session
 ([ADR-0016](adr/0016-admin-oidc-dynamodb-sessions.md), [ADR-0018](adr/0018-admin-vouch-design-language.md));
-every action works without JavaScript and no action needs the AWS console.
+every action works without JavaScript and no action needs the AWS console. A state-changing
+request is refused with a 403 unless it comes from the console's own origin (`Sec-Fetch-Site`,
+falling back to `Origin`), because the console shares a site with the customer's pages
+([#243](https://github.com/smoketurner/virtual-waiting-room/issues/243)).
 
 | Path | Purpose |
 |---|---|
@@ -474,8 +481,11 @@ See [`DEPLOY.md`](./DEPLOY.md).
 
 - **No VPC.** DynamoDB, SQS, SSM, EventBridge and Lambda are reached over IAM-authenticated
   public endpoints, so there is no NAT gateway and no VPC endpoints.
-- **Client origin.** A custom origin addressed by domain name. Restricting the origin to
-  CloudFront, for example with VPC origins, is not built by this module.
+- **Client origin.** A custom origin addressed by domain name. The distribution sends it an
+  `x-wr-origin-verify` header carrying a generated secret
+  ([#241](https://github.com/smoketurner/virtual-waiting-room/issues/241)); the origin has to
+  refuse requests without it, or its hostname bypasses the room ([`DEPLOY.md`](./DEPLOY.md)).
+  Network-level restriction, for example with VPC origins, is not built by this module.
 - **Event isolation.** One deployment serves one event, so isolation between events is isolation
   between stacks ([ADR-0008](adr/0008-partition-isolation-not-shuffle-sharding.md)). Within a
   deployment, `assign_position` and `nojs` have reserved concurrency so that ingest cannot drain

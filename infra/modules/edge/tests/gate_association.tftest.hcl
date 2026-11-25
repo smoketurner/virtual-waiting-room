@@ -129,3 +129,33 @@ run "the_readiness_parameter_is_written_where_core_reads_it" {
     error_message = "a Standard String parameter bills nothing between events (N1); an Advanced one does"
   }
 }
+
+# Issue #241: a customer origin is sent the verification header, so it can
+# refuse a request made straight to its hostname. The viewer cannot supply it:
+# CloudFront overwrites an origin custom header of the same name.
+run "the_client_origin_is_sent_the_verification_secret" {
+  command = plan
+
+  variables {
+    client_origin_domain_name = "origin.example.com"
+    client_origin_secret      = "test-client-origin-secret"
+  }
+
+  assert {
+    condition = anytrue([
+      for o in aws_cloudfront_distribution.this.origin :
+      o.domain_name == "origin.example.com" && anytrue([
+        for h in o.custom_header : h.name == "x-wr-origin-verify" && h.value == var.client_origin_secret
+      ])
+    ])
+    error_message = "the client origin must be sent x-wr-origin-verify, or its hostname bypasses the room"
+  }
+
+  assert {
+    condition = length([
+      for o in aws_cloudfront_distribution.this.origin : o
+      if anytrue([for h in o.custom_header : h.name == "x-wr-origin-verify"])
+    ]) == 1
+    error_message = "the client origin secret must be sent to the client origin only"
+  }
+}

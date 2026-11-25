@@ -51,3 +51,18 @@ resource "aws_api_gateway_usage_plan_key" "origin" {
   key_type      = "API_KEY"
   usage_plan_id = aws_api_gateway_usage_plan.origin.id
 }
+
+# --- Client origin secret (issue #241) ----------------------------------------
+#
+# The protected origin is the thing the room exists to shield, and its hostname
+# is not a secret: certificate transparency logs and DNS history give it away.
+# The distribution sends this value to the client origin as the
+# x-wr-origin-verify header on every request, so the origin can refuse anything
+# that did not come through the gate. Enforcing it is the origin's job -- this
+# stack cannot configure a server it does not own -- and docs/DEPLOY.md says
+# how. Like the API key above it is a secret against the internet, not against
+# the account's own operators.
+resource "random_password" "client_origin_secret" {
+  length  = 48
+  special = false
+}

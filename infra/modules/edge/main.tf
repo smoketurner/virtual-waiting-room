@@ -235,6 +235,17 @@ resource "aws_cloudfront_distribution" "this" {
       origin_id   = local.client_origin_id
       domain_name = var.client_origin_domain_name
 
+      # Issue #241: lets the origin tell a request that came through the gate
+      # from one sent straight to its hostname. A header of the same name from
+      # a viewer is overwritten here, so a viewer cannot supply it.
+      dynamic "custom_header" {
+        for_each = nonsensitive(var.client_origin_secret != "") ? [1] : []
+        content {
+          name  = "x-wr-origin-verify"
+          value = var.client_origin_secret
+        }
+      }
+
       custom_origin_config {
         http_port              = 80
         https_port             = 443
