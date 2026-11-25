@@ -3,7 +3,7 @@
 #   open_event  fired once at the event start by an EventBridge schedule; reads
 #               the shard counts and writes the open (seed + offsets + count +
 #               phase) in one conditional UpdateItem.
-#   read        serves GET /v1/status and /v1/queue_num over API Gateway; the
+#   read        serves GET /_wr/v1/status and /_wr/v1/queue_num over API Gateway; the
 #               route wiring lives in api.tf.
 #
 # Every function deploys its own build; there is no stub fallback.
@@ -167,7 +167,7 @@ resource "aws_lambda_function" "admin" {
       ASSIGN_POSITION_FUNCTION_NAME = aws_lambda_function.assign_position.function_name
       CONTROLLER_SCHEDULE_NAME      = aws_scheduler_schedule.controller.name
       EDGE_READINESS_PARAM          = local.edge_readiness_parameter_name
-      # API Gateway prefixes the path with the stage (e.g. /dev/admin); this
+      # API Gateway prefixes the path with the stage (e.g. /dev/_wr/admin); this
       # makes the Rust runtime strip it so the Axum routes match unprefixed.
       AWS_LAMBDA_HTTP_IGNORE_STAGE_IN_PATH = "true"
       # OIDC admin login (ADR-0016). The client secret is read from the SSM
@@ -202,7 +202,7 @@ resource "aws_lambda_function" "admin" {
   lifecycle {
     precondition {
       condition     = var.oidc_client_id != "" && var.oidc_redirect_uri != ""
-      error_message = "oidc_client_id and oidc_redirect_uri must both be set, or the admin Lambda deploys and then fails at Init on every invoke. The redirect URI is https://<cloudfront_domain_name>/admin/callback -- on a first deploy, set placeholders (e.g. \"pending\" and https://pending.invalid/admin/callback), apply, then set the real values and apply again (docs/DEPLOY.md)."
+      error_message = "oidc_client_id and oidc_redirect_uri must both be set, or the admin Lambda deploys and then fails at Init on every invoke. The redirect URI is https://<cloudfront_domain_name>/_wr/admin/callback -- on a first deploy, set placeholders (e.g. \"pending\" and https://pending.invalid/_wr/admin/callback), apply, then set the real values and apply again (docs/DEPLOY.md)."
     }
 
     precondition {
@@ -217,7 +217,7 @@ resource "aws_lambda_function" "admin" {
   depends_on = [aws_cloudwatch_log_group.lambda]
 }
 
-# API Gateway invokes the admin Lambda for the /admin routes (OIDC session auth
+# API Gateway invokes the admin Lambda for the /_wr/admin routes (OIDC session auth
 # in the Lambda, ADR-0016). /metrics and
 # /update_session were removed with the origin authorizer (ADR-0032): the first
 # was routed with no handler behind it, the second returned 501.

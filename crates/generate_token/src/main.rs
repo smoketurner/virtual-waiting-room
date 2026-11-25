@@ -1,4 +1,4 @@
-//! Lambda entry point for `POST /v1/generate_token`.
+//! Lambda entry point for `POST /_wr/v1/generate_token`.
 //!
 //! A waiting visitor calls this once their position has been reached. It
 //! checks the queue state, records the arrival the controller measures

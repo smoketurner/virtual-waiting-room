@@ -108,7 +108,7 @@ activation queues FIFO.
 
 **F3.2** — As an operator, I want to throttle admission during the event.
 - WHEN the operator changes the admission rate, THE SYSTEM SHALL apply the new target rate.
-- Acceptance: `POST /admin/rate` changes the target rate; effect visible within the cache TTL.
+- Acceptance: `POST /_wr/admin/rate` changes the target rate; effect visible within the cache TTL.
 
 **F3.3** — As an admitted visitor, I want a credential that needs no backend call.
 - WHEN a visitor is admitted, THE SYSTEM SHALL issue a cryptographically verifiable session credential.
@@ -124,7 +124,7 @@ activation queues FIFO.
 
 **F3.8** — As an operator, I want origin arrivals to hit the target despite no-shows.
 - THE SYSTEM SHALL compensate admission rate control for **no-shows**.
-- THE SYSTEM SHALL count each admitted visitor as one arrival however many times they call `/v1/generate_token`.
+- THE SYSTEM SHALL count each admitted visitor as one arrival however many times they call `/_wr/v1/generate_token`.
 - Acceptance: With a 30% no-show rate and a target of 500/min, origin arrivals converge on 500/min, not 350; three reloads add one arrival, not three.
 
 ### 1.5 Failure behaviour
@@ -183,7 +183,7 @@ A thin server-rendered client over the operator API (F5.1–F5.5); it adds no ca
 
 **F7.1** — As an operator, I want a web interface so that I need not script every action.
 - THE SYSTEM SHALL serve the operator interface from one Axum Lambda rendering server-side HTML with askama templates.
-- Acceptance: Reachable at `/admin`; one Lambda; no browser SPA bundle.
+- Acceptance: Reachable at `/_wr/admin`; one Lambda; no browser SPA bundle.
 
 **F7.2** — As an operator, I want a consistent, dependency-free look.
 - THE SYSTEM SHALL style the interface in the Vouch design language as one self-contained stylesheet (ADR-0018).
@@ -191,7 +191,7 @@ A thin server-rendered client over the operator API (F5.1–F5.5); it adds no ca
 
 **F7.3** — As an operator, I want parity with the admin API.
 - THE interface SHALL expose every operator capability in the admin API and no other.
-- Acceptance: Each `/admin/*` action has a UI control; F5.5 still holds.
+- Acceptance: Each `/_wr/admin/*` action has a UI control; F5.5 still holds.
 
 **F7.4** — As a security owner, I want one auth path.
 - WHEN an operator makes any interface request, THE SYSTEM SHALL authenticate it through one path, with no weaker second one.

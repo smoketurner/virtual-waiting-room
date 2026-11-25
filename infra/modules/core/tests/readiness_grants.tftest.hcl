@@ -104,7 +104,7 @@ variables {
   warm_throughput_read_units  = 12000
 
   oidc_client_id      = "test-client"
-  oidc_redirect_uri   = "https://example.invalid/admin/callback"
+  oidc_redirect_uri   = "https://example.invalid/_wr/admin/callback"
   oidc_allowed_emails = "operator@example.invalid"
 }
 

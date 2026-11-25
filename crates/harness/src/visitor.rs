@@ -299,9 +299,9 @@ pub async fn run<F, Fut>(
         // /status: keyed on path alone, so the whole cohort shares one entry.
         let status_origin = Arc::clone(&origin);
         let (_, status_body, _) = edge
-            .serve("/v1/status", "/v1/status", POLLED_TTL, move || {
+            .serve("/_wr/v1/status", "/_wr/v1/status", POLLED_TTL, move || {
                 let o = status_origin;
-                async move { o("/v1/status".to_owned()).await }
+                async move { o("/_wr/v1/status".to_owned()).await }
             })
             .await;
         tally.status_requests.fetch_add(1, Ordering::Relaxed);
@@ -310,7 +310,7 @@ pub async fn run<F, Fut>(
         }
         let closed = is_closed(&status_body);
         // `waiting.js`'s closed branch calls `forgetPosition()` then `return
-        // schedule()` — it clears `knownPosition` and asks no `/v1/queue_num`
+        // schedule()` — it clears `knownPosition` and asks no `/_wr/v1/queue_num`
         // that tick, so the next running poll re-asks. Clearing `held_position`
         // here is the forget; the `!closed` ask gate on `HoldPosition`/`Backoff`
         // below is the skip. Together they force the same re-ask on the first
@@ -318,7 +318,7 @@ pub async fn run<F, Fut>(
         // `held_position` would stay `Some(stale)` and the ask gate would stay
         // false forever.
         //
-        // `DerivePosition` is exempt from both: its defining `/v1/queue_num`
+        // `DerivePosition` is exempt from both: its defining `/_wr/v1/queue_num`
         // ask is timed to land *during* the closed countdown (`first_ask_after`
         // above deliberately omits `countdown_ms`), and it holds that one fetch
         // forever — the registration row exists from the moment it lands, not
@@ -331,7 +331,7 @@ pub async fn run<F, Fut>(
         let ask = match settings.polling {
             // The old client asked on every tick and knew nothing of a spread.
             // `!closed` mirrors the client's `return schedule()` in the closed
-            // branch: a closed tick asks no `/v1/queue_num`.
+            // branch: a closed tick asks no `/_wr/v1/queue_num`.
             Polling::EveryTick => !closed && started.elapsed() >= first_ask_after,
             // Not gated on `!closed`: the defining ask lands during the closed
             // countdown, and the closed-tick clearing above is exempted so the
@@ -349,11 +349,11 @@ pub async fn run<F, Fut>(
         if ask {
             // /queue_num: the request id is in the cache key, so this entry is
             // this visitor's alone and no other visitor can ever hit it.
-            let path = format!("/v1/queue_num?request_id={request_id}");
+            let path = format!("/_wr/v1/queue_num?request_id={request_id}");
             let key = path.clone();
             let qn_origin = Arc::clone(&origin);
             let (status, body, disposition) = edge
-                .serve("/v1/queue_num", &key, POLLED_TTL, move || {
+                .serve("/_wr/v1/queue_num", &key, POLLED_TTL, move || {
                     let o = qn_origin;
                     async move { o(path).await }
                 })
@@ -700,7 +700,7 @@ mod tests {
         let started = tokio::time::Instant::now();
         let origin = Arc::new(move |path: String| async move {
             let closed = started.elapsed().as_secs() < closed_secs;
-            if path.starts_with("/v1/status") {
+            if path.starts_with("/_wr/v1/status") {
                 if closed {
                     (
                         200,
@@ -795,7 +795,7 @@ mod tests {
         // leave every existing test green. closed_secs longer than the run
         // means every /status answer is "closed": the closed branch mirrors
         // `waiting.js`'s `forgetPosition()` + `return schedule()`, so
-        // `held_position` is cleared and no `/v1/queue_num` is asked while
+        // `held_position` is cleared and no `/_wr/v1/queue_num` is asked while
         // closed. Backoff must fall through to the ceiling on the closed
         // check alone, with no position-based path (the other end of the
         // `if closed {} else {}` in the sleep arm) to coincidentally agree.
@@ -807,7 +807,7 @@ mod tests {
             measure_client_requests(Polling::Backoff, VISITORS, RUN_SECS, CLOSED_SECS).await;
 
         // Ceiling-clamped (>= 30s, jitter up to 39s) exceeds the 25s run, so
-        // exactly one /status poll per visitor and no /v1/queue_num ask — a
+        // exactly one /status poll per visitor and no /_wr/v1/queue_num ask — a
         // closed tick asks none, matching the client's `return schedule()`.
         // Losing the closed check (falling through to
         // `None => POLL_FLOOR_MS`) would instead produce several /status
@@ -821,10 +821,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn backoff_forgets_position_across_close_so_re_asks_after_reopen() {
         // The shipped client's closed branch calls `forgetPosition()` (clears
-        // `knownPosition`) and `return schedule()` (asks no `/v1/queue_num` that
+        // `knownPosition`) and `return schedule()` (asks no `/_wr/v1/queue_num` that
         // tick), so on the first running tick after a `closed → running`
         // reopen `knownPosition` is null, the cache-hit guard falls through,
-        // and the chain re-asks `/v1/queue_num`. The harness's `run()` models
+        // and the chain re-asks `/_wr/v1/queue_num`. The harness's `run()` models
         // the closed branch's ceiling interval but, before the fix that cleared
         // `held_position` on a closed tick and gated the ask on `!closed`, did
         // not model `forgetPosition()`: `held_position` survived a close, so
@@ -832,7 +832,7 @@ mod tests {
         // reopen and the after-reopen re-ask the client makes never happened.
         //
         // Three phases — running [0,25s), closed [25,50s), running [50,120s) —
-        // with `/v1/queue_num` answering 409 while closed and
+        // with `/_wr/v1/queue_num` answering 409 while closed and
         // `{"position":100000000}` while open. `countdown_ms`/`spread_ms` are
         // 0 so `first_ask_after` is 0 and the whole cohort asks from the first
         // poll; `arrives_at` is 0 (`arrival_offset_ms` short-circuits on a zero
@@ -845,7 +845,7 @@ mod tests {
         // ceiling sleep (another 30–39s) lands the third poll at 60–83s —
         // strictly inside the reopen [50,120s). These bounds hold for every
         // seed, so the schedule is jitter-invariant: each visitor asks
-        // `/v1/queue_num` exactly twice — once before the close, once after the
+        // `/_wr/v1/queue_num` exactly twice — once before the close, once after the
         // reopen. Before the fix the after-reopen re-ask never happened
         // (`held_position` stayed `Some(stale)`), so the count was one per
         // visitor rather than two.
@@ -860,7 +860,7 @@ mod tests {
         let origin = Arc::new(move |path: String| async move {
             let elapsed = started.elapsed().as_secs();
             let closed = (CLOSE_START_SECS..CLOSE_END_SECS).contains(&elapsed);
-            if path.starts_with("/v1/status") {
+            if path.starts_with("/_wr/v1/status") {
                 if closed {
                     (
                         200,
@@ -912,7 +912,7 @@ mod tests {
         assert_eq!(
             queue_num,
             VISITORS * 2,
-            "expected one /v1/queue_num ask before the close and one after the reopen per visitor; \
+            "expected one /_wr/v1/queue_num ask before the close and one after the reopen per visitor; \
              harness only made {queue_num} (the after-reopen re-ask is missing — held_position is \
              not cleared on a closed tick)"
         );
@@ -922,7 +922,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn derive_position_asks_once_per_visitor_during_a_permanently_closed_countdown() {
-        // `Polling::DerivePosition`'s defining `/v1/queue_num` ask is timed to
+        // `Polling::DerivePosition`'s defining `/_wr/v1/queue_num` ask is timed to
         // land *during* the closed countdown — `first_ask_after` deliberately
         // omits `countdown_ms` (see the match above), unlike `HoldPosition`/
         // `Backoff` whose ask cannot exist before the open. The countdown is
@@ -933,7 +933,7 @@ mod tests {
         // clearing re-triggering the ask on every closed tick (one per poll,
         // not one per visitor). Both halves must be exempted together.
         //
-        // The origin is permanently `"closed"` and answers `/v1/queue_num` 200,
+        // The origin is permanently `"closed"` and answers `/_wr/v1/queue_num` 200,
         // so every ask that fires is a during-countdown ask; with `spread_ms =
         // 0` and `Arrival::Uniform`, `first_ask_after == arrives_at < countdown`
         // deterministically, and the ask fires on each visitor's first poll.
@@ -946,7 +946,7 @@ mod tests {
         let edge = Arc::new(Edge::new(Duration::from_secs(10), RUN_SECS));
         let tally = Arc::new(VisitorTally::default());
         let origin = Arc::new(|path: String| async move {
-            if path.starts_with("/v1/status") {
+            if path.starts_with("/_wr/v1/status") {
                 (
                     200,
                     r#"{"serving_state":"closed","serving_position":0}"#.to_owned(),
@@ -986,7 +986,7 @@ mod tests {
         let queue_num = tally.queue_num_requests.load(Ordering::Relaxed);
         assert_eq!(
             queue_num, VISITORS,
-            "DerivePosition must ask /v1/queue_num once per visitor during the closed countdown; \
+            "DerivePosition must ask /_wr/v1/queue_num once per visitor during the closed countdown; \
              got {queue_num} (0 ⇒ the !closed gate blocks the ask while closed; >VISITORS ⇒ the \
              held_position clearing re-triggers the ask every closed tick)"
         );
@@ -1006,7 +1006,7 @@ mod tests {
         let edge = Arc::new(Edge::new(Duration::from_secs(10), run_secs));
         let tally = Arc::new(VisitorTally::default());
         let origin = Arc::new(|path: String| async move {
-            if path.starts_with("/v1/status") {
+            if path.starts_with("/_wr/v1/status") {
                 (
                     200,
                     r#"{"serving_state":"running","serving_position":0,"target_rate":5}"#

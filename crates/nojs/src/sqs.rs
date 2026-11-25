@@ -1,4 +1,4 @@
-//! The SDK-backed [`JoinQueue`]: the same join queue `/v1/join` writes to.
+//! The SDK-backed [`JoinQueue`]: the same join queue `/_wr/v1/join` writes to.
 
 use aws_sdk_sqs::Client;
 

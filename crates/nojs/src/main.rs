@@ -1,4 +1,4 @@
-//! Lambda entry point for `POST /v1/enter` and `GET /v1/wait`: the queue for
+//! Lambda entry point for `POST /_wr/v1/enter` and `GET /_wr/v1/wait`: the queue for
 //! a visitor without JavaScript (issue #67). See the library docs.
 
 use std::env;
@@ -220,7 +220,7 @@ async fn handle_wait<S: Store, Q: JoinQueue>(
 /// The wait page for a visitor no registration exists for (issue #251).
 ///
 /// Usually the join is still in flight. One the queue or the ingest lost
-/// would otherwise leave this page refreshing forever, since `/v1/enter` will
+/// would otherwise leave this page refreshing forever, since `/_wr/v1/enter` will
 /// not join a visitor who already holds an identity: so an overdue join is
 /// sent again from here, a bounded number of times, and after that the
 /// visitor is told and gets the form back.
@@ -448,7 +448,11 @@ mod tests {
     async fn wait_with(state: &AppState<FakeStore, FakeQueue>, cookie: &str) -> Response<Body> {
         handle_wait(
             state,
-            &request("GET", "/v1/wait?next=%2Fcheckout", &[("cookie", cookie)]),
+            &request(
+                "GET",
+                "/_wr/v1/wait?next=%2Fcheckout",
+                &[("cookie", cookie)],
+            ),
             NOW,
         )
         .await
@@ -493,14 +497,14 @@ mod tests {
         let response = wait_with(&state, &stamped_cookie(SECRET, 61, nojs::MAX_REJOINS)).await;
         assert_eq!(response.status(), 200);
         let html = text(&response);
-        assert!(html.contains(r#"action="/v1/enter?next=%2Fcheckout""#));
+        assert!(html.contains(r#"action="/_wr/v1/enter?next=%2Fcheckout""#));
         assert!(!html.contains("http-equiv"));
         assert!(
             response.headers()["set-cookie"]
                 .to_str()
                 .unwrap()
                 .contains("Max-Age=0"),
-            "the identity is forgotten so /v1/enter joins afresh"
+            "the identity is forgotten so /_wr/v1/enter joins afresh"
         );
         assert!(state.queue.sent.lock().unwrap().is_empty());
     }
@@ -530,7 +534,7 @@ mod tests {
             &state,
             request(
                 "POST",
-                "https://x/v1/enter",
+                "https://x/_wr/v1/enter",
                 &[(
                     "referer",
                     "https://x/_wr/waiting.html?r=none&next=%2Fcheckout",
@@ -540,7 +544,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(response.status(), 303);
-        assert_eq!(response.headers()["location"], "/v1/wait?next=%2Fcheckout");
+        assert_eq!(
+            response.headers()["location"],
+            "/_wr/v1/wait?next=%2Fcheckout"
+        );
         let cookie = response.headers()["set-cookie"].to_str().unwrap();
         assert!(cookie.starts_with(&format!("{IDENTITY_COOKIE}=")));
         assert!(cookie.contains("HttpOnly"));
@@ -559,7 +566,11 @@ mod tests {
         let state = state(None, false);
         let response = handle(
             &state,
-            request("POST", "/v1/enter", &[("cookie", &identity_cookie(SECRET))]),
+            request(
+                "POST",
+                "/_wr/v1/enter",
+                &[("cookie", &identity_cookie(SECRET))],
+            ),
         )
         .await
         .unwrap();
@@ -571,7 +582,7 @@ mod tests {
     #[tokio::test]
     async fn a_join_the_queue_refused_holds_no_place() {
         let state = state(None, true);
-        let response = handle(&state, request("POST", "/v1/enter", &[]))
+        let response = handle(&state, request("POST", "/_wr/v1/enter", &[]))
             .await
             .unwrap();
         assert_eq!(response.status(), 503);
@@ -580,12 +591,12 @@ mod tests {
 
     #[tokio::test]
     async fn waiting_without_an_identity_offers_the_form() {
-        let response = handle(&state(None, false), request("GET", "/v1/wait", &[]))
+        let response = handle(&state(None, false), request("GET", "/_wr/v1/wait", &[]))
             .await
             .unwrap();
         assert_eq!(response.status(), 200);
         let html = text(&response);
-        assert!(html.contains(r#"action="/v1/enter?next=%2F""#));
+        assert!(html.contains(r#"action="/_wr/v1/enter?next=%2F""#));
     }
 
     #[tokio::test]
@@ -594,7 +605,7 @@ mod tests {
             &state(Some(700), false),
             request(
                 "GET",
-                "/v1/wait?next=%2Fcheckout",
+                "/_wr/v1/wait?next=%2Fcheckout",
                 &[("cookie", &identity_cookie(SECRET))],
             ),
         )
@@ -613,7 +624,7 @@ mod tests {
             &state,
             request(
                 "GET",
-                "/v1/wait?next=%2Fcheckout",
+                "/_wr/v1/wait?next=%2Fcheckout",
                 &[
                     ("cookie", &identity_cookie(SECRET)),
                     ("cloudfront-viewer-address", "198.51.100.7:4000"),
@@ -637,7 +648,7 @@ mod tests {
             &state(Some(3), false),
             request(
                 "GET",
-                "/v1/wait",
+                "/_wr/v1/wait",
                 &[("cookie", &identity_cookie(&"B".repeat(43)))],
             ),
         )

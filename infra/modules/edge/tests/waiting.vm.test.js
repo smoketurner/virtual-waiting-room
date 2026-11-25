@@ -18,8 +18,8 @@ const DIVISOR = 10;
 const POLICY = { floor_ms: FLOOR, ceiling_ms: CEILING, divisor: DIVISOR };
 
 /**
- * A `/v1/status` body for an open, active event. `participant_count: 0`
- * keeps `scheduleFirstAsk`'s spread window at exactly zero, so `/v1/queue_num`
+ * A `/_wr/v1/status` body for an open, active event. `participant_count: 0`
+ * keeps `scheduleFirstAsk`'s spread window at exactly zero, so `/_wr/v1/queue_num`
  * is always asked on the first eligible tick rather than nondeterministically
  * skipped by `Math.random()` — these tests are about the poll interval, not
  * the arrival spread, which is covered separately in `crates/harness`.
@@ -39,19 +39,19 @@ function activeStatus(overrides) {
 }
 
 /**
- * Routes `/v1/status` to `statusBody` (or `statusBody()` if given a
- * function, so a test can vary it call to call), answers `/v1/queue_num`
- * with `position`, and accepts `/v1/join` unconditionally.
+ * Routes `/_wr/v1/status` to `statusBody` (or `statusBody()` if given a
+ * function, so a test can vary it call to call), answers `/_wr/v1/queue_num`
+ * with `position`, and accepts `/_wr/v1/join` unconditionally.
  */
 function route(statusBody, position) {
   return (url) => {
-    if (url.startsWith("/v1/status")) {
+    if (url.startsWith("/_wr/v1/status")) {
       return jsonResponse(200, typeof statusBody === "function" ? statusBody() : statusBody);
     }
-    if (url.startsWith("/v1/queue_num")) {
+    if (url.startsWith("/_wr/v1/queue_num")) {
       return jsonResponse(200, { position, live_join: true });
     }
-    return jsonResponse(200, {}); // /v1/join
+    return jsonResponse(200, {}); // /_wr/v1/join
   };
 }
 
@@ -68,7 +68,7 @@ test("a first-poll rejection, before any success, schedules at the floor", async
 test("the client claims no place while /status keeps failing", async () => {
   const client = loadClient({ route: () => Promise.reject(new Error("origin down")) });
   await client.flush();
-  assert.equal(client.calls.filter((c) => c.url.includes("/v1/join")).length, 0);
+  assert.equal(client.calls.filter((c) => c.url.includes("/_wr/v1/join")).length, 0);
 });
 
 test("criterion 3: a near-front visitor with a policy still polls at the floor", async () => {
@@ -230,14 +230,14 @@ test("a visibility-triggered poll cannot overlap a chain already in flight", asy
   let statusCalls = 0;
   const client = loadClient({
     route: (url) => {
-      if (url.startsWith("/v1/status")) {
+      if (url.startsWith("/_wr/v1/status")) {
         statusCalls += 1;
         return statusCalls === 1 ? pending : jsonResponse(200, activeStatus());
       }
-      if (url.startsWith("/v1/queue_num")) {
+      if (url.startsWith("/_wr/v1/queue_num")) {
         return jsonResponse(200, { position: 200, live_join: true });
       }
-      return jsonResponse(200, {}); // /v1/join
+      return jsonResponse(200, {}); // /_wr/v1/join
     },
   });
   // Not awaited: the first /status call is still pending when visibility
@@ -267,16 +267,16 @@ test("a dropped visibility poll is caught up once the in-flight chain settles", 
   let statusCalls = 0;
   const client = loadClient({
     route: (url) => {
-      if (url.startsWith("/v1/status")) {
+      if (url.startsWith("/_wr/v1/status")) {
         statusCalls += 1;
         // Deep ahead, so the settling chain would otherwise schedule a
         // ceiling-length interval and hide whether the catch-up won.
         return statusCalls === 1 ? pending : jsonResponse(200, activeStatus({ poll_policy: POLICY }));
       }
-      if (url.startsWith("/v1/queue_num")) {
+      if (url.startsWith("/_wr/v1/queue_num")) {
         return jsonResponse(200, { position: 1_000_000, live_join: true });
       }
-      return jsonResponse(200, {}); // /v1/join
+      return jsonResponse(200, {}); // /_wr/v1/join
     },
   });
   const settle = client.flush();
@@ -343,21 +343,21 @@ test("target_rate is zero, position known and ahead > 0: interval is the floor",
 // --- redemption navigation (ADR-0021 §8: next= replaces the bounce guard) --
 
 /**
- * Routes an admitted visitor through to `/v1/generate_token`: `serving_position`
+ * Routes an admitted visitor through to `/_wr/v1/generate_token`: `serving_position`
  * ahead of `position` is what makes `redeem()` fire (`position < serving_position`).
  */
 function admittedRoute() {
   return (url) => {
-    if (url.startsWith("/v1/status")) {
+    if (url.startsWith("/_wr/v1/status")) {
       return jsonResponse(200, activeStatus({ serving_position: 100 }));
     }
-    if (url.startsWith("/v1/queue_num")) {
+    if (url.startsWith("/_wr/v1/queue_num")) {
       return jsonResponse(200, { position: 50, live_join: true });
     }
-    if (url.startsWith("/v1/generate_token")) {
+    if (url.startsWith("/_wr/v1/generate_token")) {
       return jsonResponse(200, { admitted: true });
     }
-    return jsonResponse(200, {}); // /v1/join
+    return jsonResponse(200, {}); // /_wr/v1/join
   };
 }
 
@@ -416,8 +416,8 @@ test("the join carries SHA-256 of the secret, and only redemption carries the se
   const client = loadClient({ route: admittedRoute() });
   await client.flush();
 
-  const join = client.calls.find((c) => c.url.startsWith("/v1/join"));
-  const redeem = client.calls.find((c) => c.url.startsWith("/v1/generate_token"));
+  const join = client.calls.find((c) => c.url.startsWith("/_wr/v1/join"));
+  const redeem = client.calls.find((c) => c.url.startsWith("/_wr/v1/generate_token"));
   const joinBody = JSON.parse(join.opts.body);
   const redeemBody = JSON.parse(redeem.opts.body);
 
@@ -431,7 +431,7 @@ test("the join carries SHA-256 of the secret, and only redemption carries the se
   assert.equal(joinBody.request_id, redeemBody.request_id);
   for (const call of client.calls) {
     assert.ok(!call.url.includes(redeemBody.secret), `secret in a URL: ${call.url}`);
-    if (!call.url.startsWith("/v1/generate_token") && call.opts && call.opts.body) {
+    if (!call.url.startsWith("/_wr/v1/generate_token") && call.opts && call.opts.body) {
       assert.ok(!call.opts.body.includes(redeemBody.secret), `secret sent to ${call.url}`);
     }
   }
@@ -443,7 +443,7 @@ test("the id and its secret are stored together", async () => {
 
   const stored = client.win.localStorage.getItem("vwr_identity");
   assert.match(stored, /^[0-9a-f-]{36}\.[A-Za-z0-9_-]{43}$/);
-  const join = JSON.parse(client.calls.find((c) => c.url.startsWith("/v1/join")).opts.body);
+  const join = JSON.parse(client.calls.find((c) => c.url.startsWith("/_wr/v1/join")).opts.body);
   assert.equal(join.request_id, stored.split(".")[0]);
 });
 
@@ -459,7 +459,7 @@ test("a redemption refused as not the holder stops, rather than polling forever"
   const admitted = admittedRoute();
   const client = loadClient({
     route: (url) =>
-      url.startsWith("/v1/generate_token")
+      url.startsWith("/_wr/v1/generate_token")
         ? jsonResponse(403, { admitted: false, error: "not the holder of this place in line" })
         : admitted(url),
   });
@@ -474,7 +474,7 @@ test("a redemption answered 'gone' drops the place and stops", async () => {
   const admitted = admittedRoute();
   const client = loadClient({
     route: (url) =>
-      url.startsWith("/v1/generate_token")
+      url.startsWith("/_wr/v1/generate_token")
         ? jsonResponse(410, { admitted: false, error: "the admission for this place in line has run out" })
         : admitted(url),
   });
@@ -491,7 +491,7 @@ test("a redemption answered 'at capacity' keeps polling and is admitted on a lat
   let full = true;
   const client = loadClient({
     route: (url) =>
-      url.startsWith("/v1/generate_token") && full
+      url.startsWith("/_wr/v1/generate_token") && full
         ? jsonResponse(425, { admitted: false, error: "at capacity; position 50 is next" })
         : admitted(url),
   });
@@ -556,7 +556,7 @@ function bounceBack(prev, reason, afterMs) {
 }
 
 function redemptions(client) {
-  return client.calls.filter((c) => c.url.startsWith("/v1/generate_token")).length;
+  return client.calls.filter((c) => c.url.startsWith("/_wr/v1/generate_token")).length;
 }
 
 test("a session the gate keeps refusing stops after two bounces instead of looping", async () => {
@@ -689,7 +689,7 @@ test("a redemption that fails in flight is retried, not abandoned", async () => 
   const admitted = admittedRoute();
   const client = loadClient({
     route: (url) => {
-      if (url.startsWith("/v1/generate_token") && attempts++ === 0) {
+      if (url.startsWith("/_wr/v1/generate_token") && attempts++ === 0) {
         return Promise.reject(new TypeError("Failed to fetch"));
       }
       return admitted(url);
@@ -757,7 +757,7 @@ test("the freshness stamp updates on every status poll, number or not", async ()
   // every other value is a dash, which is precisely when a visitor doubts it.
   const client = loadClient({
     route: (url) =>
-      url.includes("/v1/status")
+      url.includes("/_wr/v1/status")
         ? jsonResponse(200, { event_id: "e", phase: "pre_queue", serving_state: "closed" })
         : jsonResponse(404, {}),
   });

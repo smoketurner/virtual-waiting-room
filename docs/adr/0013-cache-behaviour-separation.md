@@ -29,3 +29,10 @@ is enabled in the cache policy, the origin request policy, or the legacy cache s
 - The client poll interval is the dominant cost variable in the system, multiplying
   CloudFront requests, WAF inspections and Bot Control charges together. Default is 10
   seconds.
+
+## Amendment: every room path is under `/_wr/` (#251)
+
+The polled and write behaviours are `/_wr/v1/*` and the console's are `/_wr/admin*` and
+`/_wr/static/*`, so the room shadows nothing on the customer's hostname outside that prefix. The
+pages' `/_wr/*` behaviour is ordered last, since CloudFront takes the first match. Paths written
+`/v1/...`, `/admin...` or `/static/...` in other ADRs are these.

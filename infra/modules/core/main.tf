@@ -445,7 +445,7 @@ resource "aws_api_gateway_model" "join" {
       # /status and assign_position discards anything else.
       event_id = { type = "string", minLength = 1, maxLength = length(var.event_id) }
       # base64url(SHA-256(secret)) (issue #62, ADR-0035). The secret itself
-      # never comes here; only /v1/generate_token sees it.
+      # never comes here; only /_wr/v1/generate_token sees it.
       h = { type = "string", minLength = 43, maxLength = 43, pattern = "^[A-Za-z0-9_-]{43}$" }
     }
   })
@@ -471,7 +471,7 @@ resource "aws_api_gateway_request_validator" "params" {
 
 resource "aws_api_gateway_resource" "join" {
   rest_api_id = aws_api_gateway_rest_api.this.id
-  parent_id   = aws_api_gateway_resource.v1.id # path-versioned: /v1/join
+  parent_id   = aws_api_gateway_resource.v1.id # path-versioned: /_wr/v1/join
   path_part   = "join"
 }
 

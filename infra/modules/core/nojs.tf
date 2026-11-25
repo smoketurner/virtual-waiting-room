@@ -1,8 +1,8 @@
 # modules/core - nojs, the queue for a visitor without JavaScript (issue #67).
 #
 # The waiting page is a script. For a browser that runs none, its <noscript>
-# form posts to /v1/enter, which joins through the same SQS queue /v1/join
-# writes to, and /v1/wait renders the visitor's place and admits them through
+# form posts to /_wr/v1/enter, which joins through the same SQS queue /_wr/v1/join
+# writes to, and /_wr/v1/wait renders the visitor's place and admits them through
 # generate_token's own admission path (the crate is a library dependency, so
 # there is one way a session is minted). This is the only join that runs
 # compute, so the function's concurrency is reserved and small: a flood of

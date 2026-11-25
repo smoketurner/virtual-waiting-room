@@ -29,7 +29,7 @@ them in arrival order. A controller admits people to the origin at the rate you 
 corrects for admitted visitors who never show up. Admitted visitors carry a signed session
 cookie that a CloudFront Function checks on every request to the protected origin.
 
-Operators run the event from a dashboard at `/admin` (OIDC login): set the rate, pause,
+Operators run the event from a dashboard at `/_wr/admin` (OIDC login): set the rate, pause,
 resume, open early, post a message, fail open for a bounded window, or take the event down.
 
 ## How it works

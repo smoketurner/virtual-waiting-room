@@ -35,7 +35,7 @@ acm_certificate_arn = ""
 #     --type SecureString --value '<secret>' --overwrite
 oidc_issuer         = "https://us.vouch.sh"
 oidc_client_id      = ""
-oidc_redirect_uri   = "" # e.g. https://<host>/admin/callback
+oidc_redirect_uri   = "" # e.g. https://<host>/_wr/admin/callback
 oidc_allowed_emails = "" # comma-separated; "" = deny all (fail closed)
 # oidc_require_email_verified = true # false only for a provider that omits the claim
 

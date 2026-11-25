@@ -111,3 +111,8 @@ subdomain, runs same-site with the operator's cookie. `SameSite=Lax` alone did n
   accepted, for a provider that omits it; an explicit `false` never is.
 - **The allowlist is re-checked on every request**, so removing an operator ends their session at
   their next request rather than at its eight-hour expiry.
+
+## Amendment: the console is at `/_wr/admin` (#251)
+
+Every `/admin...` path above is served at `/_wr/admin...`, and the callback to register is
+`https://<host>/_wr/admin/callback`. The cookies keep `Path=/`, which `__Host-` requires.

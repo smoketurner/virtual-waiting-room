@@ -6,13 +6,13 @@
 //! instead, and from then on this does in the server what `waiting.js` does in
 //! the browser:
 //!
-//! - `POST /v1/enter` mints the same identity the script would (a `UUIDv7`
+//! - `POST /_wr/v1/enter` mints the same identity the script would (a `UUIDv7`
 //!   request id and a 32-byte possession secret, ADR-0035), keeps it in an
 //!   `HttpOnly` cookie, and puts the same `{request_id, event_id, h}` message
 //!   on the same join queue, so `assign_position` cannot tell the two apart.
 //!   The cookie also records when the join was sent, so a join the queue lost
 //!   is sent again rather than waited on forever (issue #251).
-//! - `GET /v1/wait` is a server-rendered page that refreshes itself. Each load
+//! - `GET /_wr/v1/wait` is a server-rendered page that refreshes itself. Each load
 //!   runs [`generate_token::admit`], the one path a session is minted by, and
 //!   either shows the visitor their place or sets the session cookie and sends
 //!   them on.
@@ -33,10 +33,10 @@ use generate_token::{Admission, Denied};
 use wr_common::{PossessionSecret, SecretDigest};
 
 /// The identity cookie. `HttpOnly`, so no script on the origin's pages can
-/// read the secret, and scoped to `/v1/`, which a browser without JavaScript
+/// read the secret, and scoped to `/_wr/v1/`, which a browser without JavaScript
 /// requests only for [`ENTER_PATH`] and [`WAIT_PATH`].
 pub const IDENTITY_COOKIE: &str = "vwr_nojs";
-pub const IDENTITY_COOKIE_PATH: &str = "/v1/";
+pub const IDENTITY_COOKIE_PATH: &str = "/_wr/v1/";
 /// How long the identity is kept, matching the script's storage.
 pub const IDENTITY_MAX_AGE_SECS: u64 = 86_400;
 
@@ -51,8 +51,8 @@ pub const REJOIN_AFTER_SECS: u64 = 60;
 /// cost a queue write a minute for the cookie's whole day.
 pub const MAX_REJOINS: u8 = 3;
 
-pub const ENTER_PATH: &str = "/v1/enter";
-pub const WAIT_PATH: &str = "/v1/wait";
+pub const ENTER_PATH: &str = "/_wr/v1/enter";
+pub const WAIT_PATH: &str = "/_wr/v1/wait";
 
 /// A request id, the secret that proves it, and when its join was last sent,
 /// as one cookie value: `<request_id>.<secret>.<joined_at>.<rejoins>`.
@@ -309,7 +309,7 @@ fn percent_decode(s: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-/// What `GET /v1/wait` answers with.
+/// What `GET /_wr/v1/wait` answers with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WaitOutcome {
     /// Admitted: set the session cookie and send the visitor on.
@@ -412,7 +412,7 @@ mod tests {
     #[test]
     fn the_cookie_keeps_the_secret_from_scripts_and_the_origin() {
         let cookie = identity().set_cookie();
-        for part in ["HttpOnly", "Secure", "SameSite=Lax", "Path=/v1/;"] {
+        for part in ["HttpOnly", "Secure", "SameSite=Lax", "Path=/_wr/v1/;"] {
             assert!(cookie.contains(part), "{part} missing from {cookie}");
         }
     }

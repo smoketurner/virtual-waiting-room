@@ -12,12 +12,12 @@ them, and the invariants a change must not break. It does not repeat the narrati
 |---|---|---|
 | CloudFront (`infra/modules/edge`) | Separate cache behaviours for polled, join, write, admin, waiting-page and protected paths ([ADR-0013](../../../docs/adr/0013-cache-behaviour-separation.md)) | DESIGN §8 |
 | Gate: CloudFront Function, `edge/functions/gate.js.tftpl` | Viewer-request on the protected behaviour only. Reads config `c` and secret `k` from one KeyValueStore ([ADR-0021](../../../docs/adr/0021-edge-function-gate.md)) | DESIGN §2.3 |
-| API Gateway REST (`core/main.tf`, `core/api.tf`) | `/v1/join` goes straight to SQS. Every method requires the origin API key ([ADR-0038](../../../docs/adr/0038-edge-web-acl-on-flat-rate-plan.md)) | DESIGN §6, §8 |
+| API Gateway REST (`core/main.tf`, `core/api.tf`) | `/_wr/v1/join` goes straight to SQS. Every method requires the origin API key ([ADR-0038](../../../docs/adr/0038-edge-web-acl-on-flat-rate-plan.md)) | DESIGN §6, §8 |
 | `assign_position` | SQS consumer: pre-queue registration or live-join claim | DESIGN §4.1, §5.2 |
 | `open_event` | T−0: the one conditional open write | DESIGN §4.2 |
-| `read` | `/v1/status`, `/v1/queue_num` | DESIGN §4.2, §8 |
+| `read` | `/_wr/v1/status`, `/_wr/v1/queue_num` | DESIGN §4.2, §8 |
 | `generate_token` | Admission check, one admission claim, arrival count, session mint | DESIGN §2.3, §8 |
-| `nojs` | `/v1/enter`, `/v1/wait`. Admits only through `generate_token::admit` ([ADR-0037](../../../docs/adr/0037-no-javascript-queue.md)) | DESIGN §8 |
+| `nojs` | `/_wr/v1/enter`, `/_wr/v1/wait`. Admits only through `generate_token::admit` ([ADR-0037](../../../docs/adr/0037-no-javascript-queue.md)) | DESIGN §8 |
 | `controller` | Durable function: six 10 s passes per `rate(1 minute)` ([ADR-0022](../../../docs/adr/0022-durable-controller-cadence.md)) | DESIGN §7 |
 | `admin` | Axum + askama operator UI/API behind OIDC + PKCE. The only writer of the gate KeyValueStore after apply ([ADR-0016](../../../docs/adr/0016-admin-oidc-dynamodb-sessions.md), [ADR-0018](../../../docs/adr/0018-admin-vouch-design-language.md)) | DESIGN §8, §9 |
 | `wr-common` | `permutation`, `ids`, `items`, `expr`, `crypto`, `rules`, re-exported flat | DESIGN §4.3, §5.5 |
@@ -31,14 +31,14 @@ Every Lambda crate is split into `lib.rs` (pure logic, generic over a `Store` tr
 
 | Interface | Contract |
 |---|---|
-| `POST /v1/join` | `{request_id, event_id, h}` with `h = base64url(SHA-256(secret))`, schema-validated (400). 200 means enqueued, not assigned. A non-success SQS outcome returns 502 |
-| `GET /v1/status` | Phase, `serving_state`, `serving_position`, `target_rate`, message, `starts_at`, `poll_policy`. After the open it adds `shuffle_seed` (hex), `participant_count` and `prequeue_offsets`. Min TTL 1 s, path-only cache key, no cookies |
-| `GET /v1/queue_num` | 200 position, 404 re-join with the **same** `request_id`, 409 not yet open |
-| `POST /v1/generate_token` | `request_id` + possession secret ([ADR-0035](../../../docs/adr/0035-request-id-proof-of-possession.md)) → `Set-Cookie` session |
+| `POST /_wr/v1/join` | `{request_id, event_id, h}` with `h = base64url(SHA-256(secret))`, schema-validated (400). 200 means enqueued, not assigned. A non-success SQS outcome returns 502 |
+| `GET /_wr/v1/status` | Phase, `serving_state`, `serving_position`, `target_rate`, message, `starts_at`, `poll_policy`. After the open it adds `shuffle_seed` (hex), `participant_count` and `prequeue_offsets`. Min TTL 1 s, path-only cache key, no cookies |
+| `GET /_wr/v1/queue_num` | 200 position, 404 re-join with the **same** `request_id`, 409 not yet open |
+| `POST /_wr/v1/generate_token` | `request_id` + possession secret ([ADR-0035](../../../docs/adr/0035-request-id-proof-of-possession.md)) → `Set-Cookie` session |
 | Session cookie | HS256 JWS: `aud` event, `sub` request id, `iat`, `exp`, plus an optional IP tag ([ADR-0024](../../../docs/adr/0024-jws-credentials.md), [ADR-0036](../../../docs/adr/0036-optional-session-ip-binding.md)) |
 | Gate config `c` | `{v: 1, s: enforce_from, f: fail_open_until, r: rules, b?: bind_ip}`. Under ~1 KB. Terraform seeds it. `admin` read-modify-writes it under the read-time ETag |
 | Gate refusal | 302 to `/_wr/waiting.html` for navigation, 403 JSON for XHR, with a reason: `none` / `signature` / `event` / `expired` / `ip` |
-| Admin | `/admin/*` routes (DESIGN §8). Every action works without JavaScript, and the UI adds nothing the API lacks |
+| Admin | `/_wr/admin/*` routes (DESIGN §8). Every action works without JavaScript, and the UI adds nothing the API lacks |
 
 ## Data
 

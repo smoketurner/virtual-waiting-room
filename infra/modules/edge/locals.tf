@@ -4,11 +4,17 @@ locals {
   client_origin_id  = "${var.name_prefix}-origin"
   waiting_origin_id = "${var.name_prefix}-waiting"
 
+  # The one viewer path prefix the room occupies on the customer's hostname
+  # (issue #251): its pages, its API and the operator console all sit under
+  # it, so no behaviour here shadows a path the customer's own site serves.
+  room_prefix = "/_wr"
+
   # The waiting room's own pages, on their own unprotected behaviour. A visitor
   # refused by the gate is shown waiting_page_path, so it must be reachable
-  # without a credential or the refusal would loop.
-  waiting_path_pattern = "/_wr/*"
-  waiting_page_path    = "/_wr/waiting.html"
+  # without a credential or the refusal would loop. The pattern is the whole
+  # prefix, so its behaviour must be ordered after every more specific one.
+  waiting_path_pattern = "${local.room_prefix}/*"
+  waiting_page_path    = "${local.room_prefix}/waiting.html"
 
   demo_origin_id = "${var.name_prefix}-demo-origin"
 
@@ -34,25 +40,27 @@ locals {
   # https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/using-managed-cache-policies.html
   caching_disabled_policy_id = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
 
-  # Polled behaviour path patterns (viewer-facing, path-versioned under /v1) and
+  # Polled behaviour path patterns (viewer-facing, path-versioned under
+  # api_prefix) and
   # the cache policy each uses. Grouped by cache key (DESIGN §8):
   #   status  - key is path only
   #   keyed   - key adds event_id + request_id (per-visitor answers)
-  polled_status_path = "/v1/status"
-  polled_keyed_paths = ["/v1/queue_num"]
+  api_prefix         = "${local.room_prefix}/v1"
+  polled_status_path = "${local.api_prefix}/status"
+  polled_keyed_paths = ["${local.api_prefix}/queue_num"]
 
-  # Uncached write behaviour path patterns: token minting. /v1/join has its
+  # Uncached write behaviour path patterns: token minting. /_wr/v1/join has its
   # own behaviour and origin request policy, which forwards only content-type:
   # the SQS integration needs nothing else from the viewer.
   # The no-JavaScript queue (issue #67) mints the same session through the
   # same admission path, so it needs what generate_token needs.
-  write_paths = ["/v1/generate_token", "/v1/enter", "/v1/wait"]
-  join_path   = "/v1/join"
+  write_paths = ["${local.api_prefix}/generate_token", "${local.api_prefix}/enter", "${local.api_prefix}/wait"]
+  join_path   = "${local.api_prefix}/join"
 
   # Admin control plane (ADR-0016): the operator dashboard + OIDC login, plus its
   # static assets. Served by the admin Lambda; uncached, all methods, forward
   # everything to the origin. Auth is the admin Lambda's OIDC session, not the edge.
-  admin_paths = ["/admin", "/admin/*", "/static/*"]
+  admin_paths = ["${local.room_prefix}/admin", "${local.room_prefix}/admin/*", "${local.room_prefix}/static/*"]
 
   # AWS-managed origin request policy "AllViewerExceptHostHeader" — forwards
   # query string, cookies, and viewer headers except Host (API Gateway rejects a

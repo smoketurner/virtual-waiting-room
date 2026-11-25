@@ -29,7 +29,7 @@
 # which N1 does not allow.
 #
 # Every match on the URI path decodes and normalises it first (URL_DECODE, then
-# NORMALIZE_PATH), so /v1/%6Aoin and /v1//join are the same path to these rules
+# NORMALIZE_PATH), so /_wr/v1/%6Aoin and /_wr/v1//join are the same path to these rules
 # as they are to whatever serves them (issue #245).
 #
 # Only rules the flat-rate plans accept are used: no rule groups of our own,
@@ -44,26 +44,29 @@ locals {
   waf_token_cookie = "aws-waf-token"
 
   # Paths waiting.js calls. Listed rather than matched by prefix because the
-  # no-JavaScript paths share /v1/ and must not be challenged; a new JS endpoint
+  # no-JavaScript paths share /_wr/v1/ and must not be challenged; a new JS endpoint
   # has to be added here to be covered, which the terraform test checks.
-  waf_js_api_regex = "^/v1/(join|status|queue_num|generate_token)$"
+  waf_js_api_regex = "^${local.api_prefix}/(join|status|queue_num|generate_token)$"
 
   # Where waiting.js sends a browser to earn a token. Only a JavaScript client
   # ever navigates here, so challenging it cannot lock out a no-JS visitor.
-  waf_verify_path = "/_wr/verify.html"
+  waf_verify_path = "${local.room_prefix}/verify.html"
 
   # The two requests a visitor makes to take a place: earning a token and
   # posting the join. Counted together per IP, so a CAPTCHA triggered by the
   # join is shown on the verify page waiting.js navigates to in response.
-  waf_join_regex = "^(/v1/join|${replace(local.waf_verify_path, ".", "\\.")})$"
+  waf_join_regex = "^(${local.join_path}|${replace(local.waf_verify_path, ".", "\\.")})$"
 
-  waf_nojs_regex = "^/v1/(enter|wait)$"
-  waf_nojs_join  = "/v1/enter"
-  waf_nojs_wait  = "/v1/wait"
+  waf_nojs_regex = "^${local.api_prefix}/(enter|wait)$"
+  waf_nojs_join  = "${local.api_prefix}/enter"
+  waf_nojs_wait  = "${local.api_prefix}/wait"
 
-  # Everything the waiting room itself serves. Managed rules are scoped to it
-  # so they never change what the customer's origin sees.
-  waf_room_regex = "^/(v1|_wr)/"
+  # Everything the waiting room serves to visitors: its API and its pages,
+  # which sit directly under the prefix. Managed rules are scoped to it so
+  # they never change what the customer's origin sees. The operator console
+  # shares the prefix (issue #251) and is left out, as it was before it moved:
+  # an operator on a VPN must not be locked out by the anonymous-IP list.
+  waf_room_regex = "^${local.room_prefix}/(v1/|[^/]+$)"
 
   waf_anonymous_ip_namespace = "awswaf:managed:aws:anonymous-ip-list:"
 
@@ -149,7 +152,7 @@ resource "aws_wafv2_web_acl" "this" {
                 usage_of_action = "ENABLED"
 
                 exempt_uri_regular_expression {
-                  regex_string = "^/(v1|admin|static)/"
+                  regex_string = "^${local.room_prefix}/(v1|admin|static)/"
                 }
               }
             }
@@ -502,7 +505,7 @@ resource "aws_wafv2_web_acl" "this" {
 
         scope_down_statement {
           byte_match_statement {
-            search_string         = "/v1/join"
+            search_string         = local.join_path
             positional_constraint = "EXACTLY"
             field_to_match {
               uri_path {}
@@ -529,7 +532,7 @@ resource "aws_wafv2_web_acl" "this" {
 
   # A ceiling on the whole JS API per token. The page's own floor is one poll
   # every few seconds; this is well above it and far below a script hammering
-  # /v1/queue_num with invented ids to force origin misses.
+  # /_wr/v1/queue_num with invented ids to force origin misses.
   rule {
     name     = "api-per-token"
     priority = 21

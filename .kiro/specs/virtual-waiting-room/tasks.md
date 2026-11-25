@@ -19,7 +19,7 @@ The build-state record for requirements.md. Requirement IDs in brackets; decisio
 ### 1b. Event lifecycle and modes
 
 - [x] Phase state machine: idle → pre-queue → active → post-event, plus maintenance [F0.1, F0.8]
-- [x] Scheduled open at a configured start time; `/admin/open_now` opens early through `open_event` (ADR-0025) [F0.3]
+- [x] Scheduled open at a configured start time; `/_wr/admin/open_now` opens early through `open_event` (ADR-0025) [F0.3]
 - [x] Protection rules (path, header, cookie, user agent) evaluated per request by the edge gate; an empty ruleset passes everything through (dormancy) — [#60](https://github.com/smoketurner/virtual-waiting-room/issues/60), [#66](https://github.com/smoketurner/virtual-waiting-room/issues/66) [F0.6]
 - [ ] Operator-authored page per phase, CDN-cached [F0.2] — Partial: one waiting page whose text follows the phase; no operator-authored page per phase.
 - [ ] Standby mode: CloudWatch alarm on `AWS/CloudFront` `Requests` → EventBridge → phase Lambda, ~125 s worst-case activation [F0.4, F0.7]
@@ -42,17 +42,17 @@ The build-state record for requirements.md. Requirement IDs in brackets; decisio
 
 ### 1e. Read path
 
-- [x] `/v1/status` (phase, serving position, rate, message in one payload) and `/v1/queue_num`, served by the `read` Lambda [F3.1]. `/queue_pos_expiry` went with expiry (ADR-0031) and `/public_key` with signed URLs (ADR-0021).
+- [x] `/_wr/v1/status` (phase, serving position, rate, message in one payload) and `/_wr/v1/queue_num`, served by the `read` Lambda [F3.1]. `/queue_pos_expiry` went with expiry (ADR-0031) and `/public_key` with signed URLs (ADR-0021).
 - [x] Adaptive poll interval from a Terraform-set `poll_policy` — [#69](https://github.com/smoketurner/virtual-waiting-room/issues/69) [N10, ADR-0023]
 
 ### 1f. Admission, session, and outflow control
 
 - [x] Signing key from `random_bytes.signing_key`, written by Terraform to both the SSM SecureString and the gate's KeyValueStore `k` (issue #71)
-- [x] `/v1/generate_token`: checks position against `serving_counter` (via `resolve`), claims the admission once per visitor (ADR-0033), records the arrival, mints the HMAC-SHA256 session [F3.3, F3.8]
+- [x] `/_wr/v1/generate_token`: checks position against `serving_counter` (via `resolve`), claims the admission once per visitor (ADR-0033), records the arrival, mints the HMAC-SHA256 session [F3.3, F3.8]
 - [x] Gate as a CloudFront Function at viewer-request on the protected behaviour, configured from one KeyValueStore; shapes its own refusals (302 navigation, 403 XHR) — [#64](https://github.com/smoketurner/virtual-waiting-room/issues/64) [F3.4, ADR-0021]
 - [x] Session scoped per event, optional IP binding — [#61](https://github.com/smoketurner/virtual-waiting-room/issues/61) (ADR-0036); `request_id` redeemable only with its possession secret — [#62](https://github.com/smoketurner/virtual-waiting-room/issues/62) (ADR-0035) [F3.5]
 - [x] Cross-language credential and rule conformance vectors checked against the shipped gate function [ADR-0021 §6]
-- [x] `StoredControl` + `fail_open_until`; `/admin/fail_open` and `/admin/recover` mirrored to the gate (ADR-0009, ADR-0019)
+- [x] `StoredControl` + `fail_open_until`; `/_wr/admin/fail_open` and `/_wr/admin/recover` mirrored to the gate (ADR-0009, ADR-0019)
 - [x] No-show compensating controller, 10 s cadence as a durable function (ADR-0022) [F3.2, F3.8]
 - [ ] Automatic fail-open on a backend outage — [#58](https://github.com/smoketurner/virtual-waiting-room/issues/58) [F4.1, F4.2, F4.3] — Partial: the time-limited mechanism is built and operator-engaged; nothing trips it automatically.
 - [ ] Revoke an admission — [#63](https://github.com/smoketurner/virtual-waiting-room/issues/63) — no design chosen (ADR-0021 §5.2).
@@ -71,7 +71,7 @@ The build-state record for requirements.md. Requirement IDs in brackets; decisio
 - [x] Admin actions: phase, rate, message, start_time, open_now, force_maintenance, pause, resume, fail_open, recover, rules, ip_binding
 - [ ] Every operator action scriptable, no console dependency [F5.5] — Partial: every action is an HTTP endpoint, but the only auth is the browser OIDC session, and every POST needs that session's `csrf` form field and a same-origin request (#243); no machine-caller path (ADR-0016).
 - [x] Admin UI: one Axum Lambda, askama templates, one self-contained stylesheet (ADR-0018), no React [F7.1, F7.2, F7.5]
-- [x] UI is a thin client over the same `/admin/*` actions [F7.3]
+- [x] UI is a thin client over the same `/_wr/admin/*` actions [F7.3]
 - [x] OIDC Authorization Code + PKCE sessions in DynamoDB, enforced in the Lambda (ADR-0016) [F7.4]
 - [x] HTML forms work with JavaScript disabled; a small poller refreshes current state [F7.5]
 - [x] askama template tests; no SPA bundle emitted
@@ -83,7 +83,7 @@ The build-state record for requirements.md. Requirement IDs in brackets; decisio
 
 ### 1i. No-JavaScript queue
 
-- [x] `<noscript>` form posts to `/v1/enter`; `/v1/wait` is a server-rendered, self-refreshing page admitting through `generate_token` — [#67](https://github.com/smoketurner/virtual-waiting-room/issues/67) (ADR-0037)
+- [x] `<noscript>` form posts to `/_wr/v1/enter`; `/_wr/v1/wait` is a server-rendered, self-refreshing page admitting through `generate_token` — [#67](https://github.com/smoketurner/virtual-waiting-room/issues/67) (ADR-0037)
 
 **Exit:** endpoints correct; pre-queue assigns fairly and reproducibly; a visitor browses many pages on one session; operator steers a live event from API and UI; fail-open engages and the edge honours it.
 

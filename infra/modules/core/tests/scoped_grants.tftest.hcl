@@ -38,7 +38,7 @@ variables {
   nojs_artifact_path            = "tests/fixtures/bootstrap.zip"
 
   oidc_client_id      = "test-client"
-  oidc_redirect_uri   = "https://example.invalid/admin/callback"
+  oidc_redirect_uri   = "https://example.invalid/_wr/admin/callback"
   oidc_allowed_emails = "operator@example.invalid"
 }
 

@@ -96,8 +96,8 @@ same guarded mark; every session minted for the row expires from it (#237).
 | `open_event` | `Counters` | `UpdateItem` open, guarded | — | Once per event |
 | `open_event` | `Counters` | `GetItem` projecting `shuffle_seed` | Eventual | Only when the open's guard fails, to tell "already open" from "wrong phase" |
 | `read` | `Counters` | `GetItem` event | Eventual, 1 s in-process cache | ≤ 1/s per execution environment |
-| `read` | `PreQueue` | `GetItem` | Eventual | 1 per `/v1/queue_num` |
-| `read` | `Positions` | `GetItem` | Eventual | 1 per `/v1/queue_num` with no `PreQueue` row, or a straggler |
+| `read` | `PreQueue` | `GetItem` | Eventual | 1 per `/_wr/v1/queue_num` |
+| `read` | `Positions` | `GetItem` | Eventual | 1 per `/_wr/v1/queue_num` with no `PreQueue` row, or a straggler |
 | `generate_token`, `nojs` | `Counters` | `GetItem` event | Strong | 1 per call |
 | `generate_token`, `nojs` | `Positions` | `GetItem` | Strong | 1 per call |
 | `generate_token`, `nojs` | `PreQueue` | `GetItem` | Eventual | 1 per call |
@@ -255,8 +255,8 @@ floor; compressed into 100 seconds it is about 10,000/s and needs pre-warming an
 
 ## 10. The read path
 
-`/v1/status` is cached at the edge with a path-only key, so it costs about one origin fetch per
-second whatever the crowd. `/v1/queue_num` is keyed per visitor and cannot collapse, so the client
+`/_wr/v1/status` is cached at the edge with a path-only key, so it costs about one origin fetch per
+second whatever the crowd. `/_wr/v1/queue_num` is keyed per visitor and cannot collapse, so the client
 asks it once.
 
 **The first-ask spike** is the real read event. At 1,000,000 participants the client's spread
@@ -282,7 +282,7 @@ environments ≈ request_rate × mean_duration
 ```
 
 Without it the same spike is about 8,350 RCU/s against a 3,000 ceiling. Re-fetching
-`/v1/queue_num` on every poll instead of once would be about 174,000 requests/s at 1,000,000
+`/_wr/v1/queue_num` on every poll instead of once would be about 174,000 requests/s at 1,000,000
 waiters and a 5.75 s mean interval: roughly 87,000 RRU/s, over twice the default quota.
 
 ## 11. Reclamation

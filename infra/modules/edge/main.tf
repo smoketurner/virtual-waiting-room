@@ -1,16 +1,18 @@
 # modules/edge - CloudFront distribution with three cache behaviours (ADR-0013).
 #
-#   Polled   (/v1/status, /v1/queue_num)
+#   Polled   (/_wr/v1/status, /_wr/v1/queue_num)
 #            Min TTL > 0, zero cookies forwarded -> CloudFront collapses
 #            concurrent misses into one origin fetch, so origin load is
 #            independent of waiter count (C4). Cache keys differ per endpoint,
 #            so the two split across cache policies keyed by path and by
 #            path + event_id + request_id.
-#   Write    (/v1/join, /v1/generate_token) - uncached (managed CachingDisabled).
+#   Write    (/_wr/v1/join, /_wr/v1/generate_token) - uncached (managed CachingDisabled).
 #   Default  (/*) - the protected origin: uncached, session cookie forwarded.
 #
-# Public paths are path-versioned under /v1; the API origin's origin_path is the
-# stage (= env), so /v1/status is forwarded to /<env>/v1/status. The optional
+# Everything the room serves sits under one reserved prefix, /_wr/ (issue
+# #251); public paths are path-versioned under /_wr/v1. The API origin's
+# origin_path is the stage (= env), so /_wr/v1/status is forwarded to
+# /<env>/_wr/v1/status. The optional
 # WAF web ACL is in waf.tf (ADR-0038); standby activation is not built yet.
 
 # --- Cache policies (polled behaviours) --------------------------------------
@@ -67,13 +69,13 @@ resource "aws_cloudfront_cache_policy" "polled_keyed" {
 # This is the ONLY behaviour that forwards a cookie - doing so on a polled
 # behaviour would disable request collapsing (ADR-0013).
 
-# --- Origin request policy (/v1/join) -----------------------------------------
+# --- Origin request policy (/_wr/v1/join) -----------------------------------------
 # content-type is all the SQS integration needs to parse the body; forwarding
 # anything else would only widen the cache key on the one path that must stay
 # cheap under a burst.
 resource "aws_cloudfront_origin_request_policy" "join" {
   name    = "${var.name_prefix}-join"
-  comment = "POST /v1/join: forward only what the SQS integration needs to accept the body."
+  comment = "POST /_wr/v1/join: forward only what the SQS integration needs to accept the body."
 
   cookies_config {
     cookie_behavior = "none"
@@ -89,7 +91,7 @@ resource "aws_cloudfront_origin_request_policy" "join" {
   }
 }
 
-# --- Origin request policy (/v1/generate_token, /v1/enter, /v1/wait) ----------
+# --- Origin request policy (/_wr/v1/generate_token, /_wr/v1/enter, /_wr/v1/wait) ----------
 # Cookies, because a behaviour that forwards none has its Set-Cookie response
 # headers stripped, and minting the session cookie is these paths' whole job.
 # CloudFront-Viewer-Address, because the session is tagged with the viewer's
@@ -99,7 +101,7 @@ resource "aws_cloudfront_origin_request_policy" "join" {
 # Host: API Gateway rejects it.
 resource "aws_cloudfront_origin_request_policy" "generate_token" {
   name    = "${var.name_prefix}-generate-token"
-  comment = "POST /v1/generate_token: cookies (Set-Cookie survives), the viewer address, the body type."
+  comment = "POST /_wr/v1/generate_token: cookies (Set-Cookie survives), the viewer address, the body type."
 
   cookies_config {
     cookie_behavior = "all"
@@ -204,8 +206,8 @@ resource "aws_cloudfront_distribution" "this" {
   aliases = var.aliases
 
   # Origin 1: the core REST API (polled + write behaviours). origin_path is the
-  # stage (= env), so a viewer request for /v1/status is forwarded to
-  # /<env>/v1/status where the deployed, path-versioned methods live.
+  # stage (= env), so a viewer request for /_wr/v1/status is forwarded to
+  # /<env>/_wr/v1/status where the deployed, path-versioned methods live.
   origin {
     origin_id   = local.api_origin_id
     domain_name = var.api_gateway_domain_name
@@ -295,18 +297,6 @@ resource "aws_cloudfront_distribution" "this" {
     }
   }
 
-  # The waiting room's pages. Deliberately outside the gate: this is what a
-  # refused visitor is shown.
-  ordered_cache_behavior {
-    path_pattern           = local.waiting_path_pattern
-    target_origin_id       = local.waiting_origin_id
-    viewer_protocol_policy = "redirect-to-https"
-    allowed_methods        = ["GET", "HEAD", "OPTIONS"]
-    cached_methods         = ["GET", "HEAD"]
-    cache_policy_id        = aws_cloudfront_cache_policy.waiting.id
-    compress               = true
-  }
-
   # Polled: /status (path-only cache key).
   ordered_cache_behavior {
     path_pattern           = local.polled_status_path
@@ -359,7 +349,7 @@ resource "aws_cloudfront_distribution" "this" {
   # the managed AllViewerExceptHostHeader policy does not forward.
   #
   # Like the write behaviour it carries NO function association: the gate lives
-  # on the default behaviour only. Without a behaviour of its own /v1/join falls
+  # on the default behaviour only. Without a behaviour of its own /_wr/v1/join falls
   # through to that default, where the gate refuses a visitor who has no session
   # cookie yet — which is every visitor trying to join.
   ordered_cache_behavior {
@@ -373,7 +363,7 @@ resource "aws_cloudfront_distribution" "this" {
     compress                 = true
   }
 
-  # Admin control plane: /admin, /admin/*, /static/* (ADR-0016). Uncached, all
+  # Admin control plane: /_wr/admin, /_wr/admin/*, /_wr/static/* (ADR-0016). Uncached, all
   # methods, forward everything except Host so the OIDC session cookie + callback
   # query reach the admin Lambda. Access is gated by the admin Lambda's OIDC
   # session, not at the edge.
@@ -389,6 +379,23 @@ resource "aws_cloudfront_distribution" "this" {
       origin_request_policy_id = local.all_viewer_except_host_policy_id
       compress                 = true
     }
+  }
+
+  # The waiting room's pages. Deliberately outside the gate: this is what a
+  # refused visitor is shown.
+  #
+  # Last of the ordered behaviours, and it must stay last: CloudFront takes the
+  # first pattern that matches, in this order, and this one is the room's whole
+  # prefix (issue #251). Ahead of the API and console behaviours it would send
+  # every one of their requests to S3.
+  ordered_cache_behavior {
+    path_pattern           = local.waiting_path_pattern
+    target_origin_id       = local.waiting_origin_id
+    viewer_protocol_policy = "redirect-to-https"
+    allowed_methods        = ["GET", "HEAD", "OPTIONS"]
+    cached_methods         = ["GET", "HEAD"]
+    cache_policy_id        = aws_cloudfront_cache_policy.waiting.id
+    compress               = true
   }
 
   # No error is rewritten (issue #71, closes #64): the gate itself decides a

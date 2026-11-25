@@ -63,7 +63,7 @@ variable "open_event_artifact_path" {
 }
 
 variable "read_artifact_path" {
-  description = "Path to the read Lambda bootstrap zip (serves /v1/status and /v1/queue_num)."
+  description = "Path to the read Lambda bootstrap zip (serves /_wr/v1/status and /_wr/v1/queue_num)."
   type        = string
 }
 
@@ -154,7 +154,7 @@ variable "oidc_client_id" {
 }
 
 variable "oidc_redirect_uri" {
-  description = "OIDC callback URL registered with the provider — the CloudFront (or API) URL of /admin/callback, e.g. https://d123.cloudfront.net/admin/callback."
+  description = "OIDC callback URL registered with the provider — the CloudFront (or API) URL of /_wr/admin/callback, e.g. https://d123.cloudfront.net/_wr/admin/callback."
   type        = string
   default     = ""
 }
@@ -378,7 +378,7 @@ variable "alarm_sns_topic_arn" {
 # it is accepted and has no effect.
 
 variable "api_join_throttle_rate_limit" {
-  description = "Steady-state requests per second POST /v1/join accepts before answering 429. Sized for the join burst the ingest path is designed to take (10,000/s), which is also the account default limit: raise the account quota before raising this."
+  description = "Steady-state requests per second POST /_wr/v1/join accepts before answering 429. Sized for the join burst the ingest path is designed to take (10,000/s), which is also the account default limit: raise the account quota before raising this."
   type        = number
   default     = 10000
 
@@ -389,7 +389,7 @@ variable "api_join_throttle_rate_limit" {
 }
 
 variable "api_join_throttle_burst_limit" {
-  description = "Token-bucket size for POST /v1/join: how many joins may arrive at once before the rate limit applies."
+  description = "Token-bucket size for POST /_wr/v1/join: how many joins may arrive at once before the rate limit applies."
   type        = number
   default     = 5000
 
@@ -400,7 +400,7 @@ variable "api_join_throttle_burst_limit" {
 }
 
 variable "api_throttle_rate_limit" {
-  description = "Steady-state requests per second each other method accepts before answering 429. /v1/status reaches the API once a second however many are waiting and admission runs at the admission rate, but /v1/queue_num is cached per visitor, so during a join burst it is called about as often as /v1/join: so the default matches the join limit. Lower it to cap what the read and admission Lambdas can be asked for."
+  description = "Steady-state requests per second each other method accepts before answering 429. /_wr/v1/status reaches the API once a second however many are waiting and admission runs at the admission rate, but /_wr/v1/queue_num is cached per visitor, so during a join burst it is called about as often as /_wr/v1/join: so the default matches the join limit. Lower it to cap what the read and admission Lambdas can be asked for."
   type        = number
   default     = 10000
 
@@ -411,7 +411,7 @@ variable "api_throttle_rate_limit" {
 }
 
 variable "api_throttle_burst_limit" {
-  description = "Token-bucket size for each method other than POST /v1/join."
+  description = "Token-bucket size for each method other than POST /_wr/v1/join."
   type        = number
   default     = 5000
 

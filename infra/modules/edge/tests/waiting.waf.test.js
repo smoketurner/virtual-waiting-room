@@ -52,10 +52,10 @@ function renewedTo(client) {
 /** A pre-queue page whose join the edge challenges. */
 function challengedJoin(action, status) {
   return (url) => {
-    if (url.startsWith("/v1/status")) {
+    if (url.startsWith("/_wr/v1/status")) {
       return jsonResponse(200, preQueueStatus());
     }
-    if (url.startsWith("/v1/join")) {
+    if (url.startsWith("/_wr/v1/join")) {
       return wafResponse(status, action);
     }
     throw new Error(`unexpected ${url}`);
@@ -66,7 +66,7 @@ test("a challenged join is not recorded as a place in line", async () => {
   const client = loadClient({ route: challengedJoin("challenge", 202) });
   await client.flush();
 
-  assert.equal(client.calls.filter((c) => c.url === "/v1/join").length, 1);
+  assert.equal(client.calls.filter((c) => c.url === "/_wr/v1/join").length, 1);
   assert.equal(
     client.win.localStorage.getItem("vwr_joined"),
     null,
@@ -94,7 +94,7 @@ test("a challenge on /status is renewed the same way", async () => {
   await client.flush();
 
   assert.match(renewedTo(client), /\?waf=\d+$/);
-  assert.equal(client.calls.filter((c) => c.url === "/v1/join").length, 0);
+  assert.equal(client.calls.filter((c) => c.url === "/_wr/v1/join").length, 0);
 });
 
 test("the detour keeps the gate's next= so admission still lands on the refused page", async () => {
@@ -136,7 +136,7 @@ test("a WAF answer long after the last renewal renews again, replacing the old m
 test("a join the ingest accepts is still recorded when no WAF is in front", async () => {
   const client = loadClient({
     route: (url) =>
-      url.startsWith("/v1/status") ? jsonResponse(200, preQueueStatus()) : jsonResponse(200, {}),
+      url.startsWith("/_wr/v1/status") ? jsonResponse(200, preQueueStatus()) : jsonResponse(200, {}),
   });
   await client.flush();
 

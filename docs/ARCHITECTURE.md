@@ -13,7 +13,7 @@ Lambda's environment as `EVENT_ID`.
 
 Three decisions carry the design:
 
-- **The burst never touches compute.** `POST /v1/join` is an API Gateway `AWS` service
+- **The burst never touches compute.** `POST /_wr/v1/join` is an API Gateway `AWS` service
   integration that calls SQS `SendMessage` directly. No function runs in that path.
 - **Queue order is never stored.** A pre-queue visitor's position is a keyed permutation of their
   registration index, computed on read. One conditional `UpdateItem` opens the whole cohort
@@ -30,11 +30,11 @@ flat-rate plan only, a WAF web ACL.
 | Function | Trigger | Timeout | What it does |
 |---|---|---|---|
 | `assign_position` | SQS event source mapping | 30 s | Consumes join batches; claims pre-queue indices or live positions; writes rows |
-| `open_event` | EventBridge Scheduler one-shot, or `/admin/open_now` | 30 s | Folds the shard counts into offsets and writes the open |
-| `read` | API Gateway | 10 s | `GET /v1/status`, `GET /v1/queue_num` |
+| `open_event` | EventBridge Scheduler one-shot, or `/_wr/admin/open_now` | 30 s | Folds the shard counts into offsets and writes the open |
+| `read` | API Gateway | 10 s | `GET /_wr/v1/status`, `GET /_wr/v1/queue_num` |
 | `controller` | EventBridge Scheduler `rate(1 minute)` | 30 s | Durable function; meters admission in six 10 s passes |
 | `generate_token` | API Gateway | 10 s | Checks the position, claims the admission, records the arrival, signs the session cookie |
-| `nojs` | API Gateway | 10 s | The queue for a visitor without JavaScript: `POST /v1/enter`, `GET /v1/wait` ([ADR-0037](adr/0037-no-javascript-queue.md)) |
+| `nojs` | API Gateway | 10 s | The queue for a visitor without JavaScript: `POST /_wr/v1/enter`, `GET /_wr/v1/wait` ([ADR-0037](adr/0037-no-javascript-queue.md)) |
 | `admin` | API Gateway | 10 s | Axum operator UI and control plane |
 
 Every function runs `provided.al2023` at 256 MB on the architecture named in `terraform.tfvars`,
@@ -45,19 +45,19 @@ rather than in `generate_token`).
 ## 3. Request paths
 
 ```
-join:      CloudFront [/v1/join, uncached, forwards content-type only]
+join:      CloudFront [/_wr/v1/join, uncached, forwards content-type only]
              → API Gateway REST (type: aws, SQS SendMessage) → SQS → assign_position → DynamoDB
 
-poll:      CloudFront [/v1/status, Min TTL 1 s, path-only key, no cookies]
+poll:      CloudFront [/_wr/v1/status, Min TTL 1 s, path-only key, no cookies]
              → API Gateway → read → DynamoDB (1 s in-process cache)
 
-number:    CloudFront [/v1/queue_num, Min TTL 1 s, keyed on event_id + request_id]
+number:    CloudFront [/_wr/v1/queue_num, Min TTL 1 s, keyed on event_id + request_id]
              → API Gateway → read → DynamoDB            (asked once per visitor)
 
-admit:     CloudFront [/v1/generate_token, uncached, cookies + viewer address forwarded]
+admit:     CloudFront [/_wr/v1/generate_token, uncached, cookies + viewer address forwarded]
              → API Gateway → generate_token → DynamoDB → Set-Cookie (signed session)
 
-no-JS:     CloudFront [/v1/enter, /v1/wait, as admit]
+no-JS:     CloudFront [/_wr/v1/enter, /_wr/v1/wait, as admit]
              → API Gateway → nojs → SQS (join) / generate_token::admit (wait)
 
 protected: CloudFront [/*, CloudFront Function at viewer-request]
@@ -76,18 +76,23 @@ meter:     EventBridge Scheduler rate(1 minute)   [always created]
 | Path | Cache policy | Forwarded to origin | Origin |
 |---|---|---|---|
 | `/*` (default) | CachingDisabled | Session cookie, all viewer headers and query strings (none for the demo fixture) | Protected origin, gated |
-| `/_wr/*` | Cached | Nothing | Private S3 bucket, ungated |
-| `/v1/status` | Min TTL 1 s, key: path | Nothing | API Gateway |
-| `/v1/queue_num` | Min TTL 1 s, key: path + `event_id` + `request_id` | Those two query strings | API Gateway |
-| `/v1/join` | CachingDisabled | `content-type` | API Gateway |
-| `/v1/generate_token`, `/v1/enter`, `/v1/wait` | CachingDisabled | All cookies and query strings; `content-type`, `referer`, `CloudFront-Viewer-Address` | API Gateway |
-| `/admin`, `/admin/*`, `/static/*` | CachingDisabled | AllViewerExceptHostHeader | API Gateway |
+| `/_wr/v1/status` | Min TTL 1 s, key: path | Nothing | API Gateway |
+| `/_wr/v1/queue_num` | Min TTL 1 s, key: path + `event_id` + `request_id` | Those two query strings | API Gateway |
+| `/_wr/v1/join` | CachingDisabled | `content-type` | API Gateway |
+| `/_wr/v1/generate_token`, `/_wr/v1/enter`, `/_wr/v1/wait` | CachingDisabled | All cookies and query strings; `content-type`, `referer`, `CloudFront-Viewer-Address` | API Gateway |
+| `/_wr/admin`, `/_wr/admin/*`, `/_wr/static/*` | CachingDisabled | AllViewerExceptHostHeader | API Gateway |
+| `/_wr/*` (everything else under the prefix) | Cached | Nothing | Private S3 bucket, ungated |
 
 `polled_min_ttl_seconds` is validated `> 0`: a zero minimum TTL, or any forwarded cookie, disables
 request collapsing and every poll reaches the origin
 ([ADR-0013](adr/0013-cache-behaviour-separation.md)). The minting paths forward cookies because
 CloudFront strips `Set-Cookie` from a behaviour that forwards none. `/_wr/*` sits outside the gate
 so a refusal cannot loop, and a `check` block asserts the waiting page falls under it.
+
+`/_wr/` is the only path prefix the room occupies on the customer's hostname (issue #251); every
+other path reaches the protected origin. CloudFront takes the first ordered behaviour that
+matches, so `/_wr/*` is declared last: ahead of the API and console behaviours it would send their
+requests to S3.
 
 ## 4. Join
 
@@ -138,7 +143,7 @@ shard counts with one consistent `BatchGetItem`, computes
 `offset[s] = Σ counts[0..s)` and `N`, and writes seed, `N`, offsets, `queue_counter = N` and
 `phase = active` in one `UpdateItem` guarded by `attribute_not_exists(shuffle_seed) AND phase =
 :pre_queue`. A double-fire or retry fails the guard and reports `AlreadyOpen`. Both the schedule
-and `/admin/open_now` go through this one function.
+and `/_wr/admin/open_now` go through this one function.
 
 **Position on read.** `position = PRP(shuffle_seed, offset[s] + l, N)`. The PRP is a 4-round
 balanced Feistel network over the smallest power of four ≥ `N`, cycle-walked into `[0, N)`, with
@@ -165,17 +170,17 @@ failure; redelivery takes the live path, and the visitor holds both a counted `P
 
 ## 6. Waiting
 
-`GET /v1/status` returns `event_id`, `phase`, `serving_state`, `serving_position`, and, when set,
+`GET /_wr/v1/status` returns `event_id`, `phase`, `serving_state`, `serving_position`, and, when set,
 `participant_count`, `prequeue_offsets`, `shuffle_seed` (hex, only after the open), `message`,
 `target_rate` (visitors per second), `starts_at` and `poll_policy`. `serving_state` is derived from
 phase and admission control on every read ([ADR-0019](adr/0019-visitor-facing-serving-state.md)).
 Publishing the seed with the offsets and `N` lets anyone audit the whole ordering; a visitor's own
-shard and index come from `GET /v1/queue_num`.
+shard and index come from `GET /_wr/v1/queue_num`.
 
 `waiting.js`:
 
-- asks `/v1/queue_num` only until it knows its position, since a position never changes; every
-  later tick fetches `/v1/status` alone, which CloudFront collapses;
+- asks `/_wr/v1/queue_num` only until it knows its position, since a position never changes; every
+  later tick fetches `/_wr/v1/status` alone, which CloudFront collapses;
 - delays that first ask by a random slice of `min(60 s, participants / 5000 s⁻¹)` so the cohort
   does not ask at once (at 1,000,000 participants that is about 16,700 requests/s, above the
   default 10,000/s API Gateway account throttle);
@@ -184,7 +189,7 @@ shard and index come from `GET /v1/queue_num`.
   fixed 5 s;
 - stops polling while the tab is hidden and catches up when it is visible, never faster than the
   floor;
-- re-joins with the same request id after eight consecutive 404s from `/v1/queue_num`, enough to
+- re-joins with the same request id after eight consecutive 404s from `/_wr/v1/queue_num`, enough to
   clear the event source mapping's 20 s worst case;
 - treats any response carrying `x-amzn-waf-action` as "renew the WAF token on `/_wr/verify.html`",
   never as success.
@@ -232,10 +237,10 @@ after its last write, and the unused budget compensates for absentees
 
 ### 7.2 Minting the session
 
-`POST /v1/generate_token` takes `request_id` and the possession `secret`. `generate_token::admit`,
+`POST /_wr/v1/generate_token` takes `request_id` and the possession `secret`. `generate_token::admit`,
 which `nojs` also calls, reads both `PreQueue` and `Positions`. A `PreQueue` row inside its
 shard's opened count is the visitor's place whatever `Positions` holds, the same order
-`/v1/queue_num` resolves in; a `Positions` row answers only for a live joiner or a straggler
+`/_wr/v1/queue_num` resolves in; a `Positions` row answers only for a live joiner or a straggler
 ([#238](https://github.com/smoketurner/virtual-waiting-room/issues/238)). It then decides:
 
 | Check, in order | Refusal |
@@ -321,7 +326,7 @@ is not billed. A terraform test fails if a method does not require it.
 **Web ACL.** Created only when `flat_rate_plan_tier` is set; `edge/plan.tf` subscribes the
 distribution, the ACL and the KeyValueStore to the plan, which bundles their cost (on pay-as-you-go
 the ACL would bill between events, breaking N1). It requires a WAF token on the JavaScript API
-paths (`/v1/join|status|queue_num|generate_token`), earned by a challenge on `/_wr/verify.html`;
+paths (`/_wr/v1/join|status|queue_num|generate_token`), earned by a challenge on `/_wr/verify.html`;
 rate-limits per token and per IP (per-IP join limits escalate to CAPTCHA); and runs the AWS
 managed rules (Anti-DDoS, IP reputation, Bot Control common, anonymous IP) in Count until
 `waf_managed_rules_mode = "enforce"`. The no-JavaScript paths and `waiting.html` are never
@@ -329,9 +334,9 @@ challenged; they get a strict per-IP limit, anonymous-network blocking, and `noj
 to close them for an event.
 
 **No-JavaScript queue** ([ADR-0037](adr/0037-no-javascript-queue.md)). `waiting.html`'s
-`<noscript>` form posts to `/v1/enter`, which mints the same UUIDv7 and possession secret the
-script would, keeps them in an `HttpOnly` cookie scoped to `/v1/`, and sends the same `{request_id,
-event_id, h}` message to the join queue. `/v1/wait` is a self-refreshing server-rendered page that
+`<noscript>` form posts to `/_wr/v1/enter`, which mints the same UUIDv7 and possession secret the
+script would, keeps them in an `HttpOnly` cookie scoped to `/_wr/v1/`, and sends the same `{request_id,
+event_id, h}` message to the join queue. `/_wr/v1/wait` is a self-refreshing server-rendered page that
 calls `generate_token::admit`, so there is one way a session is minted. The cookie also carries
 when the join was sent: one that has not registered after 60 s is resent, up to three times, and
 then the visitor is shown the form again (`nojs_join_resent`, `nojs_join_lost`, #251).
@@ -342,18 +347,18 @@ The admin Lambda serves an Axum router behind an API Gateway greedy proxy:
 
 | Route | Method | Does |
 |---|---|---|
-| `/admin`, `/admin/state` | GET | Dashboard (with the readiness panel) and JSON state |
-| `/admin/login`, `/admin/callback` | GET | OIDC Authorization Code + PKCE ([ADR-0016](adr/0016-admin-oidc-dynamodb-sessions.md)). The callback answers a meta-refresh page, so the `SameSite=Strict` session cookie it sets is sent on the way to the dashboard |
-| `/admin/logout` | POST | Ends the session. Like every POST, needs the session's `csrf` form field |
-| `/admin/phase` | POST | Phase transition from an expected prior phase; refuses `active`, which only the open can set |
-| `/admin/start_time` | POST | Sets or clears the start time and arms the open schedule |
-| `/admin/open_now` | POST | Invokes `open_event` now |
-| `/admin/rate`, `/admin/message` | POST | Target rate (guarded on the prior rate), operator broadcast |
-| `/admin/pause`, `/admin/resume` | POST | Admission control `open` ↔ `paused` |
-| `/admin/fail_open`, `/admin/recover` | POST | Sets and clears `fail_open_until`, mirrored to the KeyValueStore |
-| `/admin/force_maintenance` | POST | Emergency stop: maintenance from any phase, not debounced |
-| `/admin/rules` | POST | Replaces the gate's ruleset in the KeyValueStore, audited on `Counters` |
-| `/admin/ip_binding` | POST | Turns session IP binding on or off ([ADR-0036](adr/0036-optional-session-ip-binding.md)) |
+| `/_wr/admin`, `/_wr/admin/state` | GET | Dashboard (with the readiness panel) and JSON state |
+| `/_wr/admin/login`, `/_wr/admin/callback` | GET | OIDC Authorization Code + PKCE ([ADR-0016](adr/0016-admin-oidc-dynamodb-sessions.md)). The callback answers a meta-refresh page, so the `SameSite=Strict` session cookie it sets is sent on the way to the dashboard |
+| `/_wr/admin/logout` | POST | Ends the session. Like every POST, needs the session's `csrf` form field |
+| `/_wr/admin/phase` | POST | Phase transition from an expected prior phase; refuses `active`, which only the open can set |
+| `/_wr/admin/start_time` | POST | Sets or clears the start time and arms the open schedule |
+| `/_wr/admin/open_now` | POST | Invokes `open_event` now |
+| `/_wr/admin/rate`, `/_wr/admin/message` | POST | Target rate (guarded on the prior rate), operator broadcast |
+| `/_wr/admin/pause`, `/_wr/admin/resume` | POST | Admission control `open` ↔ `paused` |
+| `/_wr/admin/fail_open`, `/_wr/admin/recover` | POST | Sets and clears `fail_open_until`, mirrored to the KeyValueStore |
+| `/_wr/admin/force_maintenance` | POST | Emergency stop: maintenance from any phase, not debounced |
+| `/_wr/admin/rules` | POST | Replaces the gate's ruleset in the KeyValueStore, audited on `Counters` |
+| `/_wr/admin/ip_binding` | POST | Turns session IP binding on or off ([ADR-0036](adr/0036-optional-session-ip-binding.md)) |
 
 API Gateway authorization is `NONE` (plus the origin key); the Lambda enforces an OIDC session
 stored in `Tokens` and the `OIDC_ALLOWED_EMAILS` allowlist, which denies everyone when empty, and

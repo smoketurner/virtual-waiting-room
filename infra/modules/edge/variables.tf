@@ -30,7 +30,7 @@ variable "client_origin_secret" {
 }
 
 variable "env" {
-  description = "Deployment environment. It is the REST API stage name, so it is the API origin's origin_path: a viewer request for /v1/status is forwarded to /<env>/v1/status."
+  description = "Deployment environment. It is the REST API stage name, so it is the API origin's origin_path: a viewer request for /_wr/v1/status is forwarded to /<env>/_wr/v1/status."
   type        = string
 }
 
@@ -210,7 +210,7 @@ variable "waf_join_token_limit" {
 }
 
 variable "waf_api_token_limit" {
-  description = "Requests one WAF token may make across the JavaScript API paths in 5 minutes. The waiting page polls at most once per poll_floor_ms (5 s by default, about 60 requests), so the default leaves wide headroom while stopping a script that forces /v1/queue_num origin misses."
+  description = "Requests one WAF token may make across the JavaScript API paths in 5 minutes. The waiting page polls at most once per poll_floor_ms (5 s by default, about 60 requests), so the default leaves wide headroom while stopping a script that forces /_wr/v1/queue_num origin misses."
   type        = number
   default     = 300
 
@@ -232,7 +232,7 @@ variable "waf_join_ip_limit" {
 }
 
 variable "waf_nojs_ip_limit" {
-  description = "No-JavaScript joins (POST /v1/enter, ADR-0037) from one IP in 5 minutes before further ones are refused. Tight, because that path cannot run a challenge or CAPTCHA to fall back on."
+  description = "No-JavaScript joins (POST /_wr/v1/enter, ADR-0037) from one IP in 5 minutes before further ones are refused. Tight, because that path cannot run a challenge or CAPTCHA to fall back on."
   type        = number
   default     = 10
 
@@ -243,7 +243,7 @@ variable "waf_nojs_ip_limit" {
 }
 
 variable "waf_nojs_wait_ip_limit" {
-  description = "Loads of the no-JavaScript waiting page (GET /v1/wait, ADR-0037) from one IP in 5 minutes before further ones are refused. The page reloads itself every 5 seconds near the front, about 60 loads per visitor, so the default serves five such visitors behind one address."
+  description = "Loads of the no-JavaScript waiting page (GET /_wr/v1/wait, ADR-0037) from one IP in 5 minutes before further ones are refused. The page reloads itself every 5 seconds near the front, about 60 loads per visitor, so the default serves five such visitors behind one address."
   type        = number
   default     = 300
 
@@ -254,7 +254,7 @@ variable "waf_nojs_wait_ip_limit" {
 }
 
 variable "nojs_enabled" {
-  description = "Whether the no-JavaScript queue (/v1/enter, /v1/wait, ADR-0037) is open. Only takes effect on a flat-rate plan: false blocks both paths at the edge for an event where it is being abused, at the cost of visitors without JavaScript being unable to queue."
+  description = "Whether the no-JavaScript queue (/_wr/v1/enter, /_wr/v1/wait, ADR-0037) is open. Only takes effect on a flat-rate plan: false blocks both paths at the edge for an event where it is being abused, at the cost of visitors without JavaScript being unable to queue."
   type        = bool
   default     = true
 }

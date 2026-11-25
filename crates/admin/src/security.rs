@@ -85,7 +85,7 @@ pub fn origin_of(url: &str) -> Option<&str> {
 /// The session cookie's `SameSite` stops a cross-*site* POST but not a
 /// same-site one: the console shares an origin with the customer's own pages,
 /// and their sibling subdomains are same-site. A script on any of them could
-/// otherwise post `/admin/fail_open` with the operator's cookie. Every
+/// otherwise post `/_wr/admin/fail_open` with the operator's cookie. Every
 /// operator action is a same-origin form post from the dashboard, so anything
 /// else is refused. The per-session token (`crate::operator::guard_writes`) is
 /// the second layer, for a request this one cannot tell apart.
@@ -343,19 +343,19 @@ mod tests {
     #[test]
     fn the_origin_of_a_redirect_uri_is_its_scheme_and_authority() {
         assert_eq!(
-            origin_of("https://tickets.example.com/admin/callback"),
+            origin_of("https://tickets.example.com/_wr/admin/callback"),
             Some("https://tickets.example.com")
         );
         assert_eq!(
-            origin_of("https://tickets.example.com:8443/admin/callback?x=1"),
+            origin_of("https://tickets.example.com:8443/_wr/admin/callback?x=1"),
             Some("https://tickets.example.com:8443")
         );
         assert_eq!(
             origin_of("https://tickets.example.com"),
             Some("https://tickets.example.com")
         );
-        assert_eq!(origin_of("/admin/callback"), None);
-        assert_eq!(origin_of("https:///admin"), None);
+        assert_eq!(origin_of("/_wr/admin/callback"), None);
+        assert_eq!(origin_of("https:///_wr/admin"), None);
         assert_eq!(origin_of("://host/"), None);
     }
 

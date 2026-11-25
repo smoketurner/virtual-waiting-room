@@ -151,14 +151,14 @@ run "every_path_the_waiting_page_calls_requires_a_token" {
   # caught here rather than left open.
   assert {
     condition = alltrue([
-      for p in distinct(flatten(regexall("\"(/v1/[a-z_]+)", local.waiting_js_source))) :
+      for p in distinct(flatten(regexall("\"(/_wr/v1/[a-z_]+)", local.waiting_js_source))) :
       can(regex(local.waf_js_api_regex, p))
     ])
-    error_message = "every /v1 path waiting.js calls must match waf_js_api_regex, or it can be called without a WAF token"
+    error_message = "every /_wr/v1 path waiting.js calls must match waf_js_api_regex, or it can be called without a WAF token"
   }
 
   assert {
-    condition     = length(distinct(flatten(regexall("\"(/v1/[a-z_]+)", local.waiting_js_source)))) >= 4
+    condition     = length(distinct(flatten(regexall("\"(/_wr/v1/[a-z_]+)", local.waiting_js_source)))) >= 4
     error_message = "the page scan found fewer API paths than waiting.js is known to call; the scan itself is broken"
   }
 }
@@ -171,7 +171,7 @@ run "the_no_javascript_queue_is_never_challenged" {
   }
 
   assert {
-    condition     = !can(regex(local.waf_js_api_regex, "/v1/enter")) && !can(regex(local.waf_js_api_regex, "/v1/wait"))
+    condition     = !can(regex(local.waf_js_api_regex, "/_wr/v1/enter")) && !can(regex(local.waf_js_api_regex, "/_wr/v1/wait"))
     error_message = "the no-JS paths must not require a WAF token: their visitors cannot run the challenge (ADR-0037)"
   }
 
@@ -201,11 +201,11 @@ run "closing_the_no_javascript_queue_blocks_both_paths" {
 
   assert {
     condition     = contains([for r in aws_wafv2_web_acl.this[0].rule : r.name], "nojs-closed")
-    error_message = "nojs_enabled = false must add the rule that closes /v1/enter and /v1/wait"
+    error_message = "nojs_enabled = false must add the rule that closes /_wr/v1/enter and /_wr/v1/wait"
   }
 
   assert {
-    condition     = can(regex(local.waf_nojs_regex, "/v1/enter")) && can(regex(local.waf_nojs_regex, "/v1/wait"))
+    condition     = can(regex(local.waf_nojs_regex, "/_wr/v1/enter")) && can(regex(local.waf_nojs_regex, "/_wr/v1/wait"))
     error_message = "the closing rule must cover both no-JS paths"
   }
 }
@@ -264,7 +264,7 @@ run "the_no_javascript_waiting_page_is_rate_limited_per_address" {
       for r in aws_wafv2_web_acl.this[0].rule :
       r.statement[0].rate_based_statement[0] if r.name == "nojs-wait-per-ip"
     ]).aggregate_key_type == "IP"
-    error_message = "/v1/wait runs compute on every load and needs its own per-IP limit (issue #245)"
+    error_message = "/_wr/v1/wait runs compute on every load and needs its own per-IP limit (issue #245)"
   }
 
   assert {
@@ -272,11 +272,11 @@ run "the_no_javascript_waiting_page_is_rate_limited_per_address" {
       for r in aws_wafv2_web_acl.this[0].rule :
       r.statement[0].rate_based_statement[0] if r.name == "nojs-wait-per-ip"
     ]).limit == var.waf_nojs_wait_ip_limit
-    error_message = "the /v1/wait limit must be the configured one"
+    error_message = "the /_wr/v1/wait limit must be the configured one"
   }
 
   assert {
-    condition     = local.waf_nojs_wait == "/v1/wait" && can(regex(local.waf_nojs_regex, local.waf_nojs_wait))
+    condition     = local.waf_nojs_wait == "/_wr/v1/wait" && can(regex(local.waf_nojs_regex, local.waf_nojs_wait))
     error_message = "the limit must sit on the no-JS waiting page's own path"
   }
 }

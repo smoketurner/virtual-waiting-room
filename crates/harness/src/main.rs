@@ -127,7 +127,7 @@ async fn main() -> Result<()> {
                 // No stack running: answer the shape the real endpoints answer,
                 // so the request pattern is measurable on its own.
                 None => {
-                    if path.starts_with("/v1/status") {
+                    if path.starts_with("/_wr/v1/status") {
                         let elapsed_secs = stub_started.elapsed().as_secs();
                         if elapsed_secs < countdown_secs {
                             // Countdown still running: no cursor yet, matching
@@ -228,7 +228,7 @@ async fn main() -> Result<()> {
 
 /// Reconstructs a simulated visitor's own position from the hex suffix of
 /// the synthetic request id `main` assigns it (`format!("...{n:012x}")`),
-/// so the built-in stub answers `/v1/queue_num` with a real, distinct
+/// so the built-in stub answers `/_wr/v1/queue_num` with a real, distinct
 /// position per visitor instead of the constant every other polling mode is
 /// indifferent to. `--polling backoff` needs a real "ahead" to react to.
 fn position_from_query(path: &str) -> Option<u64> {

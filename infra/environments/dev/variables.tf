@@ -82,7 +82,7 @@ variable "oidc_client_id" {
 }
 
 variable "oidc_redirect_uri" {
-  description = "OIDC callback URL registered with the provider — the CloudFront URL of /admin/callback."
+  description = "OIDC callback URL registered with the provider — the CloudFront URL of /_wr/admin/callback."
   type        = string
   default     = ""
 }
@@ -193,7 +193,7 @@ variable "waf_join_ip_limit" {
 }
 
 variable "waf_nojs_wait_ip_limit" {
-  description = "Loads of the no-JavaScript waiting page (GET /v1/wait) per IP per 5 minutes before further ones are refused."
+  description = "Loads of the no-JavaScript waiting page (GET /_wr/v1/wait) per IP per 5 minutes before further ones are refused."
   type        = number
   default     = 300
 }
@@ -258,13 +258,13 @@ variable "oidc_require_email_verified" {
 }
 
 variable "api_join_throttle_rate_limit" {
-  description = "Requests per second POST /v1/join accepts before answering 429."
+  description = "Requests per second POST /_wr/v1/join accepts before answering 429."
   type        = number
   default     = 10000
 }
 
 variable "api_join_throttle_burst_limit" {
-  description = "Token-bucket size for POST /v1/join."
+  description = "Token-bucket size for POST /_wr/v1/join."
   type        = number
   default     = 5000
 }
@@ -276,7 +276,7 @@ variable "api_throttle_rate_limit" {
 }
 
 variable "api_throttle_burst_limit" {
-  description = "Token-bucket size for each API method other than POST /v1/join."
+  description = "Token-bucket size for each API method other than POST /_wr/v1/join."
   type        = number
   default     = 5000
 }

@@ -135,7 +135,7 @@ impl CheckId {
             CheckId::StatusCaching => CheckSpec {
                 name: "/status cache behaviour",
                 requirement: "C4",
-                means: "The polled `/v1/status` behaviour has a Min TTL above zero and keeps cookies out of its cache key, so CloudFront collapses polls and origin load is independent of waiter count.",
+                means: "The polled `/_wr/v1/status` behaviour has a Min TTL above zero and keeps cookies out of its cache key, so CloudFront collapses polls and origin load is independent of waiter count.",
                 fix: "Re-apply the edge module (`polled_min_ttl_seconds` must be at least 1); do not edit the cache policy in the console.",
                 fix_url: "https://console.aws.amazon.com/cloudfront/v4/home#/policies/cache",
             },
@@ -343,7 +343,7 @@ pub struct CachingFacts {
 /// What the distribution says about caching and the gate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EdgeFacts {
-    /// The polled path the facts were read for, e.g. `/v1/status`.
+    /// The polled path the facts were read for, e.g. `/_wr/v1/status`.
     pub status_path: String,
     /// `None` when no behaviour matches that path: polls fall through to the
     /// default behaviour, uncached.
@@ -1218,7 +1218,7 @@ mod tests {
 
     fn edge_facts() -> EdgeFacts {
         EdgeFacts {
-            status_path: "/v1/status".to_owned(),
+            status_path: "/_wr/v1/status".to_owned(),
             status_caching: Some(CachingFacts {
                 min_ttl: 1,
                 cookies: CookieKey::None,
@@ -1234,7 +1234,7 @@ mod tests {
             evaluate_status_caching(&edge_facts()),
             (
                 Status::Pass,
-                "/v1/status: min TTL 1 s, no cookies in the cache key".to_owned()
+                "/_wr/v1/status: min TTL 1 s, no cookies in the cache key".to_owned()
             )
         );
     }
@@ -1282,10 +1282,13 @@ mod tests {
         assert!(detail.contains("unguarded"), "{detail}");
 
         let mut wide = edge_facts();
-        wide.gate_elsewhere = vec!["/v1/status".to_owned(), "/v1/join".to_owned()];
+        wide.gate_elsewhere = vec!["/_wr/v1/status".to_owned(), "/_wr/v1/join".to_owned()];
         let (status, detail) = evaluate_gate_association(&wide);
         assert_eq!(status, Status::Fail);
-        assert!(detail.contains("also on /v1/status, /v1/join"), "{detail}");
+        assert!(
+            detail.contains("also on /_wr/v1/status, /_wr/v1/join"),
+            "{detail}"
+        );
     }
 
     // --- Status ---

@@ -48,20 +48,38 @@ run "no_other_behaviour_carries_a_function_association" {
 }
 
 # The inverse of the assertions above, and the one that actually bit. A path
-# with no ordered behaviour of its own falls through to the DEFAULT behaviour,
-# which carries the gate — so /v1/join reaching it means the gate refuses every
-# visitor who has no session cookie yet, which is every visitor trying to join.
-# Nothing else notices: the refusal is a well-formed 403 from the edge and the
-# queue simply stays empty.
+# with no ordered behaviour of its own falls through to another one: once the
+# gated default, now the pages' /_wr/* behaviour (issue #251), which answers a
+# POST with S3's 403. Either way nobody can join and nothing else notices: the
+# refusal is well-formed and the queue simply stays empty.
 run "the_join_path_has_its_own_behaviour" {
   command = plan
 
   assert {
     condition = anytrue([
       for b in aws_cloudfront_distribution.this.ordered_cache_behavior :
-      b.path_pattern == "/v1/join"
+      b.path_pattern == "/_wr/v1/join"
     ])
-    error_message = "/v1/join needs its own ordered_cache_behavior; without one it falls through to the gated default behaviour and nobody can join"
+    error_message = "/_wr/v1/join needs its own ordered_cache_behavior; without one it falls through to the pages' behaviour and nobody can join"
+  }
+}
+
+# CloudFront takes the first ordered behaviour whose pattern matches. The
+# pages' pattern is the room's whole prefix (issue #251), so anywhere but last
+# it swallows the API and the operator console and sends them to S3.
+run "the_pages_behaviour_is_matched_last" {
+  command = plan
+
+  assert {
+    condition     = aws_cloudfront_distribution.this.ordered_cache_behavior[length(aws_cloudfront_distribution.this.ordered_cache_behavior) - 1].path_pattern == "/_wr/*"
+    error_message = "the /_wr/* behaviour must be the last ordered_cache_behavior, or it shadows /_wr/v1/*, /_wr/admin* and /_wr/static/*"
+  }
+
+  assert {
+    condition = alltrue([
+      for b in aws_cloudfront_distribution.this.ordered_cache_behavior : startswith(b.path_pattern, "/_wr/")
+    ])
+    error_message = "every path the room claims must sit under /_wr/, or it shadows the customer's own site"
   }
 }
 

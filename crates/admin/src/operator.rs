@@ -25,6 +25,16 @@ use axum::response::{IntoResponse as _, Redirect, Response};
 use crate::arrival::ArrivalTime;
 use crate::sessions::{AdminSession, SessionStore};
 
+/// The one path prefix the room reserves on the customer's hostname (issue
+/// #251). The console's routes are nested under it, so nothing the console
+/// serves shadows a path of the customer's own site. The templates and the
+/// stylesheet spell the same paths out.
+pub const ROOM_PREFIX: &str = "/_wr";
+/// The dashboard, where every action returns.
+pub const CONSOLE_PATH: &str = "/_wr/admin";
+/// Where a request without a session is sent.
+pub const LOGIN_PATH: &str = "/_wr/admin/login";
+
 /// The opaque session cookie. `__Host-` makes the browser refuse it unless it
 /// is `Secure`, `Path=/` and has no `Domain`, so a sibling subdomain cannot
 /// plant or overwrite an operator's session (issue #243).
@@ -88,9 +98,9 @@ pub fn cleared_state_cookie() -> String {
 /// needs nothing from the CSP.
 pub const SIGNED_IN_PAGE: &str = "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n\
     <meta charset=\"utf-8\">\n\
-    <meta http-equiv=\"refresh\" content=\"0;url=/admin\">\n\
+    <meta http-equiv=\"refresh\" content=\"0;url=/_wr/admin\">\n\
     <title>Signed in</title>\n</head>\n<body>\n\
-    <p>Signed in. <a href=\"/admin\">Continue to the console</a>.</p>\n\
+    <p>Signed in. <a href=\"/_wr/admin\">Continue to the console</a>.</p>\n\
     </body>\n</html>\n";
 
 /// Reads a named cookie's value from the request cookie header, if present.
@@ -332,7 +342,7 @@ pub async fn guard_writes<S: SessionLookup + Send + Sync + 'static>(
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
     let Some(session) = gate.authenticate(request.headers(), now).await else {
-        return Redirect::to("/admin/login").into_response();
+        return Redirect::to(LOGIN_PATH).into_response();
     };
     let (parts, body) = request.into_parts();
     let Ok(body) = axum::body::to_bytes(body, MAX_FORM_BYTES).await else {
@@ -398,15 +408,15 @@ mod tests {
     fn app(allowed: &str) -> Router {
         let gate = Arc::new(Gate::new(OneSession, Allowlist::parse(allowed)));
         Router::new()
-            .route("/admin", get(|| async { "dashboard" }))
+            .route("/_wr/admin", get(|| async { "dashboard" }))
             .route(
-                "/admin/pause",
+                "/_wr/admin/pause",
                 post(|Operator(session): Operator| async move {
                     format!("paused by {}", session.email)
                 }),
             )
             .route(
-                "/admin/rate",
+                "/_wr/admin/rate",
                 post(|_: Operator, Form(form): Form<RateForm>| async move {
                     format!("rate {}", form.rate)
                 }),
@@ -443,7 +453,7 @@ mod tests {
     async fn a_post_with_the_sessions_token_reaches_the_action() {
         let response = app("op@example.com")
             .oneshot(post_form(
-                "/admin/pause",
+                "/_wr/admin/pause",
                 Some(SESSION_ID),
                 "csrf=the-session-token",
             ))
@@ -457,7 +467,7 @@ mod tests {
     async fn the_handler_still_reads_its_own_form_after_the_guard_read_it() {
         let response = app("op@example.com")
             .oneshot(post_form(
-                "/admin/rate",
+                "/_wr/admin/rate",
                 Some(SESSION_ID),
                 "rate=25&csrf=the-session-token",
             ))
@@ -477,7 +487,7 @@ mod tests {
             "csrf=other",
         ] {
             let response = app("op@example.com")
-                .oneshot(post_form("/admin/rate", Some(SESSION_ID), body))
+                .oneshot(post_form("/_wr/admin/rate", Some(SESSION_ID), body))
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::FORBIDDEN, "body {body:?}");
@@ -488,7 +498,11 @@ mod tests {
     async fn a_token_outside_a_form_body_does_not_count() {
         // A header or a query string is something a cross-origin script can
         // sometimes set; the field of a same-origin form is not.
-        let mut request = post_form("/admin/pause?csrf=the-session-token", Some(SESSION_ID), "");
+        let mut request = post_form(
+            "/_wr/admin/pause?csrf=the-session-token",
+            Some(SESSION_ID),
+            "",
+        );
         request
             .headers_mut()
             .insert("x-csrf-token", HeaderValue::from_static(TOKEN));
@@ -496,7 +510,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
         let mut json = post_form(
-            "/admin/pause",
+            "/_wr/admin/pause",
             Some(SESSION_ID),
             r#"{"csrf":"the-session-token"}"#,
         );
@@ -513,7 +527,11 @@ mod tests {
         // The guard decides by method, so a route nobody has written yet is
         // covered: without a token the request never reaches routing.
         for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
-            for path in ["/admin/pause", "/admin/rate", "/admin/not_written_yet"] {
+            for path in [
+                "/_wr/admin/pause",
+                "/_wr/admin/rate",
+                "/_wr/admin/not_written_yet",
+            ] {
                 let mut request = post_form(path, Some(SESSION_ID), "rate=1");
                 *request.method_mut() = method.clone();
                 let response = app("op@example.com").oneshot(request).await.unwrap();
@@ -526,11 +544,15 @@ mod tests {
     async fn a_post_without_a_session_goes_to_the_login() {
         for cookie in [None, Some("unknown")] {
             let response = app("op@example.com")
-                .oneshot(post_form("/admin/pause", cookie, "csrf=the-session-token"))
+                .oneshot(post_form(
+                    "/_wr/admin/pause",
+                    cookie,
+                    "csrf=the-session-token",
+                ))
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::SEE_OTHER);
-            assert_eq!(response.headers()[header::LOCATION], "/admin/login");
+            assert_eq!(response.headers()[header::LOCATION], LOGIN_PATH);
         }
     }
 
@@ -538,7 +560,7 @@ mod tests {
     async fn a_session_whose_operator_left_the_allowlist_is_unauthenticated() {
         let response = app("someone-else@example.com")
             .oneshot(post_form(
-                "/admin/pause",
+                "/_wr/admin/pause",
                 Some(SESSION_ID),
                 "csrf=the-session-token",
             ))
@@ -561,7 +583,7 @@ mod tests {
     #[tokio::test]
     async fn a_safe_method_needs_no_token() {
         let mut request = Request::new(Body::empty());
-        *request.uri_mut() = "/admin".parse().unwrap();
+        *request.uri_mut() = "/_wr/admin".parse().unwrap();
         let response = app("op@example.com").oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
@@ -571,11 +593,11 @@ mod tests {
         // The other half of the guarantee: a handler that takes `Operator` on
         // a router the guard is not on answers 500 instead of acting.
         let unguarded = Router::new()
-            .route("/admin/pause", post(|_: Operator| async { "paused" }))
+            .route("/_wr/admin/pause", post(|_: Operator| async { "paused" }))
             .layer(axum::middleware::from_fn(arrival_layer));
         let response = unguarded
             .oneshot(post_form(
-                "/admin/pause",
+                "/_wr/admin/pause",
                 Some(SESSION_ID),
                 "csrf=the-session-token",
             ))
@@ -588,7 +610,7 @@ mod tests {
     async fn an_oversized_form_is_refused_before_it_is_parsed() {
         let body: &'static str = Box::leak("a".repeat(MAX_FORM_BYTES + 1).into_boxed_str());
         let response = app("op@example.com")
-            .oneshot(post_form("/admin/rate", Some(SESSION_ID), body))
+            .oneshot(post_form("/_wr/admin/rate", Some(SESSION_ID), body))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
@@ -629,10 +651,59 @@ mod tests {
         assert!(cleared_state_cookie().contains("SameSite=Lax"));
     }
 
+    /// The console's router is mounted the way `main` mounts it: nested under
+    /// the reserved prefix, with the guard layered outside the nest.
+    #[tokio::test]
+    async fn the_console_answers_only_under_the_reserved_prefix() {
+        let gate = Arc::new(Gate::new(OneSession, Allowlist::parse("op@example.com")));
+        let routes = Router::new()
+            .route("/admin", get(|| async { "dashboard" }))
+            .route("/admin/pause", post(|_: Operator| async { "paused" }));
+        let app = Router::new()
+            .nest(ROOM_PREFIX, routes)
+            .layer(axum::middleware::from_fn_with_state(gate, guard_writes))
+            .layer(axum::middleware::from_fn(arrival_layer));
+
+        for (path, expected) in [
+            (CONSOLE_PATH, StatusCode::OK),
+            ("/admin", StatusCode::NOT_FOUND),
+        ] {
+            let mut request = Request::new(Body::empty());
+            *request.uri_mut() = path.parse().unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), expected, "{path}");
+        }
+
+        let unauthenticated = app
+            .clone()
+            .oneshot(post_form(
+                "/_wr/admin/pause",
+                None,
+                "csrf=the-session-token",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.headers()[header::LOCATION], LOGIN_PATH);
+        let paused = app
+            .oneshot(post_form(
+                "/_wr/admin/pause",
+                Some(SESSION_ID),
+                "csrf=the-session-token",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(paused.status(), StatusCode::OK);
+
+        assert!(LOGIN_PATH.starts_with(CONSOLE_PATH) && CONSOLE_PATH.starts_with(ROOM_PREFIX));
+        assert!(SIGNED_IN_PAGE.contains(&format!(r#"url={CONSOLE_PATH}">"#)));
+    }
+
     #[test]
     fn the_signed_in_page_navigates_itself_rather_than_redirecting() {
-        assert!(SIGNED_IN_PAGE.contains(r#"<meta http-equiv="refresh" content="0;url=/admin">"#));
-        assert!(SIGNED_IN_PAGE.contains(r#"<a href="/admin">"#));
+        assert!(
+            SIGNED_IN_PAGE.contains(r#"<meta http-equiv="refresh" content="0;url=/_wr/admin">"#)
+        );
+        assert!(SIGNED_IN_PAGE.contains(r#"<a href="/_wr/admin">"#));
         assert!(!SIGNED_IN_PAGE.contains("<script"));
     }
 

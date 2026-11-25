@@ -3,7 +3,7 @@
 What an operator does before, during and after an event, and what to do when something goes
 wrong. [`DEPLOY.md`](./DEPLOY.md) covers standing the stack up.
 
-Every control is a form on the dashboard at `https://<host>/admin` and works without JavaScript.
+Every control is a form on the dashboard at `https://<host>/_wr/admin` and works without JavaScript.
 One deployment serves one event and is torn down afterwards.
 
 ---
@@ -56,7 +56,7 @@ items (O1, O2) days ahead; the panel shows limits in force, not pending requests
 - [ ] **Open schedule armed** (F0.3). The one-time open schedule is enabled at a time still in the future, so the event opens on its own at T-0. Fix: Set the start time on the dashboard (Start time), in the timezone you mean. The schedule itself is in EventBridge Scheduler. ([fix](https://console.aws.amazon.com/scheduler/home#schedules))
 - [ ] **Controller schedule running** (F3.2). The controller's `rate(1 minute)` schedule exists and is enabled; without it the queue forms and nobody is admitted. Fix: Re-apply Terraform, which creates the schedule enabled; check nobody disabled it in EventBridge Scheduler. ([fix](https://console.aws.amazon.com/scheduler/home#schedules))
 - [ ] **Gate ruleset** (F0.6). The gate's KeyValueStore holds at least one protection rule and no fail-open window is active. An empty ruleset passes every request through, which looks exactly like a working deployment. Fix: Set rules under Protection rules on the dashboard, then load a protected URL in a private window and confirm you are sent to the waiting page. (the dashboard)
-- [ ] **/status cache behaviour** (C4). The polled `/v1/status` behaviour has a Min TTL above zero and keeps cookies out of its cache key, so CloudFront collapses polls and origin load is independent of waiter count. Fix: Re-apply the edge module (`polled_min_ttl_seconds` must be at least 1); do not edit the cache policy in the console. ([fix](https://console.aws.amazon.com/cloudfront/v4/home#/policies/cache))
+- [ ] **/status cache behaviour** (C4). The polled `/_wr/v1/status` behaviour has a Min TTL above zero and keeps cookies out of its cache key, so CloudFront collapses polls and origin load is independent of waiter count. Fix: Re-apply the edge module (`polled_min_ttl_seconds` must be at least 1); do not edit the cache policy in the console. ([fix](https://console.aws.amazon.com/cloudfront/v4/home#/policies/cache))
 - [ ] **Gate on the protected behaviour only** (N7). The gate CloudFront Function is associated at viewer-request with the default (protected) behaviour and with no other: elsewhere it bills every poll and refuses joins. Fix: Re-apply the edge module; remove any function association added to another behaviour in the console. ([fix](https://console.aws.amazon.com/cloudfront/v4/home#/distributions))
 <!-- readiness-checks:end -->
 
@@ -197,7 +197,7 @@ operation.
 | `join-queue-age` | The oldest join has waited over 60 s: `assign_position` is not keeping up, or is failing | Check its `Errors`/`Throttles` alarms and its reserved concurrency. Joins are safe in the queue; visitors see "Getting your place" until it drains |
 | `<function>-errors`, `<function>-throttles` | A function failed or was throttled (one pair per function) | Read that function's log. A throttle on `read` or `generate_token` is the account concurrency limit; on `assign_position` or `nojs`, its reservation |
 | `counters-write-throttles`, `prequeue-write-throttles`, `positions-write-throttles` | DynamoDB refused writes on that table | The table was not pre-warmed for this rate. Raise `warm_throughput_write_units`; throttled joins retry from the queue |
-| `api-5xx` | The REST API answered a 5XX | Check the function alarms; a `/v1/join` 5XX means SQS refused the message |
+| `api-5xx` | The REST API answered a 5XX | Check the function alarms; a `/_wr/v1/join` 5XX means SQS refused the message |
 | `schedule-target-errors` | EventBridge Scheduler could not invoke a target. The metric is for the default schedule group, so any schedule in it counts | Usually the controller: nobody is being admitted. Check the schedule's role and the function's reserved concurrency (#228) |
 
 These are logged (`$.fields.event`) without an alarm of their own:
@@ -218,7 +218,7 @@ These are logged (`$.fields.event`) without an alarm of their own:
 The usual cause is a signing key regenerated while Lambdas were warm (the gate verifies with the
 new key, they sign with the old); with IP binding on, it is a visitor whose network keeps changing.
 
-**`/admin/rules` rejecting a path prefix.** A prefix containing `%`, `//`, a `.` or `..` segment,
+**`/_wr/admin/rules` rejecting a path prefix.** A prefix containing `%`, `//`, a `.` or `..` segment,
 `;` or a backslash can never match a normalised request path, so it is refused when the rule is
 written rather than accepted and silently ignored.
 

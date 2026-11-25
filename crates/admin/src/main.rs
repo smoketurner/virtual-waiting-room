@@ -1,11 +1,11 @@
 //! Lambda entry point for the admin control plane: an Axum router served through
 //! API Gateway via `lambda_http`. Access is gated by an OIDC login session
-//! (ADR-0016): unauthenticated requests to `/admin*` redirect to `/admin/login`,
+//! (ADR-0016): unauthenticated requests to `/_wr/admin*` redirect to `/_wr/admin/login`,
 //! which runs an Authorization Code + PKCE flow against the configured provider
 //! (Vouch by default). The PKCE transaction and the session live in `DynamoDB`,
 //! so they survive the login -> callback round-trip across Lambda cold starts.
 //!
-//! API Gateway prefixes the request path with the stage (e.g. `/dev/admin`).
+//! API Gateway prefixes the request path with the stage (e.g. `/dev/_wr/admin`).
 //! `AWS_LAMBDA_HTTP_IGNORE_STAGE_IN_PATH=true` (set on the function in Terraform)
 //! makes the runtime strip the stage before axum routes, so routes are declared
 //! unprefixed.
@@ -211,7 +211,8 @@ async fn main() -> Result<(), Error> {
 
     let own_origin = console_origin();
 
-    let app = Router::new()
+    // Every route sits under the room's one reserved prefix (issue #251).
+    let routes = Router::new()
         .route("/admin", get(dashboard))
         .route("/admin/state", get(state_json))
         .route("/admin/login", get(login))
@@ -230,7 +231,9 @@ async fn main() -> Result<(), Error> {
         .route("/admin/rules", post(set_rules))
         .route("/admin/ip_binding", post(set_ip_binding))
         .route("/static/{*path}", get(static_asset))
-        .with_state(state)
+        .with_state(state);
+    let app = Router::new()
+        .nest(operator::ROOM_PREFIX, routes)
         // Every state-changing request, whatever its route, needs a live
         // session still on the allowlist and that session's CSRF token (issue
         // #243). Mounted here rather than per route so a new one cannot be
@@ -255,9 +258,10 @@ async fn main() -> Result<(), Error> {
         // before any other layer can await.
         .layer(axum::middleware::from_fn(arrival_layer));
 
-    // Trim a trailing slash before routing so /admin/ resolves to the /admin
-    // route (and /admin/phase/ to /admin/phase, etc.) — the same handler, not a
-    // redirect. API Gateway collapses /admin/ onto the admin Lambda but forwards
+    // Trim a trailing slash before routing so /_wr/admin/ resolves to the
+    // /_wr/admin route (and /_wr/admin/phase/ to /_wr/admin/phase, etc.) — the
+    // same handler, not a redirect. API Gateway collapses /_wr/admin/ onto the
+    // admin Lambda but forwards
     // the trailing slash; without this the axum router would 404 on it.
     let app = tower_http::normalize_path::NormalizePathLayer::trim_trailing_slash().layer(app);
 
@@ -359,7 +363,7 @@ async fn callback(
     Query(params): Query<CallbackParams>,
 ) -> Response {
     // Browser binding: the callback must carry the login-state cookie set at
-    // /admin/login, and it must equal the returned state. Rejects a state
+    // /_wr/admin/login, and it must equal the returned state. Rejects a state
     // replayed from a different browser.
     match cookie_value(&headers, STATE_COOKIE) {
         Some(bound) if bound == params.state => {}
@@ -467,7 +471,7 @@ async fn logout(State(state): State<Shared>, _operator: Operator, headers: Heade
         StatusCode::SEE_OTHER,
         [
             (header::SET_COOKIE, operator::cleared_session_cookie()),
-            (header::LOCATION, "/admin/login".to_string()),
+            (header::LOCATION, operator::LOGIN_PATH.to_string()),
         ],
     )
         .into_response()
@@ -478,7 +482,7 @@ async fn logout(State(state): State<Shared>, _operator: Operator, headers: Heade
 /// Renders the dashboard from current control state. Unauthenticated -> login.
 async fn dashboard(State(state): State<Shared>, headers: HeaderMap, now: ArrivalTime) -> Response {
     let Some(session) = state.gate.authenticate(&headers, now).await else {
-        return Redirect::to("/admin/login").into_response();
+        return Redirect::to(operator::LOGIN_PATH).into_response();
     };
     match state.store_load(now).await {
         Ok(Some(mut view)) => {
@@ -812,7 +816,7 @@ async fn set_rules(
     )
 }
 
-/// Serves an embedded static asset (`/static/<path>`) with a guessed
+/// Serves an embedded static asset (`/_wr/static/<path>`) with a guessed
 /// content-type. Public (CSS and fonts carry no secrets). Unknown paths 404.
 ///
 /// The assets are compiled into the binary, so their content changes only when
@@ -884,7 +888,11 @@ impl AppState {
 fn finish(result: Result<(), ApplyError>) -> Response {
     use admin::{ActionError, StoreError};
     match result {
-        Ok(()) => (StatusCode::SEE_OTHER, [(header::LOCATION, "/admin")]).into_response(),
+        Ok(()) => (
+            StatusCode::SEE_OTHER,
+            [(header::LOCATION, operator::CONSOLE_PATH)],
+        )
+            .into_response(),
         // Debounce rejection — a double-click / fast toggle.
         Err(ApplyError::Action(ActionError::TooFast)) => (
             StatusCode::TOO_MANY_REQUESTS,

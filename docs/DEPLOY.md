@@ -65,7 +65,7 @@ the full shape. The values you will normally set:
 | `alarm_sns_topic_arn` | `""` | SNS topic every alarm notifies on alarm and on recovery. Empty leaves the alarms changing state with nobody told. |
 | `table_deletion_protection` | `false` | Deletion protection on the four tables. Turn on for a real event; it must be off to change `event_id` or to destroy. |
 | `controller_reserved_concurrency` | `2` | Concurrency reserved for the controller so ingest cannot starve it. |
-| `api_join_throttle_rate_limit`, `api_join_throttle_burst_limit` | `10000`, `5000` | Stage throttle on `POST /v1/join`. Raise the account quota before raising these. |
+| `api_join_throttle_rate_limit`, `api_join_throttle_burst_limit` | `10000`, `5000` | Stage throttle on `POST /_wr/v1/join`. Raise the account quota before raising these. |
 | `api_throttle_rate_limit`, `api_throttle_burst_limit` | `10000`, `5000` | Stage throttle on every other method. Lower to cap what the read and admission functions can be asked for. |
 | `admission_rate` | `5` | Visitors per second, seeded onto the event. Changed live from the dashboard. |
 | `gate_rules` | `""` | Which requests the gate covers, one rule per line, same grammar as the dashboard's rules form (`p /checkout`, `c <cookie>`, `u <agent substring>`, `h <header> <value>`). Empty is dormant: everything passes through. |
@@ -91,6 +91,14 @@ event and a returning browser's old row would otherwise resolve against the new 
 `terraform.tfvars` (falling back to `arm64`), so the build and the deployed functions agree by
 default. `make build ARCH=x86_64` against an `arm64` deployment applies cleanly and fails at
 first invoke; use it only for a one-off build.
+
+### The path the room reserves
+
+`/_wr/` is the one path prefix the room occupies on the customer's hostname: the waiting page
+(`/_wr/waiting.html`), the public API (`/_wr/v1/*`) and the operator console (`/_wr/admin`,
+`/_wr/static/*`). Every other path is forwarded to the origin, so the origin's own `/v1`, `/admin`
+or `/static` paths are untouched. A path the origin serves under `/_wr/` is not reachable through
+the distribution.
 
 ### Locking the origin to the distribution
 
@@ -127,12 +135,12 @@ open schedule, so the stack serves without any further setup step. Do not run
 
 ### OIDC: the one sequencing step
 
-`oidc_redirect_uri` is `https://<host>/admin/callback`, a path on the distribution, and the
+`oidc_redirect_uri` is `https://<host>/_wr/admin/callback`, a path on the distribution, and the
 admin Lambda fails at plan (a `precondition`) if it, `oidc_client_id` or `oidc_allowed_emails`
 is empty.
 
 **With a custom domain**, set `aliases`, `acm_certificate_arn` and
-`oidc_redirect_uri = "https://waiting.example.com/admin/callback"` together and apply once. Point
+`oidc_redirect_uri = "https://waiting.example.com/_wr/admin/callback"` together and apply once. Point
 DNS at the distribution afterwards.
 
 **Without one**, the `*.cloudfront.net` name does not exist until the distribution does. Because
@@ -142,12 +150,12 @@ first with placeholder values, then the real ones:
 ```bash
 # terraform.tfvars, first pass: real allowlist, placeholder client
 #   oidc_client_id      = "pending"
-#   oidc_redirect_uri   = "https://pending.invalid/admin/callback"
+#   oidc_redirect_uri   = "https://pending.invalid/_wr/admin/callback"
 #   oidc_allowed_emails = "you@example.com"
 make apply
 terraform -chdir=infra/environments/dev output cloudfront_domain_name
 
-# Register the OIDC application with https://<that host>/admin/callback, then:
+# Register the OIDC application with https://<that host>/_wr/admin/callback, then:
 aws ssm put-parameter --name /<name_prefix>/oidc-client-secret \
   --type SecureString --value '<secret>' --overwrite
 

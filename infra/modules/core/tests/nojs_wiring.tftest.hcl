@@ -1,5 +1,5 @@
 # The no-JavaScript queue (issue #67) is the one join that runs compute, so its
-# concurrency is capped, and it must join through the same queue /v1/join
+# concurrency is capped, and it must join through the same queue /_wr/v1/join
 # writes to, or assign_position never sees those visitors.
 #
 # Run with: terraform -chdir=infra/modules/core test
@@ -45,7 +45,7 @@ variables {
   nojs_artifact_path            = "tests/fixtures/bootstrap.zip"
 
   oidc_client_id      = "test-client"
-  oidc_redirect_uri   = "https://example.invalid/admin/callback"
+  oidc_redirect_uri   = "https://example.invalid/_wr/admin/callback"
   oidc_allowed_emails = "operator@example.invalid"
 }
 
@@ -64,7 +64,7 @@ run "the_no_javascript_path_is_capped_and_joins_the_real_queue" {
 
   assert {
     condition     = aws_api_gateway_integration.endpoint["enter"].uri == aws_lambda_function.nojs.invoke_arn && aws_api_gateway_integration.endpoint["wait"].uri == aws_lambda_function.nojs.invoke_arn
-    error_message = "/v1/enter and /v1/wait must be served by the nojs function"
+    error_message = "/_wr/v1/enter and /_wr/v1/wait must be served by the nojs function"
   }
 
   assert {

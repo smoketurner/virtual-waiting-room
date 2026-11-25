@@ -92,7 +92,7 @@ pub struct PassInputs {
     /// after an open it starts at the cohort size, so this is the end of the
     /// line however the positions were assigned.
     pub queue_counter: u64,
-    /// Operator target rate in visitors per second (the `/admin/rate` value).
+    /// Operator target rate in visitors per second (the `/_wr/admin/rate` value).
     pub target_rate: u32,
     /// Epoch seconds of the last pass that ran while admission was open, `0`
     /// if there has never been one.

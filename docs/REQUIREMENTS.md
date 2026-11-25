@@ -52,11 +52,11 @@ activation queues first-in, first-out (FIFO).
 | ID | Requirement | Acceptance |
 |---|---|---|
 | F3.1 | A visitor MUST be able to read their own position and the current serving position. | `GET /queue_num` and `GET /status` return correct values. |
-| F3.2 | The operator MUST be able to control admission rate during the event. | `POST /admin/rate` changes the target rate; effect visible within the cache TTL. |
+| F3.2 | The operator MUST be able to control admission rate during the event. | `POST /_wr/admin/rate` changes the target rate; effect visible within the cache TTL. |
 | F3.3 | Admitted visitors MUST receive a cryptographically verifiable credential. | The session cookie is signed; the edge gate verifies it locally, with no backend call. |
 | F3.4 | The protected origin MUST be unreachable without a valid session. | A request with no credential, an expired one, or one for another event is refused at the edge. |
 | F3.5 | Once a visitor's position is reached, the system MUST establish a **session** so they are not re-checked on every subsequent request. | A visitor navigates to a second page without re-presenting anything and is not re-queued. |
-| F3.8 | Admission rate control MUST compensate for **no-shows**, admitted visitors who never arrive at the origin. | With a 30% no-show rate and a target of 500/min, origin arrivals converge on 500/min, not 350. One visitor counts as one arrival however many times they call `/v1/generate_token`. |
+| F3.8 | Admission rate control MUST compensate for **no-shows**, admitted visitors who never arrive at the origin. | With a 30% no-show rate and a target of 500/min, origin arrivals converge on 500/min, not 350. One visitor counts as one arrival however many times they call `/_wr/v1/generate_token`. |
 
 ### 1.5 Failure behaviour
 
@@ -95,9 +95,9 @@ lacks.
 
 | ID | Requirement | Acceptance |
 |---|---|---|
-| F7.1 | The system MUST serve an operator web interface from one Axum Lambda rendering server-side HTML with askama templates. | Reachable at `/admin`; one Lambda; no browser SPA bundle. |
+| F7.1 | The system MUST serve an operator web interface from one Axum Lambda rendering server-side HTML with askama templates. | Reachable at `/_wr/admin`; one Lambda; no browser SPA bundle. |
 | F7.2 | The interface MUST be styled in the Vouch design language as one self-contained stylesheet ([ADR-0018](adr/0018-admin-vouch-design-language.md)). | No runtime npm dependency and no build-time token extraction. |
-| F7.3 | The interface MUST expose every operator capability in the admin API and no other. | Each `/admin/*` action has a UI control; F5.5 still holds. |
+| F7.3 | The interface MUST expose every operator capability in the admin API and no other. | Each `/_wr/admin/*` action has a UI control; F5.5 still holds. |
 | F7.4 | Every interface request MUST pass one authentication path, with no weaker second one. | OIDC Authorization Code + PKCE session enforced in the Lambda ([ADR-0016](adr/0016-admin-oidc-dynamodb-sessions.md)); unauthenticated requests are redirected to login. |
 | F7.5 | The interface MUST be server-rendered with no client-side React runtime; interactivity is HTML forms plus minimal progressive-enhancement JavaScript. | Core actions work with JavaScript disabled. |
 | F7.6 | The interface MUST display live metrics: inflow, outflow, queue depth, admitted, no-show rate. | Metrics render and refresh within one 60 s metric period. |

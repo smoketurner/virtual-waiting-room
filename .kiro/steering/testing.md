@@ -84,7 +84,7 @@ visible fairness failure at 1,000,000 people. Tests are the primary evidence.
   `fail_open_until` epoch the gate evaluates against its own clock, `resolve()` producing
   `AdmissionControl::FailOpen`, `apply_fail_open` writing both stores in the safe order), but
   nothing trips it automatically. Fail-open still depends on a human (or a watchdog that does
-  not exist yet) noticing the backend is down and calling `/admin/fail_open`. Do not write a
+  not exist yet) noticing the backend is down and calling `/_wr/admin/fail_open`. Do not write a
   test that asserts DynamoDB-unreachable automatically flips the gate open — nothing does that.
 
 ## To prove when the corresponding gap closes

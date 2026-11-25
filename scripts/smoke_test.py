@@ -148,7 +148,7 @@ def api_post(api: Api, path: str, body: dict) -> tuple[int, str | None]:
 def refused_without_key(api: Api) -> bool:
     """True when the stage refuses a keyless request, as it must (ADR-0038)."""
     try:
-        urllib.request.urlopen(f"{api.url}/v1/status")
+        urllib.request.urlopen(f"{api.url}/_wr/v1/status")
     except urllib.error.HTTPError as err:
         return err.code == 403
     return False
@@ -214,10 +214,10 @@ def main() -> int:
             check=True,
         )
 
-    say("3. Pre-queue registration: POST /v1/join for a small cohort during pre_queue")
+    say("3. Pre-queue registration: POST /_wr/v1/join for a small cohort during pre_queue")
     ids: list[str] = [uuid_v7() for _ in range(COHORT)]
     for rid in ids:
-        api_post(api, "/v1/join", join_body(rid, event_id))
+        api_post(api, "/_wr/v1/join", join_body(rid, event_id))
     print(
         f"posted {len(ids)} pre-queue joins; waiting for assign_position to drain the batch"
     )
@@ -274,7 +274,7 @@ def main() -> int:
         FunctionName=open_fn, Payload=json.dumps({"event_id": event_id}).encode()
     )
     time.sleep(2)
-    status = api_get(api, "/v1/status")
+    status = api_get(api, "/_wr/v1/status")
     print(json.dumps(status))
     assert status["phase"] == "active", status
     assert status.get("participant_count") == COHORT, status
@@ -283,7 +283,7 @@ def main() -> int:
     say("5. Resolve every pre-queue position via /queue_num; assert all distinct")
     seen: dict[int, str] = {}
     for rid in ids:
-        d = api_get(api, f"/v1/queue_num?request_id={rid}")
+        d = api_get(api, f"/_wr/v1/queue_num?request_id={rid}")
         p = d["position"]
         assert not d["live_join"], (rid, d)
         assert p not in seen, f"DUPLICATE position {p}: {rid} and {seen[p]}"
@@ -292,7 +292,7 @@ def main() -> int:
 
     say("6. Live join: POST /join, then confirm a Positions row is written")
     live_rid = uuid_v7()
-    api_post(api, "/v1/join", join_body(live_rid, event_id))
+    api_post(api, "/_wr/v1/join", join_body(live_rid, event_id))
     print(
         f"posted live join {live_rid}; waiting for assign_position to drain the batch"
     )
@@ -308,12 +308,12 @@ def main() -> int:
 
     say("7. Join through CloudFront; confirm the row lands")
     # Steps 3 and 6 post straight at API Gateway. This is the only step that
-    # exercises the path a real visitor takes — the /v1/join cache behaviour,
+    # exercises the path a real visitor takes — the /_wr/v1/join cache behaviour,
     # its origin request policy, and the SQS integration behind them — so a
     # misrouted or uncached join surfaces here and nowhere else.
     cdn_rid = uuid_v7()
     _, waf_action = api_post(
-        Api(f"https://{cf_host}", ""), "/v1/join", join_body(cdn_rid, event_id)
+        Api(f"https://{cf_host}", ""), "/_wr/v1/join", join_body(cdn_rid, event_id)
     )
     if waf_action:
         # With the web ACL on (ADR-0038) a join carrying no WAF token is

@@ -55,11 +55,16 @@ holds the reasoning for each.
 Request path:
 
 ```
-join:      CloudFront → API Gateway REST (type: aws, direct SQS SendMessage) → SQS
+join:      CloudFront [/_wr/v1/join] → API Gateway REST (type: aws, direct SQS SendMessage) → SQS
                → assign_position Lambda → DynamoDB
 protected: CloudFront [gate: CloudFront Function, viewer-request] ─ valid session cookie → client origin
                                                                    └ missing/expired → 302/403 → /_wr/waiting.html
 ```
+
+Everything the room serves is under the one viewer prefix `/_wr/` (issue #251): the S3 pages, the
+public API at `/_wr/v1/*`, the console at `/_wr/admin` and `/_wr/static/*`. The API Gateway
+resources carry the same `_wr` parent, and the pages' `/_wr/*` behaviour must stay the last ordered
+one or it swallows the others.
 
 Three separate CloudFront cache behaviours (ADR-0013). `/status` is Min TTL 1 s with no
 cookies forwarded, so CloudFront collapses simultaneous misses into one origin fetch and

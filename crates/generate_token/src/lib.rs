@@ -172,7 +172,7 @@ pub enum Admission {
 
 /// The whole admission: load the rows, [`decide`], take a unit of the
 /// admission budget, mark the visitor admitted, and sign the session. Shared by
-/// `/v1/generate_token` and the no-JavaScript waiting page (issue #67), so
+/// `/_wr/v1/generate_token` and the no-JavaScript waiting page (issue #67), so
 /// there is one path by which a session is minted.
 ///
 /// # Errors
@@ -194,7 +194,7 @@ pub async fn admit<S: Store>(
     // pre-queue row inside its shard's opened count is the visitor's place
     // whatever `Positions` holds (issue #238), and only a live joiner or a
     // straggler is answered by their `Positions` row. This is the same order
-    // `read` resolves `/v1/queue_num` in, so the number a visitor is shown is
+    // `read` resolves `/_wr/v1/queue_num` in, so the number a visitor is shown is
     // the number they are admitted at.
     let position_row = store.load_position(request_id).await?;
     let prequeue = store.load_prequeue(request_id).await?;
@@ -416,7 +416,7 @@ fn cohort_position(counters: &Counters, prequeue: Option<&PreQueueItem>) -> Opti
 /// T-0, or a client retrying a join whose response was lost -- passes the live
 /// path's `attribute_not_exists` guard and mints a position behind the whole
 /// cohort. Letting that row answer would demote a visitor who is shown their
-/// cohort position by `/v1/queue_num`, which resolves the pre-queue row first.
+/// cohort position by `/_wr/v1/queue_num`, which resolves the pre-queue row first.
 /// The row an admission claim writes carries the same cohort position, so for
 /// every other cohort member the two agree anyway.
 ///
@@ -737,7 +737,7 @@ mod tests {
         // Issue #238: a join for a cohort member's id processed after the open
         // (a redelivery across T-0, a retried join) mints a live position
         // behind the cohort. The pre-queue row the open counted still answers,
-        // so the visitor is admitted at the position /v1/queue_num shows them.
+        // so the visitor is admitted at the position /_wr/v1/queue_num shows them.
         let c = counters(20);
         let pq = PreQueueItem {
             r: REQ.to_owned(),

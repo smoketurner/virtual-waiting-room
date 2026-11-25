@@ -20,7 +20,7 @@ test("with JavaScript off, the page says the visitor is not in line and offers t
   assert.ok(bodyNotice, "the body carries a <noscript> notice");
   assert.match(bodyNotice[1], /not in line/);
   // Issue #67: a plain form into the server-rendered queue, no script needed.
-  assert.match(bodyNotice[1], /<form method="post" action="\/v1\/enter">/);
+  assert.match(bodyNotice[1], /<form method="post" action="\/_wr\/v1\/enter">/);
 });
 
 test("with JavaScript off, the let-through promise is hidden", () => {
@@ -46,5 +46,5 @@ test("a script that fails to load replaces the headline", () => {
   assert.match(nodes.subhead.textContent, /Reload to try again, or join below/);
   assert.equal(nodes.note.hidden, true);
   assert.equal(nodes["nojs-join"].hidden, false, "the script-free form is offered instead");
-  assert.match(HTML, /<form id="nojs-join" method="post" action="\/v1\/enter" hidden>/);
+  assert.match(HTML, /<form id="nojs-join" method="post" action="\/_wr\/v1\/enter" hidden>/);
 });

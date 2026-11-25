@@ -1,5 +1,5 @@
 //! Lambda entry point for the public read endpoints, served over API Gateway:
-//! `GET /v1/status` and `GET /v1/queue_num?event_id&request_id`.
+//! `GET /_wr/v1/status` and `GET /_wr/v1/queue_num?event_id&request_id`.
 
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::types::AttributeValue;

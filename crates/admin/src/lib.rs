@@ -713,9 +713,9 @@ pub fn next_phases(from: Phase) -> Vec<Phase> {
 /// `Maintenance`, which the phase dropdown routes through here.
 ///
 /// Entering `Maintenance` is rejected here even though `transition_allowed`
-/// permits it from any phase: the emergency stop must go through `/admin/force_maintenance`
+/// permits it from any phase: the emergency stop must go through `/_wr/admin/force_maintenance`
 /// (`force_maintenance`), so it is audited under its own label and a crafted
-/// `POST /admin/phase?phase=maintenance` cannot write `phase = maintenance`
+/// `POST /_wr/admin/phase?phase=maintenance` cannot write `phase = maintenance`
 /// unaudited. The phase dropdown never offers `Maintenance` (`next_phases`
 /// excludes it), so this only catches a hand-crafted request.
 ///
@@ -2330,8 +2330,8 @@ mod tests {
 
     #[tokio::test]
     async fn apply_phase_rejects_maintenance_target() {
-        // Entering maintenance must go through /admin/force_maintenance (force_maintenance)
-        // so it is audited under its own label; a crafted POST to /admin/phase
+        // Entering maintenance must go through /_wr/admin/force_maintenance (force_maintenance)
+        // so it is audited under its own label; a crafted POST to /_wr/admin/phase
         // with phase=maintenance is rejected here, before any write.
         for from in [
             Phase::Idle,

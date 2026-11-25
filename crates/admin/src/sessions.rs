@@ -6,7 +6,7 @@
 //! stale row also compares the attribute to the current time.
 //!
 //! * Login transaction: PK `pkce#<csrf_state>`, holds the PKCE verifier + nonce
-//!   for the ~10 min between `/admin/login` and `/admin/callback`. On Lambda the
+//!   for the ~10 min between `/_wr/admin/login` and `/_wr/admin/callback`. On Lambda the
 //!   two requests can hit different execution environments, so this must not be
 //!   in-process state.
 //! * Session: PK `session#<id>`, holds the authenticated subject + email and the

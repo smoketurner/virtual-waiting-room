@@ -30,7 +30,7 @@ variables {
   nojs_artifact_path            = "tests/fixtures/bootstrap.zip"
 
   oidc_client_id      = "test-client"
-  oidc_redirect_uri   = "https://example.invalid/admin/callback"
+  oidc_redirect_uri   = "https://example.invalid/_wr/admin/callback"
   oidc_allowed_emails = "operator@example.invalid"
 }
 
@@ -39,7 +39,7 @@ run "every_method_requires_the_origin_key" {
 
   assert {
     condition     = aws_api_gateway_method.join_post.api_key_required
-    error_message = "POST /v1/join must require the origin key, or bots post straight to SQS past the edge"
+    error_message = "POST /_wr/v1/join must require the origin key, or bots post straight to SQS past the edge"
   }
 
   assert {

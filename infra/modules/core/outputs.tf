@@ -49,12 +49,12 @@ output "open_event_function_name" {
 }
 
 output "read_function_name" {
-  description = "Name of the read Lambda backing /v1/status and /v1/queue_num."
+  description = "Name of the read Lambda backing /_wr/v1/status and /_wr/v1/queue_num."
   value       = aws_lambda_function.read.function_name
 }
 
 output "admin_function_name" {
-  description = "Name of the admin Lambda backing the /admin control plane."
+  description = "Name of the admin Lambda backing the /_wr/admin control plane."
   value       = aws_lambda_function.admin.function_name
 }
 

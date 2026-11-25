@@ -144,7 +144,7 @@ mod tests {
             .render()
             .unwrap();
         assert!(
-            html.contains(r#"action="/v1/enter?next=%2Fcheckout%3Fid%3D1""#),
+            html.contains(r#"action="/_wr/v1/enter?next=%2Fcheckout%3Fid%3D1""#),
             "{html}"
         );
         assert!(!html.contains("http-equiv"), "nothing to wait for yet");
@@ -158,7 +158,7 @@ mod tests {
             .render()
             .unwrap();
         assert!(html.contains("didn&#39;t go through") || html.contains("didn't go through"));
-        assert!(html.contains(r#"action="/v1/enter?next=%2Fcheckout""#));
+        assert!(html.contains(r#"action="/_wr/v1/enter?next=%2Fcheckout""#));
         assert!(!html.contains("http-equiv"), "nothing left to wait for");
     }
 

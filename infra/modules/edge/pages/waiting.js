@@ -7,10 +7,10 @@
 // The flow:
 //   1. mint or recover a request id and its possession secret (issue #62),
 //      persisted together across the storage chain below
-//   2. POST the id and SHA-256(secret) to /v1/join once, so a position is
-//      claimed; the secret itself goes only to /v1/generate_token
-//   3. poll /v1/status and /v1/queue_num
-//   4. once the position is reached, POST /v1/generate_token to collect the
+//   2. POST the id and SHA-256(secret) to /_wr/v1/join once, so a position is
+//      claimed; the secret itself goes only to /_wr/v1/generate_token
+//   3. poll /_wr/v1/status and /_wr/v1/queue_num
+//   4. once the position is reached, POST /_wr/v1/generate_token to collect the
 //      admission cookies, then reload onto the origin
 
 (function () {
@@ -193,7 +193,9 @@
   }
 
   // The identity's cookie is scoped to the waiting room's own path: at "/"
-  // the browser would send the secret to the origin on every request.
+  // the browser would send the secret to the origin on every request. The
+  // room's API shares that path (issue #251) and is the secret's destination
+  // anyway.
   function cookiePath(name) {
     return name === IDENTITY_KEY ? "/_wr/" : "/";
   }
@@ -312,7 +314,7 @@
   }
 
   // base64url(SHA-256(secret)) over the secret's ASCII, which is what
-  // /v1/join stores and wr_common::PossessionSecret::digest recomputes.
+  // /_wr/v1/join stores and wr_common::PossessionSecret::digest recomputes.
   var digestPromise = null;
   function secretDigest() {
     if (!digestPromise) {
@@ -475,7 +477,7 @@
   // position write is guarded on the request id not already existing, so
   // re-joining is a no-op when the row is merely slow to arrive.
   // An in-memory mirror of JOINED_KEY. Without it, a visitor whose storage all
-  // fails reads null on every poll and re-POSTs /v1/join for the entire wait —
+  // fails reads null on every poll and re-POSTs /_wr/v1/join for the entire wait —
   // one join per poll interval, per waiter, for the whole event.
   var joinedId = null;
 
@@ -517,7 +519,7 @@
     }
     joinAttempts += 1;
     return secretDigest().then(function (h) {
-      return postJSON("/v1/join", {
+      return postJSON("/_wr/v1/join", {
         request_id: requestId,
         event_id: eventId,
         h: h,
@@ -866,7 +868,7 @@
       return Promise.resolve();
     }
     admitting = true;
-    return postJSON("/v1/generate_token", {
+    return postJSON("/_wr/v1/generate_token", {
       request_id: requestId,
       event_id: eventId,
       secret: secret,
@@ -994,7 +996,7 @@
     }
     inFlight = true;
     lastPollAt = Date.now();
-    getJSON("/v1/status")
+    getJSON("/_wr/v1/status")
       .then(function (res) {
         if (res.status !== 200) {
           throw new Error("status " + res.status);
@@ -1100,7 +1102,7 @@
               return null;
             }
             return getJSON(
-              "/v1/queue_num?request_id=" + encodeURIComponent(requestId)
+              "/_wr/v1/queue_num?request_id=" + encodeURIComponent(requestId)
             );
           })
           .then(function (q) {

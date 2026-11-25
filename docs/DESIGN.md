@@ -24,7 +24,7 @@ no call to the backend.
 
 ```
   T−n   Visitor → CloudFront → waiting page (S3, cached)
-                                    │ POST /v1/join — one PreQueue row per visitor,
+                                    │ POST /_wr/v1/join — one PreQueue row per visitor,
                                     ▼ spread across the countdown
                               DynamoDB PreQueue {r, s, l, t, h}
 
@@ -35,13 +35,13 @@ no call to the backend.
                 prequeue_offsets, phase = active
             ConditionExpression: attribute_not_exists(shuffle_seed) AND phase = pre_queue
 
-  T+    /v1/queue_num → read Lambda: PRP(seed, offset[s] + l, N), computed per read
+  T+    /_wr/v1/queue_num → read Lambda: PRP(seed, offset[s] + l, N), computed per read
 ```
 
 ### 2.2 Live join
 
 ```
-  CloudFront   /v1/join: uncached, x-api-key origin header added
+  CloudFront   /_wr/v1/join: uncached, x-api-key origin header added
         │
   API Gateway  REST, regional; JSON Schema request validator → 400 on a malformed body
                type: aws → SQS SendMessage          ← no Lambda in the burst path
@@ -64,9 +64,9 @@ no call to the backend.
         grant admission budget for the time elapsed (plus what went unused, capped)
         → UpdateItem serving_counter (elapsed + unused), then cap c on each arrivals shard
         │
-  Visitor polls /v1/status until serving_position ≥ own position
+  Visitor polls /_wr/v1/status until serving_position ≥ own position
         │
-  POST /v1/generate_token (request_id + possession secret, ADR-0035)
+  POST /_wr/v1/generate_token (request_id + possession secret, ADR-0035)
         1. event admitting? (phase active, resolve(stored control, fail_open_until, now))
         2. position reached?
         3. take one unit of the admission budget (ADR-0039): conditional ADD n on a
@@ -95,7 +95,7 @@ The gate reads its configuration (`c`: version, `enforce_from`, `fail_open_until
 binding) and the signing secret (`k`) from one CloudFront KeyValueStore
 ([ADR-0021](adr/0021-edge-function-gate.md)); `event_id` and the cookie name are templated into
 its source. A session that fails under `k` is tried under an optional previous key `kp`, which
-nothing writes yet (#247). Terraform seeds `c` from `gate_rules`, with `enforce_from = 0`. `/admin/rules` is the
+nothing writes yet (#247). Terraform seeds `c` from `gate_rules`, with `enforce_from = 0`. `/_wr/admin/rules` is the
 ruleset's only writer after that: it validates and re-encodes through `wr_common::rules`, writes
 the KeyValueStore (the ruleset's only store) by read-modify-write, and stamps `rules_digest` /
 `rules_count` on `Counters`. No admin route writes `enforce_from`.
@@ -112,9 +112,9 @@ the KeyValueStore (the ruleset's only store) by read-modify-write, and stamps `r
 |---|---|
 | Phase state | The `phase` attribute on the event's `Counters` item. `maintenance` is one of its values, not a separate override |
 | Seed | Terraform writes the item at `idle`, or at `pre_queue` when `starts_at` is set, then ignores changes to it |
-| Scheduled open | An EventBridge Scheduler `at()` schedule invokes `open_event`. It is created disabled unless `starts_at` is set, and `/admin/start_time` arms it ([ADR-0025](adr/0025-operator-owned-seal-schedule.md)) |
-| Manual transitions | `/admin/phase` makes any transition except to `active`, which only the open writes. `/admin/open_now` invokes `open_event` |
-| Visitor-facing state | `/v1/status` carries `phase` and a derived `serving_state` ([ADR-0019](adr/0019-visitor-facing-serving-state.md)) |
+| Scheduled open | An EventBridge Scheduler `at()` schedule invokes `open_event`. It is created disabled unless `starts_at` is set, and `/_wr/admin/start_time` arms it ([ADR-0025](adr/0025-operator-owned-seal-schedule.md)) |
+| Manual transitions | `/_wr/admin/phase` makes any transition except to `active`, which only the open writes. `/_wr/admin/open_now` invokes `open_event` |
+| Visitor-facing state | `/_wr/v1/status` carries `phase` and a derived `serving_state` ([ADR-0019](adr/0019-visitor-facing-serving-state.md)) |
 
 **Protection rules** (path, header, cookie or user agent, evaluated at the gate) select what is
 queued; an unmatched request never is. A path rule also claims any decoded path with a `.` or
@@ -155,10 +155,10 @@ not waited for: they are the straggler case.
 
 **Stragglers.** A registration landing after `open_event` read its shard is invisible to the
 open. The batch re-reads `Counters` after its writes and, if the event opened underneath it, gives
-each row it wrote a live-join position; `/v1/queue_num` covers any it missed (§4.2).
+each row it wrote a live-join position; `/_wr/v1/queue_num` covers any it missed (§4.2).
 
 The waiting page is static, served from S3 through CloudFront. Its only countdown write is one
-`POST /v1/join` per visitor, deduplicated client-side across reloads where storage allows.
+`POST /_wr/v1/join` per visitor, deduplicated client-side across reloads where storage allows.
 
 ### 4.2 Assignment
 
@@ -176,7 +176,7 @@ index maps to a position nobody holds (F2.3).
 queue_position = PRP(shuffle_seed, i, participant_count)
 ```
 
-`/v1/queue_num` reads the `PreQueue` row and `Counters` and computes the position (409 before
+`/_wr/v1/queue_num` reads the `PreQueue` row and `Counters` and computes the position (409 before
 the open). The straggler test is **per shard**: `l` at or past shard `s`'s issued count
 (`offset[s+1] − offset[s]`, or `N − offset[s]` for the last). A global `i ≥ N` test would miss an
 over-count on an interior shard, whose index range belongs to a later shard, and give two
@@ -232,11 +232,11 @@ fails the build.
 | Cheap | Expected cycle-walk iterations are `domain / N`: at most 4, and 1.05 at N = 1,000,000. Each iteration is four HMACs |
 
 **The seed does not exist before T−0.** Nobody can compute a position early or choose a
-favourable index. The open writes the seed, and `/v1/status` publishes it from that moment.
+favourable index. The open writes the seed, and `/_wr/v1/status` publishes it from that moment.
 
 ### 4.4 Auditability
 
-Once the open has written them, `/v1/status` publishes `shuffle_seed` (lowercase hex),
+Once the open has written them, `/_wr/v1/status` publishes `shuffle_seed` (lowercase hex),
 `participant_count` and `prequeue_offsets`. With a registration's `(s, l)` its position can be
 recomputed; with the `PreQueue` table, every position can. This makes the order *recomputable*. It
 does not prove the seed was drawn fairly: the operator's own function draws it, after the indices
@@ -296,7 +296,7 @@ Keys are built only in `wr_common::expr`.
 | `admission_control` | The stored control, `open` or `paused` only, never `fail_open` (issue #71) |
 | `fail_open_until` | Fail-open deadline in epoch seconds. `0` means no window |
 | `target_rate` | Operator admission rate, in visitors per second |
-| `message` | Operator broadcast, delivered in `/v1/status` |
+| `message` | Operator broadcast, delivered in `/_wr/v1/status` |
 | `starts_at` | Scheduled start, which the waiting page counts down to |
 | `last_open_pass_at`, `rules_digest`/`rules_count` | The controller's last open pass; ruleset audit |
 
@@ -338,9 +338,9 @@ body must parse, the `request_id` must have the canonical UUID shape (no version
 and the `event_id` must match. A record that fails is **dropped**: counted in `join_dropped`,
 logged, and never retried or dead-lettered, because no redelivery can make it valid.
 
-**Recovery (F4.4).** A 200 from `/v1/join` means `SendMessage` succeeded, not that a position
+**Recovery (F4.4).** A 200 from `/_wr/v1/join` means `SendMessage` succeeded, not that a position
 exists; any other SQS outcome maps to a 502, which the client retries with backoff. A
-`/v1/queue_num` 404 means re-join with the **same** `request_id`: the guard passes because no row
+`/_wr/v1/queue_num` 404 means re-join with the **same** `request_id`: the guard passes because no row
 exists, and a fresh id would abandon whatever the first attempt resolves to. The straggler
 self-heal (§4.1) rides the same loop.
 
@@ -397,13 +397,16 @@ concurrency drifts with session length
 
 | Behaviour | Paths | Caching / cookies | Origin | Purpose |
 |---|---|---|---|---|
-| Polled | `/v1/status` | Min TTL 1 s, key is the path; no cookies | API Gateway → `read` | Phase, `serving_state`, `serving_position`, `target_rate`, message, `starts_at`, `poll_policy` ([ADR-0023](adr/0023-adaptive-poll-interval.md)); after T−0 the seed, count and offsets |
-| Polled | `/v1/queue_num` | Min TTL 1 s, key adds `event_id` + `request_id`; no cookies | API Gateway → `read` | Own position. 404 means re-join; 409 means not yet open |
-| Join | `/v1/join` | uncached; no cookies | API Gateway → SQS | Join the queue or the pre-queue |
-| Write | `/v1/generate_token`, `/v1/enter`, `/v1/wait` | uncached; all cookies | API Gateway → `generate_token`, `nojs` | Mint the session; the no-JavaScript queue ([ADR-0037](adr/0037-no-javascript-queue.md)) |
-| Admin | `/admin`, `/admin/*`, `/static/*` | uncached; all cookies | API Gateway → `admin` | Operator UI and API |
-| Waiting page | `/_wr/*` | cached; no cookies | S3 | Ungated: where a refused visitor lands |
+| Polled | `/_wr/v1/status` | Min TTL 1 s, key is the path; no cookies | API Gateway → `read` | Phase, `serving_state`, `serving_position`, `target_rate`, message, `starts_at`, `poll_policy` ([ADR-0023](adr/0023-adaptive-poll-interval.md)); after T−0 the seed, count and offsets |
+| Polled | `/_wr/v1/queue_num` | Min TTL 1 s, key adds `event_id` + `request_id`; no cookies | API Gateway → `read` | Own position. 404 means re-join; 409 means not yet open |
+| Join | `/_wr/v1/join` | uncached; no cookies | API Gateway → SQS | Join the queue or the pre-queue |
+| Write | `/_wr/v1/generate_token`, `/_wr/v1/enter`, `/_wr/v1/wait` | uncached; all cookies | API Gateway → `generate_token`, `nojs` | Mint the session; the no-JavaScript queue ([ADR-0037](adr/0037-no-javascript-queue.md)) |
+| Admin | `/_wr/admin`, `/_wr/admin/*`, `/_wr/static/*` | uncached; all cookies | API Gateway → `admin` | Operator UI and API |
+| Waiting page | `/_wr/*`, matched after the rows above | cached; no cookies | S3 | Ungated: where a refused visitor lands |
 | Protected | `/*` (default) | uncached; allow-listed cookies | Client origin | Behind the gate |
+
+Everything the room serves is under `/_wr/`, the one path prefix it reserves on the customer's
+hostname (issue #251).
 
 The polled behaviours need a Min TTL above zero and no forwarded cookies. Otherwise CloudFront
 disables request collapsing and every poll reaches the origin
@@ -424,12 +427,12 @@ allowlist is re-checked on every request.
 
 | Path | Purpose |
 |---|---|
-| `/admin`, `/admin/state`, `/admin/login`, `/admin/callback`, `/admin/logout` | Dashboard with the readiness panel (issue #70), its state as JSON, the OIDC session |
-| `/admin/phase`, `/admin/open_now`, `/admin/start_time` | Any transition except to `active`; open now; set T−0 and arm the schedule |
-| `/admin/rate`, `/admin/message` | Target rate; broadcast message |
-| `/admin/pause`, `/admin/resume`, `/admin/force_maintenance` | Hold or resume admission (queue and rate kept); emergency full stop ([ADR-0017](adr/0017-andon-cord-emergency-controls.md)) |
-| `/admin/fail_open`, `/admin/recover` | Set (≤ 1,440 min) or clear the fail-open epoch; a pause still in force applies once it clears |
-| `/admin/rules`, `/admin/ip_binding` | Replace the gate ruleset (§2.3); session IP binding on/off ([ADR-0036](adr/0036-optional-session-ip-binding.md)) |
+| `/_wr/admin`, `/_wr/admin/state`, `/_wr/admin/login`, `/_wr/admin/callback`, `/_wr/admin/logout` | Dashboard with the readiness panel (issue #70), its state as JSON, the OIDC session |
+| `/_wr/admin/phase`, `/_wr/admin/open_now`, `/_wr/admin/start_time` | Any transition except to `active`; open now; set T−0 and arm the schedule |
+| `/_wr/admin/rate`, `/_wr/admin/message` | Target rate; broadcast message |
+| `/_wr/admin/pause`, `/_wr/admin/resume`, `/_wr/admin/force_maintenance` | Hold or resume admission (queue and rate kept); emergency full stop ([ADR-0017](adr/0017-andon-cord-emergency-controls.md)) |
+| `/_wr/admin/fail_open`, `/_wr/admin/recover` | Set (≤ 1,440 min) or clear the fail-open epoch; a pause still in force applies once it clears |
+| `/_wr/admin/rules`, `/_wr/admin/ip_binding` | Replace the gate ruleset (§2.3); session IP binding on/off ([ADR-0036](adr/0036-optional-session-ip-binding.md)) |
 
 ### Credentials
 
@@ -474,16 +477,16 @@ per request and per rule between events, breaking N1.
 | Rule | Paths | Action |
 |---|---|---|
 | Verify-page challenge | `/_wr/verify.html` | Challenge. Issues `aws-waf-token` and returns the visitor to the waiting page |
-| Token required | `/v1/join`, `/v1/status`, `/v1/queue_num`, `/v1/generate_token` | Challenge: a 202 with `x-amzn-waf-action`, which `waiting.js` treats as "renew on the verify page" |
-| Joins per token | `/v1/join` | Block (429) past 10 per 10 min |
+| Token required | `/_wr/v1/join`, `/_wr/v1/status`, `/_wr/v1/queue_num`, `/_wr/v1/generate_token` | Challenge: a 202 with `x-amzn-waf-action`, which `waiting.js` treats as "renew on the verify page" |
+| Joins per token | `/_wr/v1/join` | Block (429) past 10 per 10 min |
 | Requests per token | the four JS API paths | Block (429) past `waf_api_token_limit` per 5 min |
-| Token requests + joins per IP | verify page, `/v1/join` | CAPTCHA past `waf_join_ip_limit` per 5 min. It escalates rather than blocks, because carrier NAT puts many real buyers behind one IP |
+| Token requests + joins per IP | verify page, `/_wr/v1/join` | CAPTCHA past `waf_join_ip_limit` per 5 min. It escalates rather than blocks, because carrier NAT puts many real buyers behind one IP |
 | Anonymous / hosting IP | verify page, join | CAPTCHA (Count until promoted) |
 | Token cookie required | the four JS API paths | Block a request with no `aws-waf-token` cookie, so a token sent only by header cannot escape the per-token limits. Count until `waf_managed_rules_mode = "enforce"` |
-| No-JS joins per IP | `/v1/enter` | Block past `waf_nojs_ip_limit` per 5 min |
-| No-JS waits per IP | `/v1/wait` | Block (429) past `waf_nojs_wait_ip_limit` per 5 min |
-| Anonymous IP, no JS | `/v1/enter` | Block (Count until promoted) |
-| No-JS closed | `/v1/enter`, `/v1/wait` | Block, only when `nojs_enabled = false` |
+| No-JS joins per IP | `/_wr/v1/enter` | Block past `waf_nojs_ip_limit` per 5 min |
+| No-JS waits per IP | `/_wr/v1/wait` | Block (429) past `waf_nojs_wait_ip_limit` per 5 min |
+| Anonymous IP, no JS | `/_wr/v1/enter` | Block (Count until promoted) |
+| No-JS closed | `/_wr/v1/enter`, `/_wr/v1/wait` | Block, only when `nojs_enabled = false` |
 | Managed: Anti-DDoS, IP reputation, Bot Control common | ACL-wide or the room's paths | Count until `waf_managed_rules_mode = "enforce"` (O5, [ADR-0012](adr/0012-anti-ddos-count-mode.md)) |
 
 Every path match decodes and normalises the URI first (`URL_DECODE`, `NORMALIZE_PATH`), so an
@@ -498,8 +501,8 @@ browser session; it does not bind a place to a person.
 | Alerting | Metric filters over the Lambdas' structured logs, each with an alarm at threshold zero, plus metric alarms on DLQ depth, join-queue age, each function's `Errors` and `Throttles`, table write throttles, API 5XX and the controller schedule's target errors (`core/logging.tf`). They notify the SNS topic in `alarm_sns_topic_arn` when one is set, and nobody otherwise. No dashboard resource ships |
 | Pre-event readiness | The dashboard's diagnostics panel, which makes read-only checks against the deployment (issue #70, [`RUNBOOK.md`](./RUNBOOK.md)) |
 | Branding | Waiting-page HTML, CSS and JS in S3 behind CloudFront |
-| Messaging | `/admin/message` makes one `UpdateItem`, and every waiter sees it within one `/v1/status` TTL |
-| Position and wait | `/v1/queue_num` gives the position. The client estimates the wait from the measured movement of the cursor, falling back to `target_rate` |
+| Messaging | `/_wr/admin/message` makes one `UpdateItem`, and every waiter sees it within one `/_wr/v1/status` TTL |
+| Position and wait | `/_wr/v1/queue_num` gives the position. The client estimates the wait from the measured movement of the cursor, falling back to `target_rate` |
 
 `waiting.js` polls adaptively (ADR-0023): the interval scales with the visitor's distance to the
 front, between a floor and a ceiling set in Terraform (`poll_floor_ms`, `poll_ceiling_ms`,
@@ -508,14 +511,14 @@ deep-queue visitor can see it up to about 39 s late (the ceiling plus jitter). T
 accepts that delay. Consecutive failed polls double the interval up to the ceiling and the first
 success resets it
 ([#251](https://github.com/smoketurner/virtual-waiting-room/issues/251)). A 410 from
-`/v1/generate_token` drops the stored identity, so the next load takes a new place (#237).
+`/_wr/v1/generate_token` drops the stored identity, so the next load takes a new place (#237).
 
 **Not built:** live metrics for F5.1 (queue depth, admitted, no-show rate). See [`tasks.md`](../.kiro/specs/virtual-waiting-room/tasks.md),
 Phase 1h.
 
 ## 10. Failure behaviour
 
-**Fail-open** ([ADR-0009](adr/0009-fail-open.md)): `/admin/fail_open` sets `fail_open_until` on
+**Fail-open** ([ADR-0009](adr/0009-fail-open.md)): `/_wr/admin/fail_open` sets `fail_open_until` on
 `Counters` and in the KeyValueStore, and the gate passes protected requests until its own clock
 passes it. The gate also passes through when it throws before a rule has matched (unreadable
 config, unknown version); a throw after a match refuses (#242).
@@ -592,7 +595,7 @@ and ~5 requests per iOS discard-and-reload.
   runs understate the saving: `make load VISITORS=1000000 SECONDS=90` reads 1.83x because the
   ~60 s first-ask spread dominates it. The harness cannot measure time-to-admission.
 - **No T−0 herd.** Open discovery spreads over the ~39 s ceiling jitter plus `scheduleFirstAsk`'s
-  60 s, so peak `/v1/queue_num` load is no higher than the 60 s spread alone
+  60 s, so peak `/_wr/v1/queue_num` load is no higher than the 60 s spread alone
   ([#84](https://github.com/smoketurner/virtual-waiting-room/issues/84)).
 
 **Pricing** (baseline, foreground-only bound, pay-as-you-go, US/Europe):

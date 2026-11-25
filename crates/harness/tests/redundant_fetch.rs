@@ -47,20 +47,25 @@ async fn single_miss_fetches_origin_once() {
     let calls = Arc::new(AtomicU64::new(0));
 
     let (status, body, disposition) = edge
-        .serve("/v1/status", "/v1/status", Duration::from_secs(1), || {
-            let calls = Arc::clone(&calls);
-            async move {
-                calls.fetch_add(1, Ordering::Relaxed);
-                (200, String::from(BODY))
-            }
-        })
+        .serve(
+            "/_wr/v1/status",
+            "/_wr/v1/status",
+            Duration::from_secs(1),
+            || {
+                let calls = Arc::clone(&calls);
+                async move {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    (200, String::from(BODY))
+                }
+            },
+        )
         .await;
 
     assert_eq!(status, 200);
     assert_eq!(body, BODY);
     assert_eq!(disposition, Disposition::Miss);
     assert_eq!(calls.load(Ordering::Relaxed), 1, "exactly one origin fetch");
-    let (client, origin, hits, collapsed) = tallies(&edge, "/v1/status").await;
+    let (client, origin, hits, collapsed) = tallies(&edge, "/_wr/v1/status").await;
     assert_eq!((client, origin, hits, collapsed), (1, 1, 0, 0));
 }
 
@@ -70,24 +75,34 @@ async fn second_request_within_ttl_is_a_hit() {
     let calls = Arc::new(AtomicU64::new(0));
 
     let (_, _, first) = edge
-        .serve("/v1/status", "/v1/status", Duration::from_secs(5), || {
-            let calls = Arc::clone(&calls);
-            async move {
-                calls.fetch_add(1, Ordering::Relaxed);
-                (200, String::from(BODY))
-            }
-        })
+        .serve(
+            "/_wr/v1/status",
+            "/_wr/v1/status",
+            Duration::from_secs(5),
+            || {
+                let calls = Arc::clone(&calls);
+                async move {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    (200, String::from(BODY))
+                }
+            },
+        )
         .await;
     assert_eq!(first, Disposition::Miss);
 
     let (_, _, second) = edge
-        .serve("/v1/status", "/v1/status", Duration::from_secs(5), || {
-            let calls = Arc::clone(&calls);
-            async move {
-                calls.fetch_add(1, Ordering::Relaxed);
-                (200, String::from(BODY))
-            }
-        })
+        .serve(
+            "/_wr/v1/status",
+            "/_wr/v1/status",
+            Duration::from_secs(5),
+            || {
+                let calls = Arc::clone(&calls);
+                async move {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    (200, String::from(BODY))
+                }
+            },
+        )
         .await;
     assert_eq!(
         second,
@@ -99,7 +114,7 @@ async fn second_request_within_ttl_is_a_hit() {
         1,
         "no second fetch for a cached entry"
     );
-    let (client, origin, hits, collapsed) = tallies(&edge, "/v1/status").await;
+    let (client, origin, hits, collapsed) = tallies(&edge, "/_wr/v1/status").await;
     assert_eq!((client, origin, hits, collapsed), (2, 1, 1, 0));
 }
 
@@ -111,8 +126,8 @@ async fn error_response_is_negative_cached_for_error_ttl() {
 
     let (status, _, first) = edge
         .serve(
-            "/v1/queue_num",
-            "/v1/queue_num?request_id=a",
+            "/_wr/v1/queue_num",
+            "/_wr/v1/queue_num?request_id=a",
             Duration::from_secs(1),
             || {
                 let calls = Arc::clone(&calls);
@@ -129,8 +144,8 @@ async fn error_response_is_negative_cached_for_error_ttl() {
     // Still within the 10s error TTL: must hit, no new fetch.
     let (_, _, second) = edge
         .serve(
-            "/v1/queue_num",
-            "/v1/queue_num?request_id=a",
+            "/_wr/v1/queue_num",
+            "/_wr/v1/queue_num?request_id=a",
             Duration::from_secs(1),
             || {
                 let calls = Arc::clone(&calls);
@@ -159,10 +174,10 @@ async fn origin_timeline_and_peak_record_origin_requests() {
     for n in 0..3u64 {
         // A distinct key per call forces three genuine misses (no shared
         // cache entry), so three origin requests get recorded.
-        let key = format!("/v1/queue_num?request_id={n}");
+        let key = format!("/_wr/v1/queue_num?request_id={n}");
         let calls = Arc::clone(&calls);
         edge.serve(
-            "/v1/queue_num",
+            "/_wr/v1/queue_num",
             key.as_str(),
             Duration::from_secs(60),
             || {
@@ -216,8 +231,8 @@ async fn cohort(
         let calls = Arc::clone(&calls);
         tasks.push(tokio::spawn(async move {
             edge.serve(
-                "/v1/status",
-                "/v1/status",
+                "/_wr/v1/status",
+                "/_wr/v1/status",
                 Duration::from_secs(1),
                 move || {
                     let calls = calls;
@@ -238,7 +253,7 @@ async fn cohort(
     for task in tasks {
         let _ = task.await.unwrap();
     }
-    let (client, origin, hits, collapsed) = tallies(&edge, "/v1/status").await;
+    let (client, origin, hits, collapsed) = tallies(&edge, "/_wr/v1/status").await;
     (
         calls.load(Ordering::Relaxed),
         client,
