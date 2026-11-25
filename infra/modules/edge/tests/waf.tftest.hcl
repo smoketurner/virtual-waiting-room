@@ -225,3 +225,126 @@ run "managed_rules_observe_until_promoted" {
     error_message = "every managed rule group must run in Count by default (O5)"
   }
 }
+
+run "path_matches_decode_and_normalise_first" {
+  command = plan
+
+  variables {
+    flat_rate_plan_tier = "BUSINESS"
+  }
+
+  # Scanned from the source: the planned rule set carries computed values, so
+  # a plan cannot walk it, and the statements nest at different depths. Every
+  # field_to_match on the path must be followed by the two transformations, in
+  # that order, so a rule added later with a bare NONE is caught. (The ACL is
+  # named only because an assertion must reference the module under test.)
+  assert {
+    condition = length(aws_wafv2_web_acl.this) == 1 && (
+      length(regexall("uri_path \\{\\}", file("waf.tf")))
+      == length(regexall("uri_path \\{\\}\\s+\\}\\s+text_transformation \\{\\s+priority = 0\\s+type\\s+= \"URL_DECODE\"\\s+\\}\\s+text_transformation \\{\\s+priority = 1\\s+type\\s+= \"NORMALIZE_PATH\"", file("waf.tf")))
+    )
+    error_message = "every match on the URI path must apply URL_DECODE then NORMALIZE_PATH, or an encoded or doubled-slash path walks past the rule (issue #245)"
+  }
+
+  assert {
+    condition     = length(aws_wafv2_web_acl.this) == 1 && length(regexall("uri_path \\{\\}", file("waf.tf"))) >= 13
+    error_message = "the scan found fewer path matches than the ACL is known to have; the scan itself is broken"
+  }
+}
+
+run "the_no_javascript_waiting_page_is_rate_limited_per_address" {
+  command = plan
+
+  variables {
+    flat_rate_plan_tier = "BUSINESS"
+  }
+
+  assert {
+    condition = one([
+      for r in aws_wafv2_web_acl.this[0].rule :
+      r.statement[0].rate_based_statement[0] if r.name == "nojs-wait-per-ip"
+    ]).aggregate_key_type == "IP"
+    error_message = "/v1/wait runs compute on every load and needs its own per-IP limit (issue #245)"
+  }
+
+  assert {
+    condition = one([
+      for r in aws_wafv2_web_acl.this[0].rule :
+      r.statement[0].rate_based_statement[0] if r.name == "nojs-wait-per-ip"
+    ]).limit == var.waf_nojs_wait_ip_limit
+    error_message = "the /v1/wait limit must be the configured one"
+  }
+
+  assert {
+    condition     = local.waf_nojs_wait == "/v1/wait" && can(regex(local.waf_nojs_regex, local.waf_nojs_wait))
+    error_message = "the limit must sit on the no-JS waiting page's own path"
+  }
+}
+
+run "a_token_without_its_cookie_is_refused_only_after_the_challenge" {
+  command = plan
+
+  variables {
+    flat_rate_plan_tier    = "BUSINESS"
+    waf_managed_rules_mode = "enforce"
+  }
+
+  # Ahead of the challenge it would block every visitor's first, tokenless
+  # call instead of answering the 202 that sends them to the verify page.
+  assert {
+    condition = (
+      one([for r in aws_wafv2_web_acl.this[0].rule : r.priority if r.name == "api-token-cookie-required"])
+      > one([for r in aws_wafv2_web_acl.this[0].rule : r.priority if r.name == "api-requires-token"])
+    )
+    error_message = "the cookie requirement must be evaluated after the challenge, or it breaks the challenge flow"
+  }
+
+  # And ahead of the limits it protects.
+  assert {
+    condition = alltrue([
+      for r in aws_wafv2_web_acl.this[0].rule :
+      r.priority > one([for c in aws_wafv2_web_acl.this[0].rule : c.priority if c.name == "api-token-cookie-required"])
+      if contains(["join-per-token", "api-per-token"], r.name)
+    ])
+    error_message = "the cookie requirement must run before the per-token limits that key on the cookie"
+  }
+
+  assert {
+    condition = length(one([
+      for r in aws_wafv2_web_acl.this[0].rule : r.action[0].block if r.name == "api-token-cookie-required"
+    ])) == 1
+    error_message = "in enforce mode a tokened request without the cookie must be blocked (issue #245)"
+  }
+}
+
+run "the_token_cookie_requirement_observes_until_promoted" {
+  command = plan
+
+  variables {
+    flat_rate_plan_tier = "BUSINESS"
+  }
+
+  assert {
+    condition = length(one([
+      for r in aws_wafv2_web_acl.this[0].rule : r.action[0].count if r.name == "api-token-cookie-required"
+    ])) == 1
+    error_message = "the cookie requirement refuses real visitors if it is wrong, so it runs in Count by default (O5)"
+  }
+}
+
+run "transient_errors_are_cached_for_a_second_and_not_rewritten" {
+  command = plan
+
+  assert {
+    condition     = toset([for e in aws_cloudfront_distribution.this.custom_error_response : e.error_code]) == toset([404, 429, 500, 502, 503, 504])
+    error_message = "the transient error codes need a short error-caching TTL, or one failed poll is served to every waiter for CloudFront's default ten seconds (issue #251)"
+  }
+
+  assert {
+    condition = alltrue([
+      for e in aws_cloudfront_distribution.this.custom_error_response :
+      e.error_caching_min_ttl == 1 && e.response_code == null && e.response_page_path == null
+    ])
+    error_message = "the entries set a caching TTL only; rewriting a status or body would undo the gate's own refusal shaping (issue #71)"
+  }
+}

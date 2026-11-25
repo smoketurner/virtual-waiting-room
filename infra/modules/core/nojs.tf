@@ -41,9 +41,12 @@ resource "aws_lambda_function" "nojs" {
       POSITIONS_TABLE       = aws_dynamodb_table.positions.name
       EVENT_ID              = var.event_id
       SIGNING_KEY_PARAMETER = aws_ssm_parameter.signing_key.name
-      SESSION_COOKIE_NAME   = var.session_cookie_name
-      SESSION_TTL_SECS      = tostring(var.session_ttl_seconds)
-      JOIN_QUEUE_URL        = aws_sqs_queue.join.url
+      # Not read by the code: it changes when the key does, so a new key
+      # retires the environments holding the old one (main.tf, issue #247).
+      SIGNING_KEY_FINGERPRINT = local.signing_key_fingerprint
+      SESSION_COOKIE_NAME     = var.session_cookie_name
+      SESSION_TTL_SECS        = tostring(var.session_ttl_seconds)
+      JOIN_QUEUE_URL          = aws_sqs_queue.join.url
     })
   }
 

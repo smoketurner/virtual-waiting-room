@@ -7,6 +7,19 @@ data "aws_region" "current" {}
 
 data "aws_partition" "current" {}
 
+# Partition-key values on the Counters table, for scoping each function to the
+# items it touches (issue #250). The table holds the event's own item and its
+# striped shard counters, and a grant on the whole table lets the function that
+# counts arrivals also rewrite serving_counter. These must stay equal to what
+# wr_common::expr::Key::value builds: a value that matches nothing denies every
+# call the function makes. event_id cannot contain '#', so a shard pattern
+# reaches no other event's items.
+locals {
+  counters_event_key           = "EVT#${var.event_id}"
+  counters_prequeue_shard_keys = "EVT#${var.event_id}#PQ#*"
+  counters_arrivals_shard_keys = "EVT#${var.event_id}#AR#*"
+}
+
 # Trust policy for the assign_position Lambda execution role.
 data "aws_iam_policy_document" "lambda_assume_role" {
   statement {
@@ -43,6 +56,8 @@ data "aws_iam_policy_document" "assign_position" {
     resources = [aws_dynamodb_table.positions.arn]
   }
 
+  # Reads the event item, claims a block on it, and bumps a pre-queue shard.
+  # Never an arrivals shard.
   statement {
     sid    = "ReadAndClaimCounters"
     effect = "Allow"
@@ -51,6 +66,12 @@ data "aws_iam_policy_document" "assign_position" {
       "dynamodb:GetItem",
     ]
     resources = [aws_dynamodb_table.counters.arn]
+
+    condition {
+      test     = "ForAllValues:StringLike"
+      variable = "dynamodb:LeadingKeys"
+      values   = [local.counters_event_key, local.counters_prequeue_shard_keys]
+    }
   }
 
   statement {
@@ -114,6 +135,21 @@ data "aws_iam_policy_document" "open_event" {
       "dynamodb:UpdateItem",
     ]
     resources = [aws_dynamodb_table.counters.arn]
+
+    condition {
+      test     = "ForAllValues:StringLike"
+      variable = "dynamodb:LeadingKeys"
+      values   = [local.counters_event_key, local.counters_prequeue_shard_keys]
+    }
+  }
+
+  # The open waits for the join queue to drain before it counts the cohort
+  # (issue #239). Depth only: it never receives or deletes a join.
+  statement {
+    sid       = "ReadJoinQueueDepth"
+    effect    = "Allow"
+    actions   = ["sqs:GetQueueAttributes"]
+    resources = [aws_sqs_queue.join.arn]
   }
 
   statement {
@@ -160,6 +196,8 @@ data "aws_iam_policy_document" "read" {
 # update the Counters item (phase / rate / message), plus logs. It never touches
 # PreQueue or Positions.
 data "aws_iam_policy_document" "admin" {
+  # The event item only: every operator action is a write to it, and none
+  # touches a shard.
   statement {
     sid    = "ReadAndWriteCounters"
     effect = "Allow"
@@ -168,6 +206,12 @@ data "aws_iam_policy_document" "admin" {
       "dynamodb:UpdateItem",
     ]
     resources = [aws_dynamodb_table.counters.arn]
+
+    condition {
+      test     = "ForAllValues:StringLike"
+      variable = "dynamodb:LeadingKeys"
+      values   = [local.counters_event_key]
+    }
   }
 
   statement {
@@ -295,8 +339,10 @@ data "aws_iam_policy_document" "admin" {
 
   # The distribution and its cache policies are created by the edge module,
   # which depends on this one, so their ids cannot be referenced here without
-  # a module cycle. Scoped to this account's distributions and cache policies
-  # rather than "*"; both actions only read configuration.
+  # a module cycle -- which is also why this cannot be narrowed to this
+  # deployment's own distribution (issue #250): its ARN exists only after edge
+  # has consumed core's outputs. Scoped to this account's distributions and
+  # cache policies rather than "*"; both actions only read configuration.
   statement {
     sid    = "ReadinessDistribution"
     effect = "Allow"
@@ -332,9 +378,9 @@ data "aws_iam_policy_document" "admin" {
   }
 }
 
-# Execution-role permissions for the controller: read and advance the Counters
-# item (serving_counter, max_expired_position, smoothing state), scan Positions
-# for expiry and mark them expired, plus logs.
+# Execution-role permissions for the controller: read and advance the event's
+# Counters item (serving_counter, smoothing state), sum and settle the arrivals
+# shards, plus logs. It holds nothing on Positions or the pre-queue shards.
 data "aws_iam_policy_document" "controller" {
   statement {
     sid    = "AdvanceCounters"
@@ -346,6 +392,12 @@ data "aws_iam_policy_document" "controller" {
       "dynamodb:UpdateItem",
     ]
     resources = [aws_dynamodb_table.counters.arn]
+
+    condition {
+      test     = "ForAllValues:StringLike"
+      variable = "dynamodb:LeadingKeys"
+      values   = [local.counters_event_key, local.counters_arrivals_shard_keys]
+    }
   }
 
   statement {
@@ -386,22 +438,11 @@ data "aws_iam_policy_document" "scheduler_assume_role" {
   }
 }
 
-# generate_token: read the counters and the visitor's position, claim the
-# admission, count the arrival, and read the signing key.
-# nojs (issue #67): generate_token's grants, because it admits through the
-# same code, plus SendMessage on the join queue its form post joins through.
-data "aws_iam_policy_document" "nojs" {
-  source_policy_documents = [data.aws_iam_policy_document.generate_token.json]
-
-  statement {
-    sid       = "Join"
-    effect    = "Allow"
-    actions   = ["sqs:SendMessage"]
-    resources = [aws_sqs_queue.join.arn]
-  }
-}
-
-data "aws_iam_policy_document" "generate_token" {
+# What admitting a visitor needs: read the counters and the visitor's position,
+# claim the admission, count the arrival, and read the signing key. Shared by
+# generate_token and nojs (issue #67), which admits through the same code. Each
+# adds its own log grant, so neither can write the other's log.
+data "aws_iam_policy_document" "admission" {
   statement {
     sid     = "ReadQueueState"
     effect  = "Allow"
@@ -413,11 +454,20 @@ data "aws_iam_policy_document" "generate_token" {
     ]
   }
 
+  # An arrivals shard and nothing else on Counters. This is the function an
+  # anonymous visitor reaches, and with the table-wide grant it could have
+  # advanced serving_counter (issue #250).
   statement {
     sid       = "RecordArrival"
     effect    = "Allow"
     actions   = ["dynamodb:UpdateItem"]
     resources = [aws_dynamodb_table.counters.arn]
+
+    condition {
+      test     = "ForAllValues:StringLike"
+      variable = "dynamodb:LeadingKeys"
+      values   = [local.counters_arrivals_shard_keys]
+    }
   }
 
   # Issue #62: one conditional write per visitor marks their admission claimed,
@@ -437,11 +487,36 @@ data "aws_iam_policy_document" "generate_token" {
     actions   = ["ssm:GetParameter"]
     resources = [aws_ssm_parameter.signing_key.arn]
   }
+}
+
+# No CreateLogGroup on either: Terraform owns the groups (logging.tf) and each
+# function depends on its own existing.
+data "aws_iam_policy_document" "generate_token" {
+  source_policy_documents = [data.aws_iam_policy_document.admission.json]
 
   statement {
     sid       = "Logs"
     effect    = "Allow"
-    actions   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
-    resources = ["arn:${local.aws_partition}:logs:${local.aws_region}:${local.aws_account_id}:*"]
+    actions   = ["logs:CreateLogStream", "logs:PutLogEvents"]
+    resources = ["${aws_cloudwatch_log_group.lambda[local.generate_token_name].arn}:*"]
+  }
+}
+
+# nojs adds SendMessage on the join queue its form post joins through.
+data "aws_iam_policy_document" "nojs" {
+  source_policy_documents = [data.aws_iam_policy_document.admission.json]
+
+  statement {
+    sid       = "Join"
+    effect    = "Allow"
+    actions   = ["sqs:SendMessage"]
+    resources = [aws_sqs_queue.join.arn]
+  }
+
+  statement {
+    sid       = "Logs"
+    effect    = "Allow"
+    actions   = ["logs:CreateLogStream", "logs:PutLogEvents"]
+    resources = ["${aws_cloudwatch_log_group.lambda[local.nojs_name].arn}:*"]
   }
 }

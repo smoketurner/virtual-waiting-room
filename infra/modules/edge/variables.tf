@@ -165,7 +165,7 @@ variable "flat_rate_plan_tier" {
 }
 
 variable "waf_managed_rules_mode" {
-  description = "\"count\" observes the AWS managed rules (Anti-DDoS, IP reputation, Bot Control common) and the anonymous-IP rules without acting; \"enforce\" lets them act. New rules run one event in count before enforce (O5, ADR-0012). The token and rate-limit rules act in either mode: they are the mechanism, not a classifier with an unknown false-positive rate."
+  description = "\"count\" observes the AWS managed rules (Anti-DDoS, IP reputation, Bot Control common), the anonymous-IP rules and the token-cookie requirement without acting; \"enforce\" lets them act. New rules run one event in count before enforce (O5, ADR-0012). The token and rate-limit rules act in either mode: they are the mechanism, not a classifier with an unknown false-positive rate."
   type        = string
   default     = "count"
 
@@ -227,6 +227,17 @@ variable "waf_nojs_ip_limit" {
   validation {
     condition     = var.waf_nojs_ip_limit >= 10
     error_message = "waf_nojs_ip_limit must be at least 10, WAF's minimum rate limit."
+  }
+}
+
+variable "waf_nojs_wait_ip_limit" {
+  description = "Loads of the no-JavaScript waiting page (GET /v1/wait, ADR-0037) from one IP in 5 minutes before further ones are refused. The page reloads itself every 5 seconds near the front, about 60 loads per visitor, so the default serves five such visitors behind one address."
+  type        = number
+  default     = 300
+
+  validation {
+    condition     = var.waf_nojs_wait_ip_limit >= 10
+    error_message = "waf_nojs_wait_ip_limit must be at least 10, WAF's minimum rate limit."
   }
 }
 

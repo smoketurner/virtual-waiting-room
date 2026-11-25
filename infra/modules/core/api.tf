@@ -267,3 +267,37 @@ resource "aws_api_gateway_stage" "this" {
 
   tags = var.tags
 }
+
+# --- Stage throttles (issue #245) ---------------------------------------------
+# API Gateway meters every method in the account's region against one token
+# bucket (10,000 requests/s, burst 5,000, unless raised). With no limit of its
+# own, a flood on any one path spends that bucket and the 429s land on all the
+# others, /v1/join included -- and on any other API the account runs. On a
+# flat-rate plan the web ACL's per-viewer limits stand in front of this; on
+# pay-as-you-go nothing does, and these are the only bound.
+#
+# Each method gets the default; /v1/join gets its own, sized for the burst the
+# room exists to absorb. Neither is per viewer -- a limit here is one bucket
+# for everyone behind the distribution -- so they are set where an honest
+# crowd does not reach them, not where they would shape traffic.
+resource "aws_api_gateway_method_settings" "default" {
+  rest_api_id = aws_api_gateway_rest_api.this.id
+  stage_name  = aws_api_gateway_stage.this.stage_name
+  method_path = "*/*"
+
+  settings {
+    throttling_rate_limit  = var.api_throttle_rate_limit
+    throttling_burst_limit = var.api_throttle_burst_limit
+  }
+}
+
+resource "aws_api_gateway_method_settings" "join" {
+  rest_api_id = aws_api_gateway_rest_api.this.id
+  stage_name  = aws_api_gateway_stage.this.stage_name
+  method_path = "${trimprefix(aws_api_gateway_resource.join.path, "/")}/${aws_api_gateway_method.join_post.http_method}"
+
+  settings {
+    throttling_rate_limit  = var.api_join_throttle_rate_limit
+    throttling_burst_limit = var.api_join_throttle_burst_limit
+  }
+}

@@ -13,7 +13,11 @@
 # Idle cost (N1): log groups and metric filters bill nothing to exist and
 # nothing to evaluate — only ingested log data is charged, and between events no
 # function is invoked. The alarms are the only standing charge, at $0.10 each
-# per month.
+# per month, and there are 31 of them: $3.10 of the $5 idle budget. That is the
+# reason for what is absent. One alarm per signal and no composites; DynamoDB
+# throttles on writes only, and only on the three visitor-path tables; no
+# per-function duration or concurrency alarms. Add one only for a failure
+# nothing here already reports.
 
 # Terraform owns every log group because Lambda's auto-created ones never
 # expire. One block, one retention, no function left to grow without bound.
@@ -161,6 +165,10 @@ locals {
   }
 
   metric_namespace = "VirtualWaitingRoom/${var.name_prefix}"
+
+  # Where every alarm below reports, in both directions. Empty leaves them
+  # visible in the console and silent, which is all a dev stack wants.
+  alarm_actions = var.alarm_sns_topic_arn == "" ? [] : [var.alarm_sns_topic_arn]
 }
 
 resource "aws_cloudwatch_log_metric_filter" "event" {
@@ -206,6 +214,9 @@ resource "aws_cloudwatch_metric_alarm" "event" {
   # missing data is a broken pipeline rather than a healthy one.
   treat_missing_data = "notBreaching"
 
+  alarm_actions = local.alarm_actions
+  ok_actions    = local.alarm_actions
+
   tags = var.tags
 }
 
@@ -230,6 +241,9 @@ resource "aws_cloudwatch_metric_alarm" "join_dlq_not_empty" {
   # SQS publishes this metric only while the queue has been active, so absent
   # data is an idle queue, which is the healthy state.
   treat_missing_data = "notBreaching"
+
+  alarm_actions = local.alarm_actions
+  ok_actions    = local.alarm_actions
 
   tags = var.tags
 }
@@ -259,6 +273,194 @@ resource "aws_cloudwatch_metric_alarm" "open_dlq_not_empty" {
   # SQS publishes this metric only while the queue has been active, so absent
   # data is an idle queue, which is the healthy state.
   treat_missing_data = "notBreaching"
+
+  alarm_actions = local.alarm_actions
+  ok_actions    = local.alarm_actions
+
+  tags = var.tags
+}
+
+# --- Service metrics ----------------------------------------------------------
+# The alarms above catch what the code knows went wrong. These catch what it
+# never got to log: a function that crashed or was throttled before its first
+# line, a queue nobody is draining, a schedule that stopped firing (issue #246).
+# The services publish these metrics themselves, so they need no filter.
+
+# A join waiting this long is a registrant without a position. assign_position
+# normally empties the queue within its one-second batching window; a minute
+# means it is failing, throttled, or its event-source mapping is off -- and at
+# T-0 whoever is still queued is not in the cohort. Two periods, so the up to
+# 20 seconds Lambda may hold a lone message on an idle queue cannot trip it.
+resource "aws_cloudwatch_metric_alarm" "join_queue_age" {
+  alarm_name        = "${var.name_prefix}-join-queue-age"
+  alarm_description = "The oldest join has waited over a minute for a position: assign_position is not keeping up with the queue, or not consuming it at all."
+
+  namespace   = "AWS/SQS"
+  metric_name = "ApproximateAgeOfOldestMessage"
+  dimensions = {
+    QueueName = aws_sqs_queue.join.name
+  }
+
+  statistic           = "Maximum"
+  period              = 60
+  threshold           = 60
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  # An empty queue reports no age.
+  treat_missing_data = "notBreaching"
+
+  alarm_actions = local.alarm_actions
+  ok_actions    = local.alarm_actions
+
+  tags = var.tags
+}
+
+locals {
+  alarmed_functions = {
+    assign_position = local.assign_position_name
+    open_event      = local.open_event_name
+    read            = local.read_name
+    admin           = local.admin_name
+    controller      = local.controller_name
+    generate_token  = local.generate_token_name
+    nojs            = local.nojs_name
+  }
+
+  # Errors is an invocation that failed: a panic, a timeout, a handler Err.
+  # Throttles is one that never ran. Neither leaves a log line the filters
+  # above could key on -- a throttled controller is indistinguishable, from the
+  # logs, from an idle one.
+  function_alarms = merge([
+    for key, name in local.alarmed_functions : {
+      "${key}-errors"    = { function = name, metric = "Errors" }
+      "${key}-throttles" = { function = name, metric = "Throttles" }
+    }
+  ]...)
+
+  # The tables a visitor's request writes. Tokens holds operator sessions at
+  # operator rates and is left out. Reads are left out too: a throttled read
+  # surfaces as a 5XX on the API, which is alarmed below.
+  alarmed_tables = {
+    counters  = aws_dynamodb_table.counters.name
+    prequeue  = aws_dynamodb_table.prequeue.name
+    positions = aws_dynamodb_table.positions.name
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "function" {
+  for_each = local.function_alarms
+
+  alarm_name        = "${var.name_prefix}-${each.key}"
+  alarm_description = "Lambda ${each.value.metric} on ${each.value.function}: invocations that failed or never ran, which the function's own log cannot report."
+
+  namespace   = "AWS/Lambda"
+  metric_name = each.value.metric
+  dimensions = {
+    FunctionName = each.value.function
+  }
+
+  statistic           = "Sum"
+  period              = 300
+  threshold           = 0
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  # Lambda publishes nothing for a function that was not invoked.
+  treat_missing_data = "notBreaching"
+
+  alarm_actions = local.alarm_actions
+  ok_actions    = local.alarm_actions
+
+  tags = var.tags
+}
+
+# The SDK retries a throttled write, so the first throttles cost latency rather
+# than failures and nothing else reports them. They are the early sign of a
+# table that was not pre-warmed for the cohort it is getting.
+resource "aws_cloudwatch_metric_alarm" "table_write_throttles" {
+  for_each = local.alarmed_tables
+
+  alarm_name        = "${var.name_prefix}-${each.key}-write-throttles"
+  alarm_description = "DynamoDB throttled writes to ${each.value}: the table is ramping behind the load. Raise warm_throughput_write_units before the next event."
+
+  namespace   = "AWS/DynamoDB"
+  metric_name = "WriteThrottleEvents"
+  dimensions = {
+    TableName = each.value
+  }
+
+  statistic           = "Sum"
+  period              = 300
+  threshold           = 0
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  # Published only when a write is throttled.
+  treat_missing_data = "notBreaching"
+
+  alarm_actions = local.alarm_actions
+  ok_actions    = local.alarm_actions
+
+  tags = var.tags
+}
+
+# Everything behind the API answering with a server error: a Lambda that
+# failed or timed out, a join SQS refused (the 502 in main.tf), an integration
+# API Gateway could not reach. A visitor sees a retry; nobody else sees
+# anything.
+resource "aws_cloudwatch_metric_alarm" "api_5xx" {
+  alarm_name        = "${var.name_prefix}-api-5xx"
+  alarm_description = "The REST API answered 5XX: a function behind it failed or timed out, or SQS refused a join."
+
+  namespace   = "AWS/ApiGateway"
+  metric_name = "5XXError"
+  dimensions = {
+    ApiName = aws_api_gateway_rest_api.this.name
+    Stage   = aws_api_gateway_stage.this.stage_name
+  }
+
+  statistic           = "Sum"
+  period              = 300
+  threshold           = 0
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  # No requests, no datapoints.
+  treat_missing_data = "notBreaching"
+
+  alarm_actions = local.alarm_actions
+  ok_actions    = local.alarm_actions
+
+  tags = var.tags
+}
+
+# The controller's schedule could not deliver a fire (issue #228): the role
+# lost its grant, the function was deleted or renamed. Its retry policy drops
+# an undeliverable fire rather than queueing it, so this is the only trace. No
+# controller means no admissions, and the queue page gives no sign of it.
+#
+# Scheduler publishes this per schedule group, not per schedule, and both
+# schedules live in the default group -- the admin Lambda addresses them
+# there. So this also covers the open schedule, which is wanted, and any other
+# schedule in the account's default group in this region, which is noise worth
+# having over silence.
+resource "aws_cloudwatch_metric_alarm" "schedule_target_errors" {
+  alarm_name        = "${var.name_prefix}-schedule-target-errors"
+  alarm_description = "EventBridge Scheduler could not invoke a target in the default group: the controller (nobody is being admitted) or the open."
+
+  namespace   = "AWS/Scheduler"
+  metric_name = "TargetErrorCount"
+  dimensions = {
+    ScheduleGroup = aws_scheduler_schedule.controller.group_name
+  }
+
+  statistic           = "Sum"
+  period              = 300
+  threshold           = 0
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  # Published only when a delivery fails.
+  treat_missing_data = "notBreaching"
+
+  alarm_actions = local.alarm_actions
+  ok_actions    = local.alarm_actions
 
   tags = var.tags
 }

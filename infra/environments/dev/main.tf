@@ -26,10 +26,11 @@ module "core" {
   event_id                      = var.event_id
 
   # Admin OIDC login (ADR-0016). Secret is an SSM SecureString written out of band.
-  oidc_issuer         = var.oidc_issuer
-  oidc_client_id      = var.oidc_client_id
-  oidc_redirect_uri   = var.oidc_redirect_uri
-  oidc_allowed_emails = var.oidc_allowed_emails
+  oidc_issuer                 = var.oidc_issuer
+  oidc_client_id              = var.oidc_client_id
+  oidc_redirect_uri           = var.oidc_redirect_uri
+  oidc_allowed_emails         = var.oidc_allowed_emails
+  oidc_require_email_verified = var.oidc_require_email_verified
 
   # Adaptive poll policy (#69), published on /status.
   poll_floor_ms   = var.poll_floor_ms
@@ -51,6 +52,18 @@ module "core" {
   gate_rules         = var.gate_rules
   starts_at          = var.starts_at
   starts_at_timezone = var.starts_at_timezone
+
+  # Operations: where alarms report, and whether the tables survive a destroy.
+  alarm_sns_topic_arn             = var.alarm_sns_topic_arn
+  table_deletion_protection       = var.table_deletion_protection
+  controller_reserved_concurrency = var.controller_reserved_concurrency
+
+  # Stage throttles: the only rate bound on pay-as-you-go, where there is no
+  # web ACL (issue #245).
+  api_join_throttle_rate_limit  = var.api_join_throttle_rate_limit
+  api_join_throttle_burst_limit = var.api_join_throttle_burst_limit
+  api_throttle_rate_limit       = var.api_throttle_rate_limit
+  api_throttle_burst_limit      = var.api_throttle_burst_limit
 }
 
 # demo-origin: a stand-in for the customer's protected origin. This is the dev
@@ -104,5 +117,6 @@ module "edge" {
   flat_rate_plan_tier    = var.flat_rate_plan_tier
   waf_managed_rules_mode = var.waf_managed_rules_mode
   waf_join_ip_limit      = var.waf_join_ip_limit
+  waf_nojs_wait_ip_limit = var.waf_nojs_wait_ip_limit
   nojs_enabled           = var.nojs_enabled
 }

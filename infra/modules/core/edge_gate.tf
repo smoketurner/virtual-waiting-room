@@ -23,7 +23,10 @@ resource "aws_cloudfront_key_value_store" "gate" {
 #
 # ignore_changes because the admin Lambda owns this key from here: it mutates
 # fail_open_until (the 'f' field) and replaces the ruleset out of band, so
-# Terraform seeds the value and then never touches it again.
+# Terraform seeds the value and then never touches it again. That includes a
+# change of event_id (main.tf, terraform_data.event_id): the value names no
+# event, and replacing the key would leave the gate with no configuration
+# between the delete and the create.
 resource "aws_cloudfrontkeyvaluestore_key" "config" {
   key                 = "c"
   key_value_store_arn = aws_cloudfront_key_value_store.gate.arn

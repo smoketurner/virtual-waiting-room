@@ -77,8 +77,12 @@ run "every_other_outcome_falls_through_to_a_5xx" {
   # one: enumerating the error codes instead would leave any status code nobody
   # anticipated with no response at all.
   assert {
-    condition = contains(
-      [null, ""], aws_api_gateway_integration_response.join_502.selection_pattern
+    # Null-safe: an unset pattern plans as null, which contains() and
+    # coalesce() both refuse to compare.
+    condition = (
+      aws_api_gateway_integration_response.join_502.selection_pattern == null
+      ? true
+      : aws_api_gateway_integration_response.join_502.selection_pattern == ""
     )
     error_message = "the join error integration response must be the default (no selection pattern), so no SQS outcome is left unmapped"
   }

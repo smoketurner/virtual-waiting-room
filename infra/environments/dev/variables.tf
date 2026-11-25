@@ -192,8 +192,67 @@ variable "waf_join_ip_limit" {
   default     = 100
 }
 
+variable "waf_nojs_wait_ip_limit" {
+  description = "Loads of the no-JavaScript waiting page (GET /v1/wait) per IP per 5 minutes before further ones are refused."
+  type        = number
+  default     = 300
+}
+
 variable "nojs_enabled" {
   description = "Whether the no-JavaScript queue stays open on a flat-rate plan. false closes it at the edge for an event where it is being abused."
   type        = bool
   default     = true
+}
+
+# --- Operations ---------------------------------------------------------------
+# Validated in modules/core/variables.tf, which also carries the rationale.
+
+variable "alarm_sns_topic_arn" {
+  description = "SNS topic every CloudWatch alarm notifies, on alarm and on recovery. Empty attaches no action: the alarms evaluate and nobody is told."
+  type        = string
+  default     = ""
+}
+
+variable "table_deletion_protection" {
+  description = "DynamoDB deletion protection on all four tables. Off for dev stacks, which are destroyed. Must be off for the apply that follows a change of event_id, which recreates PreQueue and Positions."
+  type        = bool
+  default     = false
+}
+
+variable "controller_reserved_concurrency" {
+  description = "Reserved concurrency on the controller function, so a burst cannot starve admission. -1 leaves it unreserved."
+  type        = number
+  default     = 2
+}
+
+# --- REST API stage throttles (issue #245) ------------------------------------
+
+variable "oidc_require_email_verified" {
+  description = "Whether an admin login needs the provider's email_verified claim to be present and true. Turn off only for a provider that omits the claim and verifies every address."
+  type        = bool
+  default     = true
+}
+
+variable "api_join_throttle_rate_limit" {
+  description = "Requests per second POST /v1/join accepts before answering 429."
+  type        = number
+  default     = 10000
+}
+
+variable "api_join_throttle_burst_limit" {
+  description = "Token-bucket size for POST /v1/join."
+  type        = number
+  default     = 5000
+}
+
+variable "api_throttle_rate_limit" {
+  description = "Requests per second each other API method accepts before answering 429."
+  type        = number
+  default     = 50000
+}
+
+variable "api_throttle_burst_limit" {
+  description = "Token-bucket size for each API method other than POST /v1/join."
+  type        = number
+  default     = 1000
 }

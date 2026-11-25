@@ -391,10 +391,25 @@ resource "aws_cloudfront_distribution" "this" {
     }
   }
 
-  # No custom_error_response (issue #71, closes #64): the gate itself decides
-  # a refusal's shape — a 302 to the waiting page for navigation, 403 JSON for
-  # XHR (#72) — so origin 403s reach the visitor unrewritten instead of being
-  # mapped to the waiting page regardless of which origin produced them.
+  # No error is rewritten (issue #71, closes #64): the gate itself decides a
+  # refusal's shape — a 302 to the waiting page for navigation, 403 JSON for
+  # XHR (#72) — so an origin's error reaches the visitor with its own status
+  # and body. These entries set only how long CloudFront caches one.
+  #
+  # The default is 10 seconds, which on the polled paths outlasts ten of their
+  # own 1-second TTLs: one failed /status fetch is served to every waiter for
+  # ten seconds after the origin recovers, and a /queue_num 404 for a join
+  # still in the queue hides the position for as long. One second keeps the
+  # collapsing — a failing origin still sees one request per path per second —
+  # without the stale error (issue #251). 403 is left out: the origin key and
+  # the gate produce those, and neither is transient.
+  dynamic "custom_error_response" {
+    for_each = toset([404, 429, 500, 502, 503, 504])
+    content {
+      error_code            = custom_error_response.value
+      error_caching_min_ttl = 1
+    }
+  }
 
   restrictions {
     geo_restriction {

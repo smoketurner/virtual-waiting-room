@@ -33,7 +33,9 @@ resource "aws_api_gateway_api_key" "origin" {
 # A key only authorises a stage through a usage plan. No throttle or quota is
 # set here: the plan carries the key, and rate limiting lives in the edge's web
 # ACL, where it can be keyed per viewer. A plan-level throttle would be one
-# bucket shared by every visitor behind the distribution.
+# bucket shared by every visitor behind the distribution. The stage's own
+# per-method throttles (api.tf) are that kind of bucket too, and are there only
+# to keep one path from spending the account's.
 resource "aws_api_gateway_usage_plan" "origin" {
   name        = "${var.name_prefix}-cloudfront-origin"
   description = "Authorises the CloudFront origin key on this deployment's stage (ADR-0038)."
