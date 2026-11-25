@@ -1,619 +1,380 @@
 # Architecture
 
 A virtual waiting room holds visitors during a traffic spike and releases them into an origin at
-a rate the origin can sustain. This document describes what the deployed system does, read from
-`crates/` and `infra/`.
-
-[`DESIGN.md`](./DESIGN.md) and [`REQUIREMENTS.md`](./REQUIREMENTS.md) describe the same system and
-are kept in agreement with it; where one of them turns out to be wrong, the fix is to that
-document, not a row in a table here. §10 lists what the code genuinely does not do.
-[`DYNAMODB.md`](./DYNAMODB.md) covers the data layer.
-
----
+a rate the origin can sustain. This document is a tour of the deployed system as built, read from
+`crates/` and `infra/`. [`DESIGN.md`](./DESIGN.md) gives the design, [`DYNAMODB.md`](./DYNAMODB.md)
+the data layer, and [`adr/`](./adr/) the reasoning behind each decision.
 
 ## 1. Summary
 
-The system deploys into the customer's own Amazon Web Services (AWS) account. It runs no
-always-on compute and no cache tier. One deployment serves one event: `event_id` is a Terraform
-variable, baked into every Lambda's environment as `EVENT_ID`.
+The system deploys into the customer's own AWS account. It runs no always-on compute and no
+cache tier. One deployment serves one event: `event_id` is a Terraform variable, baked into every
+Lambda's environment as `EVENT_ID`.
 
-Three decisions carry the design.
+Three decisions carry the design:
 
-**The burst never touches compute.** `POST /v1/join` is an API Gateway `AWS` service integration
-that calls Simple Queue Service (SQS) `SendMessage` directly, through a Velocity template. No
-function of ours runs in that path.
-
-**Queue order is never stored.** A visitor's position is the output of a keyed permutation applied
-to their registration index. One conditional `UpdateItem` assigns positions to the whole
-pre-queue cohort. The permutation is a 4-round Feistel network keyed by a 256-bit seed, and its
-byte encoding is pinned by frozen test vectors.
-
-**The gate is a CloudFront Function.** The default cache behaviour associates a viewer-request
-function that decides locally from a KeyValueStore (ADR-0021, issue #71): no configured rule, a
-valid session cookie, or a fail-open/pending epoch all pass through; otherwise it refuses before
-the origin receives the request. Sub-millisecond compute at the edge, never a call to the origin
-or any backend.
-
-The core Terraform module holds 65 managed resources; the edge module holds 15.
-
----
+- **The burst never touches compute.** `POST /v1/join` is an API Gateway `AWS` service
+  integration that calls SQS `SendMessage` directly. No function runs in that path.
+- **Queue order is never stored.** A pre-queue visitor's position is a keyed permutation of their
+  registration index, computed on read. One conditional `UpdateItem` opens the whole cohort
+  ([ADR-0002](adr/0002-seeded-permutation-not-materialised-shuffle.md)).
+- **The gate is a CloudFront Function.** It decides at viewer-request from a KeyValueStore and
+  never calls a backend ([ADR-0021](adr/0021-edge-function-gate.md)).
 
 ## 2. The moving parts
 
-Six Lambda functions, four DynamoDB tables, one SQS queue with a dead-letter queue, one REST
-API, one CloudFront distribution.
+Seven Lambda functions, four DynamoDB tables, one SQS join queue with a dead-letter queue, one
+REST API, one CloudFront distribution with a CloudFront Function and its KeyValueStore, and, on a
+flat-rate plan only, a WAF web ACL.
 
 | Function | Trigger | Timeout | What it does |
 |---|---|---|---|
-| `assign_position` | SQS event source mapping | 30 s | Consumes join batches; claims indices or positions; writes rows |
-| `open_event` | EventBridge Scheduler, one-shot | 10 s | Folds shard counts into offsets; writes the open |
-| `read` | API Gateway | 10 s | Serves `GET /v1/status` and `GET /v1/queue_num` |
-| `controller` | EventBridge Scheduler, `rate(1 minute)` | 30 s | Meters admission |
-| `generate_token` | API Gateway | 10 s | Checks the position; records the arrival; signs the session cookie the edge gate verifies |
+| `assign_position` | SQS event source mapping | 30 s | Consumes join batches; claims pre-queue indices or live positions; writes rows |
+| `open_event` | EventBridge Scheduler one-shot, or `/admin/open_now` | 10 s | Folds the shard counts into offsets and writes the open |
+| `read` | API Gateway | 10 s | `GET /v1/status`, `GET /v1/queue_num` |
+| `controller` | EventBridge Scheduler `rate(1 minute)` | 30 s | Durable function; meters admission in six 10 s passes |
+| `generate_token` | API Gateway | 10 s | Checks the position, claims the admission, records the arrival, signs the session cookie |
+| `nojs` | API Gateway | 10 s | The queue for a visitor without JavaScript: `POST /v1/enter`, `GET /v1/wait` ([ADR-0037](adr/0037-no-javascript-queue.md)) |
 | `admin` | API Gateway | 10 s | Axum operator UI and control plane |
 
-Every function runs `provided.al2023` at 256 MB on the architecture named in
-`terraform.tfvars`. Every function deploys a real build. There is no placeholder artifact and no
-fallback path.
+Every function runs `provided.al2023` at 256 MB on the architecture named in `terraform.tfvars`,
+and every function deploys a real build; there is no placeholder artifact. `assign_position` and
+`nojs` carry reserved concurrency (`nojs` defaults to 5, so a flood of form posts throttles there
+rather than in `generate_token`).
 
----
-
-## 3. Ingest
-
-```
-POST /v1/join
-  → API Gateway REST, regional
-      request validator: JSON Schema "JoinRequest"
-        required: request_id, event_id
-        additionalProperties: false
-        request_id maxLength 36
-        event_id maxLength = length of this deployment's event id
-      integration type AWS, credentials: an IAM role
-        Action=SendMessage&MessageBody=$util.urlEncode($input.body)
-      integration responses
-        selection pattern 2\d{2} → 200, the SQS response passed through
-        default                  → 502, fixed JSON body
-  → SQS standard queue
-      visibility timeout 181 s, maxReceiveCount 5
-      DLQ retention 14 days
-  → assign_position
-      BatchSize 100, MaximumBatchingWindowInSeconds 1
-      FunctionResponseTypes: [ReportBatchItemFailures]
-```
-
-The event source mapping is `enabled = true` unconditionally. The comment above it claims it is
-enabled only for a real artifact, which the argument beneath it contradicts.
-
-`assign_position` validates every record twice. The gateway's JSON Schema checks that
-`request_id` and `event_id` are present and that no extra field rides along. The function then
-parses `request_id` as a UUID version 7 — 36 bytes, hyphens at positions 8, 13, 18 and 23, a `7`
-version nibble at position 14, and a variant nibble in `8..=b` — and checks `event_id` against
-its own `EVENT_ID`. A record that fails either check, or belongs to another event, is returned as
-a batch failure and never claims anything.
-
-Each invocation makes exactly one `ADD queue_counter` call regardless of how many joins it
-carries, and that counter is a single DynamoDB item with a write ceiling near 1,000 per second. At
-10,000 joins per second, batching by 100 costs 100 counter writes per second. Batching by 10 costs
-1,000 and sits on the ceiling.
-
-The batch size costs latency. A batch size above 10 requires a batching window of at least one
-second, and AWS documents that any window lets Lambda wait up to 20 seconds before invoking on a
-quiet queue. A lone join during testing can take about 20 seconds to get a position.
-
----
-
-## 4. Position assignment
-
-### 4.1 One read decides the whole batch
-
-`assign_position` reads the event's `Counters` item once per batch with a strongly consistent
-`GetItem`. Every valid record in that batch then takes the same path:
-
-```rust
-let live_path = counters.opened().is_some() || counters.phase != Phase::PreQueue;
-```
-
-The branch is on the open outputs, never on the phase alone. An operator can walk the phase back to
-`pre_queue` after an open without undoing the index space, and a record arriving then is
-still a live join. A missing `Counters` item fails every valid record: the event has not been
-set up, and processing a join before setup would let a pre-open live join increment
-`queue_counter` ahead of the open, which the open's unconditional `SET queue_counter = :n`
-would then overwrite — handing a cohort member (or a post-open joiner) the same numeric
-position.
-
-### 4.2 Pre-queue registration claims an index, not a position
-
-Each record hashes to one of ten shards with FNV-1a over the request id bytes, reduced modulo 10.
-The function groups the batch by shard and issues one `SET s = :shard ADD n :count` with
-`ALL_NEW` per non-empty shard group. That claims a whole group's local indices in one round trip.
-It then writes one `PreQueue` row per record: `{r, s, l, t}` — request id, shard, local index,
-registration time.
-
-Hashing rather than round-robin makes a retry safe. A retried join lands on the same shard, the
-`attribute_not_exists(r)` guard rejects the row, and the burned index belongs to whichever
-invocation wrote the authoritative row.
-
-The block's first local index is `checked_sub`, not saturating. A saturated pre-queue index
-would be a duplicate global index that hands two visitors the same position, where a saturated
-live-join position would only be a gap.
-
-### 4.3 The open writes five values in one guarded update
+## 3. Request paths
 
 ```
-SET shuffle_seed = :seed, participant_count = :n, queue_counter = :n,
-    prequeue_offsets = :offsets, phase = :active
-ConditionExpression: attribute_not_exists(shuffle_seed) AND phase = :pre_queue
-```
-
-`open_event` first gathers the ten shard counts with one strongly consistent `BatchGetItem`, then
-folds them: `offset[s]` is the sum of counts `0..s`, and `N` is the total. An unprocessed key
-aborts the open rather than under-counting the cohort. A shard with no registrations has no item
-at all, and `BatchGetItem` returns nothing for it, so the fold counts it as zero. A shard item
-that exists but whose index cannot be read raises an error, because zeroing it silently would
-unadmit every registrant in it.
-
-A double-fire or a retry finds the seed present, fails the condition, and returns `AlreadyOpen`
-without changing anything.
-
-`queue_counter = :n` rides in the same update because a separate write could be lost between the
-open and the first live join.
-
-### 4.4 Position is computed on read
-
-```
-i        = prequeue_offsets[s] + l
-position = PRP(shuffle_seed, i, participant_count)
-```
-
-`PRP` is a 4-round balanced Feistel network over the smallest power of four at or above `N`, with
-cycle-walking to restrict the output to `[0, N)`. The round function is
-`F(r, x) = be_u32(HMAC-SHA256(seed, r ‖ x)[0..4]) & mask`, with a 5-byte message: the round as one
-byte, then the right half as a 4-byte big-endian integer. `aws-lc-rs` supplies the HMAC.
-
-A third party recomputing a position has to reproduce these bytes exactly, so two tests pin them.
-`frozen_wire_encoding_vectors` pins 14 `(seed, N) → [(index, position)]` cases, including
-`prp(SEED_COUNTING, 0, 1_000_000) == 890_568`. `frozen_round_function_encoding` pins three raw
-round-function outputs separately, so a failure separates a change in one round from a change in
-the network around it. The vectors were computed from a separate implementation of the documented
-encoding, not captured from this code.
-
-Four rounds is fewer than the ten that NIST Special Publication 800-38G specifies for FF1. The
-seed is not a long-term secret here. It does not exist before the open, so nobody can predict
-their position; after the open it is published so a third party can recompute the ordering. The
-construction has to be bijective and uniform, and both are tested directly.
-
-`prp` returns `i` unchanged when `i >= n` or `n <= 1`. It is never evaluated outside its domain.
-
-### 4.5 Live joins
-
-One `ADD queue_counter :n` with `ALL_NEW` claims a block for the whole valid set. The block is
-`[end - n + 1, end]`, computed with saturating arithmetic because the release profile has no
-overflow checks. Each row is then written with `attribute_not_exists(request_id)`.
-
-Because the block starts at `end - n + 1` and the open leaves `queue_counter` at `N`, the first
-live joiner after an open receives position `N + 1`. Position `N` is never issued. The pre-queue
-cohort holds `[0, N)`, live joins hold `[N + 1, …)`, and the single position between them is a
-permitted gap.
-
-### 4.6 A join that races the open
-
-A shard claim can land after `open_event` read that shard's count. The row is then invisible to
-the open, and `CohortOffsets::assign` resolves it to `Assignment::LiveJoin`.
-
-The test is per shard, against `offset[s+1] - offset[s]`, never against a global `i >= N`. A
-global test would let an over-count on an interior shard reconstruct into an index range a later
-shard legitimately owns, and two visitors would hold the same position.
-
-`assign_position` handles this itself. After its pre-queue writes land, it re-reads `Counters`
-consistently. Every row this invocation actually wrote — never a duplicate, whose authoritative
-row belongs to another invocation — that now resolves to `LiveJoin` gets a real live position from
-the same `queue_counter`. Every failure inside that fix-up is swallowed rather than reported as a
-batch failure, because redelivery would take the live path and mint a second position for a
-visitor already counted into the cohort.
-
-One case is left open. A pre-queue write that times out on the caller side but actually lands is
-indistinguishable from one that failed. It is reported as a batch failure, redelivery finds the
-event opened, and the visitor ends up with a `Positions` row as well as a counted `PreQueue` row.
-Closing it costs a `PreQueue` `GetItem` on every live join.
-
----
-
-## 5. Waiting
-
-### 5.1 What `/v1/status` returns
-
-```json
-{
-  "event_id": "...",
-  "phase": "active",
-  "serving_state": "running",
-  "serving_position": 41234,
-  "participant_count": 1000000,
-  "prequeue_offsets": [0, 99873, ...],
-  "shuffle_seed": "9f1c…",
-  "message": "...",
-  "target_rate": 500,
-  "poll_policy": { "floor_ms": 5000, "ceiling_ms": 30000, "divisor": 10 }
-}
-```
-
-`serving_state` is derived from `(phase, admission_control)` and never stored, so it cannot drift.
-`target_rate` is **visitors per second**. `message`, `participant_count`, `prequeue_offsets`,
-`shuffle_seed`, `target_rate` and `poll_policy` are omitted when unset. `poll_policy` (#69,
-ADR-0023) is a Terraform-set deploy-time value, not something an operator changes mid-event
-through the admin surface.
-
-`shuffle_seed` is the 256-bit permutation key as lowercase hex, present only once the open has
-written it — it does not exist earlier, so no registrant can pick a registration index that lands
-at the front. Publishing it with `participant_count` and `prequeue_offsets` is what lets an
-outside party recompute the whole ordering and check it.
-
-Holding the seed still does not tell a visitor their own position: that needs their shard and
-local index, which live in their `PreQueue` row. A client asks `/v1/queue_num` for it.
-
-### 5.2 The client asks for its number once, and polls less often the further back it is
-
-`waiting.js` computes its own poll interval from `poll_policy` and its distance to the front
-(#69, ADR-0023): `clamp(floorMs, ceilingMs, aheadSeconds * 1000 / divisor)`, jittered by a
-proportional fraction (`interval * (1 + random() * 0.3)`). With no `poll_policy` published, floor
-and ceiling both default to 5,000 ms with a divisor of 1, reproducing the fixed 5 s (plus jitter)
-interval every client used before #69. Each tick fetches `/v1/status`. It fetches `/v1/queue_num`
-only while it does not yet know its position.
-
-A position never changes once known. A pre-queue registrant's comes from the opened permutation
-and a live joiner's from a claimed row. Only the cursor moves, and `/v1/status` carries it.
-
-`/v1/status` is cached with a path-only key and no cookies forwarded, so CloudFront collapses
-concurrent misses into one origin fetch. `/v1/queue_num` is keyed on `event_id` and `request_id`,
-so it cannot collapse — and it is asked once per visitor rather than once per poll. Origin load
-stays flat as the room grows.
-
-The client also stops polling outright while its tab is hidden (the Page Visibility API) and
-catches up the moment it becomes visible again, rate-guarded so a visitor rapidly switching tabs
-cannot poll faster than the floor, and serialized against the poll already in flight so a
-visibility-triggered restart cannot start a second `join()` for the same visitor.
-
-Everyone learns their number at the same moment, so the client waits a random slice of
-`min(60_000, participants / 5000 × 1000)` milliseconds before asking. At 1,000,000 participants
-the spread saturates at 60 seconds, which is about 16,700 requests per second — above the default
-API Gateway account throttle of 10,000.
-
-A 404 from `/v1/queue_num` means the row has not landed. The client counts eight consecutive
-misses before dropping its joined flag and re-joining with the same request id. Eight is chosen to
-clear the event source mapping's 20-second worst case, not its typical one.
-
----
-
-## 6. Admission
-
-### 6.1 The controller
-
-`EventBridge Scheduler` fires `rate(1 minute)` against the universal
-`arn:aws:scheduler:::aws-sdk:lambda:invoke` target with `InvocationType: Event` and a qualified
-function name. The templated Lambda target invokes synchronously, which holds the invocation open
-through the waits and bills the full minute of cadence. A durable function cannot be invoked
-through an unqualified name, because an execution is pinned to the version that started it.
-
-Each execution runs six passes ten seconds apart. The gaps are durable waits, so the execution
-suspends rather than holding an invocation open. `durable_config` sets `execution_timeout = 120`
-and `retention_period = 7`.
-
-The schedule is created unconditionally. A controller nothing fires leaves the queue to form and
-never drain.
-
-A pass runs only when `phase == Active` **and** `admission_control == Open`. Any other admission
-control returns the whole pass, so neither the cursor nor the expiry advances — a visitor cannot
-lose a position to expiry during a hold they had no way to act through.
-
-```
-observed  = sum(arrivals) − last_arrivals_total
-released  = serving_counter − last_serving_counter
-no_show   = 1 − clamp(observed / released, 0, 1)
-smoothed  = 0.3 × no_show + 0.7 × previous          // EWMA
-release   = min(target_rate × 10 / (1 − smoothed), target_rate × 10 × 2)
-```
-
-With nothing released last interval there is nothing to measure, so the release falls back to the
-raw target and the smoothed state is carried unchanged. Every subtraction saturates: arrivals and
-the cursor come from separate updates and can read below the stored baseline.
-
-The cursor is then clamped to `queue_counter + 1` and forced monotonic:
-
-```rust
-let ceiling = inputs.queue_counter.saturating_add(1);
-let next = inputs.serving_counter
-    .saturating_add(release)
-    .min(ceiling)
-    .max(inputs.serving_counter);
-```
-
-Advancing past the end of the line banks admission credit against an empty queue, and the next
-burst walks straight through every position already released. The decision reports the distance
-the cursor moved, not the distance requested, so the next interval measures arrivals against the
-people who were let through.
-
-The write is guarded on `serving_counter = :expected`, so two overlapping executions cannot
-double-advance. A failed condition is logged and skipped, not retried.
-
-### 6.2 No expiry
-
-A position lives until DynamoDB TTL reclaims its row, 24 hours after it was written
-([ADR-0031](adr/0031-remove-controller-driven-expiry.md)). The controller expires nothing and
-performs no `Scan`.
-
-The mechanism that used to do this cost an unbounded `Scan` of `Positions` six times a minute,
-could not see the pre-queue cohort at all — those visitors have no `Positions` row — and
-advanced an attribute nothing read. Its grace was expressed in seconds but applied as a
-distance in positions, so under the no-show correction's `2×` cap it shrank to about half the
-advertised window and a hidden tab lost its place. The no-show correction already compensates
-for absentees by measuring arrivals against releases.
-
-### 6.3 Minting the session cookie
-
-`POST /v1/generate_token` takes `request_id` from the query string or the JSON body. It reads
-`Positions` first; a live-join row is authoritative and the `PreQueue` lookup is skipped when one
-answers.
-
-`decide` refuses in this order: resolved admission control (`wr_common::resolve(stored_control,
-fail_open_until, now)`, issue #71) not `Open`, phase not `Active`, no registration, position not
-yet reached. The cursor is exclusive: `position >= serving_counter` means still queued. A row
-whose status is already `admitted` is not a refusal — see below.
-
-Refusals map to statuses the waiting page acts on: 425 still queued, 409 not admitting or not
-opened, 404 not registered, 500 corrupt.
-
-**The admission is then claimed** (ADR-0033): one `UpdateItem` setting `status = admitted`,
-guarded by `attribute_not_exists(request_id) OR status = "issued"`. One expression covers both
-populations — it claims a live joiner's existing row and creates the row a pre-queue member does
-not have. Only the call that wins the guard records an arrival. A call that loses it is still
-admitted with a freshly signed session, because `request_id` travels in a URL and a reload, a
-second tab or a lost response must not strand a visitor holding a position that is still theirs.
-A claim that fails with a store error counts the arrival anyway and logs `admission_claim_failed`:
-over-counting under-releases, missing one over-releases.
-
-The arrival is recorded before the cookie is signed. A visitor counted but not admitted
-understates the no-show rate. One admitted but not counted makes the controller over-release for
-every later interval. A failed arrival write is logged at error under the stable event name
-`arrival_record_failed` and the visitor is admitted anyway.
-
-The credential is an HMAC-SHA256 `wr_common::crypto::Session`, signed under a key derived from
-the deployment secret rather than the secret itself (ADR-0024) — set directly as a cookie,
-defaulting to a one-hour lifetime:
-
-```
-<session_cookie_name>=<base64url(payload)>.<base64url(mac)>; Path=/; Max-Age=3600; Secure; HttpOnly; SameSite=Lax
-```
-
-`Path=/` with no `Domain` must be used or the browser never sends the cookie back on the
-protected request.
-
-The signing key is read from SSM Parameter Store once at cold start, inside the boosted init
-phase, so the TLS handshake does not land on a visitor's request. Terraform generates that key and
-writes it to both SSM and the gate's KeyValueStore in the same apply, so the minting and verifying
-sides always hold the same value.
-
----
-
-## 7. The gate
-
-A CloudFront Function (`cloudfront-js-2.0`, ADR-0021, issue #71) is associated with the default
-cache behaviour at `viewer-request`, reading its whole configuration and the signing secret from
-one CloudFront KeyValueStore. It decides locally, in this order:
-
-1. No rule in the KeyValueStore's ruleset matches → pass through untouched (`r: []` is dormancy).
-2. `enforce_from` (a scheduled go-live epoch) or `fail_open_until` (break-glass) is in the
-   future → pass through, marked `x-wr-gate: pending` / `failopen`.
-3. A valid session cookie for this event, not expired → pass through.
-4. Otherwise → refused with a reason: a navigation gets a 302 to the waiting page with
-   `?r=<reason>&next=<destination>`; an XHR/fetch gets 403 JSON with `x-wr-reason`.
-5. The gate itself throwing (an unreadable KeyValueStore, an unrecognised config version) →
-   pass through, marked `x-wr-gate-failed: true`. This is not the same thing as a
-   backend-unreachable fail-open (#58) — the function makes no network calls and cannot observe
-   that at all.
-
-Caching is disabled on this behaviour and an origin request policy forwards the session cookie,
-all viewer headers, and all query strings. `x-wr-gate`/`x-wr-gate-failed` are stripped from the
-incoming request before any decision logic runs, since the protected behaviour forwards
-`allViewer` and a visitor's own request could otherwise carry a spoofed value.
-
-`/_wr/*` is its own behaviour against a private S3 bucket, outside the gate. Gating it would make
-the refusal loop, and a `check` block asserts the waiting page's path falls under the pattern that
-serves it. The `next=` parameter on a redirect carries the visitor's original destination through
-the waiting page, so they land where they were going once admitted.
-
-### The cache behaviours
-
-| Behaviour | Path | Cache policy | Cookies | Origin |
-|---|---|---|---|---|
-| Default | `/*` | CachingDisabled | session cookie forwarded | Protected origin, gated by the CloudFront Function |
-| Waiting page | `/_wr/*` | Cached | none | S3, ungated |
-| Polled | `/v1/status` | Min TTL 1 s, key: path | none | API Gateway |
-| Polled | `/v1/queue_num` | Min TTL 1 s, key: path + `event_id` + `request_id` | none | API Gateway |
-| Write | `/v1/join`, `/v1/generate_token` | CachingDisabled | AllViewerExceptHostHeader | API Gateway |
-| Admin | `/admin`, `/admin/*`, `/static/*` | CachingDisabled | AllViewerExceptHostHeader | API Gateway |
-
-`polled_min_ttl_seconds` is validated `> 0`. A minimum TTL of zero, or any forwarded cookie,
-disables request collapsing and every poll reaches the origin.
-
-CloudFront strips `Set-Cookie` response headers from a behaviour that forwards no cookies.
-`/v1/generate_token`'s whole job is to return cookies, so the write behaviours carry an origin
-request policy. Without it the visitor is admitted, receives nothing, and waits forever.
-
----
-
-## 8. The operator surface
-
-The admin Lambda serves an Axum router behind an API Gateway greedy proxy:
-
-| Route | Method | State |
-|---|---|---|
-| `/admin` | GET | Dashboard |
-| `/admin/state` | GET | JSON state |
-| `/admin/login`, `/admin/callback`, `/admin/logout` | GET | OIDC Authorization Code with PKCE |
-| `/admin/phase` | POST | Phase transition, guarded on the expected prior phase. Refuses `active` for an event the open has never run for |
-| `/admin/open_now` | POST | Opens the event now, invoking `open_event` rather than writing the open a second time |
-| `/admin/rate` | POST | Target rate, guarded on the expected prior rate |
-| `/admin/message` | POST | Operator broadcast |
-| `/admin/force_maintenance` | POST | The emergency full-stop: forces the maintenance phase from any phase, undebounced |
-| `/admin/pause`, `/admin/resume` | POST | Admission control transitions |
-| `/admin/fail_open`, `/admin/recover` | POST | Sets and clears the break-glass epoch |
-| `/admin/rules` | POST | Writes the edge gate's ruleset to the KeyValueStore |
-
-API Gateway authorization is `NONE` on every admin route. The Lambda enforces access with an OIDC
-login session in DynamoDB and an email allowlist from `OIDC_ALLOWED_EMAILS`. An unset allowlist
-denies everyone.
-
-Every mutation writes four audit attributes alongside the change — `last_action`,
-`last_action_by`, `last_action_at`, `last_action_epoch_ms` — in the same `UpdateItem`.
-
-Every mutation is guarded twice. An optimistic-concurrency guard on the expected prior value makes
-a transition another operator already applied a 409 rather than a second apply. A 2,000-millisecond
-debounce guard on `last_action_epoch_ms` makes a double-submitted form a no-op. Forcing maintenance
-mode is guarded on the expected phase but **not** debounced. An emergency stop must always apply.
-
-Rendering is askama compile-time templates with design-system tokens as plain CSS. There is no
-React, no bundler, and no runtime npm dependency.
-
----
-
-## 9. What the tests prove
-
-Read from the test bodies.
-
-| Property | Test | What it asserts |
-|---|---|---|
-| Wire encoding is frozen | `frozen_wire_encoding_vectors` | 14 `(seed, N)` cases, 2 seeds, N from 2 to 1,000,000, computed from an independent implementation |
-| Round function is frozen | `frozen_round_function_encoding` | Three raw big-endian words, unmasked, so a byte-order change cannot hide |
-| Bijective | `prop_bijective` | Arbitrary seed, `n` in `1..2000`: the sorted image set equals `[0, n)` exactly |
-| Bijective, fixed cases | `bijective_over_small_domains` | `n` in {2, 3, 5, 8, 15, 16, 100, 256, 999, 1000} |
-| In domain | `prop_in_domain` | Arbitrary seed, `n` and `i` up to 100,000 |
-| Uniform | `prop_uniform_by_decile` | At `n = 10,000`, χ² across 10 deciles stays below 27.88 — the p = 0.001 critical value at 9 degrees of freedom |
-| Shards are distinct keys | `shard_keys_are_distinct_partition_keys` | Ten distinct partition keys; pre-queue and arrival families disjoint |
-| No expression inlines a `#` | `no_expression_inlines_an_attribute_name_containing_a_hash` | Pins the bug that broke every arrival write |
-| Token kinds do not collide | `the_tokens_table_key_space_does_not_collide_across_kinds` | `SESS#` and `PKCE#` are two rows |
-| Open starts the live sequence | `open_starts_the_live_join_sequence_at_the_cohort_size` | `queue_counter = :n` is in the open update |
-| Release is bounded | `near_total_no_show_is_bounded_at_cap`, `zero_arrivals_is_bounded_at_cap_not_infinite` | A no-show rate at 1.0 yields the cap, not a division by zero |
-
-Two figures that appear in `DESIGN.md` have no test behind them: a 200,000-sample bijectivity run
-at N = 1,000,000, and "χ² = 0.0 against a 16.9 critical value at p = 0.05". The committed
-uniformity test uses a different threshold and does not assert a specific χ².
-
----
-
-## 10. Known gaps in the code
-
-Each of these is deliberate or unfixed, not unnoticed. A gap that has a fix in the tree does not
-belong here — it belongs in the tree.
-
-**Fail-open requires an operator.** Setting `fail_open_until` makes every edge pass traffic
-through until that epoch, and nothing sets it automatically. The gate makes no network calls, so
-it cannot detect an unreachable backend
-([#58](https://github.com/smoketurner/virtual-waiting-room/issues/58)); tripping it would need a
-component that observes the origin. A CloudWatch alarm driving a KeyValueStore write is the
-obvious shape and a worse failure: a flapping alarm opens the gate mid-event and dumps the whole
-queue onto the origin. The manual path is fast and documented instead.
-
-**Standby requires an operator, for the same reason.** An empty ruleset passes every request
-through and `enforce_from` switches every edge at one instant. Nothing triggers either.
-
-**The session cookie is a bearer credential unless the operator binds it.** The gate verifies a
-signature, the event and an expiry. With IP binding on (dashboard, [ADR-0036](adr/0036-optional-session-ip-binding.md),
-[#61](https://github.com/smoketurner/virtual-waiting-room/issues/61)) it also checks a keyed tag
-of the visitor's IPv4 address or IPv6 /64, and a visitor whose network changes is sent through the
-waiting page once to re-mint. It is off by default because it breaks visitors whose address keeps
-changing, and it cannot separate clients behind one NAT. Nothing revokes a session
-([#63](https://github.com/smoketurner/virtual-waiting-room/issues/63)). Minting one needs the
-request id *and* the possession secret it joined with ([ADR-0035](adr/0035-request-id-proof-of-possession.md),
-[#62](https://github.com/smoketurner/virtual-waiting-room/issues/62)), so an id read from a log or
-a shared URL no longer admits anyone. ADR-0033 removed the most damaging consequence of a replayed
-admission, the corrupted no-show measurement.
-
-**The admin Lambda can read the signing key.** Its KeyValueStore grant covers the key as well as
-the config, and IAM cannot narrow it: the store is the only resource type the service defines, it
-publishes no condition keys, and a function associates exactly one store.
-
-**The edge does not extend sessions.** `generate_token` mints one session for
-`session_ttl_seconds` and nothing re-issues it, so a visitor still on the origin when it lapses
-returns to the queue mid-checkout. Setting the value longer than the worst realistic time on the
-origin is the whole of the control. The sliding alternative lived in the origin authorizer and
-went with it (ADR-0032); F3.7 is retired rather than left as a `MUST` with no mechanism. A
-viewer-response function re-signing a near-expiry cookie under a hard cap is the design that would
-fix it, with four cases to get right — expired, past the cap, forged, absent.
-
-**GovCloud has no gate.** The gate is a CloudFront Function and that partition does not offer
-them. The origin authorizer that filled the role was removed (ADR-0032) — nothing had ever invoked
-it, and as wired it forwarded every request. N4 says commercial regions are supported and GovCloud
-is out of scope until a gate exists for it.
-
----
-
-## 11. Frequently asked questions
-
-**Why not store the shuffled order?**
-Writing a million rows at the scheduled start is not atomic. There would be an interval in which
-some participants hold positions and others do not. The open is one conditional `UpdateItem`, so a
-reader sees either the unopened state or all five values together.
-
-**Why DynamoDB rather than a cache tier?**
-A cache tier is always-on compute, and idle cost is the constraint the whole design is built
-around. `UpdateItem` with `ADD` and `ReturnValues: ALL_NEW` serializes per item and returns each
-value once, which is the property a position sequence needs.
-
-**Why a REST API rather than an HTTP API?**
-REST supports request validators, which reject a malformed body with 400 before anything
-downstream runs, and the `AWS` service integration to SQS `SendMessage`, which keeps Lambda out of
-the burst path. HTTP APIs support neither.
-
-**Why is `queue_counter` not sharded when the pre-queue counter is?**
-A sequence must yield a unique ordered value, and summing shards cannot produce one. The
-permutation needs registration indices to be unique and inside `[0, N)`; it does not need them
-ordered. The prefix offsets written at the open reassemble ten shards into that exact range.
-
-**Why is the straggler check per shard rather than against `N`?**
-An over-count on an interior shard can reconstruct into an index that still falls inside `[0, N)`,
-because that index legitimately belongs to a later shard. Resolving it as pre-queue would hand two
-visitors the same position.
-
-**Can one deployment run two events?**
-No. `event_id` is a Terraform variable and every Lambda carries it as `EVENT_ID`. The key builders
-are written so a second event could share the tables, and a test pins the one collision that would
-cause — an `event_id` containing `#` — but nothing else in the deployment is parameterized per
-event.
-
-**What happens when the signing key is compromised?**
-Everything. One per-deployment key signs every session cookie the edge gate verifies, so holding
-it mints admission for the whole event. Terraform generates it, so changing it
-means forcing `random_bytes.signing_key` to regenerate — which invalidates every live session, so
-it is a between-events operation rather than a routine one.
-
----
-
-## Appendix — Request paths
-
-```
-join:      CloudFront [/v1/join, uncached]
-             → API Gateway REST (type: aws, SQS SendMessage)
-             → SQS  → assign_position → DynamoDB
+join:      CloudFront [/v1/join, uncached, forwards content-type only]
+             → API Gateway REST (type: aws, SQS SendMessage) → SQS → assign_position → DynamoDB
 
 poll:      CloudFront [/v1/status, Min TTL 1 s, path-only key, no cookies]
              → API Gateway → read → DynamoDB (1 s in-process cache)
 
-number:    CloudFront [/v1/queue_num, Min TTL 1 s, keyed per visitor]
-             → API Gateway → read → DynamoDB   (once per visitor)
+number:    CloudFront [/v1/queue_num, Min TTL 1 s, keyed on event_id + request_id]
+             → API Gateway → read → DynamoDB            (asked once per visitor)
 
-admit:     CloudFront [/v1/generate_token, uncached, AllViewerExceptHostHeader]
-             → API Gateway → generate_token
-             → DynamoDB (check position, record arrival)
-             → 1 Set-Cookie header (HMAC session credential)
+admit:     CloudFront [/v1/generate_token, uncached, cookies + viewer address forwarded]
+             → API Gateway → generate_token → DynamoDB → Set-Cookie (signed session)
+
+no-JS:     CloudFront [/v1/enter, /v1/wait, as admit]
+             → API Gateway → nojs → SQS (join) / generate_token::admit (wait)
 
 protected: CloudFront [/*, CloudFront Function at viewer-request]
-             ├─ valid session cookie → customer origin (or the demo fixture)
-             └─ missing/expired       → 302/403 → /_wr/waiting.html
+             ├─ no rule matches, or a valid session cookie → customer origin (or the demo fixture)
+             └─ otherwise → 302 to /_wr/waiting.html, or 403 JSON for XHR
 
-open:      EventBridge Scheduler at(operator's time)   [always; disabled until set]
-             → open_event → BatchGetItem ×10 → one guarded UpdateItem
+open:      EventBridge Scheduler at(start time)   [always created; disabled until the operator sets it]
+             → open_event → BatchGetItem ×10 shards → one guarded UpdateItem
 
-meter:     EventBridge Scheduler rate(1 minute)        [always]
-             → controller, six durable passes at 10 s
-             → DynamoDB (sum arrivals, advance cursor, scan and expire)
+meter:     EventBridge Scheduler rate(1 minute)   [always created]
+             → controller, six durable passes 10 s apart → DynamoDB
 ```
+
+### Cache behaviours
+
+| Path | Cache policy | Forwarded to origin | Origin |
+|---|---|---|---|
+| `/*` (default) | CachingDisabled | Session cookie, all viewer headers and query strings (none for the demo fixture) | Protected origin, gated |
+| `/_wr/*` | Cached | Nothing | Private S3 bucket, ungated |
+| `/v1/status` | Min TTL 1 s, key: path | Nothing | API Gateway |
+| `/v1/queue_num` | Min TTL 1 s, key: path + `event_id` + `request_id` | Those two query strings | API Gateway |
+| `/v1/join` | CachingDisabled | `content-type` | API Gateway |
+| `/v1/generate_token`, `/v1/enter`, `/v1/wait` | CachingDisabled | All cookies and query strings; `content-type`, `referer`, `CloudFront-Viewer-Address` | API Gateway |
+| `/admin`, `/admin/*`, `/static/*` | CachingDisabled | AllViewerExceptHostHeader | API Gateway |
+
+`polled_min_ttl_seconds` is validated `> 0`: a zero minimum TTL, or any forwarded cookie, disables
+request collapsing and every poll reaches the origin
+([ADR-0013](adr/0013-cache-behaviour-separation.md)). The minting paths forward cookies because
+CloudFront strips `Set-Cookie` from a behaviour that forwards none. `/_wr/*` sits outside the gate
+so a refusal cannot loop, and a `check` block asserts the waiting page falls under it.
+
+## 4. Join
+
+API Gateway validates the body against a JSON Schema before anything runs: `request_id` (≤ 36
+characters), `event_id` (≤ the length of this deployment's id) and `h`, the 43-character base64url
+digest of the visitor's possession secret ([ADR-0035](adr/0035-request-id-proof-of-possession.md)),
+all required, no other properties. The integration sends the body as the SQS message; a 2xx from
+SQS maps to 200, anything else to a fixed 502.
+
+The queue has a 181 s visibility timeout (6 × 30 s + the 1 s window) and moves a message to the DLQ
+after 5 receives. The event source mapping uses `BatchSize` 100, a 1 s batching window and
+`ReportBatchItemFailures`, with `maximum_concurrency` capped at the function's reserved
+concurrency.
+
+Batch size 100 is load-bearing: each invocation makes one `ADD queue_counter`, and that single
+item's write ceiling is about 1,000/s (arithmetic in [DYNAMODB.md §3](./DYNAMODB.md#3-amortise-the-sequence-across-a-batch)).
+The cost is latency on a quiet queue: any batching window lets Lambda wait up to about 20 s before
+invoking, so a lone test join can take that long to get a position.
+
+`assign_position` drops, without retry, a record whose body does not parse, whose `event_id` is
+not this deployment's, or whose `request_id` is not UUID-shaped (36 characters, hyphens at 8, 13,
+18, 23). Dropped records claim nothing.
+
+## 5. Position assignment
+
+`assign_position` reads the event's `Counters` item once per batch, strongly consistent, and every
+valid record in the batch takes the same path:
+
+| State | Path |
+|---|---|
+| The open has run (`shuffle_seed`, `participant_count`, `prequeue_offsets` all present), in any phase | Live join |
+| Not opened, phase `pre_queue` | Pre-queue registration |
+| Not opened, any other phase, or no `Counters` item | Every record fails and retries |
+
+The branch is on the open outputs, not the phase: an operator can walk the phase back after an
+open without undoing the index space. Refusing joins before setup matters because the open's
+`SET queue_counter = N` would overwrite any earlier live increment and collide positions.
+
+**Pre-queue.** The invocation draws one shard uniformly at random (issue #59), drops duplicates
+within the batch and any id that already has a `PreQueue` row, and claims a contiguous block of
+local indices on that shard with one `ADD n`. Each row `{r, s, l, t, h}` is written with
+`attribute_not_exists(r)`. Shard striping is [ADR-0015](adr/0015-stripe-prequeue-counter.md).
+
+**The open.** `open_event` reads the ten shard counts with one consistent `BatchGetItem`, computes
+`offset[s] = Σ counts[0..s)` and `N`, and writes seed, `N`, offsets, `queue_counter = N` and
+`phase = active` in one `UpdateItem` guarded by `attribute_not_exists(shuffle_seed) AND phase =
+:pre_queue`. A double-fire or retry fails the guard and reports `AlreadyOpen`. Both the schedule
+and `/admin/open_now` go through this one function.
+
+**Position on read.** `position = PRP(shuffle_seed, offset[s] + l, N)`. The PRP is a 4-round
+balanced Feistel network over the smallest power of four ≥ `N`, cycle-walked into `[0, N)`, with
+round function `be_u32(HMAC-SHA256(seed, r ‖ be_u32(x))[0..4]) & mask` (`aws-lc-rs`). The byte
+encoding is pinned by frozen vectors computed from an independent implementation, so a third party
+can recompute any position from the published seed. Four rounds is enough because the seed is not
+a long-term secret: it does not exist before the open and is published after it.
+
+**Live join.** One `ADD queue_counter :n` with `ALL_NEW` claims `[end − n + 1, end]` for the `n`
+valid records, then each `Positions` row is written with `attribute_not_exists(request_id)`. The
+open leaves `queue_counter` at `N`, so the first live joiner gets `N + 1`; position `N` is a
+permitted gap.
+
+**A join that races the open.** A shard claim can land after `open_event` read that shard. The row
+then lies past its shard's opened count (checked per shard, never against a global `N`, or an
+over-count on an interior shard would alias a later shard's range) and resolves as a live join.
+After its pre-queue writes, `assign_position` re-reads `Counters` and gives every row it wrote
+that now resolves that way a real live position. Failures in that fix-up are swallowed rather than
+retried, because redelivery would mint a second position.
+
+One case stays open: a `PreQueue` write that times out client-side but landed is reported as a
+failure; redelivery takes the live path, and the visitor holds both a counted `PreQueue` row and a
+`Positions` row.
+
+## 6. Waiting
+
+`GET /v1/status` returns `event_id`, `phase`, `serving_state`, `serving_position`, and, when set,
+`participant_count`, `prequeue_offsets`, `shuffle_seed` (hex, only after the open), `message`,
+`target_rate` (visitors per second), `starts_at` and `poll_policy`. `serving_state` is derived from
+phase and admission control on every read ([ADR-0019](adr/0019-visitor-facing-serving-state.md)).
+Publishing the seed with the offsets and `N` lets anyone audit the whole ordering; a visitor's own
+shard and index come from `GET /v1/queue_num`.
+
+`waiting.js`:
+
+- asks `/v1/queue_num` only until it knows its position, since a position never changes; every
+  later tick fetches `/v1/status` alone, which CloudFront collapses;
+- delays that first ask by a random slice of `min(60 s, participants / 5000 s⁻¹)` so the cohort
+  does not ask at once (at 1,000,000 participants that is about 16,700 requests/s, above the
+  default 10,000/s API Gateway account throttle);
+- polls at `clamp(floor, ceiling, secondsAhead × 1000 / divisor)` plus up to 30 % jitter, from the
+  Terraform-set `poll_policy` ([ADR-0023](adr/0023-adaptive-poll-interval.md)), defaulting to a
+  fixed 5 s;
+- stops polling while the tab is hidden and catches up when it is visible, never faster than the
+  floor;
+- re-joins with the same request id after eight consecutive 404s from `/v1/queue_num`, enough to
+  clear the event source mapping's 20 s worst case;
+- treats any response carrying `x-amzn-waf-action` as "renew the WAF token on `/_wr/verify.html`",
+  never as success.
+
+## 7. Admission
+
+### 7.1 The controller
+
+EventBridge Scheduler fires `rate(1 minute)` through the universal `aws-sdk:lambda:invoke` target
+with `InvocationType: Event` and a qualified function name; a durable execution is pinned to the
+version that started it. Each execution runs six passes ten seconds apart, and each gap is a
+durable wait that suspends the execution instead of billing it
+([ADR-0022](adr/0022-durable-controller-cadence.md)); `execution_timeout = 120`, retention 7 days.
+
+A pass runs only when `phase = active` and the resolved admission control is `Open`; otherwise it
+writes nothing.
+
+```
+observed  = Σ arrivals − last_arrivals_total
+released  = serving_counter − last_serving_counter
+no_show   = 1 − clamp(observed / released, 0, 1)
+smoothed  = 0.3 × no_show + 0.7 × previous                      // EWMA
+release   = min(target_rate × 10 / (1 − smoothed), 2 × target_rate × 10)
+next      = clamp(serving_counter + release, serving_counter, queue_counter + 1)
+```
+
+With nothing released last interval, or when the previous open pass is older than two intervals
+(an operator hold froze the baselines), the pass releases the raw target and carries the EWMA
+unchanged. All arithmetic saturates. The cursor never passes `queue_counter + 1`, so admission
+credit is not banked against an empty queue. The write is guarded on `serving_counter =
+:expected`, so overlapping executions cannot double-advance.
+
+The controller expires nothing. A position lives until DynamoDB TTL reclaims its row 24 hours
+after its last write, and the no-show correction compensates for absentees
+([ADR-0031](adr/0031-remove-controller-driven-expiry.md)).
+
+### 7.2 Minting the session
+
+`POST /v1/generate_token` takes `request_id` and the possession `secret`. `generate_token::admit`,
+which `nojs` also calls, reads `Positions` first and `PreQueue` only when no row answers, then
+decides:
+
+| Check, in order | Refusal |
+|---|---|
+| `request_id` or `secret` missing or malformed | 400 |
+| No `Positions` or `PreQueue` row | 404 |
+| The secret's digest does not match the row's `h` | 403 |
+| Resolved admission control not `Open`, or phase not `active` | 409 |
+| Event not opened | 409 |
+| A straggler row with no live position | 404 |
+| Corrupt row | 500 |
+| `position ≥ serving_counter` | 425, keep polling |
+
+Admission control is resolved by `wr_common::resolve(stored, fail_open_until, now)`; `FailOpen` is
+never stored.
+
+The admission is then **claimed once** ([ADR-0033](adr/0033-admission-claimed-once-per-visitor.md)):
+an `UpdateItem` on the `Positions` row setting `status = admitted`, guarded by
+`attribute_not_exists(request_id) OR status = issued`. It claims a live joiner's row or creates a
+pre-queue member's. Only the winner records an arrival on a random arrivals shard; a repeat (reload,
+second tab, lost response) is still admitted with a fresh session. A failed claim counts the
+arrival anyway, and a failed arrival write is logged as `arrival_record_failed` and the visitor
+admitted: over-counting under-releases, which is the safer error.
+
+The session is a compact JWS (HS256) signed under a key derived from the deployment secret with a
+per-kind label ([ADR-0024](adr/0024-jws-credentials.md)), carrying the event as `aud`, the expiry,
+and a keyed tag of the viewer's IPv4 address or IPv6 /64 from `CloudFront-Viewer-Address`:
+
+```
+<session_cookie_name>=<jws>; Path=/; Max-Age=<session_ttl_seconds>; Secure; HttpOnly; SameSite=Lax
+```
+
+`session_ttl_seconds` defaults to 3,600. The signing key is read from SSM once at cold start.
+Terraform generates it (`random_bytes.signing_key`) and writes it to both SSM and the gate's
+KeyValueStore in the same apply.
+
+## 8. The gate
+
+A `cloudfront-js-2.0` function on the default behaviour at viewer-request reads its config (`c`)
+and the signing secret (`k`) from one KeyValueStore. `event_id`, the cookie name and the waiting
+path are templated into its source. It first strips any inbound `x-wr-gate`/`x-wr-gate-failed`
+header, then:
+
+1. No rule in the ruleset matches → pass through. An empty ruleset is dormancy.
+2. Now is before `enforce_from` → pass, `x-wr-gate: pending`. Before `fail_open_until` → pass,
+   `x-wr-gate: failopen`.
+3. Missing cookie, bad signature, wrong event, expired, or — with IP binding on — a different
+   network → refuse with reason `none`/`signature`/`event`/`expired`/`ip`: a 302 to
+   `waiting.html?r=<reason>&next=<destination>` for navigation, 403 JSON with `x-wr-reason` for
+   XHR.
+4. Otherwise pass through.
+
+If the function throws (unreadable store, unknown config version) it passes the request with
+`x-wr-gate-failed: true`. That is the gate failing, not a backend fail-open: it makes no network
+calls and cannot observe the backend. Cross-language conformance with `wr_common::crypto` and
+`wr_common::rules` is checked by `infra/modules/edge/tests/*.conformance.test.js` against vectors
+from `crates/wr-common/tests/vectors.rs`. The function must stay under CloudFront's 10,240-byte
+limit (a precondition), with a warning past 9,000.
+
+## 9. Edge protection
+
+**Origin key** ([ADR-0038](adr/0038-edge-web-acl-on-flat-rate-plan.md)). Every REST method sets
+`api_key_required`, and only the distribution holds the key, sent as an `x-api-key` origin custom
+header. A request straight to `execute-api` is refused with 403 before any integration runs, and
+is not billed. A terraform test fails if a method does not require it.
+
+**Web ACL.** Created only when `flat_rate_plan_tier` is set; `edge/plan.tf` subscribes the
+distribution, the ACL and the KeyValueStore to the plan, which bundles their cost (on pay-as-you-go
+the ACL would bill between events, breaking N1). It requires a WAF token on the JavaScript API
+paths (`/v1/join|status|queue_num|generate_token`), earned by a challenge on `/_wr/verify.html`;
+rate-limits per token and per IP (per-IP join limits escalate to CAPTCHA); and runs the AWS
+managed rules (Anti-DDoS, IP reputation, Bot Control common, anonymous IP) in Count until
+`waf_managed_rules_mode = "enforce"`. The no-JavaScript paths and `waiting.html` are never
+challenged; they get a strict per-IP limit, anonymous-network blocking, and `nojs_enabled = false`
+to close them for an event.
+
+**No-JavaScript queue** ([ADR-0037](adr/0037-no-javascript-queue.md)). `waiting.html`'s
+`<noscript>` form posts to `/v1/enter`, which mints the same UUIDv7 and possession secret the
+script would, keeps them in an `HttpOnly` cookie scoped to `/v1/`, and sends the same `{request_id,
+event_id, h}` message to the join queue. `/v1/wait` is a self-refreshing server-rendered page that
+calls `generate_token::admit`, so there is one way a session is minted.
+
+## 10. The operator surface
+
+The admin Lambda serves an Axum router behind an API Gateway greedy proxy:
+
+| Route | Method | Does |
+|---|---|---|
+| `/admin`, `/admin/state` | GET | Dashboard (with the readiness panel) and JSON state |
+| `/admin/login`, `/admin/callback`, `/admin/logout` | GET | OIDC Authorization Code + PKCE ([ADR-0016](adr/0016-admin-oidc-dynamodb-sessions.md)) |
+| `/admin/phase` | POST | Phase transition from an expected prior phase; refuses `active`, which only the open can set |
+| `/admin/start_time` | POST | Sets or clears the start time and arms the open schedule |
+| `/admin/open_now` | POST | Invokes `open_event` now |
+| `/admin/rate`, `/admin/message` | POST | Target rate (guarded on the prior rate), operator broadcast |
+| `/admin/pause`, `/admin/resume` | POST | Admission control `open` ↔ `paused` |
+| `/admin/fail_open`, `/admin/recover` | POST | Sets and clears `fail_open_until`, mirrored to the KeyValueStore |
+| `/admin/force_maintenance` | POST | Emergency stop: maintenance from any phase, not debounced |
+| `/admin/rules` | POST | Replaces the gate's ruleset in the KeyValueStore, audited on `Counters` |
+| `/admin/ip_binding` | POST | Turns session IP binding on or off ([ADR-0036](adr/0036-optional-session-ip-binding.md)) |
+
+API Gateway authorization is `NONE` (plus the origin key); the Lambda enforces an OIDC session
+stored in `Tokens` and the `OIDC_ALLOWED_EMAILS` allowlist, which denies everyone when empty, and
+the apply fails if it is. Every mutation is guarded on its expected prior value (a concurrent
+change is a 409) and debounced 2 s on `last_action_epoch_ms`, and writes its audit attributes in
+the same `UpdateItem` ([DYNAMODB.md §5](./DYNAMODB.md#5-conditional-writes)). Rendering is askama
+templates with one plain-CSS stylesheet; no React, no bundler
+([ADR-0018](adr/0018-admin-vouch-design-language.md)).
+
+## 11. Tests
+
+[`.kiro/steering/testing.md`](../.kiro/steering/testing.md) lists the properties that must stay
+proven. The core ones:
+
+| Property | Test |
+|---|---|
+| Wire encoding frozen | `frozen_wire_encoding_vectors` (14 `(seed, N)` cases up to N = 1,000,000), `frozen_round_function_encoding` |
+| Bijective | `prop_bijective` (arbitrary seed, `n < 2000`), `bijective_over_small_domains` |
+| In domain | `prop_in_domain` |
+| Uniform | `prop_uniform_by_decile` (χ² over 10 deciles at `n = 10,000`, below the p = 0.001 critical value) |
+| Keys distinct | `shard_keys_are_distinct_partition_keys`, `the_tokens_table_key_space_does_not_collide_across_kinds` |
+| Release bounded | `near_total_no_show_is_bounded_at_cap`, `zero_arrivals_is_bounded_at_cap_not_infinite` |
+| Gate conformance | `infra/modules/edge/tests/gate.conformance.test.js` |
+
+## 12. Known gaps
+
+[`tasks.md`](../.kiro/specs/virtual-waiting-room/tasks.md) is the authoritative list. The ones that
+shape how the built system behaves:
+
+- **Fail-open and standby need an operator.** Nothing sets `fail_open_until` or a ruleset
+  automatically; the gate cannot see the backend (#58).
+- **Nothing bounds how many places one visitor holds.** `request_id` is client-minted, so volume
+  converts into share of the front (#59). The WAF token and rate limits raise the cost but do not
+  bound it.
+- **Sessions are bearer credentials** unless IP binding is on, and nothing revokes one (#63).
+  Minting one requires the possession secret, so a leaked request id admits no one.
+- **Sessions are not extended.** A visitor still on the origin when `session_ttl_seconds` lapses
+  returns to the queue; set it longer than the worst realistic visit.
+- **The admin Lambda can read the signing key.** Its KeyValueStore grant covers `k` as well as the
+  config, and IAM cannot narrow it.
+- **No concurrency term in the control law** (#65): nothing reports when a visitor leaves the
+  origin.
+- **GovCloud has no gate.** CloudFront Functions are not offered there (N4).
+
+## 13. FAQ
+
+**Why a REST API rather than an HTTP API?** Only REST supports request validators and the `AWS`
+service integration to SQS, which keep malformed bodies and Lambda out of the burst path
+([ADR-0005](adr/0005-rest-api-not-http-api.md)).
+
+**Can one deployment run two events?** No. `event_id` is a deployment variable. The key builders
+would let two events share tables (`event_id` may not contain `#`), but nothing else is
+parameterised per event, and `Positions` rows carry no `event_id`.
+
+**What if the signing key is compromised?** It mints admission for the whole event. Rotate by
+forcing `random_bytes.signing_key` to regenerate and applying, which invalidates every live
+session, so it is a between-events operation.
