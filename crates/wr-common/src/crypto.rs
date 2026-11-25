@@ -281,7 +281,7 @@ fn is_b64url_32(s: &str) -> bool {
 
 /// The visitor's proof that a `request_id` is theirs (issue #62, ADR-0035):
 /// 32 random bytes, generated in the browser next to the `request_id` and
-/// never sent anywhere but `/v1/generate_token`. The join carries only its
+/// never sent anywhere but `/_wr/v1/generate_token`. The join carries only its
 /// [`SecretDigest`], so the value that appears in URLs, caches and logs — the
 /// `request_id` — is no longer enough to be admitted as its holder.
 #[derive(Clone, PartialEq, Eq)]

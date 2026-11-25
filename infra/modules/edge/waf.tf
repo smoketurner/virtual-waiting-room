@@ -28,6 +28,10 @@
 # requires it; on pay-as-you-go it bills per ACL and per rule between events,
 # which N1 does not allow.
 #
+# Every match on the URI path decodes and normalises it first (URL_DECODE, then
+# NORMALIZE_PATH), so /_wr/v1/%6Aoin and /_wr/v1//join are the same path to these rules
+# as they are to whatever serves them (issue #245).
+#
 # Only rules the flat-rate plans accept are used: no rule groups of our own,
 # no Targeted Bot Control, no ATP/ACFP. The Business plan's 50-rule allowance
 # covers everything here.
@@ -40,25 +44,29 @@ locals {
   waf_token_cookie = "aws-waf-token"
 
   # Paths waiting.js calls. Listed rather than matched by prefix because the
-  # no-JavaScript paths share /v1/ and must not be challenged; a new JS endpoint
+  # no-JavaScript paths share /_wr/v1/ and must not be challenged; a new JS endpoint
   # has to be added here to be covered, which the terraform test checks.
-  waf_js_api_regex = "^/v1/(join|status|queue_num|generate_token)$"
+  waf_js_api_regex = "^${local.api_prefix}/(join|status|queue_num|generate_token)$"
 
   # Where waiting.js sends a browser to earn a token. Only a JavaScript client
   # ever navigates here, so challenging it cannot lock out a no-JS visitor.
-  waf_verify_path = "/_wr/verify.html"
+  waf_verify_path = "${local.room_prefix}/verify.html"
 
   # The two requests a visitor makes to take a place: earning a token and
   # posting the join. Counted together per IP, so a CAPTCHA triggered by the
   # join is shown on the verify page waiting.js navigates to in response.
-  waf_join_regex = "^(/v1/join|${replace(local.waf_verify_path, ".", "\\.")})$"
+  waf_join_regex = "^(${local.join_path}|${replace(local.waf_verify_path, ".", "\\.")})$"
 
-  waf_nojs_regex = "^/v1/(enter|wait)$"
-  waf_nojs_join  = "/v1/enter"
+  waf_nojs_regex = "^${local.api_prefix}/(enter|wait)$"
+  waf_nojs_join  = "${local.api_prefix}/enter"
+  waf_nojs_wait  = "${local.api_prefix}/wait"
 
-  # Everything the waiting room itself serves. Managed rules are scoped to it
-  # so they never change what the customer's origin sees.
-  waf_room_regex = "^/(v1|_wr)/"
+  # Everything the waiting room serves to visitors: its API and its pages,
+  # which sit directly under the prefix. Managed rules are scoped to it so
+  # they never change what the customer's origin sees. The operator console
+  # shares the prefix (issue #251) and is left out, as it was before it moved:
+  # an operator on a VPN must not be locked out by the anonymous-IP list.
+  waf_room_regex = "^${local.room_prefix}/(v1/|[^/]+$)"
 
   waf_anonymous_ip_namespace = "awswaf:managed:aws:anonymous-ip-list:"
 
@@ -144,7 +152,7 @@ resource "aws_wafv2_web_acl" "this" {
                 usage_of_action = "ENABLED"
 
                 exempt_uri_regular_expression {
-                  regex_string = "^/(v1|admin|static)/"
+                  regex_string = "^${local.room_prefix}/(v1|admin|static)/"
                 }
               }
             }
@@ -188,7 +196,11 @@ resource "aws_wafv2_web_acl" "this" {
             }
             text_transformation {
               priority = 0
-              type     = "NONE"
+              type     = "URL_DECODE"
+            }
+            text_transformation {
+              priority = 1
+              type     = "NORMALIZE_PATH"
             }
           }
         }
@@ -227,7 +239,11 @@ resource "aws_wafv2_web_acl" "this" {
             }
             text_transformation {
               priority = 0
-              type     = "NONE"
+              type     = "URL_DECODE"
+            }
+            text_transformation {
+              priority = 1
+              type     = "NORMALIZE_PATH"
             }
           }
         }
@@ -275,7 +291,11 @@ resource "aws_wafv2_web_acl" "this" {
             }
             text_transformation {
               priority = 0
-              type     = "NONE"
+              type     = "URL_DECODE"
+            }
+            text_transformation {
+              priority = 1
+              type     = "NORMALIZE_PATH"
             }
           }
         }
@@ -311,7 +331,11 @@ resource "aws_wafv2_web_acl" "this" {
         }
         text_transformation {
           priority = 0
-          type     = "NONE"
+          type     = "URL_DECODE"
+        }
+        text_transformation {
+          priority = 1
+          type     = "NORMALIZE_PATH"
         }
       }
     }
@@ -342,7 +366,11 @@ resource "aws_wafv2_web_acl" "this" {
         }
         text_transformation {
           priority = 0
-          type     = "NONE"
+          type     = "URL_DECODE"
+        }
+        text_transformation {
+          priority = 1
+          type     = "NORMALIZE_PATH"
         }
       }
     }
@@ -350,6 +378,92 @@ resource "aws_wafv2_web_acl" "this" {
     visibility_config {
       cloudwatch_metrics_enabled = true
       metric_name                = "${var.name_prefix}-api-requires-token"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  # WAF also accepts the token in an x-aws-waf-token header, and the per-token
+  # limits below key on the cookie: a request that sends the token only in the
+  # header passes the challenge above and is counted by neither (issue #245).
+  # The page gets its token from the verify-page interstitial, which sets the
+  # cookie, so a tokened request without it is not the page.
+  #
+  # Ordered after the challenge on purpose: a request with no token at all is
+  # ended there with the 202 waiting.js acts on, so only a request that already
+  # holds a valid token reaches this rule. Before it, this would refuse every
+  # visitor's first call instead of sending them to the verify page.
+  #
+  # Enforced by default. A browser that got its token from the interstitial
+  # holds the cookie, and one with cookies disabled never gets a token at all,
+  # so nothing honest reaches this rule without it. `waf_require_token_cookie`
+  # drops it to Count for a deployment that wants to watch first. An oversized
+  # cookie header counts as carrying the cookie.
+  rule {
+    name     = "api-token-cookie-required"
+    priority = 12
+
+    action {
+      dynamic "block" {
+        for_each = var.waf_require_token_cookie ? [1] : []
+        content {
+          custom_response {
+            response_code = 403
+          }
+        }
+      }
+      dynamic "count" {
+        for_each = var.waf_require_token_cookie ? [] : [1]
+        content {}
+      }
+    }
+
+    statement {
+      and_statement {
+        statement {
+          regex_match_statement {
+            regex_string = local.waf_js_api_regex
+            field_to_match {
+              uri_path {}
+            }
+            text_transformation {
+              priority = 0
+              type     = "URL_DECODE"
+            }
+            text_transformation {
+              priority = 1
+              type     = "NORMALIZE_PATH"
+            }
+          }
+        }
+        statement {
+          not_statement {
+            statement {
+              size_constraint_statement {
+                comparison_operator = "GT"
+                size                = 0
+                field_to_match {
+                  cookies {
+                    match_scope       = "VALUE"
+                    oversize_handling = "MATCH"
+                    match_pattern {
+                      included_cookies = [local.waf_token_cookie]
+                    }
+                  }
+                }
+                text_transformation {
+                  priority = 0
+                  type     = "NONE"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "${var.name_prefix}-api-token-cookie-required"
       sampled_requests_enabled   = true
     }
   }
@@ -391,14 +505,18 @@ resource "aws_wafv2_web_acl" "this" {
 
         scope_down_statement {
           byte_match_statement {
-            search_string         = "/v1/join"
+            search_string         = local.join_path
             positional_constraint = "EXACTLY"
             field_to_match {
               uri_path {}
             }
             text_transformation {
               priority = 0
-              type     = "NONE"
+              type     = "URL_DECODE"
+            }
+            text_transformation {
+              priority = 1
+              type     = "NORMALIZE_PATH"
             }
           }
         }
@@ -414,7 +532,7 @@ resource "aws_wafv2_web_acl" "this" {
 
   # A ceiling on the whole JS API per token. The page's own floor is one poll
   # every few seconds; this is well above it and far below a script hammering
-  # /v1/queue_num with invented ids to force origin misses.
+  # /_wr/v1/queue_num with invented ids to force origin misses.
   rule {
     name     = "api-per-token"
     priority = 21
@@ -452,7 +570,11 @@ resource "aws_wafv2_web_acl" "this" {
             }
             text_transformation {
               priority = 0
-              type     = "NONE"
+              type     = "URL_DECODE"
+            }
+            text_transformation {
+              priority = 1
+              type     = "NORMALIZE_PATH"
             }
           }
         }
@@ -493,7 +615,11 @@ resource "aws_wafv2_web_acl" "this" {
             }
             text_transformation {
               priority = 0
-              type     = "NONE"
+              type     = "URL_DECODE"
+            }
+            text_transformation {
+              priority = 1
+              type     = "NORMALIZE_PATH"
             }
           }
         }
@@ -541,7 +667,11 @@ resource "aws_wafv2_web_acl" "this" {
             }
             text_transformation {
               priority = 0
-              type     = "NONE"
+              type     = "URL_DECODE"
+            }
+            text_transformation {
+              priority = 1
+              type     = "NORMALIZE_PATH"
             }
           }
         }
@@ -582,7 +712,11 @@ resource "aws_wafv2_web_acl" "this" {
           }
           text_transformation {
             priority = 0
-            type     = "NONE"
+            type     = "URL_DECODE"
+          }
+          text_transformation {
+            priority = 1
+            type     = "NORMALIZE_PATH"
           }
         }
       }
@@ -626,7 +760,11 @@ resource "aws_wafv2_web_acl" "this" {
             }
             text_transformation {
               priority = 0
-              type     = "NONE"
+              type     = "URL_DECODE"
+            }
+            text_transformation {
+              priority = 1
+              type     = "NORMALIZE_PATH"
             }
           }
         }
@@ -636,6 +774,57 @@ resource "aws_wafv2_web_acl" "this" {
     visibility_config {
       cloudwatch_metrics_enabled = true
       metric_name                = "${var.name_prefix}-nojs-per-ip"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  # The no-JS waiting page reloads itself, at most every five seconds near the
+  # front, and every load runs the nojs function and its DynamoDB reads. The
+  # join limit above does not cover it, so without this one address can hold
+  # the function's small reserved concurrency and stall every no-JS visitor
+  # (issue #245).
+  rule {
+    name     = "nojs-wait-per-ip"
+    priority = 43
+
+    action {
+      block {
+        custom_response {
+          response_code            = 429
+          custom_response_body_key = "nojs_refused_html"
+        }
+      }
+    }
+
+    statement {
+      rate_based_statement {
+        limit                 = var.waf_nojs_wait_ip_limit
+        evaluation_window_sec = 300
+        aggregate_key_type    = "IP"
+
+        scope_down_statement {
+          byte_match_statement {
+            search_string         = local.waf_nojs_wait
+            positional_constraint = "EXACTLY"
+            field_to_match {
+              uri_path {}
+            }
+            text_transformation {
+              priority = 0
+              type     = "URL_DECODE"
+            }
+            text_transformation {
+              priority = 1
+              type     = "NORMALIZE_PATH"
+            }
+          }
+        }
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "${var.name_prefix}-nojs-wait-per-ip"
       sampled_requests_enabled   = true
     }
   }
@@ -679,7 +868,11 @@ resource "aws_wafv2_web_acl" "this" {
             }
             text_transformation {
               priority = 0
-              type     = "NONE"
+              type     = "URL_DECODE"
+            }
+            text_transformation {
+              priority = 1
+              type     = "NORMALIZE_PATH"
             }
           }
         }

@@ -45,6 +45,10 @@ impl WaitHtml {
                 "We couldn't confirm this place is yours",
                 "Join again to take a new place in line.",
             ),
+            WaitPage::JoinLost => (
+                "We couldn't get you a place in line",
+                "Your request to join didn't go through. Join again to take a place in line.",
+            ),
             WaitPage::Unavailable => (
                 "The waiting room is having trouble",
                 "You keep your place. This page will try again on its own.",
@@ -59,13 +63,20 @@ impl WaitHtml {
             | WaitPage::Joining
             | WaitPage::Holding
             | WaitPage::Lost
+            | WaitPage::JoinLost
             | WaitPage::Unavailable => None,
         };
         Self {
             title,
             sub,
             queued,
-            show_form: matches!(page, WaitPage::NotInLine | WaitPage::Lost),
+            show_form: match page {
+                WaitPage::NotInLine | WaitPage::Lost | WaitPage::JoinLost => true,
+                WaitPage::Joining
+                | WaitPage::Queued { .. }
+                | WaitPage::Holding
+                | WaitPage::Unavailable => false,
+            },
             refresh: page.refresh_secs(),
             next_encoded: encode_component(next),
         }
@@ -133,10 +144,22 @@ mod tests {
             .render()
             .unwrap();
         assert!(
-            html.contains(r#"action="/v1/enter?next=%2Fcheckout%3Fid%3D1""#),
+            html.contains(r#"action="/_wr/v1/enter?next=%2Fcheckout%3Fid%3D1""#),
             "{html}"
         );
         assert!(!html.contains("http-equiv"), "nothing to wait for yet");
+    }
+
+    #[test]
+    fn a_visitor_whose_join_was_lost_is_told_and_given_the_form_back() {
+        // Not the "Joining" page, which refreshes forever and offers nothing
+        // (issue #251).
+        let html = WaitHtml::of(&WaitPage::JoinLost, "/checkout")
+            .render()
+            .unwrap();
+        assert!(html.contains("didn&#39;t go through") || html.contains("didn't go through"));
+        assert!(html.contains(r#"action="/_wr/v1/enter?next=%2Fcheckout""#));
+        assert!(!html.contains("http-equiv"), "nothing left to wait for");
     }
 
     #[test]

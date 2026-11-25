@@ -23,7 +23,10 @@ resource "aws_cloudfront_key_value_store" "gate" {
 #
 # ignore_changes because the admin Lambda owns this key from here: it mutates
 # fail_open_until (the 'f' field) and replaces the ruleset out of band, so
-# Terraform seeds the value and then never touches it again.
+# Terraform seeds the value and then never touches it again. That includes a
+# change of event_id (main.tf, terraform_data.event_id): the value names no
+# event, and replacing the key would leave the gate with no configuration
+# between the delete and the create.
 resource "aws_cloudfrontkeyvaluestore_key" "config" {
   key                 = "c"
   key_value_store_arn = aws_cloudfront_key_value_store.gate.arn
@@ -46,5 +49,14 @@ resource "aws_cloudfrontkeyvaluestore_key" "config" {
 resource "aws_cloudfrontkeyvaluestore_key" "secret" {
   key                 = "k"
   key_value_store_arn = aws_cloudfront_key_value_store.gate.arn
-  value               = random_bytes.signing_key.base64
+  value               = random_bytes.signing_key[local.signing_key_current].base64
+}
+
+# 'kp': the previous generation's key, which the gate tries only once 'k' has
+# refused a signature (issue #247). Nothing mints with it. On a first deploy
+# it is a key nobody has ever held, which accepts nothing.
+resource "aws_cloudfrontkeyvaluestore_key" "previous_secret" {
+  key                 = "kp"
+  key_value_store_arn = aws_cloudfront_key_value_store.gate.arn
+  value               = random_bytes.signing_key[local.signing_key_previous].base64
 }

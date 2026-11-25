@@ -26,7 +26,8 @@ pub trait RequestView {
 /// request no rule matches is unprotected and forwarded without a credential.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProtectionRule {
-    /// The request path starts with this prefix.
+    /// The request path starts with this prefix — or is one an origin might
+    /// canonicalise into anything at all ([`suspicious_path`], issue #242).
     PathPrefix(String),
     /// A request header equals this `(name, value)` pair (case-insensitive
     /// name and value).
@@ -43,7 +44,9 @@ impl ProtectionRule {
     pub fn matches<R: RequestView + ?Sized>(&self, req: &R) -> bool {
         match self {
             Self::PathPrefix(prefix) => {
-                normalized_path(req.path()).starts_with(prefix.to_ascii_lowercase().as_str())
+                let decoded = decoded_path(req.path());
+                suspicious_path(&decoded)
+                    || normalized_path(&decoded).starts_with(prefix.to_ascii_lowercase().as_str())
             }
             Self::Header { name, value } => req
                 .header(name)
@@ -99,29 +102,33 @@ fn percent_decode(s: &str) -> Vec<u8> {
     out
 }
 
-/// Normalizes a path the same way `gate.js.tftpl`'s `normalizedPath` does:
-/// per-byte percent-decoded (a malformed `%XX` is left literal, never thrown
-/// on), every run of `/` collapsed to one and every `.` segment removed —
-/// repeated until neither changes anything, so a stacked form such as
-/// `/././checkout` or `/.//checkout` cannot survive one pass — then
-/// case-folded. Defence in depth against a `PathPrefix` rule being evaded by
-/// a path an origin would treat as equivalent to the rule's own prefix,
-/// anywhere in the path (`/shop//checkout` under a `/shop/checkout` rule), not
-/// just at its start. Not a full RFC 3986 path resolver: `..`-segment
-/// resolution is deliberately not attempted.
-fn normalized_path(path: &str) -> String {
-    let mut p = String::from_utf8_lossy(&percent_decode(path)).into_owned();
-    loop {
-        let next = collapse_slashes(&p).replace("/./", "/");
-        if next == p {
-            break;
-        }
-        p = next;
-    }
-    if let Some(stem) = p.strip_suffix("/.") {
-        p = format!("{stem}/");
-    }
-    p.to_ascii_lowercase()
+/// The request path as an origin would first read it: per-byte
+/// percent-decoded, a malformed `%XX` left literal, never thrown on.
+fn decoded_path(path: &str) -> String {
+    String::from_utf8_lossy(&percent_decode(path)).into_owned()
+}
+
+/// Whether a decoded path carries something origins disagree about (issue
+/// #242): a `.` or `..` segment, a `;` (path parameters) or a backslash.
+/// `/x/../checkout`, `/shop;a/checkout` and `/shop\checkout` each reach a
+/// typical origin as a protected path while matching no prefix here, and no
+/// resolver at the edge can know which canonicalisation the origin applies.
+/// So the gate does not guess: every `PathPrefix` rule covers such a path, and
+/// it needs a session like any protected one. Mirrors `gate.js.tftpl`'s
+/// `SUSPICIOUS_RE`.
+fn suspicious_path(decoded: &str) -> bool {
+    decoded.contains([';', '\\']) || decoded.split('/').any(|seg| seg == "." || seg == "..")
+}
+
+/// Normalizes a decoded path the same way `gate.js.tftpl` does before its
+/// prefix comparison: every run of `/` collapsed to one, then case-folded.
+/// Defence in depth against a `PathPrefix` rule being evaded by a path an
+/// origin would treat as equivalent to the rule's own prefix, anywhere in the
+/// path (`/shop//checkout` under a `/shop/checkout` rule), not just at its
+/// start. Dot segments are not removed here: [`suspicious_path`] has already
+/// claimed any path that has one.
+fn normalized_path(decoded: &str) -> String {
+    collapse_slashes(decoded).to_ascii_lowercase()
 }
 
 /// Collapses every run of `/` to a single `/`.
@@ -174,6 +181,32 @@ pub enum RuleFieldError {
         rule_index: usize,
         field: &'static str,
     },
+    /// A path prefix that could never match (issue #242). The gate compares
+    /// against a decoded, slash-collapsed path and claims suspicious ones
+    /// before the comparison, so a prefix holding `%`, `//`, a `.` or `..`
+    /// segment, `;` or a backslash would save cleanly and protect nothing.
+    #[error("rule {rule_index}: path prefix contains {found}, which no request path can match")]
+    UnmatchablePathPrefix {
+        rule_index: usize,
+        found: &'static str,
+    },
+}
+
+/// What in a path prefix makes it unmatchable, if anything.
+fn unmatchable_in_prefix(prefix: &str) -> Option<&'static str> {
+    if prefix.contains('%') {
+        Some("a percent sign (write the decoded character instead)")
+    } else if prefix.contains("//") {
+        Some("a doubled slash")
+    } else if prefix.contains(';') {
+        Some("a semicolon")
+    } else if prefix.contains('\\') {
+        Some("a backslash")
+    } else if prefix.split('/').any(|seg| seg == "." || seg == "..") {
+        Some("a \".\" or \"..\" segment")
+    } else {
+        None
+    }
 }
 
 fn check_field(
@@ -211,6 +244,12 @@ pub fn validate_rule_fields(rules: &[ProtectionRule]) -> Result<(), RuleFieldErr
         match rule {
             ProtectionRule::PathPrefix(p) => {
                 check_field(i, "path prefix", p, MAX_PATH_PREFIX_BYTES)?;
+                if let Some(found) = unmatchable_in_prefix(p) {
+                    return Err(RuleFieldError::UnmatchablePathPrefix {
+                        rule_index: i,
+                        found,
+                    });
+                }
             }
             ProtectionRule::Cookie(name) => {
                 check_field(i, "cookie name", name, MAX_COOKIE_NAME_BYTES)?;
@@ -366,24 +405,104 @@ mod tests {
         ] {
             assert!(rule.matches(&req(evasion)), "evaded via {evasion:?}");
         }
-        for other in ["/shop/checkin", "/shop/../checkout", "/shop/.checkout"] {
+        for other in ["/shop/checkin", "/shop/.checkout", "/shop/..checkout"] {
             assert!(!rule.matches(&req(other)), "over-matched {other:?}");
         }
     }
 
     #[test]
+    fn a_path_an_origin_might_canonicalise_is_covered_by_any_path_rule() {
+        // #242: each reaches a typical origin as /checkout or /shop/checkout
+        // while matching neither prefix as written.
+        let rule = ProtectionRule::PathPrefix("/shop/checkout".to_owned());
+        for evasion in [
+            "/x/../shop/checkout",
+            "/%2e%2e/shop/checkout",
+            "/x/%2E%2e/shop/checkout",
+            "/shop/..",
+            "/shop;a/checkout",
+            "/shop%3Ba/checkout",
+            "/shop\\checkout",
+            "/shop%5ccheckout",
+            "/./about",
+            "..",
+        ] {
+            assert!(rule.matches(&req(evasion)), "evaded via {evasion:?}");
+        }
+    }
+
+    #[test]
+    fn a_suspicious_path_is_not_protected_without_a_path_rule() {
+        // Dormancy (#60) and a header-only ruleset stay untouched: the rule
+        // belongs to PathPrefix, not to the ruleset.
+        assert!(!matches_any(&[], &req("/x/../checkout")));
+        let rules = vec![ProtectionRule::Cookie("gate".to_owned())];
+        assert!(!matches_any(&rules, &req("/x/../checkout")));
+    }
+
+    #[test]
+    fn validate_rule_fields_rejects_a_path_prefix_that_could_never_match() {
+        for prefix in [
+            "/check%6fut",
+            "/shop//checkout",
+            "/shop/./checkout",
+            "/shop/../checkout",
+            "/shop/..",
+            "/shop;a",
+            "/shop\\checkout",
+        ] {
+            let rules = vec![
+                ProtectionRule::PathPrefix("/ok".to_owned()),
+                ProtectionRule::PathPrefix(prefix.to_owned()),
+            ];
+            assert!(
+                matches!(
+                    validate_rule_fields(&rules),
+                    Err(RuleFieldError::UnmatchablePathPrefix { rule_index: 1, .. })
+                ),
+                "accepted {prefix:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rule_fields_leaves_those_characters_alone_outside_a_path_prefix() {
+        let rules = vec![
+            ProtectionRule::PathPrefix("/shop/.well-known/a..b".to_owned()),
+            ProtectionRule::UserAgent("Mozilla/5.0 (X11; Linux) 100%".to_owned()),
+            ProtectionRule::Header {
+                name: "x-path".to_owned(),
+                value: "a//b;c\\d/../e".to_owned(),
+            },
+        ];
+        assert_eq!(validate_rule_fields(&rules), Ok(()));
+    }
+
+    #[test]
+    fn the_unmatchable_prefix_error_names_the_rule_and_the_cause() {
+        let rules = vec![ProtectionRule::PathPrefix("/a;b".to_owned())];
+        assert_eq!(
+            validate_rule_fields(&rules).unwrap_err().to_string(),
+            "rule 0: path prefix contains a semicolon, which no request path can match"
+        );
+    }
+
+    fn normalized(path: &str) -> String {
+        normalized_path(&decoded_path(path))
+    }
+
+    #[test]
     fn normalized_path_keeps_a_trailing_slash() {
-        assert_eq!(normalized_path("/checkout/"), "/checkout/");
-        assert_eq!(normalized_path("/checkout/."), "/checkout/");
-        assert_eq!(normalized_path("/"), "/");
-        assert_eq!(normalized_path("/."), "/");
+        assert_eq!(normalized("/checkout/"), "/checkout/");
+        assert_eq!(normalized("/checkout//"), "/checkout/");
+        assert_eq!(normalized("/"), "/");
     }
 
     #[test]
     fn normalized_path_leaves_malformed_percent_encoding_as_is() {
         // "%zz" is not valid hex; the raw bytes are kept rather than the
         // match failing outright, mirroring gate.js.tftpl's percentDecode.
-        assert_eq!(normalized_path("/foo%zzbar"), "/foo%zzbar");
+        assert_eq!(normalized("/foo%zzbar"), "/foo%zzbar");
     }
 
     #[test]
@@ -393,10 +512,10 @@ mod tests {
         // gate.js.tftpl's digit-by-digit `hexVal` leaves it literal. Decoding
         // per digit keeps the two in step: `%` followed by anything that is
         // not two hex digits stays literal in both.
-        assert_eq!(normalized_path("/%+41dmin"), "/%+41dmin");
-        assert_eq!(normalized_path("/a%+a"), "/a%+a");
+        assert_eq!(normalized("/%+41dmin"), "/%+41dmin");
+        assert_eq!(normalized("/a%+a"), "/a%+a");
         // A `+` that is itself percent-encoded still decodes, in both.
-        assert_eq!(normalized_path("/%2badmin"), "/+admin");
+        assert_eq!(normalized("/%2badmin"), "/+admin");
     }
 
     #[test]
@@ -405,8 +524,8 @@ mod tests {
         // escape and reverted the whole URI, dropping an earlier valid
         // decode and so evading a PathPrefix rule. Per-byte decoding leaves
         // the malformed escape literal instead, so the valid decode stands.
-        assert_eq!(normalized_path("/%61dmin/secret%zz"), "/admin/secret%zz");
-        assert_eq!(normalized_path("/foo%63bar%zz"), "/foocbar%zz");
+        assert_eq!(normalized("/%61dmin/secret%zz"), "/admin/secret%zz");
+        assert_eq!(normalized("/foo%63bar%zz"), "/foocbar%zz");
     }
 
     #[test]

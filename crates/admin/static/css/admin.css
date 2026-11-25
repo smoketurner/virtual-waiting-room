@@ -5,7 +5,7 @@
  * 1:1 from Vouch's Tailwind theme to plain CSS — no build step, no bundler
  * (ADR-0018). Server-rendered; only the live poller needs JS. */
 
-/* Self-hosted fonts (vendored woff2, served from /static/fonts) — matches
+/* Self-hosted fonts (vendored woff2, served from /_wr/static/fonts) — matches
  * Vouch's @font-face exactly, so the type is identical and the CSP needs no
  * external font-src. */
 @font-face {
@@ -13,7 +13,7 @@
   font-style: normal;
   font-weight: 400 700;
   font-display: swap;
-  src: url('/static/fonts/inter-latin.woff2') format('woff2');
+  src: url('/_wr/static/fonts/inter-latin.woff2') format('woff2');
 }
 
 @font-face {
@@ -21,7 +21,7 @@
   font-style: normal;
   font-weight: 400 500;
   font-display: swap;
-  src: url('/static/fonts/jetbrains-mono-latin.woff2') format('woff2');
+  src: url('/_wr/static/fonts/jetbrains-mono-latin.woff2') format('woff2');
 }
 
 :root {
@@ -102,6 +102,17 @@ body {
   font-family: var(--font-mono);
   font-size: 13px;
   color: var(--gray-400);
+}
+
+.top-nav .session {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.top-nav .session button {
+  padding: 6px 12px;
+  font-size: 13px;
 }
 
 /* --- Content + header ----------------------------------------------------- */

@@ -22,10 +22,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aws_durable_execution_sdk as durable;
-use aws_durable_execution_sdk::{RetryDecision, StepSemantics};
+use aws_durable_execution_sdk::{OperationErrorKind, RetryDecision, StepSemantics};
 use controller::dynamo::DynamoStore;
 use controller::{INTERVAL_SECS, PASSES_PER_INVOKE, PassOutcome, Store, run_pass};
 use serde_json::Value;
+use wr_common::Phase;
 
 #[tokio::main]
 async fn main() -> Result<(), lambda_runtime::Error> {
@@ -100,17 +101,88 @@ async fn handle(
             // ends the execution and the next scheduled one starts a clean
             // minute, which is what a failed pass did before.
             .retry_strategy(|_err, _attempt| RetryDecision::Stop)
-            .await?;
+            .await;
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            // A pass that failed is skipped, and the cadence carries on (issue
+            // #236). Ending the execution here would leave the rest of the
+            // minute with no passes at all, so one transient `DynamoDB` error
+            // stalled admission for up to fifty seconds. The next pass is owed
+            // the seconds this one did not grant, so nothing is lost. Any
+            // other failure is the execution's own and still ends it.
+            Err(err) if matches!(err.kind(), OperationErrorKind::Step(_)) => {
+                tracing::error!(
+                    error = %err,
+                    event = "controller_pass_failed",
+                    pass,
+                    "controller pass failed; skipping it"
+                );
+                wait_for_next(&ctx, pass).await?;
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        };
+        let idle = idles(&outcome);
         outcomes.push(outcome);
 
-        // Skip the final wait so the execution completes on its last pass
-        // rather than suspending for an interval it does not use.
-        if pass + 1 < PASSES_PER_INVOKE {
-            ctx.wait(Duration::from_secs(INTERVAL_SECS))
-                .name(format!("cadence-{pass}"))
-                .await?;
+        // An event that has not started, or is over, only becomes active by
+        // way of `pre_queue` and an open, so the rest of this minute's passes
+        // would almost always read the same thing and wait in between -- which
+        // is most of what the controller costs between events (N1). The price
+        // is that an operator who registers and opens within one minute waits
+        // for the next execution before admission starts.
+        if idle {
+            break;
         }
+
+        wait_for_next(&ctx, pass).await?;
     }
 
     Ok(outcomes)
+}
+
+/// Whether a pass found the event in a phase the rest of the minute cannot
+/// leave for `Active`: only the open makes an event active, and the open needs
+/// `pre_queue`. `pre_queue` and `maintenance` keep the cadence, so admission
+/// starts within one interval of the open or of a recovery.
+fn idles(outcome: &PassOutcome) -> bool {
+    match outcome {
+        PassOutcome::NotActive(phase) => match phase {
+            Phase::Idle | Phase::PostEvent => true,
+            Phase::PreQueue | Phase::Active | Phase::Maintenance => false,
+        },
+        PassOutcome::Held(_) | PassOutcome::Ran { .. } => false,
+    }
+}
+
+/// The durable wait between passes. Skipped after the last one, so the
+/// execution completes on its final pass rather than suspending for an
+/// interval it does not use.
+async fn wait_for_next(ctx: &durable::DurableContext, pass: u32) -> Result<(), durable::BoxError> {
+    if pass.saturating_add(1) < PASSES_PER_INVOKE {
+        ctx.wait(Duration::from_secs(INTERVAL_SECS))
+            .name(format!("cadence-{pass}"))
+            .await?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use controller::PassOutcome;
+    use wr_common::{AdmissionControl, Phase};
+
+    use super::idles;
+
+    #[test]
+    fn only_a_phase_that_cannot_open_this_minute_ends_the_cadence_early() {
+        assert!(idles(&PassOutcome::NotActive(Phase::Idle)));
+        assert!(idles(&PassOutcome::NotActive(Phase::PostEvent)));
+        // The open can land at any second of a countdown, and a recovery from
+        // maintenance should resume within one interval.
+        assert!(!idles(&PassOutcome::NotActive(Phase::PreQueue)));
+        assert!(!idles(&PassOutcome::NotActive(Phase::Maintenance)));
+        assert!(!idles(&PassOutcome::Held(AdmissionControl::Paused)));
+        assert!(!idles(&PassOutcome::Ran { released: 0 }));
+    }
 }

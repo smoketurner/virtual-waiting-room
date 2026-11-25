@@ -30,7 +30,7 @@ variables {
   nojs_artifact_path            = "tests/fixtures/bootstrap.zip"
 
   oidc_client_id      = "test-client"
-  oidc_redirect_uri   = "https://example.invalid/admin/callback"
+  oidc_redirect_uri   = "https://example.invalid/_wr/admin/callback"
   oidc_allowed_emails = "operator@example.invalid"
 }
 
@@ -39,7 +39,7 @@ run "every_method_requires_the_origin_key" {
 
   assert {
     condition     = aws_api_gateway_method.join_post.api_key_required
-    error_message = "POST /v1/join must require the origin key, or bots post straight to SQS past the edge"
+    error_message = "POST /_wr/v1/join must require the origin key, or bots post straight to SQS past the edge"
   }
 
   assert {
@@ -64,7 +64,14 @@ run "the_key_is_bound_to_the_stage" {
   }
 
   assert {
-    condition     = aws_api_gateway_usage_plan_key.origin.key_type == "API_KEY"
+    condition     = alltrue([for k in aws_api_gateway_usage_plan_key.origin : k.key_type == "API_KEY"])
     error_message = "the origin key must be attached to its usage plan"
+  }
+
+  # Issue #251: the key the distribution is about to stop sending has to keep
+  # working until it has, so two generations are attached at once.
+  assert {
+    condition     = length(aws_api_gateway_usage_plan_key.origin) == 2
+    error_message = "the current and the previous origin key must both be valid, or a rotation is an outage for as long as CloudFront takes to deploy"
   }
 }

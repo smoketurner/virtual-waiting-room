@@ -55,11 +55,16 @@ holds the reasoning for each.
 Request path:
 
 ```
-join:      CloudFront → API Gateway REST (type: aws, direct SQS SendMessage) → SQS
+join:      CloudFront [/_wr/v1/join] → API Gateway REST (type: aws, direct SQS SendMessage) → SQS
                → assign_position Lambda → DynamoDB
 protected: CloudFront [gate: CloudFront Function, viewer-request] ─ valid session cookie → client origin
                                                                    └ missing/expired → 302/403 → /_wr/waiting.html
 ```
+
+Everything the room serves is under the one viewer prefix `/_wr/` (issue #251): the S3 pages, the
+public API at `/_wr/v1/*`, the console at `/_wr/admin` and `/_wr/static/*`. The API Gateway
+resources carry the same `_wr` parent, and the pages' `/_wr/*` behaviour must stay the last ordered
+one or it swallows the others.
 
 Three separate CloudFront cache behaviours (ADR-0013). `/status` is Min TTL 1 s with no
 cookies forwarded, so CloudFront collapses simultaneous misses into one origin fetch and
@@ -74,21 +79,26 @@ Position assignment has two paths:
   `attribute_not_exists(shuffle_seed)`, so a double-fire opens exactly once. A visitor's
   position is `PRP(seed, offset[s] + l, N)`, computed on read — never stored (ADR-0002), and
   `queue_counter` starts at `N` so live joiners are numbered behind the whole cohort. The open
-  reads the ten shard counters and never the rows, so it takes the same fraction of a second at
-  a million registrations as at ten.
+  reads the ten shard counters and never the rows, so the write costs the same at a million
+  registrations as at ten. Before it reads them it waits, up to 15 s, for the join queue to read
+  empty, so joins accepted before T−0 are in the cohort rather than behind it (issue #239).
 - **Live join.** `assign_position` claims a contiguous block with one
   `UpdateItem ADD queue_counter :n / ALL_NEW`, incrementing by the count of **valid** records
   only, then writes each row with `attribute_not_exists(request_id)`. Gaps are acceptable;
   duplicates are not.
 
-Admission is closed-loop: `controller` runs six passes per `rate(1 minute)` execution
-(10 s cadence), measures arrivals against what it released, smooths the no-show rate with an
-EWMA, and advances `serving_counter` by a bounded correction. It is a **Lambda durable
+Admission is metered where it happens (ADR-0039): `controller` runs six passes per
+`rate(1 minute)` execution (10 s cadence), and each grants an **admission budget** for the seconds
+elapsed (written as a cap `c` on each arrivals shard, at most two intervals outstanding) and
+advances `serving_counter` by the same amount, steered to leave a quarter of it unused: more unused
+than that releases extra (the no-show correction), and a spent budget releases three quarters so a
+backlog of visitors already invited drains. It is a **Lambda durable
 function** (ADR-0022): each pass is a checkpointed durable step and each 10 s gap a durable
 wait that suspends the execution instead of holding the invocation open, so the waiting is not
 billed. The SDK (`aws-durable-execution-sdk`) is generally available and pinned exactly. It does
-not expire positions: a row lives until its DynamoDB TTL reclaims it (ADR-0031), and the no-show
-correction is what compensates for absentees.
+not expire positions: a row lives until its DynamoDB TTL reclaims it (ADR-0031), and the unused
+budget is what compensates for absentees. A failed pass is skipped and the next is owed its
+seconds; an execution that finds the event `idle` or `post_event` ends after one pass.
 
 **The gate is a CloudFront Function** (ADR-0021, issue #71), associated at viewer-request with the
 protected behaviour only — never distribution-wide, since Functions bill per invocation and a
@@ -96,21 +106,29 @@ distribution-wide association would bill every `/status` poll from every waiter.
 locally, reading its whole configuration and the HMAC signing secret from one CloudFront
 KeyValueStore (`infra/modules/edge/functions/gate.js.tftpl`): no rule matches → pass through
 (dormancy, #60); a valid session cookie → pass through; otherwise refuse with a reason (#73), a
-302 to the waiting page for navigation and 403 JSON for XHR (#72). `event_id` and the session
+302 to the waiting page for navigation and 403 JSON for XHR (#72). A path rule also claims any
+path with a dot segment, `;` or backslash, and a failure after a rule has matched refuses rather
+than passes; only an unreadable config passes, marked (#242). `event_id` and the session
 cookie name are templated into the function's own source rather than carried in the
 KeyValueStore value, so Terraform stays their single source of truth.
 
 `generate_token` mints the session cookie the gate verifies: it checks the visitor's position
 against `serving_counter` (resolving the operator's admission control through
 `wr_common::resolve(StoredControl, fail_open_until, now)` — `FailOpen` is never a stored string,
-only an epoch), records the arrival, and signs an HMAC-SHA256 session credential
-(`wr_common::crypto`). It is the only writer of
-`arrivals#*` while admission is Open, so the controller's no-show correction depends on it.
+only an epoch), takes one unit of the admission budget (a conditional `ADD n` on a random arrivals
+shard while `n < c`; 425 when spent), and signs an HMAC-SHA256 session credential
+(`wr_common::crypto`). A visitor already marked admitted re-mints without taking a unit, into the
+same visit: every session expires at `admitted_at + ttl`, and after that the answer is 410 (issue
+#237). It is the only writer of the shards' `n`, which is both the meter and what the controller
+reads back.
 
-The signing key is generated by `random_bytes.signing_key` during apply. Terraform writes that one
-value to both readers: the SSM SecureString the Lambdas read, and the KeyValueStore key `k` the
-gate reads. There is no bootstrap step and no placeholder, so the two copies cannot diverge.
-Regenerating the key invalidates every session cookie already issued.
+The signing key is generated by `random_bytes.signing_key` during apply, one per generation.
+Terraform writes the current one to both readers: the SSM SecureString the Lambdas read, and the
+KeyValueStore key `k` the gate reads. There is no bootstrap step and no placeholder, so the two
+copies cannot differ at apply. The Lambdas read the key once at init, so a
+`SIGNING_KEY_FINGERPRINT` in their environment is what makes running functions follow a rotation.
+Raising `signing_key_generation` rotates: the previous generation becomes the gate's `kp`, so
+sessions already issued last until they expire, and the rotation after that drops them.
 
 
 ### Crates
@@ -138,7 +156,9 @@ Every Lambda crate follows the same three-file split, and new ones should:
 `admin` is an Axum Lambda rendering askama compile-time templates, styled with the Vouch design
 language as one self-contained plain-CSS stylesheet — no React, no bundler, no runtime npm
 dependency (ADR-0014, ADR-0018).
-Auth is OIDC Authorization Code + PKCE with sessions in DynamoDB (ADR-0016). Core operator
+Auth is OIDC Authorization Code + PKCE with sessions in DynamoDB (ADR-0016). Every state-changing
+request must be same-origin and carry the session's `csrf` form field (`operator::guard_writes`,
+issue #243), so a new POST route needs neither added by hand. Core operator
 actions must work with JavaScript disabled, and the UI adds no capability the admin API lacks.
 
 ### State
@@ -186,7 +206,9 @@ target architecture from `terraform.tfvars`.
 **The apply seeds a working stack.** Terraform writes the event's `Counters` item, the gate's
 ruleset and the open schedule, then ignores changes to all three — the control plane owns them
 from there. A fresh apply therefore answers `/status` and every admin action without running
-`scripts/reset-env.py`, which is a destructive test script, not a setup step. The admin Lambda's OIDC
+`scripts/reset-env.py`, which is a destructive test script, not a setup step. Changing `event_id`
+and applying re-seeds the event item and recreates the `PreQueue` and `Positions` tables: that is
+the supported way to run another event on a stack (`table_deletion_protection` must be off). The admin Lambda's OIDC
 configuration is the one thing an apply cannot derive — the redirect URI is a path on the
 distribution, and `edge` already depends on `core` — so a missing value fails the apply through
 a `precondition` rather than deploying a Lambda that dies at Init.

@@ -35,11 +35,11 @@ crates/                       Rust workspace — one crate per Lambda + shared l
                               infra/modules/edge/tests/*.conformance.test.js consume
   assign_position/            SQS consumer: position range claim + Positions writes
   open_event/                 T−0 conditional open
-  read/                       /v1/status, /v1/queue_num
+  read/                       /_wr/v1/status, /_wr/v1/queue_num
   generate_token/             Admission check + signed session cookie minting (issue #71)
   nojs/                       The queue without JavaScript: form join + server-rendered wait page (ADR-0037)
   controller/                 Outflow control
-  admin/                      Axum operator UI and /admin/* actions, including the edge gate's
+  admin/                      Axum operator UI and /_wr/admin/* actions, including the edge gate's
                               KeyValueStore writer (edge.rs)
 scripts/
 examples/                     Deployable example + generated variable reference — not built

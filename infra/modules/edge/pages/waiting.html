@@ -69,14 +69,14 @@
           You are not in line yet. Join below: it works without JavaScript,
           on a page that refreshes itself while you wait.
         </p>
-        <form method="post" action="/v1/enter">
+        <form method="post" action="/_wr/v1/enter">
           <button type="submit">Join the line</button>
         </form>
       </noscript>
 
       <!-- Shown by the script tag's onerror: JavaScript is on, but the
            waiting room's own script did not load. -->
-      <form id="nojs-join" method="post" action="/v1/enter" hidden>
+      <form id="nojs-join" method="post" action="/_wr/v1/enter" hidden>
         <button type="submit">Join the line without the script</button>
       </form>
     </main>

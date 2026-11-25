@@ -29,6 +29,11 @@ variable "warm_throughput_write_units" {
     condition     = var.warm_throughput_write_units == 0 || var.warm_throughput_write_units >= 4000
     error_message = "warm_throughput_write_units must be 0 (no pre-warm) or >= 4000 (AWS DynamoDB warm-throughput minimum)."
   }
+
+  validation {
+    condition     = var.expected_join_rate <= 4000 || var.warm_throughput_write_units >= var.expected_join_rate
+    error_message = "expected_join_rate is above the 4,000 writes/s an un-warmed on-demand table serves: set warm_throughput_write_units to at least expected_join_rate."
+  }
 }
 
 variable "warm_throughput_read_units" {
@@ -58,7 +63,7 @@ variable "open_event_artifact_path" {
 }
 
 variable "read_artifact_path" {
-  description = "Path to the read Lambda bootstrap zip (serves /v1/status and /v1/queue_num)."
+  description = "Path to the read Lambda bootstrap zip (serves /_wr/v1/status and /_wr/v1/queue_num)."
   type        = string
 }
 
@@ -149,7 +154,7 @@ variable "oidc_client_id" {
 }
 
 variable "oidc_redirect_uri" {
-  description = "OIDC callback URL registered with the provider — the CloudFront (or API) URL of /admin/callback, e.g. https://d123.cloudfront.net/admin/callback."
+  description = "OIDC callback URL registered with the provider — the CloudFront (or API) URL of /_wr/admin/callback, e.g. https://d123.cloudfront.net/_wr/admin/callback."
   type        = string
   default     = ""
 }
@@ -158,6 +163,45 @@ variable "oidc_allowed_emails" {
   description = "Comma-separated allowlist of operator emails permitted to hold an admin session. Empty = deny all (the admin Lambda fails closed)."
   type        = string
   default     = ""
+}
+
+variable "signing_key_generation" {
+  description = "Generation of the session signing key. Raise it by one to rotate: the new key signs from then on and the gate still accepts the previous generation's sessions until they expire (issue #247). Rotating twice within one session lifetime invalidates the oldest sessions."
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.signing_key_generation >= 1 && floor(var.signing_key_generation) == var.signing_key_generation
+    error_message = "signing_key_generation must be a whole number of at least 1."
+  }
+}
+
+variable "origin_key_generation" {
+  description = "Generation of the API key CloudFront sends the REST API. Raise it by one to rotate: the previous generation stays valid until the next rotation, so the API keeps answering while the distribution deploys the new key (issue #251)."
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.origin_key_generation >= 1 && floor(var.origin_key_generation) == var.origin_key_generation
+    error_message = "origin_key_generation must be a whole number of at least 1."
+  }
+}
+
+variable "expected_join_rate" {
+  description = "The peak joins per second this event is expected to take, or 0 if unknown. Above 4,000, the on-demand tables' cold ceiling, the plan fails unless warm_throughput_write_units covers it: a throttled join is retried and can land behind the cohort it registered for (issue #251)."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.expected_join_rate >= 0
+    error_message = "expected_join_rate must be 0 (unknown) or a positive rate."
+  }
+}
+
+variable "oidc_require_email_verified" {
+  description = "Whether an admin login needs the provider's email_verified claim to be present and true (issue #243). Turn off only for a provider that omits the claim and verifies every address; an explicit false is refused either way."
+  type        = bool
+  default     = true
 }
 
 variable "assign_position_reserved_concurrency" {
@@ -298,5 +342,81 @@ variable "starts_at_timezone" {
   validation {
     condition     = can(regex("^(UTC|[A-Za-z]+/[A-Za-z_+-]+)$", var.starts_at_timezone))
     error_message = "starts_at_timezone must be UTC or an IANA zone name such as America/New_York."
+  }
+}
+
+variable "controller_reserved_concurrency" {
+  description = "Reserved concurrency on the controller function. A guarantee more than a cap: during a burst the visitor-path functions can hold the account's whole concurrency, and a throttled controller admits nobody. 2 lets one execution's last pass meet the next one's first. -1 leaves it unreserved, for an account whose concurrency quota cannot spare the reservation (Lambda keeps 100 unreserved, so every reservation in this module needs quota above that)."
+  type        = number
+  default     = 2
+
+  validation {
+    condition     = var.controller_reserved_concurrency == -1 || (var.controller_reserved_concurrency >= 1 && floor(var.controller_reserved_concurrency) == var.controller_reserved_concurrency)
+    error_message = "controller_reserved_concurrency must be -1 (unreserved) or a whole number of at least 1; 0 would stop the controller, and with it all admission."
+  }
+}
+
+variable "table_deletion_protection" {
+  description = "DynamoDB deletion protection on all four tables. Off by default because dev stacks are destroyed; turn it on for a stack whose queue matters. It also blocks the apply that follows a change of event_id, which recreates PreQueue and Positions: turn it off, apply, then turn it back on."
+  type        = bool
+  default     = false
+}
+
+variable "alarm_sns_topic_arn" {
+  description = "SNS topic every CloudWatch alarm in this module notifies, on alarm and on recovery. Empty attaches no action: the alarms still evaluate and show in the console, and nobody is told. The topic is the operator's own; the module creates none, since a topic with no subscriber tells nobody either."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.alarm_sns_topic_arn == "" || can(regex("^arn:[a-z0-9-]+:sns:[a-z0-9-]+:\\d{12}:[A-Za-z0-9_-]+(\\.fifo)?$", var.alarm_sns_topic_arn))
+    error_message = "alarm_sns_topic_arn must be empty or an SNS topic ARN (arn:aws:sns:<region>:<account>:<name>)."
+  }
+}
+
+# --- REST API stage throttles (issue #245) ------------------------------------
+# See api.tf. API Gateway caps both at the account's own limit, so a value above
+# it is accepted and has no effect.
+
+variable "api_join_throttle_rate_limit" {
+  description = "Steady-state requests per second POST /_wr/v1/join accepts before answering 429. Deliberately below the account's default limit of 10,000/s, which every method shares: when a crowd arrives at once joins would otherwise take the whole account bucket, and admission, position lookups and the operator console would be answered 429 alongside them. Raise it together with the account quota, keeping it under that quota."
+  type        = number
+  default     = 7000
+
+  validation {
+    condition     = var.api_join_throttle_rate_limit >= 1
+    error_message = "api_join_throttle_rate_limit must be at least 1; 0 refuses every join."
+  }
+}
+
+variable "api_join_throttle_burst_limit" {
+  description = "Token-bucket size for POST /_wr/v1/join: how many joins may arrive at once before the rate limit applies."
+  type        = number
+  default     = 3500
+
+  validation {
+    condition     = var.api_join_throttle_burst_limit >= 1 && floor(var.api_join_throttle_burst_limit) == var.api_join_throttle_burst_limit
+    error_message = "api_join_throttle_burst_limit must be a whole number of at least 1."
+  }
+}
+
+variable "api_throttle_rate_limit" {
+  description = "Steady-state requests per second each other method accepts before answering 429. /_wr/v1/status reaches the API once a second however many are waiting and admission runs at the admission rate, but /_wr/v1/queue_num is cached per visitor, so during a join burst it is called about as often as /_wr/v1/join: so the default matches the join limit. Lower it to cap what the read and admission Lambdas can be asked for."
+  type        = number
+  default     = 10000
+
+  validation {
+    condition     = var.api_throttle_rate_limit >= 1
+    error_message = "api_throttle_rate_limit must be at least 1; 0 refuses every request, the dashboard included."
+  }
+}
+
+variable "api_throttle_burst_limit" {
+  description = "Token-bucket size for each method other than POST /_wr/v1/join."
+  type        = number
+  default     = 5000
+
+  validation {
+    condition     = var.api_throttle_burst_limit >= 1 && floor(var.api_throttle_burst_limit) == var.api_throttle_burst_limit
+    error_message = "api_throttle_burst_limit must be a whole number of at least 1."
   }
 }

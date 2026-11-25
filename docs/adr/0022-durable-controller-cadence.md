@@ -175,3 +175,24 @@ replay.
 
 GA does not reopen §6. The clean-minute restart is kept because a pass is not idempotent, which
 is a property of the controller and not of the SDK's maturity.
+
+## Amendment: a failed pass is skipped, and an idle event ends the minute early (#236, #251)
+
+§6's clean-minute restart is replaced. A pass whose step fails is logged (`controller_pass_failed`)
+and skipped, and the cadence continues: ending the execution left the rest of the minute with no
+passes, so one transient DynamoDB error stalled admission for up to fifty seconds. Skipping is safe
+because a pass now grants for elapsed seconds ([ADR-0039](0039-meter-admissions-not-the-cursor.md)),
+so the next one is owed what the failed one did not grant. Any other failure still ends the
+execution. Whether the durable service lets a handler continue past a failed step in every case
+has been read from the SDK, not measured against a deployment.
+
+The execution's bounds changed with it. `execution_timeout` is 60 s, not 120: an execution cut off
+before its last pass loses nothing, because the next execution's first pass is owed those seconds.
+The schedule's `retry_policy` and the function's async invoke config both retry zero times and
+drop an invoke older than 60 s, so a delayed start is skipped instead of running beside the next
+one. The function has reserved concurrency so ingest cannot starve it.
+
+An execution whose first pass finds the phase `idle` or `post_event` ends there. Such an event only
+becomes active by way of `pre_queue` and an open, so the remaining passes and waits were most of
+what the controller cost between events (N1). The price: an operator who goes
+idle → pre_queue → open inside one minute waits for the next execution before admission starts.

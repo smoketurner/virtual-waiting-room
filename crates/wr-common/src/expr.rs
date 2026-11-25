@@ -65,6 +65,11 @@ pub const SHARD_INDEX_ATTR: &str = "s";
 /// increment, forever, for no benefit — nothing queries by attribute name.
 pub const SHARD_COUNT_ATTR: &str = "n";
 
+/// The attribute an arrivals shard holds its admission cap in: the count the
+/// shard may be taken up to (ADR-0039). One letter for the same reason as the
+/// count, which it is written beside on every controller pass.
+pub const SHARD_CAP_ATTR: &str = "c";
+
 /// The attribute the event's scheduled start is stored in, epoch seconds.
 ///
 /// Named here because two crates must agree on it and neither can see the
@@ -96,6 +101,12 @@ pub const POSSESSION_DIGEST_ATTR: &str = "h";
 
 /// The server-stamped time a `Positions` row was created, epoch seconds.
 pub const ENTRY_TIME_ATTR: &str = "entry_time";
+
+/// The attribute a `Positions` row records its admission in, epoch seconds.
+/// Written once, when the visitor is first admitted: every session minted for
+/// the row afterwards expires from this moment, not from the re-mint (issue
+/// #237).
+pub const ADMITTED_AT_ATTR: &str = "admitted_at";
 
 /// The expiry attribute of a `Positions` row.
 ///
@@ -352,6 +363,24 @@ impl Condition {
         };
         let name = condition.bind_name(attr);
         condition.expression = format!("attribute_not_exists({name})");
+        condition
+    }
+
+    /// `<attr> < <other>` — one attribute of the item compared with another.
+    ///
+    /// False when either is absent, which is what the admission budget wants:
+    /// a shard that has never been granted a cap admits nobody.
+    #[must_use]
+    pub fn attr_less_than(attr: &str, other: &str) -> Self {
+        let mut condition = Self {
+            expression: String::new(),
+            names: HashMap::new(),
+            values: HashMap::new(),
+            next: 0,
+        };
+        let left = condition.bind_name(attr);
+        let right = condition.bind_name(other);
+        condition.expression = format!("{left} < {right}");
         condition
     }
 

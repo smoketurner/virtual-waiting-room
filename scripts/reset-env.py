@@ -238,16 +238,16 @@ def fresh_counters(
     counter rather than stored, so a test needs the distance, not the bodies.
 
     It also pauses admission, which is the part that makes the queue hold.
-    Nobody occupies those positions, so the controller measures no arrivals,
-    reads a 100% no-show rate, releases at its cap of twice the target every
-    pass, and reaches `queue_counter + 1` in about a minute — the queue would
+    Nobody occupies those positions, so none of the admission budget is taken,
+    the controller releases at its cap of twice the target every pass to make
+    up for it, and reaches `queue_counter + 1` in about a minute — the queue would
     drain before a tester had finished opening the page. Paused, the controller
     returns `Held` and the cursor does not move until an operator resumes.
 
     Deliberately absent: shuffle_seed, participant_count, and prequeue_offsets
     (written only by the open), the prequeue_counter and arrivals shards, and
-    the controller's carried state (last_arrivals_total, last_serving_counter,
-    no_show_rate).
+    the controller's carried state (last_open_pass_at on this item; the taken
+    count `n` and cap `c` on each arrivals shard).
     """
     return {
         "event_id": {"S": event_key(event_id)},

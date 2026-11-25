@@ -17,15 +17,30 @@
 # Terraform state and in the distribution's configuration. It is a secret
 # against the internet, which is the only thing it has to keep out.
 
+#
+# Two generations of the key are valid at once, the current and the one before
+# it (issue #251). API Gateway honours a new key the moment it exists, but the
+# distribution takes minutes to start sending it, and with one key that window
+# is every API path answering 403. Raising `origin_key_generation` adds the new
+# key while the old one still works; the distribution moves to the new one in
+# the same apply, and the old one is retired by the rotation after.
+locals {
+  origin_key_current  = tostring(var.origin_key_generation)
+  origin_key_previous = tostring(var.origin_key_generation - 1)
+  origin_key_live     = toset([local.origin_key_current, local.origin_key_previous])
+}
+
 resource "random_password" "origin_key" {
-  length  = 48
-  special = false
+  for_each = local.origin_key_live
+  length   = 48
+  special  = false
 }
 
 resource "aws_api_gateway_api_key" "origin" {
-  name        = "${var.name_prefix}-cloudfront-origin"
+  for_each    = local.origin_key_live
+  name        = "${var.name_prefix}-cloudfront-origin-${each.key}"
   description = "Held only by this deployment's CloudFront distribution, which sends it as x-api-key on every API origin request (ADR-0038)."
-  value       = random_password.origin_key.result
+  value       = random_password.origin_key[each.key].result
 
   tags = var.tags
 }
@@ -33,7 +48,9 @@ resource "aws_api_gateway_api_key" "origin" {
 # A key only authorises a stage through a usage plan. No throttle or quota is
 # set here: the plan carries the key, and rate limiting lives in the edge's web
 # ACL, where it can be keyed per viewer. A plan-level throttle would be one
-# bucket shared by every visitor behind the distribution.
+# bucket shared by every visitor behind the distribution. The stage's own
+# per-method throttles (api.tf) are that kind of bucket too, and are there only
+# to keep one path from spending the account's.
 resource "aws_api_gateway_usage_plan" "origin" {
   name        = "${var.name_prefix}-cloudfront-origin"
   description = "Authorises the CloudFront origin key on this deployment's stage (ADR-0038)."
@@ -47,7 +64,23 @@ resource "aws_api_gateway_usage_plan" "origin" {
 }
 
 resource "aws_api_gateway_usage_plan_key" "origin" {
-  key_id        = aws_api_gateway_api_key.origin.id
+  for_each      = local.origin_key_live
+  key_id        = aws_api_gateway_api_key.origin[each.key].id
   key_type      = "API_KEY"
   usage_plan_id = aws_api_gateway_usage_plan.origin.id
+}
+
+# --- Client origin secret (issue #241) ----------------------------------------
+#
+# The protected origin is the thing the room exists to shield, and its hostname
+# is not a secret: certificate transparency logs and DNS history give it away.
+# The distribution sends this value to the client origin as the
+# x-wr-origin-verify header on every request, so the origin can refuse anything
+# that did not come through the gate. Enforcing it is the origin's job -- this
+# stack cannot configure a server it does not own -- and docs/DEPLOY.md says
+# how. Like the API key above it is a secret against the internet, not against
+# the account's own operators.
+resource "random_password" "client_origin_secret" {
+  length  = 48
+  special = false
 }

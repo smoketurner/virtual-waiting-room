@@ -28,7 +28,7 @@ variables {
   # The admin Lambda's preconditions refuse a stack whose control plane cannot
   # start, so a test harness has to describe a deployable configuration.
   oidc_client_id      = "test-client"
-  oidc_redirect_uri   = "https://example.invalid/admin/callback"
+  oidc_redirect_uri   = "https://example.invalid/_wr/admin/callback"
   oidc_allowed_emails = "operator@example.invalid"
 }
 
@@ -72,5 +72,22 @@ run "a_join_must_carry_the_possession_digest" {
   assert {
     condition     = !contains(keys(jsondecode(aws_api_gateway_model.join.schema).properties), "secret")
     error_message = "the secret itself must never be accepted by the join"
+  }
+}
+
+# Issue #240: the validator and the mapping template only cover
+# application/json. Any other content type must be refused, not passed through
+# to SQS unvalidated and unmapped.
+run "a_join_in_another_content_type_is_refused_not_passed_through" {
+  command = plan
+
+  assert {
+    condition     = aws_api_gateway_integration.join_sqs.passthrough_behavior == "NEVER"
+    error_message = "the join integration must set passthrough_behavior = NEVER; the default hands a non-JSON body to SQS as the query, unvalidated"
+  }
+
+  assert {
+    condition     = keys(aws_api_gateway_integration.join_sqs.request_templates) == keys(aws_api_gateway_method.join_post.request_models)
+    error_message = "every content type the join integration maps must have a request model, or it is mapped without being validated"
   }
 }

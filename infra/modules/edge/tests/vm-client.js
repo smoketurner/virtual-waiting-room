@@ -43,6 +43,9 @@ function loadClient({
   // does. Passing all three leaves only the in-memory tier, which is the case
   // the conditional fragment strip exists for.
   storageFails,
+  // localStorage contents present before the script runs, for what the page
+  // reads once at load rather than on demand.
+  stored,
 }) {
   const clock = { now: now || 1_700_000_000_000 };
   const calls = [];
@@ -53,7 +56,7 @@ function loadClient({
   const fails = new Set(storageFails || []);
 
   const storageOf = (name) => {
-    const store = new Map();
+    const store = new Map(name === "local" ? Object.entries(stored || {}) : []);
     const guard = () => {
       if (fails.has(name)) {
         throw new Error(`${name}Storage unavailable`);

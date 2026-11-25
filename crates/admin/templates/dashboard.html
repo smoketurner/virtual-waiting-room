@@ -5,7 +5,13 @@
 {% block content %}
 <header class="top-nav">
   <span class="brand">Virtual Waiting Room</span>
-  <span class="who">{{ operator_email }}</span>
+  {# Sign-out is a form post carrying the session token like every other
+     action (issue #243), so no other page can sign the operator out. #}
+  <form class="session" method="post" action="/_wr/admin/logout">
+    <input type="hidden" name="csrf" value="{{ csrf_token }}">
+    <span class="who">{{ operator_email }}</span>
+    <button class="normal" type="submit" title="End this session.">Sign out</button>
+  </form>
 </header>
 
 <main class="content">
@@ -100,12 +106,14 @@
         {% if admission_control == "paused" %}
         <p class="deferred">Admission is paused. Waiting visitors see a "you keep your place" notice and nobody new is let through.</p>
         <p class="help">Resume clears the notice and starts admitting again. Every visitor kept their queue position through the pause.</p>
-        <form method="post" action="/admin/resume">
+        <form method="post" action="/_wr/admin/resume">
+          <input type="hidden" name="csrf" value="{{ csrf_token }}">
           <button class="normal" type="submit" title="Start admitting visitors again. The notice clears.">Resume admission</button>
         </form>
         {% else %}
         <p class="help"><strong>Pause holds the line.</strong> Waiting visitors see a "you keep your place" notice, the queue keeps forming, and nobody new is admitted. A Resume button appears here to clear it. Reversible.</p>
-        <form method="post" action="/admin/pause">
+        <form method="post" action="/_wr/admin/pause">
+          <input type="hidden" name="csrf" value="{{ csrf_token }}">
           <button class="danger" type="submit" title="Pause admission. Waiting visitors see a 'you keep your place' notice; nobody new is let through.">Pause admission</button>
         </form>
         {% endif %}
@@ -113,11 +121,13 @@
         <div class="control">
         {% if admission_control == "fail_open" %}
         <p class="deferred">FAIL OPEN for {{ fail_open_remaining_secs }}s more, then <strong>{{ queued_control }}</strong>. The waiting room is bypassed; every arrival goes straight to the origin.</p>
-        <form method="post" action="/admin/recover" data-confirm="Clear fail-open now? Admission lands in {{ queued_control }} immediately.">
+        <form method="post" action="/_wr/admin/recover" data-confirm="Clear fail-open now? Admission lands in {{ queued_control }} immediately.">
+          <input type="hidden" name="csrf" value="{{ csrf_token }}">
           <button class="danger" type="submit" title="Clear the fail-open window now. Admission lands in the state shown above.">Clear fail-open (lands in {{ queued_control }})</button>
         </form>
         {% else %}
-        <form method="post" action="/admin/fail_open" data-confirm="Bypass the waiting room? Every arrival will go straight to the origin for the duration entered, with no admission check.">
+        <form method="post" action="/_wr/admin/fail_open" data-confirm="Bypass the waiting room? Every arrival will go straight to the origin for the duration entered, with no admission check.">
+          <input type="hidden" name="csrf" value="{{ csrf_token }}">
           <div class="form-field">
             <label for="fail_open_minutes">Fail open for (minutes)</label>
             <input id="fail_open_minutes" name="minutes" type="number" min="1" max="1440" required title="How long to bypass the waiting room, in minutes.">
@@ -132,7 +142,8 @@
         <p class="deferred">The event is in maintenance. Waiting visitors see an "event is temporarily down" page. Recover from the Phase control: return to <code>active</code> to resume, or <code>idle</code> to reset.</p>
         {% else %}
         <p class="help"><strong>Force maintenance takes the whole event down.</strong> Waiting visitors see an "event is temporarily down" page, not a queue. Use it for an outage, not a routine hold. Recover from the Phase control (return to <code>active</code> or <code>idle</code>). Pause only holds admission; this stops everything.</p>
-        <form method="post" action="/admin/force_maintenance" data-confirm="Force maintenance takes the whole event down. Waiting visitors see an 'event is temporarily down' page. Continue?">
+        <form method="post" action="/_wr/admin/force_maintenance" data-confirm="Force maintenance takes the whole event down. Waiting visitors see an 'event is temporarily down' page. Continue?">
+          <input type="hidden" name="csrf" value="{{ csrf_token }}">
           <button class="danger" type="submit" title="Take the event down. Waiting visitors see an 'event is temporarily down' page. Requires confirmation. Reversible from the Phase control.">Force maintenance</button>
         </form>
         {% endif %}
@@ -152,7 +163,8 @@
         {% elif allowed_transitions.is_empty() %}
         <p class="deferred">The event is over (<code>post_event</code>). There is no next phase. Start a new event to run again.</p>
         {% else %}
-        <form method="post" action="/admin/phase">
+        <form method="post" action="/_wr/admin/phase">
+          <input type="hidden" name="csrf" value="{{ csrf_token }}">
           <div class="form-field">
             <label for="phase">Transition to</label>
             <select id="phase" name="phase" title="The phases you can move to next.">
@@ -184,7 +196,8 @@
         <p class="sub">Target visitors admitted to the origin per second.</p>
       </div>
       <div class="card-body">
-        <form method="post" action="/admin/rate">
+        <form method="post" action="/_wr/admin/rate">
+          <input type="hidden" name="csrf" value="{{ csrf_token }}">
           <div class="form-field">
             <label for="rate">Target rate (visitors per second)</label>
             <input id="rate" name="rate" type="number" min="1" required value="{{ target_rate_raw }}" title="Target visitors admitted to the origin per second.">
@@ -202,7 +215,8 @@
         <p class="sub">When the pre-queue closes and the event opens.</p>
       </div>
       <div class="card-body">
-        <form method="post" action="/admin/start_time">
+        <form method="post" action="/_wr/admin/start_time">
+          <input type="hidden" name="csrf" value="{{ csrf_token }}">
           <div class="form-field">
             <label for="starts_at">Event opens at</label>
             <input id="starts_at" name="starts_at" type="datetime-local" value="{{ starts_at_raw }}" title="Local date and time the event opens, read in the timezone below.">
@@ -219,7 +233,8 @@
           <button type="submit" title="Schedule when the event opens.">Set start time</button>
         </form>
         {% if !starts_at_raw.is_empty() %}
-        <form method="post" action="/admin/start_time" data-confirm="Clear the start time? The event will no longer open on its own and the countdown disappears." style="margin-top:12px;">
+        <form method="post" action="/_wr/admin/start_time" data-confirm="Clear the start time? The event will no longer open on its own and the countdown disappears." style="margin-top:12px;">
+          <input type="hidden" name="csrf" value="{{ csrf_token }}">
           <input type="hidden" name="starts_at" value="">
           <input type="hidden" name="timezone" value="{{ starts_at_timezone }}">
           <button type="submit" class="normal" title="Unschedule the event.">Clear start time</button>
@@ -227,7 +242,8 @@
         {% endif %}
         {% if !opened %}
         {% if phase == "pre_queue" %}
-        <form method="post" action="/admin/open_now" data-confirm="Open the event now? The pre-queue closes, everyone waiting is assigned their place, and the event starts admitting. This cannot be undone." style="margin-top:12px;">
+        <form method="post" action="/_wr/admin/open_now" data-confirm="Open the event now? The pre-queue closes, everyone waiting is assigned their place, and the event starts admitting. This cannot be undone." style="margin-top:12px;">
+          <input type="hidden" name="csrf" value="{{ csrf_token }}">
           <button type="submit" class="danger" title="Close the pre-queue and open the event immediately, without waiting for a scheduled time.">Open now</button>
           <span class="help">Closes the pre-queue and opens the event immediately. The same thing the schedule does, so a scheduled time that has not fired yet becomes a no-op rather than a second opening.</span>
         </form>
@@ -247,7 +263,8 @@
         <p class="sub">Text shown to every waiting visitor.</p>
       </div>
       <div class="card-body">
-        <form method="post" action="/admin/message">
+        <form method="post" action="/_wr/admin/message">
+          <input type="hidden" name="csrf" value="{{ csrf_token }}">
           <div class="form-field">
             <label for="message">Message shown to waiting visitors</label>
             <input id="message" name="message" type="text" value="{{ message_raw }}" title="Shown on the waiting page to every waiting visitor.">
@@ -256,7 +273,8 @@
           <button type="submit" title="Update the message shown to waiting visitors.">Set message</button>
         </form>
         {% if !message_raw.is_empty() %}
-        <form method="post" action="/admin/message" data-confirm="Clear the broadcast message? Waiting visitors will no longer see it." style="margin-top:12px;">
+        <form method="post" action="/_wr/admin/message" data-confirm="Clear the broadcast message? Waiting visitors will no longer see it." style="margin-top:12px;">
+          <input type="hidden" name="csrf" value="{{ csrf_token }}">
           <input type="hidden" name="message" value="">
           <button type="submit" class="normal" title="Remove the broadcast message.">Clear message</button>
         </form>
@@ -276,7 +294,8 @@
         {% if rules_load_failed %}
         <p class="status status-error">Could not read the current ruleset from the edge gate's KeyValueStore. Set rules is disabled until this succeeds — submitting an unseen ruleset here could overwrite the real one with an empty one. Reload to retry.</p>
         {% else %}
-        <form method="post" action="/admin/rules">
+        <form method="post" action="/_wr/admin/rules">
+          <input type="hidden" name="csrf" value="{{ csrf_token }}">
           <div class="form-field">
             <label for="rules">Rules</label>
             <textarea id="rules" name="rules" rows="6" title="One rule per line: p &lt;path prefix&gt;, c &lt;cookie name&gt;, u &lt;user agent substring&gt;, or h &lt;header name&gt; &lt;header value&gt;.">{{ rules_text }}</textarea>
@@ -290,8 +309,9 @@
           </div>
           <button type="submit" title="Replace the edge gate's ruleset with what is in the box above.">Set rules</button>
         </form>
-        <form method="post" action="/admin/ip_binding" style="margin-top:12px;"
+        <form method="post" action="/_wr/admin/ip_binding" style="margin-top:12px;"
           {% if ip_binding.is_on() %}data-confirm="Stop binding sessions to the visitor's network? A copied session cookie will work from anywhere again."{% else %}data-confirm="Bind admitted sessions to the visitor's network? Visitors whose address changes (mobile handoff, some carriers) are sent back to the waiting page, which lets them straight through again if they are still admitted."{% endif %}>
+          <input type="hidden" name="csrf" value="{{ csrf_token }}">
           <p class="sub">IP binding: <strong>{% if ip_binding.is_on() %}on{% else %}off{% endif %}</strong>. While on, a session cookie only works from the network it was issued to (IPv4 address, or IPv6 /64), so it cannot be passed around.</p>
           {% if ip_binding.is_on() %}
           <input type="hidden" name="binding" value="off">
@@ -333,7 +353,7 @@
     });
     var nums = ["serving_counter", "queue_counter", "participant_count", "target_rate", "message", "serving_state", "starts_at"];
     function refresh() {
-      fetch("/admin/state", { headers: { "Accept": "application/json" }, credentials: "same-origin" })
+      fetch("/_wr/admin/state", { headers: { "Accept": "application/json" }, credentials: "same-origin" })
         .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
         .then(function (s) {
           nums.forEach(function (f) {

@@ -3,7 +3,7 @@
 #   open_event  fired once at the event start by an EventBridge schedule; reads
 #               the shard counts and writes the open (seed + offsets + count +
 #               phase) in one conditional UpdateItem.
-#   read        serves GET /v1/status and /v1/queue_num over API Gateway; the
+#   read        serves GET /_wr/v1/status and /_wr/v1/queue_num over API Gateway; the
 #               route wiring lives in api.tf.
 #
 # Every function deploys its own build; there is no stub fallback.
@@ -28,10 +28,19 @@ resource "aws_lambda_function" "open_event" {
   runtime       = "provided.al2023"
   architectures = [local.lambda_runtime_arch]
   handler       = "bootstrap"
-  # One BatchGetItem and one conditional UpdateItem; it finishes in well under
-  # a second whatever the cohort size, because it reads counters, not rows.
-  timeout     = 10
+  # The open itself is one BatchGetItem and one conditional UpdateItem, well
+  # under a second whatever the cohort size, because it reads counters, not
+  # rows. The rest of the budget is the wait for the join queue to drain first
+  # (issue #239), so a registrant still in the queue at T-0 is in the cohort.
+  timeout     = 30
   memory_size = 256
+
+  # A reservation is a guarantee as much as a cap. The open fires at T-0, into
+  # the burst, when assign_position and generate_token can hold the account's
+  # whole concurrency; without one the invoke that opens the event can be the
+  # one that is throttled. One is enough: a second concurrent open could only
+  # lose the conditional write to the first (issue #236).
+  reserved_concurrent_executions = 1
 
   filename         = local.lambda_zip["open_event"]
   source_code_hash = local.lambda_hash["open_event"]
@@ -39,6 +48,8 @@ resource "aws_lambda_function" "open_event" {
   environment {
     variables = merge(local.dynamo_lambda_env, {
       COUNTERS_TABLE = aws_dynamodb_table.counters.name
+      # Whose depth the open waits on before it counts the cohort (issue #239).
+      JOIN_QUEUE_URL = aws_sqs_queue.join.url
     })
   }
 
@@ -156,7 +167,7 @@ resource "aws_lambda_function" "admin" {
       ASSIGN_POSITION_FUNCTION_NAME = aws_lambda_function.assign_position.function_name
       CONTROLLER_SCHEDULE_NAME      = aws_scheduler_schedule.controller.name
       EDGE_READINESS_PARAM          = local.edge_readiness_parameter_name
-      # API Gateway prefixes the path with the stage (e.g. /dev/admin); this
+      # API Gateway prefixes the path with the stage (e.g. /dev/_wr/admin); this
       # makes the Rust runtime strip it so the Axum routes match unprefixed.
       AWS_LAMBDA_HTTP_IGNORE_STAGE_IN_PATH = "true"
       # OIDC admin login (ADR-0016). The client secret is read from the SSM
@@ -167,7 +178,8 @@ resource "aws_lambda_function" "admin" {
       OIDC_CLIENT_SECRET_PARAM = aws_ssm_parameter.oidc_client_secret.name
       # Comma-separated allowlist of operator emails permitted to log in. Empty
       # = deny all (the admin Lambda fails closed).
-      OIDC_ALLOWED_EMAILS = var.oidc_allowed_emails
+      OIDC_ALLOWED_EMAILS         = var.oidc_allowed_emails
+      OIDC_REQUIRE_EMAIL_VERIFIED = tostring(var.oidc_require_email_verified)
     })
   }
 
@@ -190,7 +202,7 @@ resource "aws_lambda_function" "admin" {
   lifecycle {
     precondition {
       condition     = var.oidc_client_id != "" && var.oidc_redirect_uri != ""
-      error_message = "oidc_client_id and oidc_redirect_uri must both be set, or the admin Lambda deploys and then fails at Init on every invoke. The redirect URI is https://<cloudfront_domain_name>/admin/callback -- on a first deploy, set placeholders (e.g. \"pending\" and https://pending.invalid/admin/callback), apply, then set the real values and apply again (docs/DEPLOY.md)."
+      error_message = "oidc_client_id and oidc_redirect_uri must both be set, or the admin Lambda deploys and then fails at Init on every invoke. The redirect URI is https://<cloudfront_domain_name>/_wr/admin/callback -- on a first deploy, set placeholders (e.g. \"pending\" and https://pending.invalid/_wr/admin/callback), apply, then set the real values and apply again (docs/DEPLOY.md)."
     }
 
     precondition {
@@ -205,7 +217,7 @@ resource "aws_lambda_function" "admin" {
   depends_on = [aws_cloudwatch_log_group.lambda]
 }
 
-# API Gateway invokes the admin Lambda for the /admin routes (OIDC session auth
+# API Gateway invokes the admin Lambda for the /_wr/admin routes (OIDC session auth
 # in the Lambda, ADR-0016). /metrics and
 # /update_session were removed with the origin authorizer (ADR-0032): the first
 # was routed with no handler behind it, the second returned 501.
@@ -328,10 +340,9 @@ resource "aws_iam_role_policy" "open_scheduler" {
 
 # --- controller ---------------------------------------------------------------
 #
-# The closed-loop outflow controller. It advances
-# serving_counter to meter admission against the operator's target rate while
-# compensating for no-shows, and expires positions past expires_at. Falls back
-# from its own build.
+# The closed-loop outflow controller. It advances serving_counter to meter
+# admission against the operator's target rate while compensating for
+# no-shows. It does not expire positions (ADR-0031).
 
 resource "aws_iam_role" "controller" {
   name               = "${local.controller_name}-role"
@@ -356,13 +367,29 @@ resource "aws_lambda_function" "controller" {
   timeout     = 30
   memory_size = 256
 
+  # Guarantees the controller a slot during the burst, when the functions on
+  # the visitor path can hold the account's whole concurrency and a throttled
+  # controller means nobody is admitted. Two rather than one: a resumed pass of
+  # one execution can meet the first pass of the next, and throttling either
+  # delays a release.
+  reserved_concurrent_executions = var.controller_reserved_concurrency
+
   # The 10s cadence is built from durable waits: the execution suspends between
   # passes without incurring duration charges, instead of holding the invocation
-  # open across six passes. ExecutionTimeout bounds one minute of cadence with
-  # headroom for step retries; a stuck execution is abandoned rather than
-  # overlapping the next scheduled one.
+  # open across six passes.
+  #
+  # ExecutionTimeout is the schedule's own period. Six passes ten seconds apart
+  # finish in about fifty seconds plus each pass's latency, so a healthy
+  # execution fits; one that has drifted past the minute is stopped, and the
+  # pass it loses is the one the next execution's first pass makes anyway --
+  # what a pass releases follows the wall clock, not the pass count. At the
+  # earlier 120 a slow execution ran alongside the next for up to a minute.
+  #
+  # Executions can still overlap briefly: the schedule's fire time and the stop
+  # are not synchronised. The controller is written for that (issue #236) --
+  # an extra pass is owed only the seconds since the one before it.
   durable_config {
-    execution_timeout = 120
+    execution_timeout = 60
     retention_period  = 7
   }
 
@@ -432,7 +459,31 @@ resource "aws_scheduler_schedule" "controller" {
       InvocationType = "Event"
       Payload        = jsonencode({ event_id = var.event_id })
     })
+
+    # Deliberately not the service defaults (185 attempts over 24 hours). A
+    # fire that could not be delivered is worth nothing a minute later: the
+    # next fire has already happened, and a retried one would start a second
+    # execution beside it. Dropped, the next minute's first pass makes up the
+    # time, because a pass releases by the wall clock (issue #236).
+    retry_policy {
+      maximum_event_age_in_seconds = 60
+      maximum_retry_attempts       = 0
+    }
   }
+}
+
+# The schedule invokes asynchronously (InvocationType = Event), so Lambda's own
+# async queue sits between the fire and the function and has the same problem
+# one step later: by default it holds a throttled or failed invoke for up to
+# six hours and retries it twice, then starts a minute of passes long after the
+# minute it was for. Scoped to $LATEST because that is the qualifier the
+# schedule invokes.
+resource "aws_lambda_function_event_invoke_config" "controller" {
+  function_name = aws_lambda_function.controller.function_name
+  qualifier     = "$LATEST"
+
+  maximum_event_age_in_seconds = 60
+  maximum_retry_attempts       = 0
 }
 
 resource "aws_iam_role" "controller_scheduler" {

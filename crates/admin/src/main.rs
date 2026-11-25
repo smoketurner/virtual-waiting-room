@@ -1,11 +1,11 @@
 //! Lambda entry point for the admin control plane: an Axum router served through
 //! API Gateway via `lambda_http`. Access is gated by an OIDC login session
-//! (ADR-0016): unauthenticated requests to `/admin*` redirect to `/admin/login`,
+//! (ADR-0016): unauthenticated requests to `/_wr/admin*` redirect to `/_wr/admin/login`,
 //! which runs an Authorization Code + PKCE flow against the configured provider
 //! (Vouch by default). The PKCE transaction and the session live in `DynamoDB`,
 //! so they survive the login -> callback round-trip across Lambda cold starts.
 //!
-//! API Gateway prefixes the request path with the stage (e.g. `/dev/admin`).
+//! API Gateway prefixes the request path with the stage (e.g. `/dev/_wr/admin`).
 //! `AWS_LAMBDA_HTTP_IGNORE_STAGE_IN_PATH=true` (set on the function in Terraform)
 //! makes the runtime strip the stage before axum routes, so routes are declared
 //! unprefixed.
@@ -17,10 +17,13 @@ use admin::dynamo::DynamoStore;
 use admin::edge::KvsStore;
 use admin::oidc::{self, OidcClient, OidcConfig};
 use admin::opener::LambdaOpener;
+use admin::operator::{
+    self, Allowlist, Gate, Operator, SESSION_COOKIE, STATE_COOKIE, cookie_value,
+};
 use admin::probe::{AwsProbe, Clients, Names, TableNames};
 use admin::readiness::{self, WarmTargets};
 use admin::scheduler::SchedulerStore;
-use admin::sessions::{AdminSession, PendingLogin, SessionStore};
+use admin::sessions::{PendingLogin, SessionStore};
 use admin::templates::Dashboard;
 use admin::{
     ApplyError, EdgeConfigStore, apply_fail_open, apply_force_maintenance, apply_ip_binding,
@@ -46,12 +49,6 @@ use rust_embed::RustEmbed;
 use serde::Deserialize;
 use tower::Layer as _;
 
-/// Name of the opaque session cookie.
-const SESSION_COOKIE: &str = "vwr_admin_session";
-/// Name of the short-lived cookie binding a login to the browser that started
-/// it: holds the CSRF state, checked against the callback's `state` param.
-const STATE_COOKIE: &str = "vwr_admin_login_state";
-
 /// Static assets (CSS) embedded into the binary at build time.
 #[derive(RustEmbed)]
 #[folder = "static/"]
@@ -71,16 +68,67 @@ struct AppState {
     /// The warm throughput Terraform configured, which the panel compares the
     /// applied values against.
     warm_targets: WarmTargets,
-    sessions: SessionStore,
+    /// The session store and the operator allowlist, shared with the layer
+    /// that guards every state-changing request (issue #243).
+    gate: Arc<Gate<SessionStore>>,
     oidc: OidcClient,
     http: reqwest::Client,
     event_id: String,
-    /// Emails permitted to hold an admin session. Empty = deny all (fail closed
-    /// for a control plane): an OIDC identity not on this list is rejected.
-    allowed_emails: Vec<String>,
 }
 
 type Shared = Arc<AppState>;
+
+/// The console's own origin, from the redirect URI the OIDC client is
+/// configured with: `CloudFront` does not forward `Host` to this origin, so the
+/// request itself cannot say where it was served from.
+fn console_origin() -> Arc<Option<String>> {
+    Arc::new(
+        std::env::var("OIDC_REDIRECT_URI")
+            .ok()
+            .and_then(|uri| admin::security::origin_of(&uri).map(str::to_owned)),
+    )
+}
+
+/// Refuses a state-changing request another site sent (issue #243), before any
+/// handler runs.
+async fn refuse_cross_site_writes(
+    State(own_origin): State<Arc<Option<String>>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if admin::security::is_cross_site_write(
+        request.method(),
+        request.headers(),
+        own_origin.as_deref(),
+    ) {
+        tracing::warn!(
+            event = "admin_cross_site_write_refused",
+            path = request.uri().path(),
+            "refused a state-changing admin request from another site"
+        );
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    next.run(request).await
+}
+
+/// Whether a login needs the provider's `email_verified` claim to be present.
+///
+/// On unless `OIDC_REQUIRE_EMAIL_VERIFIED` is exactly `false`. The claim is
+/// optional in `OpenID` Connect, and a provider that only ever issues verified
+/// addresses may omit it; requiring it there would refuse every operator.
+fn email_verified_required() -> bool {
+    std::env::var("OIDC_REQUIRE_EMAIL_VERIFIED").as_deref() != Ok("false")
+}
+
+/// The verification a login is judged on. With the requirement off an absent
+/// claim counts as verified; an explicit `false` never does.
+fn effective_email_verified(claim: Option<bool>, required: bool) -> Option<bool> {
+    match (claim, required) {
+        (Some(verified), _) => Some(verified),
+        (None, true) => None,
+        (None, false) => Some(true),
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -149,26 +197,27 @@ async fn main() -> Result<(), Error> {
         ),
         probe,
         warm_targets,
-        sessions: SessionStore::new(dynamo, std::env::var("TOKENS_TABLE")?),
+        // Comma-separated allowlist. Empty (unset) = deny all — the operator
+        // must configure who may log in.
+        gate: Arc::new(Gate::new(
+            SessionStore::new(dynamo, std::env::var("TOKENS_TABLE")?),
+            Allowlist::parse(&std::env::var("OIDC_ALLOWED_EMAILS").unwrap_or_default()),
+        )),
         oidc,
         http,
         event_id: std::env::var("EVENT_ID")?,
-        // Comma-separated allowlist; entries trimmed and lowercased. Empty (unset)
-        // = deny all — the operator must configure who may log in.
-        allowed_emails: std::env::var("OIDC_ALLOWED_EMAILS")
-            .unwrap_or_default()
-            .split(',')
-            .map(|s| s.trim().to_ascii_lowercase())
-            .filter(|s| !s.is_empty())
-            .collect(),
     });
+    let gate = Arc::clone(&state.gate);
 
-    let app = Router::new()
+    let own_origin = console_origin();
+
+    // Every route sits under the room's one reserved prefix (issue #251).
+    let routes = Router::new()
         .route("/admin", get(dashboard))
         .route("/admin/state", get(state_json))
         .route("/admin/login", get(login))
         .route("/admin/callback", get(callback))
-        .route("/admin/logout", get(logout))
+        .route("/admin/logout", post(logout))
         .route("/admin/phase", post(set_phase))
         .route("/admin/rate", post(set_rate))
         .route("/admin/message", post(set_message))
@@ -182,7 +231,24 @@ async fn main() -> Result<(), Error> {
         .route("/admin/rules", post(set_rules))
         .route("/admin/ip_binding", post(set_ip_binding))
         .route("/static/{*path}", get(static_asset))
-        .with_state(state)
+        .with_state(state);
+    let app = Router::new()
+        .nest(operator::ROOM_PREFIX, routes)
+        // Every state-changing request, whatever its route, needs a live
+        // session still on the allowlist and that session's CSRF token (issue
+        // #243). Mounted here rather than per route so a new one cannot be
+        // registered without it.
+        .layer(axum::middleware::from_fn_with_state(
+            gate,
+            operator::guard_writes::<SessionStore>,
+        ))
+        // Refuses a state-changing request another site sent (issue #243),
+        // before any handler runs. Inside the hardening layer so the refusal
+        // carries the same headers as every other response.
+        .layer(axum::middleware::from_fn_with_state(
+            own_origin,
+            refuse_cross_site_writes,
+        ))
         // Security-headers middleware: apply the hardening + no-cache headers to
         // every response. The dashboard handler sets its own nonce'd CSP first;
         // apply_hardening leaves an existing CSP intact, so this adds the policy
@@ -192,9 +258,10 @@ async fn main() -> Result<(), Error> {
         // before any other layer can await.
         .layer(axum::middleware::from_fn(arrival_layer));
 
-    // Trim a trailing slash before routing so /admin/ resolves to the /admin
-    // route (and /admin/phase/ to /admin/phase, etc.) — the same handler, not a
-    // redirect. API Gateway collapses /admin/ onto the admin Lambda but forwards
+    // Trim a trailing slash before routing so /_wr/admin/ resolves to the
+    // /_wr/admin route (and /_wr/admin/phase/ to /_wr/admin/phase, etc.) — the
+    // same handler, not a redirect. API Gateway collapses /_wr/admin/ onto the
+    // admin Lambda but forwards
     // the trailing slash; without this the axum router would 404 on it.
     let app = tower_http::normalize_path::NormalizePathLayer::trim_trailing_slash().layer(app);
 
@@ -236,26 +303,6 @@ async fn harden_response(mut response: Response) -> Response {
 
 // --- Auth helpers -------------------------------------------------------------
 
-/// Reads a named cookie's value from the request cookie header, if present.
-fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
-    let raw = headers.get(header::COOKIE)?.to_str().ok()?;
-    cookie::Cookie::split_parse(raw)
-        .filter_map(Result::ok)
-        .find(|c| c.name() == name)
-        .map(|c| c.value().to_string())
-}
-
-/// Extracts the session id from the request cookie header, if present.
-fn session_id_from(headers: &HeaderMap) -> Option<String> {
-    cookie_value(headers, SESSION_COOKIE)
-}
-
-/// Returns the authenticated session, or `None` if the request is unauthenticated.
-async fn authed(state: &Shared, headers: &HeaderMap, now: ArrivalTime) -> Option<AdminSession> {
-    let id = session_id_from(headers)?;
-    state.sessions.load_session(&id, now).await.ok().flatten()
-}
-
 // --- OIDC flow ----------------------------------------------------------------
 
 /// Starts the login: build the authorize URL with PKCE, persist the transaction
@@ -280,7 +327,8 @@ async fn login(State(state): State<Shared>, now: ArrivalTime) -> Response {
         nonce: nonce.secret().clone(),
     };
     if let Err(e) = state
-        .sessions
+        .gate
+        .sessions()
         .put_pending(csrf.secret(), &pending, now)
         .await
     {
@@ -289,10 +337,7 @@ async fn login(State(state): State<Shared>, now: ArrivalTime) -> Response {
     // Bind this login to the browser that started it: a short-lived cookie
     // holding the CSRF state, required to match the callback's state param. A
     // state stolen from elsewhere cannot complete a login without this cookie.
-    let state_cookie = format!(
-        "{STATE_COOKIE}={}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=600",
-        csrf.secret()
-    );
+    let state_cookie = operator::state_cookie(csrf.secret());
     (
         StatusCode::SEE_OTHER,
         [
@@ -318,7 +363,7 @@ async fn callback(
     Query(params): Query<CallbackParams>,
 ) -> Response {
     // Browser binding: the callback must carry the login-state cookie set at
-    // /admin/login, and it must equal the returned state. Rejects a state
+    // /_wr/admin/login, and it must equal the returned state. Rejects a state
     // replayed from a different browser.
     match cookie_value(&headers, STATE_COOKIE) {
         Some(bound) if bound == params.state => {}
@@ -326,7 +371,8 @@ async fn callback(
     }
 
     let Some(pending) = state
-        .sessions
+        .gate
+        .sessions()
         .take_pending(&params.state, now)
         .await
         .ok()
@@ -362,57 +408,70 @@ async fn callback(
     };
 
     let subject = claims.subject().as_str().to_string();
-    let email = claims.email().map_or_default(|e| e.as_str().to_string());
 
-    // Operator allowlist: only configured emails may hold an admin session.
-    // Empty allowlist = deny all (fail closed).
-    if !state.allowed_emails.contains(&email.to_ascii_lowercase()) {
-        tracing::warn!(subject = %subject, "admin login denied: email not in allowlist");
-        return (StatusCode::FORBIDDEN, "not authorized for admin access").into_response();
-    }
+    // Operator allowlist: only a configured email the provider has verified
+    // may hold an admin session (issue #243). Empty allowlist = deny all.
+    let email = match operator::admit_login(
+        state.gate.allowlist(),
+        claims.email().map(|e| e.as_str()),
+        effective_email_verified(claims.email_verified(), email_verified_required()),
+    ) {
+        Ok(email) => email,
+        Err(refusal) => {
+            tracing::warn!(
+                event = "admin_login_refused",
+                reason = refusal.reason(),
+                subject = %subject,
+                "admin login refused"
+            );
+            return (StatusCode::FORBIDDEN, "not authorized for admin access").into_response();
+        }
+    };
 
     let session_id = match state
-        .sessions
-        .create_session(&AdminSession { subject, email }, now)
+        .gate
+        .sessions()
+        .create_session(&subject, &email, now)
         .await
     {
         Ok(id) => id,
         Err(e) => return server_error(&e.to_string()),
     };
 
-    let cookie = format!(
-        "{SESSION_COOKIE}={session_id}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=28800"
-    );
-    // Clear the one-shot login-state cookie now that it has been consumed.
-    let clear_state = format!("{STATE_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0");
-    // Two Set-Cookie headers: append rather than a header array (which would
-    // insert-overwrite the first).
-    let mut response = (StatusCode::SEE_OTHER, [(header::LOCATION, "/admin")]).into_response();
+    // A page that navigates to the dashboard, not a redirect: a redirect out
+    // of this provider-initiated navigation would not carry the Strict session
+    // cookie set here (see `operator::SIGNED_IN_PAGE`).
+    let mut response = Html(operator::SIGNED_IN_PAGE).into_response();
     let set_cookie = |v: String| {
         v.parse()
             .map_err(|e| tracing::error!(error = %e, "invalid Set-Cookie value"))
             .ok()
     };
-    if let Some(c) = set_cookie(cookie) {
-        response.headers_mut().append(header::SET_COOKIE, c);
-    }
-    if let Some(c) = set_cookie(clear_state) {
-        response.headers_mut().append(header::SET_COOKIE, c);
+    // Two Set-Cookie headers, appended: the session, and the one-shot
+    // login-state cookie cleared now that it has been consumed.
+    for cookie in [
+        operator::session_cookie(&session_id),
+        operator::cleared_state_cookie(),
+    ] {
+        if let Some(c) = set_cookie(cookie) {
+            response.headers_mut().append(header::SET_COOKIE, c);
+        }
     }
     response
 }
 
-/// Clears the session and its cookie.
-async fn logout(State(state): State<Shared>, headers: HeaderMap) -> Response {
-    if let Some(id) = session_id_from(&headers) {
-        let _ = state.sessions.delete_session(&id).await;
+/// Clears the session and its cookie. A POST carrying the session's token like
+/// every other action (issue #243): as a GET, any page could sign the operator
+/// out with an image tag.
+async fn logout(State(state): State<Shared>, _operator: Operator, headers: HeaderMap) -> Response {
+    if let Some(id) = cookie_value(&headers, SESSION_COOKIE) {
+        let _ = state.gate.sessions().delete_session(&id).await;
     }
-    let cleared = format!("{SESSION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0");
     (
         StatusCode::SEE_OTHER,
         [
-            (header::SET_COOKIE, cleared),
-            (header::LOCATION, "/admin/login".to_string()),
+            (header::SET_COOKIE, operator::cleared_session_cookie()),
+            (header::LOCATION, operator::LOGIN_PATH.to_string()),
         ],
     )
         .into_response()
@@ -422,13 +481,14 @@ async fn logout(State(state): State<Shared>, headers: HeaderMap) -> Response {
 
 /// Renders the dashboard from current control state. Unauthenticated -> login.
 async fn dashboard(State(state): State<Shared>, headers: HeaderMap, now: ArrivalTime) -> Response {
-    let Some(session) = authed(&state, &headers, now).await else {
-        return Redirect::to("/admin/login").into_response();
+    let Some(session) = state.gate.authenticate(&headers, now).await else {
+        return Redirect::to(operator::LOGIN_PATH).into_response();
     };
     match state.store_load(now).await {
         Ok(Some(mut view)) => {
             view.csp_nonce = admin::security::nonce();
             view.operator_email = session.email;
+            view.csrf_token = session.csrf;
             // Rules live only in the KeyValueStore (issue #71), not in
             // ControlState, so the current ruleset is a second read. A
             // failure here must not break the whole dashboard — the operator
@@ -478,7 +538,7 @@ async fn dashboard(State(state): State<Shared>, headers: HeaderMap, now: Arrival
 /// Current control state as JSON for the dashboard's poller. Session-gated like
 /// the dashboard; returns the same view the HTML renders.
 async fn state_json(State(state): State<Shared>, headers: HeaderMap, now: ArrivalTime) -> Response {
-    if authed(&state, &headers, now).await.is_none() {
+    if state.gate.authenticate(&headers, now).await.is_none() {
         return (StatusCode::UNAUTHORIZED, "not authenticated").into_response();
     }
     match state.store_load(now).await {
@@ -495,13 +555,10 @@ struct PhaseForm {
 
 async fn set_phase(
     State(state): State<Shared>,
-    headers: HeaderMap,
+    Operator(session): Operator,
     now: ArrivalTime,
     Form(form): Form<PhaseForm>,
 ) -> Response {
-    let Some(session) = authed(&state, &headers, now).await else {
-        return Redirect::to("/admin/login").into_response();
-    };
     finish(
         apply_phase(
             &state.store,
@@ -522,13 +579,10 @@ struct RateForm {
 
 async fn set_rate(
     State(state): State<Shared>,
-    headers: HeaderMap,
+    Operator(session): Operator,
     now: ArrivalTime,
     Form(form): Form<RateForm>,
 ) -> Response {
-    let Some(session) = authed(&state, &headers, now).await else {
-        return Redirect::to("/admin/login").into_response();
-    };
     finish(
         apply_rate(
             &state.store,
@@ -549,13 +603,10 @@ struct MessageForm {
 
 async fn set_message(
     State(state): State<Shared>,
-    headers: HeaderMap,
+    Operator(session): Operator,
     now: ArrivalTime,
     Form(form): Form<MessageForm>,
 ) -> Response {
-    let Some(session) = authed(&state, &headers, now).await else {
-        return Redirect::to("/admin/login").into_response();
-    };
     finish(
         apply_message(
             &state.store,
@@ -585,10 +636,11 @@ struct StartTimeForm {
 /// one conditional write carrying the permutation seed, and a phase flipped to
 /// `Active` without it is an event that says it is open while every pre-queue
 /// visitor is told it is not.
-async fn open_now(State(state): State<Shared>, headers: HeaderMap, now: ArrivalTime) -> Response {
-    let Some(session) = authed(&state, &headers, now).await else {
-        return Redirect::to("/admin/login").into_response();
-    };
+async fn open_now(
+    State(state): State<Shared>,
+    Operator(session): Operator,
+    now: ArrivalTime,
+) -> Response {
     finish(
         apply_open_now(
             &state.store,
@@ -604,13 +656,10 @@ async fn open_now(State(state): State<Shared>, headers: HeaderMap, now: ArrivalT
 
 async fn set_start_time(
     State(state): State<Shared>,
-    headers: HeaderMap,
+    Operator(session): Operator,
     now: ArrivalTime,
     Form(form): Form<StartTimeForm>,
 ) -> Response {
-    let Some(session) = authed(&state, &headers, now).await else {
-        return Redirect::to("/admin/login").into_response();
-    };
     finish(
         apply_start_time(
             &state.store,
@@ -630,28 +679,27 @@ async fn set_start_time(
 /// nothing and is reversed from the phase control.
 async fn force_maintenance(
     State(state): State<Shared>,
-    headers: HeaderMap,
+    Operator(session): Operator,
     now: ArrivalTime,
 ) -> Response {
-    let Some(session) = authed(&state, &headers, now).await else {
-        return Redirect::to("/admin/login").into_response();
-    };
     finish(apply_force_maintenance(&state.store, &state.event_id, &session.email, now).await)
 }
 
 /// Holds admission while the queue keeps forming. Reversible, no confirmation.
-async fn pause(State(state): State<Shared>, headers: HeaderMap, now: ArrivalTime) -> Response {
-    let Some(session) = authed(&state, &headers, now).await else {
-        return Redirect::to("/admin/login").into_response();
-    };
+async fn pause(
+    State(state): State<Shared>,
+    Operator(session): Operator,
+    now: ArrivalTime,
+) -> Response {
     finish(apply_pause(&state.store, &state.event_id, &session.email, now).await)
 }
 
 /// Resume admission after a pause.
-async fn resume(State(state): State<Shared>, headers: HeaderMap, now: ArrivalTime) -> Response {
-    let Some(session) = authed(&state, &headers, now).await else {
-        return Redirect::to("/admin/login").into_response();
-    };
+async fn resume(
+    State(state): State<Shared>,
+    Operator(session): Operator,
+    now: ArrivalTime,
+) -> Response {
     finish(apply_resume(&state.store, &state.event_id, &session.email, now).await)
 }
 
@@ -664,13 +712,10 @@ struct FailOpenForm {
 /// lapses on its own. Legal regardless of pause state.
 async fn fail_open(
     State(state): State<Shared>,
-    headers: HeaderMap,
+    Operator(session): Operator,
     now: ArrivalTime,
     Form(form): Form<FailOpenForm>,
 ) -> Response {
-    let Some(session) = authed(&state, &headers, now).await else {
-        return Redirect::to("/admin/login").into_response();
-    };
     finish(
         apply_fail_open(
             &state.store,
@@ -686,10 +731,11 @@ async fn fail_open(
 
 /// Clears the fail-open epoch. Not "resume": under the split this only
 /// clears the epoch, so a pause queued during the window still applies.
-async fn recover(State(state): State<Shared>, headers: HeaderMap, now: ArrivalTime) -> Response {
-    let Some(session) = authed(&state, &headers, now).await else {
-        return Redirect::to("/admin/login").into_response();
-    };
+async fn recover(
+    State(state): State<Shared>,
+    Operator(session): Operator,
+    now: ArrivalTime,
+) -> Response {
     finish(
         apply_recover(
             &state.store,
@@ -712,13 +758,10 @@ struct IpBindingForm {
 /// Turns the gate's session IP binding on or off (issue #61, ADR-0036).
 async fn set_ip_binding(
     State(state): State<Shared>,
-    headers: HeaderMap,
+    Operator(session): Operator,
     now: ArrivalTime,
     Form(form): Form<IpBindingForm>,
 ) -> Response {
-    let Some(session) = authed(&state, &headers, now).await else {
-        return Redirect::to("/admin/login").into_response();
-    };
     let on = match form.binding.as_str() {
         "on" => true,
         "off" => false,
@@ -752,13 +795,10 @@ struct RulesForm {
 /// JavaScript disabled.
 async fn set_rules(
     State(state): State<Shared>,
-    headers: HeaderMap,
+    Operator(session): Operator,
     now: ArrivalTime,
     Form(form): Form<RulesForm>,
 ) -> Response {
-    let Some(session) = authed(&state, &headers, now).await else {
-        return Redirect::to("/admin/login").into_response();
-    };
     let rules = match parse_rules(&form.rules) {
         Ok(rules) => rules,
         Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
@@ -776,7 +816,7 @@ async fn set_rules(
     )
 }
 
-/// Serves an embedded static asset (`/static/<path>`) with a guessed
+/// Serves an embedded static asset (`/_wr/static/<path>`) with a guessed
 /// content-type. Public (CSS and fonts carry no secrets). Unknown paths 404.
 ///
 /// The assets are compiled into the binary, so their content changes only when
@@ -848,7 +888,11 @@ impl AppState {
 fn finish(result: Result<(), ApplyError>) -> Response {
     use admin::{ActionError, StoreError};
     match result {
-        Ok(()) => (StatusCode::SEE_OTHER, [(header::LOCATION, "/admin")]).into_response(),
+        Ok(()) => (
+            StatusCode::SEE_OTHER,
+            [(header::LOCATION, operator::CONSOLE_PATH)],
+        )
+            .into_response(),
         // Debounce rejection — a double-click / fast toggle.
         Err(ApplyError::Action(ActionError::TooFast)) => (
             StatusCode::TOO_MANY_REQUESTS,
@@ -869,4 +913,22 @@ fn finish(result: Result<(), ApplyError>) -> Response {
 fn server_error(msg: &str) -> Response {
     tracing::error!(error = %msg, "admin handler error");
     (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::effective_email_verified;
+
+    #[test]
+    fn an_absent_claim_counts_as_verified_only_when_the_requirement_is_off() {
+        assert_eq!(effective_email_verified(None, true), None);
+        assert_eq!(effective_email_verified(None, false), Some(true));
+    }
+
+    #[test]
+    fn an_explicitly_unverified_address_is_never_accepted() {
+        assert_eq!(effective_email_verified(Some(false), true), Some(false));
+        assert_eq!(effective_email_verified(Some(false), false), Some(false));
+        assert_eq!(effective_email_verified(Some(true), true), Some(true));
+    }
 }

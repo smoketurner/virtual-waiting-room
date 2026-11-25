@@ -1,4 +1,4 @@
-//! Lambda entry point for `POST /v1/enter` and `GET /v1/wait`: the queue for
+//! Lambda entry point for `POST /_wr/v1/enter` and `GET /_wr/v1/wait`: the queue for
 //! a visitor without JavaScript (issue #67). See the library docs.
 
 use std::env;
@@ -13,10 +13,11 @@ use lambda_http::{Body, Error, Request, Response, run, service_fn};
 use nojs::page::{WaitHtml, encode_component};
 use nojs::sqs::SqsJoinQueue;
 use nojs::{
-    ENTER_PATH, Identity, JoinQueue, WAIT_PATH, WaitOutcome, WaitPage, clear_identity_cookie,
-    enter, identity_from_cookies, next_from_referer, next_param, outcome, safe_next,
+    ENTER_PATH, Identity, JoinQueue, Unanswered, WAIT_PATH, WaitOutcome, WaitPage,
+    clear_identity_cookie, enter, identity_from_cookies, next_from_referer, next_param, outcome,
+    safe_next,
 };
-use tracing::error;
+use tracing::{error, warn};
 use wr_common::SigningKey;
 
 struct AppState<S: Store, Q: JoinQueue> {
@@ -209,7 +210,63 @@ async fn handle_wait<S: Store, Q: JoinQueue>(
             &next,
             Some(&clear_identity_cookie()),
         ),
+        WaitOutcome::Show(WaitPage::Joining) => {
+            handle_unanswered(state, &identity, &next, now).await
+        }
         WaitOutcome::Show(shown) => page(StatusCode::OK, &shown, &next, None),
+    }
+}
+
+/// The wait page for a visitor no registration exists for (issue #251).
+///
+/// Usually the join is still in flight. One the queue or the ingest lost
+/// would otherwise leave this page refreshing forever, since `/_wr/v1/enter` will
+/// not join a visitor who already holds an identity: so an overdue join is
+/// sent again from here, a bounded number of times, and after that the
+/// visitor is told and gets the form back.
+async fn handle_unanswered<S: Store, Q: JoinQueue>(
+    state: &AppState<S, Q>,
+    identity: &Identity,
+    next: &str,
+    now: u64,
+) -> Result<Response<Body>, Error> {
+    match identity.unanswered(now) {
+        Unanswered::InFlight => page(StatusCode::OK, &WaitPage::Joining, next, None),
+        Unanswered::Resend(restamped) => {
+            if let Err(e) = enter(&state.queue, &state.event_id, &restamped).await {
+                // The cookie keeps its old stamp, so the next load tries again.
+                error!(error = %e, event = "nojs_join_failed", "could not resend a no-JavaScript join");
+                return page(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &WaitPage::Unavailable,
+                    next,
+                    None,
+                );
+            }
+            warn!(
+                event = "nojs_join_resent",
+                rejoins = restamped.rejoins,
+                "resent a no-JavaScript join that never registered"
+            );
+            page(
+                StatusCode::OK,
+                &WaitPage::Joining,
+                next,
+                Some(&restamped.set_cookie()),
+            )
+        }
+        Unanswered::GaveUp => {
+            error!(
+                event = "nojs_join_lost",
+                "a no-JavaScript join never registered after every resend"
+            );
+            page(
+                StatusCode::OK,
+                &WaitPage::JoinLost,
+                next,
+                Some(&clear_identity_cookie()),
+            )
+        }
     }
 }
 
@@ -247,7 +304,7 @@ mod tests {
 
     use std::sync::Mutex;
 
-    use generate_token::{AdmissionClaim, PositionRow, StoreError};
+    use generate_token::{PositionRow, StoreError};
     use nojs::{IDENTITY_COOKIE, QueueError};
     use wr_common::{
         Counters, Phase, PositionStatus, PossessionSecret, PreQueueItem, SHARDS, Session, Shard,
@@ -298,19 +355,19 @@ mod tests {
         {
             std::future::ready(Ok(self.position.clone()))
         }
-        fn claim_admission(
+        fn take_slot(
+            &self,
+            _event_id: &str,
+            _shard: Shard,
+        ) -> impl std::future::Future<Output = Result<bool, StoreError>> + Send {
+            std::future::ready(Ok(true))
+        }
+        fn mark_admitted(
             &self,
             _request_id: &str,
             _position: u64,
             _digest: &wr_common::SecretDigest,
             _now: u64,
-        ) -> impl std::future::Future<Output = Result<AdmissionClaim, StoreError>> + Send {
-            std::future::ready(Ok(AdmissionClaim::First))
-        }
-        fn record_arrival(
-            &self,
-            _event_id: &str,
-            _shard: Shard,
         ) -> impl std::future::Future<Output = Result<(), StoreError>> + Send {
             std::future::ready(Ok(()))
         }
@@ -344,6 +401,7 @@ mod tests {
                     position: p,
                     status: PositionStatus::Issued,
                     digest: Some(PossessionSecret::parse(SECRET).unwrap().digest()),
+                    admitted_at: None,
                 }),
             },
             queue: FakeQueue {
@@ -375,8 +433,98 @@ mod tests {
         }
     }
 
+    /// The second every wait in these tests is served at.
+    const NOW: u64 = 1_700_000_000;
+
+    /// A cookie whose join was sent `ago` seconds before [`NOW`].
+    fn stamped_cookie(secret: &str, ago: u64, rejoins: u8) -> String {
+        format!("{IDENTITY_COOKIE}={ID}.{secret}.{}.{rejoins}", NOW - ago)
+    }
+
     fn identity_cookie(secret: &str) -> String {
-        format!("{IDENTITY_COOKIE}={ID}.{secret}")
+        stamped_cookie(secret, 0, 0)
+    }
+
+    async fn wait_with(state: &AppState<FakeStore, FakeQueue>, cookie: &str) -> Response<Body> {
+        handle_wait(
+            state,
+            &request(
+                "GET",
+                "/_wr/v1/wait?next=%2Fcheckout",
+                &[("cookie", cookie)],
+            ),
+            NOW,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_join_still_in_flight_is_waited_on_not_resent() {
+        let state = state(None, false);
+        let response = wait_with(&state, &stamped_cookie(SECRET, 30, 0)).await;
+        assert_eq!(response.status(), 200);
+        assert!(text(&response).contains("http-equiv=\"refresh\" content=\"5\""));
+        assert!(response.headers().get("set-cookie").is_none());
+        assert!(state.queue.sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_lost_join_is_resent_as_the_same_join_and_the_cookie_restamped() {
+        let state = state(None, false);
+        let response = wait_with(&state, &stamped_cookie(SECRET, 61, 0)).await;
+        assert_eq!(response.status(), 200);
+        assert!(text(&response).contains("http-equiv=\"refresh\""));
+
+        let sent = state.queue.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        let msg: serde_json::Value = serde_json::from_str(&sent[0]).unwrap();
+        assert_eq!(msg["request_id"], ID);
+        assert_eq!(
+            msg["h"],
+            PossessionSecret::parse(SECRET).unwrap().digest().as_str()
+        );
+        let cookie = response.headers()["set-cookie"].to_str().unwrap();
+        assert!(
+            cookie.starts_with(&format!("{IDENTITY_COOKIE}={ID}.{SECRET}.{NOW}.1;")),
+            "{cookie}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_join_lost_after_every_resend_gets_the_form_back() {
+        let state = state(None, false);
+        let response = wait_with(&state, &stamped_cookie(SECRET, 61, nojs::MAX_REJOINS)).await;
+        assert_eq!(response.status(), 200);
+        let html = text(&response);
+        assert!(html.contains(r#"action="/_wr/v1/enter?next=%2Fcheckout""#));
+        assert!(!html.contains("http-equiv"));
+        assert!(
+            response.headers()["set-cookie"]
+                .to_str()
+                .unwrap()
+                .contains("Max-Age=0"),
+            "the identity is forgotten so /_wr/v1/enter joins afresh"
+        );
+        assert!(state.queue.sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_resend_the_queue_refused_is_tried_again_on_the_next_load() {
+        let state = state(None, true);
+        let response = wait_with(&state, &stamped_cookie(SECRET, 61, 0)).await;
+        assert_eq!(response.status(), 503);
+        assert!(text(&response).contains("http-equiv=\"refresh\""));
+        // No restamp: the attempt did not happen, so it is not counted.
+        assert!(response.headers().get("set-cookie").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_registered_visitor_is_never_resent_however_old_the_stamp() {
+        let state = state(Some(700), false);
+        let response = wait_with(&state, &stamped_cookie(SECRET, 80_000, nojs::MAX_REJOINS)).await;
+        assert!(text(&response).contains("700"));
+        assert!(state.queue.sent.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -386,7 +534,7 @@ mod tests {
             &state,
             request(
                 "POST",
-                "https://x/v1/enter",
+                "https://x/_wr/v1/enter",
                 &[(
                     "referer",
                     "https://x/_wr/waiting.html?r=none&next=%2Fcheckout",
@@ -396,7 +544,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(response.status(), 303);
-        assert_eq!(response.headers()["location"], "/v1/wait?next=%2Fcheckout");
+        assert_eq!(
+            response.headers()["location"],
+            "/_wr/v1/wait?next=%2Fcheckout"
+        );
         let cookie = response.headers()["set-cookie"].to_str().unwrap();
         assert!(cookie.starts_with(&format!("{IDENTITY_COOKIE}=")));
         assert!(cookie.contains("HttpOnly"));
@@ -415,7 +566,11 @@ mod tests {
         let state = state(None, false);
         let response = handle(
             &state,
-            request("POST", "/v1/enter", &[("cookie", &identity_cookie(SECRET))]),
+            request(
+                "POST",
+                "/_wr/v1/enter",
+                &[("cookie", &identity_cookie(SECRET))],
+            ),
         )
         .await
         .unwrap();
@@ -427,7 +582,7 @@ mod tests {
     #[tokio::test]
     async fn a_join_the_queue_refused_holds_no_place() {
         let state = state(None, true);
-        let response = handle(&state, request("POST", "/v1/enter", &[]))
+        let response = handle(&state, request("POST", "/_wr/v1/enter", &[]))
             .await
             .unwrap();
         assert_eq!(response.status(), 503);
@@ -436,12 +591,12 @@ mod tests {
 
     #[tokio::test]
     async fn waiting_without_an_identity_offers_the_form() {
-        let response = handle(&state(None, false), request("GET", "/v1/wait", &[]))
+        let response = handle(&state(None, false), request("GET", "/_wr/v1/wait", &[]))
             .await
             .unwrap();
         assert_eq!(response.status(), 200);
         let html = text(&response);
-        assert!(html.contains(r#"action="/v1/enter?next=%2F""#));
+        assert!(html.contains(r#"action="/_wr/v1/enter?next=%2F""#));
     }
 
     #[tokio::test]
@@ -450,7 +605,7 @@ mod tests {
             &state(Some(700), false),
             request(
                 "GET",
-                "/v1/wait?next=%2Fcheckout",
+                "/_wr/v1/wait?next=%2Fcheckout",
                 &[("cookie", &identity_cookie(SECRET))],
             ),
         )
@@ -469,7 +624,7 @@ mod tests {
             &state,
             request(
                 "GET",
-                "/v1/wait?next=%2Fcheckout",
+                "/_wr/v1/wait?next=%2Fcheckout",
                 &[
                     ("cookie", &identity_cookie(SECRET)),
                     ("cloudfront-viewer-address", "198.51.100.7:4000"),
@@ -493,7 +648,7 @@ mod tests {
             &state(Some(3), false),
             request(
                 "GET",
-                "/v1/wait",
+                "/_wr/v1/wait",
                 &[("cookie", &identity_cookie(&"B".repeat(43)))],
             ),
         )

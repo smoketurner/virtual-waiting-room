@@ -7,25 +7,28 @@
 // The flow:
 //   1. mint or recover a request id and its possession secret (issue #62),
 //      persisted together across the storage chain below
-//   2. POST the id and SHA-256(secret) to /v1/join once, so a position is
-//      claimed; the secret itself goes only to /v1/generate_token
-//   3. poll /v1/status and /v1/queue_num
-//   4. once the position is reached, POST /v1/generate_token to collect the
+//   2. POST the id and SHA-256(secret) to /_wr/v1/join once, so a position is
+//      claimed; the secret itself goes only to /_wr/v1/generate_token
+//   3. poll /_wr/v1/status and /_wr/v1/queue_num
+//   4. once the position is reached, POST /_wr/v1/generate_token to collect the
 //      admission cookies, then reload onto the origin
 
 (function () {
   "use strict";
 
   // "<request_id>.<secret>" as one value, so the id is never recovered
-  // without the secret that proves it (issue #62). Replaces vwr_request_id,
-  // which held the id alone and is cleared on sight.
+  // without the secret that proves it (issue #62).
   var IDENTITY_KEY = "vwr_identity";
-  var LEGACY_ID_KEY = "vwr_request_id";
   var IDENTITY_RE = /^([0-9a-f-]{36})\.([A-Za-z0-9_-]{43})$/;
   var JOINED_KEY = "vwr_joined";
   var AHEAD_AT_START_KEY = "vwr_ahead_at_start";
   var IP_REBIND_KEY = "vwr_ip_rebind";
   var IP_REBIND_WINDOW_MS = 60000;
+  // "<epoch ms>.<bounces>": when this page last redeemed, and how many times
+  // in a row the gate had by then sent the visitor straight back (issue #247).
+  var REDEEMED_KEY = "vwr_redeemed";
+  var BOUNCE_WINDOW_MS = 60000;
+  var MAX_BOUNCES = 2;
 
   // Adaptive poll interval (#69). No policy published ⇒ behave
   // exactly as this client always has: floor === ceiling === 5000ms, divisor
@@ -190,7 +193,9 @@
   }
 
   // The identity's cookie is scoped to the waiting room's own path: at "/"
-  // the browser would send the secret to the origin on every request.
+  // the browser would send the secret to the origin on every request. The
+  // room's API shares that path (issue #251) and is the secret's destination
+  // anyway.
   function cookiePath(name) {
     return name === IDENTITY_KEY ? "/_wr/" : "/";
   }
@@ -253,6 +258,24 @@
     delete memoryStore[key];
   }
 
+  // The gate sends a refused visitor here with a reason (r=). Arriving that
+  // way moments after this page redeemed means the gate turned the fresh
+  // session down -- a rotated key, blocked cookies, an event id that does not
+  // match -- and redeeming again would only repeat it, at navigation speed
+  // (issue #247). Counted once, at load: by the time redeem() runs again the
+  // window may have passed, and the loop it guards is the immediate one.
+  // r=ip has its own, stricter guard in redeem().
+  var bounces = (function () {
+    if (!/[?&]r=/.test(window.location.search || "")) {
+      return 0;
+    }
+    var m = /^(\d+)\.(\d+)$/.exec(readStored(REDEEMED_KEY) || "");
+    if (!m || Date.now() - Number(m[1]) >= BOUNCE_WINDOW_MS) {
+      return 0;
+    }
+    return Number(m[2]) + 1;
+  })();
+
   var requestId = null;
   var secret = null;
 
@@ -275,8 +298,7 @@
   // Resolves the identity this page queues under, before the first poll. The
   // id and its secret survive a reload together through the storage chain
   // above; a visitor whose every tier fails mints a fresh pair and so takes a
-  // new place rather than recovering their old one. A legacy bare id cannot
-  // be redeemed (it has no secret behind it), so it is replaced, not reused.
+  // new place rather than recovering their old one.
   function resolveIdentity() {
     var match = IDENTITY_RE.exec(readStored(IDENTITY_KEY) || "");
     if (match) {
@@ -284,7 +306,6 @@
       secret = match[2];
       return;
     }
-    removeStored(LEGACY_ID_KEY);
     var bytes = new Uint8Array(32);
     crypto.getRandomValues(bytes);
     requestId = uuidv7();
@@ -293,7 +314,7 @@
   }
 
   // base64url(SHA-256(secret)) over the secret's ASCII, which is what
-  // /v1/join stores and wr_common::PossessionSecret::digest recomputes.
+  // /_wr/v1/join stores and wr_common::PossessionSecret::digest recomputes.
   var digestPromise = null;
   function secretDigest() {
     if (!digestPromise) {
@@ -334,6 +355,14 @@
     try {
       next = decodeURIComponent(match[1]);
     } catch (e) {
+      return "/";
+    }
+    // A browser strips tabs and newlines out of a URL before resolving it, so
+    // "/<tab>/host" navigates to "//host" while its second character here is
+    // the tab (issue #244). No path this page is sent back to carries a raw
+    // control character, so one anywhere refuses the whole value -- the same
+    // rule the no-JavaScript path applies (crates/nojs safe_next).
+    if (/[\x00-\x1f\x7f]/.test(next)) {
       return "/";
     }
     // A browser reads "/\host" as "//host", which leaves the site.
@@ -448,7 +477,7 @@
   // position write is guarded on the request id not already existing, so
   // re-joining is a no-op when the row is merely slow to arrive.
   // An in-memory mirror of JOINED_KEY. Without it, a visitor whose storage all
-  // fails reads null on every poll and re-POSTs /v1/join for the entire wait —
+  // fails reads null on every poll and re-POSTs /_wr/v1/join for the entire wait —
   // one join per poll interval, per waiter, for the whole event.
   var joinedId = null;
 
@@ -460,6 +489,8 @@
   var MAX_REJOIN_CYCLES = 3;
   var JOIN_BACKOFF_CEILING_MS = 120000;
   var joinAttempts = 0;
+  // Joins answered 429. Paces the retry; never ends it.
+  var joinThrottles = 0;
   var rejoinCycles = 0;
   var joinBlockedUntil = 0;
 
@@ -490,7 +521,7 @@
     }
     joinAttempts += 1;
     return secretDigest().then(function (h) {
-      return postJSON("/v1/join", {
+      return postJSON("/_wr/v1/join", {
         request_id: requestId,
         event_id: eventId,
         h: h,
@@ -502,15 +533,30 @@
       if (res.status >= 200 && res.status < 300) {
         joinedId = requestId;
         joinAttempts = 0;
+        joinThrottles = 0;
         writeStored(JOINED_KEY, requestId);
         return;
       }
+      // A 429 is the API smoothing a burst, not refusing this visitor: when a
+      // whole crowd arrives at once the gateway takes them at its own rate and
+      // everyone else is told to come back. That can take minutes at a million
+      // people, so it never counts towards giving up -- a visitor who is
+      // turned away for being one of many must not be told the queue is
+      // broken. Structural failures still count.
+      if (res.status === 429) {
+        joinAttempts -= 1;
+        joinThrottles += 1;
+      }
       // Exponential, capped. The cap bounds the rate; MAX_JOIN_ATTEMPTS is what
-      // bounds the total.
-      var backoff = Math.min(
-        JOIN_BACKOFF_CEILING_MS,
-        policy.floorMs * Math.pow(2, joinAttempts - 1)
-      );
+      // bounds the total. Spread by half either way, because every visitor
+      // turned away in the same second would otherwise come back in the same
+      // second, and the gateway would sit idle in between.
+      var backoff =
+        Math.min(
+          JOIN_BACKOFF_CEILING_MS,
+          policy.floorMs * Math.pow(2, Math.min(joinAttempts + joinThrottles, 7) - 1)
+        ) *
+        (0.5 + Math.random());
       joinBlockedUntil = Date.now() + backoff;
     });
   }
@@ -525,6 +571,8 @@
   // misses lands inside that window, so the recovery fired on every normal join
   // and sent a duplicate message for a place that was simply still in flight.
   var MAX_MISSES = 8;
+  // What a poll resolves to while no join has been accepted.
+  var UNJOINED = {};
   var misses = 0;
 
   // A place in line, once known, never changes: it is derived from an opened
@@ -587,7 +635,7 @@
   // spread alone stops being enough and the account's API Gateway throttle
   // (10,000 requests a second by default, raisable on request) has to go up.
   var FIRST_ASK_TARGET_RPS = 5000;
-  var FIRST_ASK_MAX_SPREAD_MS = 60000;
+  var FIRST_ASK_MAX_SPREAD_MS = 120000;
   var firstAskAt = null;
 
   function scheduleFirstAsk(participants) {
@@ -603,9 +651,9 @@
 
   // How fast the cursor is actually moving, in positions per second, measured
   // from /status rather than taken on trust. The operator's target rate says
-  // what the origin was asked to absorb; the controller then corrects releases
-  // against the share of admitted visitors who never arrive, so the cursor's
-  // real speed is not the target. A visitor should be told what is happening,
+  // what the origin was asked to absorb; the controller then releases extra
+  // positions for admissions nobody took (ADR-0039), so the cursor's real
+  // speed is not the target. A visitor should be told what is happening,
   // not what was intended.
   //
   // Measured across a window rather than between consecutive polls. The cursor
@@ -657,7 +705,7 @@
 
   // Prefer what was observed over what was merely declared, and share that
   // choice between the on-screen ETA and the poll interval so the two never
-  // disagree: the controller corrects releases against a no-show rate, so
+  // disagree: the controller releases extra positions for no-shows, so
   // the cursor's real speed differs from the operator's target, and the
   // interval should track what is actually happening rather than what was
   // only intended.
@@ -828,8 +876,18 @@
     if (admitting) {
       return Promise.resolve();
     }
+    if (bounces >= MAX_BOUNCES) {
+      // Twice admitted, twice turned back. A reload after the window starts
+      // the count again, which is what the message asks for (issue #247).
+      say(
+        "We let you in, but the site turned you back",
+        "Please reload in a minute."
+      );
+      stop();
+      return Promise.resolve();
+    }
     admitting = true;
-    return postJSON("/v1/generate_token", {
+    return postJSON("/_wr/v1/generate_token", {
       request_id: requestId,
       event_id: eventId,
       secret: secret,
@@ -851,20 +909,37 @@
           }
           writeStored(IP_REBIND_KEY, String(Date.now()));
         }
+        writeStored(REDEEMED_KEY, Date.now() + "." + bounces);
         say("You're through", "Taking you to the site…");
         // Replace so the waiting page does not sit in the back history.
         window.location.replace(nextDestination());
         return;
       }
-      // Not admitted after all: the cursor moved back, the position expired, or
-      // the operator paused. Fall back to polling rather than hammering.
+      // Not admitted this time: the origin has had its share for the moment
+      // (a 425 while the admission budget is spent, ADR-0039), or the operator
+      // paused. Fall back to polling rather than hammering.
       admitting = false;
+      // Everyone whose turn has come is told 425 while the budget is spent,
+      // and asks again. Each asks less often the longer it lasts, so a spent
+      // budget is not also a storm of refusals.
+      capacityMisses = res.status === 425 ? capacityMisses + 1 : 0;
       if (res.status === 403) {
         // The secret this browser holds is not the one the place was taken
         // with (issue #62). Nothing on this page can recover that.
         say(
           "We couldn't confirm this place is yours",
           "Open the waiting room again from the link you were given to take a new place."
+        );
+        stop();
+      } else if (res.status === 410) {
+        // This place was used and the visit it bought is over (issue #237).
+        // It cannot be redeemed again, so drop it: the next load of this page
+        // takes a new place instead of asking for the old one forever.
+        removeStored(IDENTITY_KEY);
+        removeStored(JOINED_KEY);
+        say(
+          "Your visit has ended",
+          "Reload this page to take a new place in line."
         );
         stop();
       }
@@ -876,6 +951,9 @@
       throw err;
     });
   }
+
+  // Consecutive "at capacity" answers to a redemption. See redeem().
+  var capacityMisses = 0;
 
   var timer = null;
   var stopped = false;
@@ -895,6 +973,8 @@
   // being caught up promptly. schedule() consumes this once the running
   // chain settles.
   var catchUpWanted = false;
+  // The interval the last failed poll retried at; 0 once a poll succeeds.
+  var backoffMs = 0;
 
   function stop() {
     stopped = true;
@@ -942,7 +1022,7 @@
     }
     inFlight = true;
     lastPollAt = Date.now();
-    getJSON("/v1/status")
+    getJSON("/_wr/v1/status")
       .then(function (res) {
         if (res.status !== 200) {
           throw new Error("status " + res.status);
@@ -1044,14 +1124,28 @@
                 body: { position: knownPosition, live_join: knownLiveJoin },
               };
             }
+            if (joinedId !== requestId) {
+              // No join has been accepted yet, so there is no number to ask
+              // for. Asking anyway costs a request per visitor per poll on an
+              // endpoint the edge cannot collapse, and when a crowd arrives at
+              // once those requests crowd out the joins they are waiting on.
+              return UNJOINED;
+            }
             if (Date.now() < firstAskAt) {
               return null;
             }
             return getJSON(
-              "/v1/queue_num?request_id=" + encodeURIComponent(requestId)
+              "/_wr/v1/queue_num?request_id=" + encodeURIComponent(requestId)
             );
           })
           .then(function (q) {
+            if (q === UNJOINED) {
+              nextIntervalMs = policy.floorMs;
+              if (!stopped) {
+                say("Getting your place in line…", "Just a moment.");
+              }
+              return schedule();
+            }
             if (q === null) {
               // Inside the spread window. The queue is open and moving, and
               // saying so is more honest than a spinner — this visitor has a
@@ -1103,6 +1197,10 @@
                 // navigates away and a permanent refusal has called stop(),
                 // which schedule() honours.
                 if (!admitting) {
+                  nextIntervalMs = Math.min(
+                    policy.ceilingMs,
+                    policy.floorMs * Math.pow(2, Math.min(capacityMisses, 6))
+                  );
                   schedule();
                 }
               });
@@ -1115,11 +1213,20 @@
             return schedule();
           });
       })
+      .then(function () {
+        backoffMs = 0;
+      })
       .catch(function () {
         // Transient. Say nothing alarming and try again — a blip must not
-        // look like a lost place. nextIntervalMs is left at its last value:
-        // an unknown state deserves no faster and no slower a retry than the
-        // visitor was already getting.
+        // look like a lost place. But an origin answering 5xx or 429 is not
+        // helped by every waiter retrying at the pace it was polled at when
+        // healthy (issue #251): each consecutive failure doubles the interval,
+        // up to the ceiling a healthy deep-queue poll already uses, and the
+        // first success above drops straight back. Kept apart from
+        // nextIntervalMs because a chain that fails after /status succeeded
+        // has already reset that to the floor.
+        backoffMs = Math.min(policy.ceilingMs, (backoffMs || nextIntervalMs) * 2);
+        nextIntervalMs = backoffMs;
         schedule();
       })
       .then(function () {

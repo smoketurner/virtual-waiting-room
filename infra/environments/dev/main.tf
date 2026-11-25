@@ -26,10 +26,14 @@ module "core" {
   event_id                      = var.event_id
 
   # Admin OIDC login (ADR-0016). Secret is an SSM SecureString written out of band.
-  oidc_issuer         = var.oidc_issuer
-  oidc_client_id      = var.oidc_client_id
-  oidc_redirect_uri   = var.oidc_redirect_uri
-  oidc_allowed_emails = var.oidc_allowed_emails
+  oidc_issuer                 = var.oidc_issuer
+  oidc_client_id              = var.oidc_client_id
+  oidc_redirect_uri           = var.oidc_redirect_uri
+  oidc_allowed_emails         = var.oidc_allowed_emails
+  oidc_require_email_verified = var.oidc_require_email_verified
+  signing_key_generation      = var.signing_key_generation
+  origin_key_generation       = var.origin_key_generation
+  expected_join_rate          = var.expected_join_rate
 
   # Adaptive poll policy (#69), published on /status.
   poll_floor_ms   = var.poll_floor_ms
@@ -51,6 +55,18 @@ module "core" {
   gate_rules         = var.gate_rules
   starts_at          = var.starts_at
   starts_at_timezone = var.starts_at_timezone
+
+  # Operations: where alarms report, and whether the tables survive a destroy.
+  alarm_sns_topic_arn             = var.alarm_sns_topic_arn
+  table_deletion_protection       = var.table_deletion_protection
+  controller_reserved_concurrency = var.controller_reserved_concurrency
+
+  # Stage throttles: the only rate bound on pay-as-you-go, where there is no
+  # web ACL (issue #245).
+  api_join_throttle_rate_limit  = var.api_join_throttle_rate_limit
+  api_join_throttle_burst_limit = var.api_join_throttle_burst_limit
+  api_throttle_rate_limit       = var.api_throttle_rate_limit
+  api_throttle_burst_limit      = var.api_throttle_burst_limit
 }
 
 # demo-origin: a stand-in for the customer's protected origin. This is the dev
@@ -77,6 +93,7 @@ module "edge" {
 
   api_gateway_domain_name   = module.core.api_gateway_domain_name
   api_origin_key            = module.core.api_origin_key
+  client_origin_secret      = module.core.client_origin_secret
   env                       = var.env
   client_origin_domain_name = var.client_origin_domain_name
 
@@ -93,6 +110,7 @@ module "edge" {
   # Where the distribution's facts are published for the admin's readiness
   # panel (issue #70). core names it; edge writes it.
   readiness_parameter_name = module.core.edge_readiness_parameter_name
+  admin_role_name          = module.core.admin_role_name
 
   # The customer's own hostname, or empty for the *.cloudfront.net default.
   aliases             = var.aliases
@@ -100,8 +118,10 @@ module "edge" {
 
   # Pay-as-you-go unless a flat-rate plan is set; the plan brings the web ACL
   # (ADR-0038), whose cost it bundles.
-  flat_rate_plan_tier    = var.flat_rate_plan_tier
-  waf_managed_rules_mode = var.waf_managed_rules_mode
-  waf_join_ip_limit      = var.waf_join_ip_limit
-  nojs_enabled           = var.nojs_enabled
+  flat_rate_plan_tier      = var.flat_rate_plan_tier
+  waf_managed_rules_mode   = var.waf_managed_rules_mode
+  waf_join_ip_limit        = var.waf_join_ip_limit
+  waf_nojs_wait_ip_limit   = var.waf_nojs_wait_ip_limit
+  waf_require_token_cookie = var.waf_require_token_cookie
+  nojs_enabled             = var.nojs_enabled
 }

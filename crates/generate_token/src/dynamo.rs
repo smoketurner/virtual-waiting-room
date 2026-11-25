@@ -1,19 +1,60 @@
 //! The `aws-sdk-dynamodb`-backed [`Store`] for `generate_token`.
 
 use std::collections::HashMap;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
 use aws_sdk_dynamodb::types::AttributeValue;
 use wr_common::expr::{
-    Condition, ENTRY_TIME_ATTR, Key, POSITION_TTL_SECS, POSITIONS_KEY_ATTR, POSITIONS_TTL_ATTR,
-    POSSESSION_DIGEST_ATTR, QUEUE_POSITION_ATTR, SHARD_COUNT_ATTR, SHARD_INDEX_ATTR, STATUS_ATTR,
-    Update,
+    ADMITTED_AT_ATTR, Condition, ENTRY_TIME_ATTR, Key, POSITION_TTL_SECS, POSITIONS_KEY_ATTR,
+    POSITIONS_TTL_ATTR, POSSESSION_DIGEST_ATTR, QUEUE_POSITION_ATTR, SHARD_CAP_ATTR,
+    SHARD_COUNT_ATTR, STATUS_ATTR, Update,
 };
-use wr_common::{Counters, PositionStatus, PreQueueItem, SecretDigest, Shard};
+use wr_common::{Counters, PositionStatus, PreQueueItem, SHARDS, SecretDigest, Shard};
 
-use crate::{AdmissionClaim, PositionRow, Store, StoreError};
+use crate::{PositionRow, Store, StoreError};
+
+/// How long one execution environment answers from what it last read or
+/// learned, in seconds. See [`SpentShards`] and `load_counters`.
+const MEMO_SECS: u64 = 1;
+
+/// Which arrivals shards this execution environment last saw with no budget
+/// left, and until when it will take that as still true.
+///
+/// A refused take is a conditional write that failed, and a failed conditional
+/// write is billed and counted against the shard's partition like one that
+/// landed. When the budget is spent, everyone whose turn has come keeps
+/// asking, so without this every refusal is up to [`crate::SLOT_ATTEMPTS`]
+/// such writes: at a million visitors that is several times what the ten
+/// shard items can take, and the throttling it causes falls on real
+/// admissions. A shard's cap only rises on a controller pass, every ten
+/// seconds, so a shard seen spent is not asked again for [`MEMO_SECS`]; the
+/// cost is that new budget is noticed up to that much late.
+#[derive(Debug, Default)]
+pub struct SpentShards {
+    until: [AtomicU64; SHARDS],
+}
+
+impl SpentShards {
+    /// Whether `shard` was seen spent recently enough to skip asking it.
+    #[must_use]
+    pub fn is_spent(&self, shard: Shard, now: u64) -> bool {
+        self.until
+            .get(shard.index())
+            .is_some_and(|until| now <= until.load(Ordering::Relaxed))
+    }
+
+    /// Records that `shard` refused a take at `now`.
+    pub fn mark(&self, shard: Shard, now: u64) {
+        if let Some(until) = self.until.get(shard.index()) {
+            until.store(now.saturating_add(MEMO_SECS), Ordering::Relaxed);
+        }
+    }
+}
 
 /// A live store bound to the three tables the admission check reads.
 pub struct DynamoStore {
@@ -21,6 +62,9 @@ pub struct DynamoStore {
     counters_table: String,
     prequeue_table: String,
     positions_table: String,
+    spent: SpentShards,
+    /// The event's `Counters` item as last read, and when.
+    counters: Mutex<Option<(Instant, Option<Counters>)>>,
 }
 
 impl DynamoStore {
@@ -36,12 +80,32 @@ impl DynamoStore {
             counters_table,
             prequeue_table,
             positions_table,
+            spent: SpentShards::default(),
+            counters: Mutex::new(None),
         }
     }
 }
 
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 impl Store for DynamoStore {
     async fn load_counters(&self, event_id: &str) -> Result<Option<Counters>, StoreError> {
+        // Every admission attempt, refused or not, reads this one item, and a
+        // single partition key serves 3,000 consistent reads a second. Each
+        // execution environment therefore holds it for a second, as `read`
+        // does for the same item: the cursor moves every ten seconds and a
+        // pause takes effect at most a second late.
+        if let Ok(guard) = self.counters.lock()
+            && let Some((at, cached)) = guard.as_ref()
+            && at.elapsed() < Duration::from_secs(MEMO_SECS)
+        {
+            return Ok(cached.clone());
+        }
+
         let out = self
             .client
             .get_item()
@@ -54,7 +118,11 @@ impl Store for DynamoStore {
             .await
             .map_err(|e| StoreError(format!("get_item counters: {e}")))?;
 
-        Ok(out.item().map(|item| Counters::from_item(event_id, item)))
+        let counters = out.item().map(|item| Counters::from_item(event_id, item));
+        if let Ok(mut guard) = self.counters.lock() {
+            *guard = Some((Instant::now(), counters.clone()));
+        }
+        Ok(counters)
     }
 
     async fn load_prequeue(&self, request_id: &str) -> Result<Option<PreQueueItem>, StoreError> {
@@ -89,13 +157,13 @@ impl Store for DynamoStore {
         Ok(out.item().and_then(position_from_item))
     }
 
-    async fn claim_admission(
+    async fn mark_admitted(
         &self,
         request_id: &str,
         position: u64,
         digest: &SecretDigest,
         now: u64,
-    ) -> Result<AdmissionClaim, StoreError> {
+    ) -> Result<(), StoreError> {
         // One `UpdateItem` serves both populations. A live joiner already has
         // the row, written at registration with `status = issued`; a pre-queue
         // member has none, and this creates it. The guard is the disjunction of
@@ -114,6 +182,9 @@ impl Store for DynamoStore {
                 AttributeValue::S(status_wire(PositionStatus::Admitted)),
             )
             .set(QUEUE_POSITION_ATTR, AttributeValue::N(position.to_string()))
+            // The guard lets this write land once per row, so this is the
+            // first admission and every later session expires from it (#237).
+            .set(ADMITTED_AT_ATTR, AttributeValue::N(now.to_string()))
             .set_if_not_exists(ENTRY_TIME_ATTR, AttributeValue::N(now.to_string()))
             // A live joiner's row has the digest already; a pre-queue member's
             // is created here, and its later calls read this row first.
@@ -153,42 +224,64 @@ impl Store for DynamoStore {
             .await;
 
         match result {
-            Ok(_) => Ok(AdmissionClaim::First),
+            Ok(_) => Ok(()),
             Err(SdkError::ServiceError(se))
                 if matches!(
                     se.err(),
                     UpdateItemError::ConditionalCheckFailedException(_)
                 ) =>
             {
-                Ok(AdmissionClaim::Repeat)
+                // Already marked by a concurrent call for the same visitor.
+                Ok(())
             }
-            Err(e) => Err(StoreError(format!("update_item claim admission: {e}"))),
+            Err(e) => Err(StoreError(format!("update_item mark admitted: {e}"))),
         }
     }
 
-    async fn record_arrival(&self, event_id: &str, shard: Shard) -> Result<(), StoreError> {
-        // Stamps the shard's own index alongside the +1 so a reader that
-        // fetched a batch of shards knows which is which.
+    async fn take_slot(&self, event_id: &str, shard: Shard) -> Result<bool, StoreError> {
+        let now = now_secs();
+        if self.spent.is_spent(shard, now) {
+            return Ok(false);
+        }
         let bump = Update::new()
-            .set(
-                SHARD_INDEX_ATTR,
-                AttributeValue::N(shard.index().to_string()),
-            )
             .add(SHARD_COUNT_ATTR, AttributeValue::N("1".to_owned()))
             .build();
-        // The shard is its own item, so arrivals at the admission rate do not
-        // contend with the queue_counter claims on the Counters item.
-        self.client
+        // Allowed only below the cap the controller last wrote (ADR-0039). A
+        // shard with no cap yet -- an event the controller has not passed over
+        // -- fails the comparison and admits nobody, which is the right answer
+        // before anyone has been granted anything.
+        let guard = Condition::attr_less_than(SHARD_COUNT_ATTR, SHARD_CAP_ATTR).build();
+
+        let mut names = bump.names;
+        names.extend(guard.names);
+
+        // The shard is its own item, so admissions do not contend with the
+        // queue_counter claims on the event's item.
+        let result = self
+            .client
             .update_item()
             .table_name(&self.counters_table)
             .set_key(Some(Key::ArrivalsShard { event_id, shard }.build()))
             .update_expression(bump.expression)
-            .set_expression_attribute_names(Some(bump.names))
+            .condition_expression(guard.expression)
+            .set_expression_attribute_names(Some(names))
             .set_expression_attribute_values(Some(bump.values))
             .send()
-            .await
-            .map_err(|e| StoreError(format!("update_item arrivals: {e}")))?;
-        Ok(())
+            .await;
+
+        match result {
+            Ok(_) => Ok(true),
+            Err(SdkError::ServiceError(se))
+                if matches!(
+                    se.err(),
+                    UpdateItemError::ConditionalCheckFailedException(_)
+                ) =>
+            {
+                self.spent.mark(shard, now);
+                Ok(false)
+            }
+            Err(e) => Err(StoreError(format!("update_item admission slot: {e}"))),
+        }
     }
 }
 
@@ -232,10 +325,15 @@ fn position_from_item(item: &HashMap<String, AttributeValue>) -> Option<Position
         .get(POSSESSION_DIGEST_ATTR)
         .and_then(|v| v.as_s().ok())
         .and_then(|s| SecretDigest::parse(s).ok());
+    let admitted_at = item
+        .get(ADMITTED_AT_ATTR)
+        .and_then(|v| v.as_n().ok())
+        .and_then(|s| s.parse::<u64>().ok());
     Some(PositionRow {
         position,
         status,
         digest,
+        admitted_at,
     })
 }
 
@@ -272,7 +370,8 @@ mod tests {
                 Some(PositionRow {
                     position: 7,
                     status,
-                    digest: None
+                    digest: None,
+                    admitted_at: None,
                 })
             );
         }
@@ -306,5 +405,19 @@ mod tests {
             AttributeValue::S("short".to_owned()),
         );
         assert_eq!(position_from_item(&item).unwrap().digest, None);
+    }
+
+    #[test]
+    fn a_shard_seen_spent_is_not_asked_again_until_the_memo_lapses() {
+        let spent = SpentShards::default();
+        let shard = Shard::new(3).unwrap();
+        let other = Shard::new(4).unwrap();
+        assert!(!spent.is_spent(shard, 100));
+        spent.mark(shard, 100);
+        assert!(spent.is_spent(shard, 100));
+        assert!(spent.is_spent(shard, 100 + MEMO_SECS));
+        assert!(!spent.is_spent(shard, 101 + MEMO_SECS));
+        // One shard running out says nothing about the others.
+        assert!(!spent.is_spent(other, 100));
     }
 }

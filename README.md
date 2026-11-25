@@ -29,7 +29,7 @@ them in arrival order. A controller admits people to the origin at the rate you 
 corrects for admitted visitors who never show up. Admitted visitors carry a signed session
 cookie that a CloudFront Function checks on every request to the protected origin.
 
-Operators run the event from a dashboard at `/admin` (OIDC login): set the rate, pause,
+Operators run the event from a dashboard at `/_wr/admin` (OIDC login): set the rate, pause,
 resume, open early, post a message, fail open for a bounded window, or take the event down.
 
 ## How it works
@@ -46,8 +46,10 @@ protected: CloudFront Function gate ── valid session cookie → your origin
 - **The queue order is never stored.** It is a seeded pseudorandom permutation computed on read,
   so opening a million-person pre-queue is one conditional DynamoDB write. A published seed lets
   anyone recompute every position.
-- **Closed-loop admission.** The controller measures arrivals against releases and compensates
-  for no-shows, up to twice the target rate.
+- **Closed-loop admission.** Every admission takes a unit of a budget the controller grants at the
+  target rate, so the origin's intake is bounded; budget nobody took releases more of the queue,
+  compensating for no-shows up to about 43% of the line, and a spent budget holds the queue back
+  so visitors already invited drain first.
 - **The gate makes no network calls.** It reads its rules and signing key from a CloudFront
   KeyValueStore. Requests that match no rule pass through untouched.
 - **Fail-open is manual.** An operator can open the gate for a bounded window, but nothing trips

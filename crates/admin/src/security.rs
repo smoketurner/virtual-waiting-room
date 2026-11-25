@@ -6,8 +6,8 @@
 //! same-origin inline poller script (allowed by nonce, not `'unsafe-inline'`).
 //! Everything else is denied.
 
-use axum::http::HeaderValue;
 use axum::http::header::{self, HeaderMap, HeaderName};
+use axum::http::{HeaderValue, Method};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
@@ -62,6 +62,57 @@ fn nonce_from(rng: &impl NonceRng) -> String {
         return String::new();
     }
     URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// The origin (`scheme://host[:port]`) of an absolute URL, or `None` if it is
+/// not one. Used on the configured OIDC redirect URI, which is a path on the
+/// distribution the console is served from, so its origin is the console's own.
+#[must_use]
+pub fn origin_of(url: &str) -> Option<&str> {
+    let scheme_end = url.find("://")?;
+    let authority_start = scheme_end.checked_add(3)?;
+    let rest = url.get(authority_start..)?;
+    let authority_len = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    if scheme_end == 0 || authority_len == 0 {
+        return None;
+    }
+    url.get(..authority_start.checked_add(authority_len)?)
+}
+
+/// Whether a request is a state-changing one that another site sent (issue
+/// #243).
+///
+/// The session cookie's `SameSite` stops a cross-*site* POST but not a
+/// same-site one: the console shares an origin with the customer's own pages,
+/// and their sibling subdomains are same-site. A script on any of them could
+/// otherwise post `/_wr/admin/fail_open` with the operator's cookie. Every
+/// operator action is a same-origin form post from the dashboard, so anything
+/// else is refused. The per-session token (`crate::operator::guard_writes`) is
+/// the second layer, for a request this one cannot tell apart.
+///
+/// `Sec-Fetch-Site` decides when the browser sends it, since a page cannot
+/// set or remove it. Without it, `Origin` is compared with the console's own
+/// origin; a browser sends one on every cross-origin POST. A request with
+/// neither is not from a browser carrying the operator's cookie ambiently, and
+/// passes -- it still has to present a session.
+///
+/// Safe methods never change state here and are always allowed, so a link or
+/// a bookmark to the dashboard keeps working.
+#[must_use]
+pub fn is_cross_site_write(method: &Method, headers: &HeaderMap, own_origin: Option<&str>) -> bool {
+    if crate::operator::is_safe(method) {
+        return false;
+    }
+    if let Some(site) = headers.get("sec-fetch-site") {
+        return site.as_bytes() != b"same-origin";
+    }
+    match headers.get(header::ORIGIN) {
+        Some(origin) => match (origin.to_str(), own_origin) {
+            (Ok(sent), Some(own)) => !sent.eq_ignore_ascii_case(own),
+            (Err(_), _) | (_, None) => true,
+        },
+        None => false,
+    }
 }
 
 /// Applies the hardening headers to a response's header map. `nonce` is the
@@ -272,5 +323,88 @@ mod tests {
             headers.get("x-frame-options").map(HeaderValue::as_bytes),
             Some(&b"DENY"[..])
         );
+    }
+
+    // --- cross-site writes (issue #243) --------------------------------------
+
+    use super::{is_cross_site_write, origin_of};
+    use axum::http::Method;
+
+    const OWN: Option<&str> = Some("https://tickets.example.com");
+
+    fn with(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (name, value) in pairs {
+            h.insert(*name, HeaderValue::from_static(value));
+        }
+        h
+    }
+
+    #[test]
+    fn the_origin_of_a_redirect_uri_is_its_scheme_and_authority() {
+        assert_eq!(
+            origin_of("https://tickets.example.com/_wr/admin/callback"),
+            Some("https://tickets.example.com")
+        );
+        assert_eq!(
+            origin_of("https://tickets.example.com:8443/_wr/admin/callback?x=1"),
+            Some("https://tickets.example.com:8443")
+        );
+        assert_eq!(
+            origin_of("https://tickets.example.com"),
+            Some("https://tickets.example.com")
+        );
+        assert_eq!(origin_of("/_wr/admin/callback"), None);
+        assert_eq!(origin_of("https:///_wr/admin"), None);
+        assert_eq!(origin_of("://host/"), None);
+    }
+
+    #[test]
+    fn the_dashboards_own_form_posts_are_allowed() {
+        let h = with(&[("sec-fetch-site", "same-origin")]);
+        assert!(!is_cross_site_write(&Method::POST, &h, OWN));
+    }
+
+    #[test]
+    fn a_post_from_a_sibling_subdomain_or_another_site_is_refused() {
+        for site in ["same-site", "cross-site", "none"] {
+            let h = with(&[("sec-fetch-site", site)]);
+            assert!(is_cross_site_write(&Method::POST, &h, OWN), "{site}");
+        }
+    }
+
+    #[test]
+    fn sec_fetch_site_outranks_a_matching_origin() {
+        // A sibling subdomain cannot forge Sec-Fetch-Site, so it decides.
+        let h = with(&[
+            ("sec-fetch-site", "same-site"),
+            ("origin", "https://tickets.example.com"),
+        ]);
+        assert!(is_cross_site_write(&Method::POST, &h, OWN));
+    }
+
+    #[test]
+    fn without_fetch_metadata_the_origin_header_decides() {
+        let own = with(&[("origin", "https://tickets.example.com")]);
+        assert!(!is_cross_site_write(&Method::POST, &own, OWN));
+        let other = with(&[("origin", "https://blog.example.com")]);
+        assert!(is_cross_site_write(&Method::POST, &other, OWN));
+        let opaque = with(&[("origin", "null")]);
+        assert!(is_cross_site_write(&Method::POST, &opaque, OWN));
+        // With no origin of its own configured, nothing can match.
+        assert!(is_cross_site_write(&Method::POST, &own, None));
+    }
+
+    #[test]
+    fn a_request_with_neither_header_is_left_to_the_session_check() {
+        assert!(!is_cross_site_write(&Method::POST, &HeaderMap::new(), OWN));
+    }
+
+    #[test]
+    fn safe_methods_are_never_refused() {
+        let h = with(&[("sec-fetch-site", "cross-site")]);
+        for method in [Method::GET, Method::HEAD, Method::OPTIONS] {
+            assert!(!is_cross_site_write(&method, &h, OWN));
+        }
     }
 }

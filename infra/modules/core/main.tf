@@ -16,6 +16,22 @@
 
 # --- DynamoDB -----------------------------------------------------------------
 
+# A new event_id is a new event. Everything Terraform seeds or keys by the
+# event hangs off this one value through replace_triggered_by, because the
+# seeds ignore their own changes (the control plane owns them once written) and
+# would otherwise never notice the event they were written for is gone: the
+# apply would report nothing to do and leave a stack with no event item, which
+# answers 404 on /status (issue #248).
+#
+# Changing event_id and applying is the supported way to run another event on
+# the same stack. It reseeds the event item and recreates PreQueue and
+# Positions empty (see those tables). Counters and Tokens are kept: their rows
+# carry the event in the key or belong to operators. The gate's ruleset is kept
+# too -- it names no event, and the dashboard owns it.
+resource "terraform_data" "event_id" {
+  input = var.event_id
+}
+
 resource "aws_dynamodb_table" "counters" {
   name         = local.table_names.counters
   billing_mode = "PAY_PER_REQUEST"
@@ -29,6 +45,8 @@ resource "aws_dynamodb_table" "counters" {
   point_in_time_recovery {
     enabled = true
   }
+
+  deletion_protection_enabled = var.table_deletion_protection
 
   dynamic "warm_throughput" {
     for_each = local.warm_throughput_enabled ? [1] : []
@@ -63,7 +81,9 @@ resource "aws_dynamodb_table" "counters" {
 # ignore_changes on the whole item because the control plane owns it from here:
 # the admin Lambda moves the phase, the rate and the message, the open writes
 # the seed and offsets, and the controller advances serving_counter. Terraform
-# seeds it and then never touches it again.
+# seeds it and then never touches it again -- except when event_id changes.
+# The key is inside the ignored item, so without the trigger a new event_id
+# would seed nothing.
 resource "aws_dynamodb_table_item" "event" {
   table_name = aws_dynamodb_table.counters.name
   hash_key   = aws_dynamodb_table.counters.hash_key
@@ -78,10 +98,16 @@ resource "aws_dynamodb_table_item" "event" {
   })
 
   lifecycle {
-    ignore_changes = [item]
+    ignore_changes       = [item]
+    replace_triggered_by = [terraform_data.event_id]
   }
 }
 
+# Recreated empty when event_id changes. Rows here and in Positions are keyed
+# by the bare request id and carry no event, and a browser keeps its request id:
+# a visitor returning for the next event would find their old row and be placed
+# by it in a cohort they never registered for. Deletion protection has to be
+# off for that apply, since the replacement deletes the table.
 resource "aws_dynamodb_table" "prequeue" {
   name         = local.table_names.prequeue
   billing_mode = "PAY_PER_REQUEST"
@@ -96,6 +122,8 @@ resource "aws_dynamodb_table" "prequeue" {
     enabled = true
   }
 
+  deletion_protection_enabled = var.table_deletion_protection
+
   dynamic "warm_throughput" {
     for_each = local.warm_throughput_enabled ? [1] : []
     content {
@@ -105,8 +133,13 @@ resource "aws_dynamodb_table" "prequeue" {
   }
 
   tags = var.tags
+
+  lifecycle {
+    replace_triggered_by = [terraform_data.event_id]
+  }
 }
 
+# Recreated empty when event_id changes, for the reason given on PreQueue.
 resource "aws_dynamodb_table" "positions" {
   name         = local.table_names.positions
   billing_mode = "PAY_PER_REQUEST"
@@ -120,6 +153,8 @@ resource "aws_dynamodb_table" "positions" {
   point_in_time_recovery {
     enabled = true
   }
+
+  deletion_protection_enabled = var.table_deletion_protection
 
   # TTL is now the only expiry mechanism (ADR-0031): a row is reclaimed a day
   # after it was written, and until then it is a live position. Deletion is
@@ -140,6 +175,10 @@ resource "aws_dynamodb_table" "positions" {
   }
 
   tags = var.tags
+
+  lifecycle {
+    replace_triggered_by = [terraform_data.event_id]
+  }
 }
 
 # Admission-token reservations, operator OIDC sessions, and pending PKCE logins.
@@ -156,6 +195,8 @@ resource "aws_dynamodb_table" "tokens" {
   point_in_time_recovery {
     enabled = true
   }
+
+  deletion_protection_enabled = var.table_deletion_protection
 
   # Must stay equal to wr_common::expr::TOKENS_TTL_ATTR, which every writer of
   # this table takes its expiry attribute name from. DynamoDB reclaims a row
@@ -192,15 +233,43 @@ resource "aws_dynamodb_table" "tokens" {
 # This puts the key in Terraform state, which the S3 backend encrypts. That is
 # the same trade the retired tls_private_key made for the RSA key this one
 # replaces, so it is not a new exposure.
+#
+# One key per generation, the current and the one before it (issue #247).
+# Raising `signing_key_generation` creates the new generation's key and keeps
+# the previous one, which the gate goes on accepting (edge_gate.tf, 'kp'): a
+# session minted before the rotation stays good until it expires instead of
+# every admitted visitor being thrown back to the waiting page at once. The
+# generation before that is destroyed, so after two rotations a key is gone.
+locals {
+  signing_key_current  = tostring(var.signing_key_generation)
+  signing_key_previous = tostring(var.signing_key_generation - 1)
+}
+
 resource "random_bytes" "signing_key" {
-  length = 32
+  for_each = toset([local.signing_key_current, local.signing_key_previous])
+  length   = 32
+}
+
+# A function reads the key once, at Init, and a warm environment keeps what it
+# read. Regenerating the key changes the SSM value but nothing about the
+# functions, so they would go on minting sessions the gate -- which reads the
+# new key at once -- refuses, until each environment happened to be recycled.
+# This goes into the environment of every function that reads the key: a new
+# key is then a new function configuration, which retires the warm
+# environments (issue #247).
+#
+# Not secret, so marked nonsensitive rather than hiding each function's whole
+# environment from the plan: 64 bits of a SHA-256 over a random 256-bit key
+# say nothing about the key and cannot be searched for.
+locals {
+  signing_key_fingerprint = nonsensitive(substr(sha256(random_bytes.signing_key[local.signing_key_current].hex), 0, 16))
 }
 
 resource "aws_ssm_parameter" "signing_key" {
   name        = "/${var.name_prefix}/signing-key"
   description = "Virtual Waiting Room per-deployment signing key (admission tokens + session cookies)."
   type        = "SecureString"
-  value       = random_bytes.signing_key.base64
+  value       = random_bytes.signing_key[local.signing_key_current].base64
 
   tags = var.tags
 }
@@ -223,8 +292,8 @@ resource "aws_ssm_parameter" "oidc_client_secret" {
 }
 
 # --- SQS (ingest buffer, DESIGN §6, §11) --------------------------------------
-# One join queue + DLQ per deployment. maxReceiveCount 5 -> DLQ. Visibility
-# timeout follows the design formula: 6 x function_timeout + batching window.
+# One join queue + DLQ per deployment. Visibility timeout follows the design
+# formula: 6 x function_timeout + batching window.
 
 resource "aws_sqs_queue" "join_dlq" {
   name                      = "${var.name_prefix}-join-dlq"
@@ -239,7 +308,14 @@ resource "aws_sqs_queue" "join" {
 
   redrive_policy = jsonencode({
     deadLetterTargetArn = aws_sqs_queue.join_dlq.arn
-    maxReceiveCount     = 5
+    # A message here is a join the visitor was told succeeded, so giving up
+    # on one loses a place. What fails a batch during a burst is transient --
+    # a table still ramping, a throttled invoke -- and each failure costs one
+    # receive and a visibility timeout. Five ran out in about fifteen minutes,
+    # inside a cold table's ramp; ten rides it out. A body that can never
+    # parse is dropped by the function, not retried, so nothing loops here
+    # (issue #251).
+    maxReceiveCount = 10
   })
 
   tags = var.tags
@@ -315,7 +391,7 @@ resource "aws_lambda_event_source_mapping" "join" {
   # Capped at the function's reserved concurrency. Uncapped, the SQS poller
   # scales past it during a join burst, the excess invocations are throttled,
   # and each throttled batch goes back on the queue with its receive count
-  # raised: five of those and accepted joins land in the DLQ. The cap makes
+  # raised: maxReceiveCount of those and accepted joins land in the DLQ. The cap makes
   # the poller hold messages instead. 2..1000 is the range Lambda accepts.
   dynamic "scaling_config" {
     for_each = var.assign_position_reserved_concurrency >= 2 ? [1] : []
@@ -369,7 +445,7 @@ resource "aws_api_gateway_model" "join" {
       # /status and assign_position discards anything else.
       event_id = { type = "string", minLength = 1, maxLength = length(var.event_id) }
       # base64url(SHA-256(secret)) (issue #62, ADR-0035). The secret itself
-      # never comes here; only /v1/generate_token sees it.
+      # never comes here; only /_wr/v1/generate_token sees it.
       h = { type = "string", minLength = 43, maxLength = 43, pattern = "^[A-Za-z0-9_-]{43}$" }
     }
   })
@@ -395,7 +471,7 @@ resource "aws_api_gateway_request_validator" "params" {
 
 resource "aws_api_gateway_resource" "join" {
   rest_api_id = aws_api_gateway_rest_api.this.id
-  parent_id   = aws_api_gateway_resource.v1.id # path-versioned: /v1/join
+  parent_id   = aws_api_gateway_resource.v1.id # path-versioned: /_wr/v1/join
   path_part   = "join"
 }
 
@@ -425,6 +501,13 @@ resource "aws_api_gateway_integration" "join_sqs" {
   request_parameters = {
     "integration.request.header.Content-Type" = "'application/x-www-form-urlencoded'"
   }
+
+  # Issue #240: the model and the template below are both keyed on
+  # application/json. Left at the default (WHEN_NO_MATCH), a request with any
+  # other Content-Type matches neither: it skips the schema validator and its
+  # body is handed to SQS as the query itself, so the caller chooses the action
+  # and its parameters. NEVER answers an unmatched type with a 415 instead.
+  passthrough_behavior = "NEVER"
 
   request_templates = {
     "application/json" = "Action=SendMessage&MessageBody=$util.urlEncode($input.body)"

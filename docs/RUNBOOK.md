@@ -3,7 +3,7 @@
 What an operator does before, during and after an event, and what to do when something goes
 wrong. [`DEPLOY.md`](./DEPLOY.md) covers standing the stack up.
 
-Every control is a form on the dashboard at `https://<host>/admin` and works without JavaScript.
+Every control is a form on the dashboard at `https://<host>/_wr/admin` and works without JavaScript.
 One deployment serves one event and is torn down afterwards.
 
 ---
@@ -56,7 +56,7 @@ items (O1, O2) days ahead; the panel shows limits in force, not pending requests
 - [ ] **Open schedule armed** (F0.3). The one-time open schedule is enabled at a time still in the future, so the event opens on its own at T-0. Fix: Set the start time on the dashboard (Start time), in the timezone you mean. The schedule itself is in EventBridge Scheduler. ([fix](https://console.aws.amazon.com/scheduler/home#schedules))
 - [ ] **Controller schedule running** (F3.2). The controller's `rate(1 minute)` schedule exists and is enabled; without it the queue forms and nobody is admitted. Fix: Re-apply Terraform, which creates the schedule enabled; check nobody disabled it in EventBridge Scheduler. ([fix](https://console.aws.amazon.com/scheduler/home#schedules))
 - [ ] **Gate ruleset** (F0.6). The gate's KeyValueStore holds at least one protection rule and no fail-open window is active. An empty ruleset passes every request through, which looks exactly like a working deployment. Fix: Set rules under Protection rules on the dashboard, then load a protected URL in a private window and confirm you are sent to the waiting page. (the dashboard)
-- [ ] **/status cache behaviour** (C4). The polled `/v1/status` behaviour has a Min TTL above zero and keeps cookies out of its cache key, so CloudFront collapses polls and origin load is independent of waiter count. Fix: Re-apply the edge module (`polled_min_ttl_seconds` must be at least 1); do not edit the cache policy in the console. ([fix](https://console.aws.amazon.com/cloudfront/v4/home#/policies/cache))
+- [ ] **/status cache behaviour** (C4). The polled `/_wr/v1/status` behaviour has a Min TTL above zero and keeps cookies out of its cache key, so CloudFront collapses polls and origin load is independent of waiter count. Fix: Re-apply the edge module (`polled_min_ttl_seconds` must be at least 1); do not edit the cache policy in the console. ([fix](https://console.aws.amazon.com/cloudfront/v4/home#/policies/cache))
 - [ ] **Gate on the protected behaviour only** (N7). The gate CloudFront Function is associated at viewer-request with the default (protected) behaviour and with no other: elsewhere it bills every poll and refuses joins. Fix: Re-apply the edge module; remove any function association added to another behaviour in the console. ([fix](https://console.aws.amazon.com/cloudfront/v4/home#/distributions))
 <!-- readiness-checks:end -->
 
@@ -80,15 +80,16 @@ On the day (**manual**):
       protected URL in a private window and confirm you land on the waiting page. **An empty
       ruleset passes every request through**, which looks exactly like a working deployment.
 - [ ] **The admission rate is what the origin can serve**, not the seeded default.
-- [ ] **Alarms reach someone.** Terraform creates the alarms below with no actions. Subscribe a
-      destination, or watch them in CloudWatch.
+- [ ] **Alarms reach someone.** The alarms below notify only when `alarm_sns_topic_arn` is set to
+      a topic with a subscriber. Without it they change state in CloudWatch and tell nobody.
 - [ ] **Someone who can act is watching.**
 
 ### Deciding the admission rate
 
-Enter the requests per second the origin sustains, as a whole number. The controller corrects
-upward for no-shows to at most **twice** the target, so the origin must survive twice what you
-enter. Rate 0 is rejected; use Pause to stop admission.
+Enter the requests per second the origin sustains, as a whole number. Admissions are metered
+against a budget: over any stretch of time the origin receives at most the rate you enter, plus a
+burst of up to **two intervals** (20 seconds' worth of admissions) that can arrive at once, so the
+origin must survive that burst. Rate 0 is rejected; use Pause to stop admission.
 
 ---
 
@@ -183,16 +184,44 @@ operation.
 | Alarm | What happened | What to do |
 |---|---|---|
 | `join_dropped` | A join reached SQS and was discarded (malformed body, or an `event_id` that does not match). The visitor got a 200 | Check `event_id` in `terraform.tfvars` against the event item. A mismatch drops **every** join |
-| `join-dlq-not-empty` | A join was retried to exhaustion and lost | Check `assign_position`'s logs. The messages are in the dead-letter queue and can be redriven |
-| `arrival_record_failed` | An admitted visitor's arrival went uncounted | Cumulative: each one inflates the measured no-show rate, so the controller over-releases. Consider lowering the rate |
+| `join-dlq-not-empty` | A join was received 10 times without being written and was dead-lettered | Check `assign_position`'s logs. The messages are in the dead-letter queue and can be redriven |
+| `arrival_record_failed` | A unit of the admission budget could not be taken, so the visitor was **not** admitted and will ask again | Harmless once. If continuous, admission has stopped: check `generate_token`'s logs and its grant on the `Counters` table |
 | `arrival_shard_draw_failed` | Same, one step earlier | As above |
-| `admission_claim_failed` | The write that counts an admission once did not land | Harmless once. If continuous, the measured no-show rate collapses toward zero and the controller stops correcting |
+| `admission_claim_failed` | The write that marks a visitor admitted did not land; they were admitted anyway | Harmless once. If continuous, every reload takes a second unit of budget, so fewer people are admitted than the rate allows, never more |
 | `admission_control_unreadable` | The stored admission control could not be parsed; the controller is holding admission | The queue has stopped. Pause, then Resume |
 | `rules_audit_failed` | The ruleset changed but its audit stamp did not | Gate is correct; "last changed by" is stale. No visitor impact |
 | `fail_open_audit_lost` | Fail-open changed but its audit stamp lost a race | Change took effect; "last changed by" is stale. No visitor impact |
 | `nojs_join_failed` | A no-JavaScript join was not enqueued | The visitor was told and can retry. If continuous, check the `nojs` function's logs and its SQS grant |
 | `open_event_error` | The open failed, usually because the event was not in the pre-queue phase | Check the phase. The scheduler retries for up to 10 minutes; or fix the phase and **Open now** |
 | `open-dlq-not-empty` | A scheduled open failed every retry | The event is **not open** and the one-time schedule is spent. Fix the cause, then **Open now** |
+| `join-queue-age` | The oldest join has waited over 60 s: `assign_position` is not keeping up, or is failing | Check its `Errors`/`Throttles` alarms and its reserved concurrency. Joins are safe in the queue; visitors see "Getting your place" until it drains |
+| `<function>-errors`, `<function>-throttles` | A function failed or was throttled (one pair per function) | Read that function's log. A throttle on `read` or `generate_token` is the account concurrency limit; on `assign_position` or `nojs`, its reservation |
+| `counters-write-throttles`, `prequeue-write-throttles`, `positions-write-throttles` | DynamoDB refused writes on that table | The table was not pre-warmed for this rate. Raise `warm_throughput_write_units`; throttled joins retry from the queue |
+| `api-5xx` | The REST API answered a 5XX | Check the function alarms; a `/_wr/v1/join` 5XX means SQS refused the message |
+| `schedule-target-errors` | EventBridge Scheduler could not invoke a target. The metric is for the default schedule group, so any schedule in it counts | Usually the controller: nobody is being admitted. Check the schedule's role and the function's reserved concurrency (#228) |
+
+These are logged (`$.fields.event`) without an alarm of their own:
+
+| Event | What happened | What to do |
+|---|---|---|
+| `controller_pass_failed` | One controller pass failed and was skipped; the next is owed the seconds it missed | Harmless once. If continuous the queue has stopped: check the `controller` function's logs |
+| `open_drain_timed_out` | The join queue did not empty within 15 s, so the open went ahead; joins still queued are numbered behind the cohort | Check `assign_position`'s concurrency and the tables' pre-warming before the next event |
+| `open_drain_unreadable` | The open could not read the join queue and did not wait for it | Check `open_event`'s `sqs:GetQueueAttributes` grant |
+| `nojs_join_resent` | A no-JavaScript join had not registered after 60 s and was sent again | Expected occasionally. Many at once means the join consumer is behind |
+| `nojs_join_lost` | A no-JavaScript join never registered after three resends; the visitor was shown the form again | Check the join queue, its dead-letter queue and `assign_position` |
+| `admin_login_refused` | A login was refused: not on the allowlist, or the provider did not say the email is verified | If every login is refused for `email_verified`, the provider omits the claim: set `oidc_require_email_verified = false` |
+| `admin_session_refused` | A session's email is no longer on the allowlist | Expected after removing an operator |
+| `admin_csrf_refused` | A state-changing request lacked the session's `csrf` field | A stale dashboard tab (reload it), or a request another page made |
+
+**Visitors reporting "We let you in, but the site turned you back".** The gate refused a session
+`generate_token` had just minted, twice within a minute, and the page stopped rather than loop.
+The usual cause is a signing key two generations old (rotated twice within one session
+lifetime, so the gate no longer holds it as `kp`); with IP binding on, it is a visitor whose
+network keeps changing.
+
+**`/_wr/admin/rules` rejecting a path prefix.** A prefix containing `%`, `//`, a `.` or `..` segment,
+`;` or a backslash can never match a normalised request path, so it is refused when the rule is
+written rather than accepted and silently ignored.
 
 ---
 
@@ -221,5 +250,7 @@ operation.
   across many addresses still takes them. A request id alone admits no one (it also needs the
   secret the browser joined with, [ADR-0035](adr/0035-request-id-proof-of-possession.md)), but a
   visitor who hands over both hands over their place.
-- **Survive a signing-key rotation.** Regenerating the key invalidates every issued session. Do it
-  before an event opens, never during one.
+- **Survive two signing-key rotations.** Raising `signing_key_generation` once keeps issued
+  sessions valid until they expire (the gate still accepts the previous generation); raising it
+  again inside one session lifetime ends the oldest. See
+  [`DEPLOY.md`](./DEPLOY.md#rotating-keys).

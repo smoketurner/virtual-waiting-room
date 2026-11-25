@@ -1,8 +1,8 @@
 # modules/core - nojs, the queue for a visitor without JavaScript (issue #67).
 #
 # The waiting page is a script. For a browser that runs none, its <noscript>
-# form posts to /v1/enter, which joins through the same SQS queue /v1/join
-# writes to, and /v1/wait renders the visitor's place and admits them through
+# form posts to /_wr/v1/enter, which joins through the same SQS queue /_wr/v1/join
+# writes to, and /_wr/v1/wait renders the visitor's place and admits them through
 # generate_token's own admission path (the crate is a library dependency, so
 # there is one way a session is minted). This is the only join that runs
 # compute, so the function's concurrency is reserved and small: a flood of
@@ -41,9 +41,12 @@ resource "aws_lambda_function" "nojs" {
       POSITIONS_TABLE       = aws_dynamodb_table.positions.name
       EVENT_ID              = var.event_id
       SIGNING_KEY_PARAMETER = aws_ssm_parameter.signing_key.name
-      SESSION_COOKIE_NAME   = var.session_cookie_name
-      SESSION_TTL_SECS      = tostring(var.session_ttl_seconds)
-      JOIN_QUEUE_URL        = aws_sqs_queue.join.url
+      # Not read by the code: it changes when the key does, so a new key
+      # retires the environments holding the old one (main.tf, issue #247).
+      SIGNING_KEY_FINGERPRINT = local.signing_key_fingerprint
+      SESSION_COOKIE_NAME     = var.session_cookie_name
+      SESSION_TTL_SECS        = tostring(var.session_ttl_seconds)
+      JOIN_QUEUE_URL          = aws_sqs_queue.join.url
     })
   }
 

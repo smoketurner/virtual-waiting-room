@@ -6,11 +6,12 @@
 //! stale row also compares the attribute to the current time.
 //!
 //! * Login transaction: PK `pkce#<csrf_state>`, holds the PKCE verifier + nonce
-//!   for the ~10 min between `/admin/login` and `/admin/callback`. On Lambda the
+//!   for the ~10 min between `/_wr/admin/login` and `/_wr/admin/callback`. On Lambda the
 //!   two requests can hit different execution environments, so this must not be
 //!   in-process state.
-//! * Session: PK `session#<id>`, holds the authenticated subject + email for
-//!   ~8 h. The cookie carries only the opaque `<id>`.
+//! * Session: PK `session#<id>`, holds the authenticated subject + email and the
+//!   session's CSRF token (issue #243) for ~8 h. The cookie carries only the
+//!   opaque `<id>`.
 
 use std::collections::HashMap;
 
@@ -29,10 +30,10 @@ const SESSION_TTL_SECS: u64 = 8 * 60 * 60;
 pub enum SessionError {
     #[error("dynamodb: {0}")]
     Backend(String),
-    /// The operating system RNG could not produce a session id. Refusing the
-    /// login is the only safe answer: a session id is a bearer credential, and
-    /// one drawn from anything predictable can be guessed by whoever knows the
-    /// fallback.
+    /// The operating system RNG could not produce a session id or its CSRF
+    /// token. Refusing the login is the only safe answer: a session id is a
+    /// bearer credential, and one drawn from anything predictable can be
+    /// guessed by whoever knows the fallback.
     #[error("no randomness available for a session id")]
     Rng,
 }
@@ -45,9 +46,15 @@ pub struct PendingLogin {
 }
 
 /// An authenticated admin session.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdminSession {
     pub subject: String,
     pub email: String,
+    /// The token every state-changing form must echo (issue #243). Drawn once
+    /// when the session is created and never sent anywhere but the operator's
+    /// own dashboard, so another page -- a same-site one included -- cannot
+    /// build a form the console accepts.
+    pub csrf: String,
 }
 
 /// Session/PKCE store over the `Tokens` table.
@@ -91,6 +98,33 @@ fn pending_login_from(
         }),
         _ => None,
     }
+}
+
+/// Decodes a session row, or `None` when it is absent, past its
+/// [`TOKENS_TTL_ATTR`] deadline, or missing a field. A row without a CSRF token
+/// is no session: its forms could not be told from a forged one.
+///
+/// The AWS-free half of `load_session`, as [`pending_login_from`] is of
+/// `take_pending`.
+fn session_from(
+    attributes: Option<&HashMap<String, AttributeValue>>,
+    now: u64,
+) -> Option<AdminSession> {
+    let item = attributes?;
+    let expired = item
+        .get(TOKENS_TTL_ATTR)
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<u64>().ok())
+        .is_some_and(|exp| now >= exp);
+    if expired {
+        return None;
+    }
+    let text = |name: &str| item.get(name).and_then(|v| v.as_s().ok()).cloned();
+    Some(AdminSession {
+        subject: text("subject")?,
+        email: text("email")?,
+        csrf: text("csrf").filter(|token| !token.is_empty())?,
+    })
 }
 
 impl SessionStore {
@@ -155,25 +189,28 @@ impl SessionStore {
         Ok(pending_login_from(out.attributes(), now.epoch_seconds()))
     }
 
-    /// Creates a session expiring `SESSION_TTL_SECS` after `now`, and returns
-    /// its opaque id (for the cookie).
+    /// Creates a session expiring `SESSION_TTL_SECS` after `now`, with a fresh
+    /// CSRF token (issue #243), and returns its opaque id (for the cookie).
     ///
     /// # Errors
-    /// Returns [`SessionError::Rng`] if no session id can be drawn, or
-    /// [`SessionError::Backend`] if the write fails.
+    /// Returns [`SessionError::Rng`] if no session id or CSRF token can be
+    /// drawn, or [`SessionError::Backend`] if the write fails.
     pub async fn create_session(
         &self,
-        session: &AdminSession,
+        subject: &str,
+        email: &str,
         now: ArrivalTime,
     ) -> Result<String, SessionError> {
         let id = session_id(now)?;
+        let csrf = csrf_token()?;
         let expires = now.epoch_seconds().saturating_add(SESSION_TTL_SECS);
         self.client
             .put_item()
             .table_name(&self.tokens_table)
             .set_item(Some(Key::OidcSession { session_id: &id }.build()))
-            .item("subject", AttributeValue::S(session.subject.clone()))
-            .item("email", AttributeValue::S(session.email.clone()))
+            .item("subject", AttributeValue::S(subject.to_owned()))
+            .item("email", AttributeValue::S(email.to_owned()))
+            .item("csrf", AttributeValue::S(csrf))
             .item(TOKENS_TTL_ATTR, AttributeValue::N(expires.to_string()))
             .send()
             .await
@@ -201,23 +238,7 @@ impl SessionStore {
             .await
             .map_err(|e| SessionError::Backend(format!("load_session: {e}")))?;
 
-        let Some(item) = out.item() else {
-            return Ok(None);
-        };
-        let expired = item
-            .get(TOKENS_TTL_ATTR)
-            .and_then(|v| v.as_n().ok())
-            .and_then(|n| n.parse::<u64>().ok())
-            .is_some_and(|exp| now.epoch_seconds() >= exp);
-        if expired {
-            return Ok(None);
-        }
-        let subject = item.get("subject").and_then(|v| v.as_s().ok()).cloned();
-        let email = item.get("email").and_then(|v| v.as_s().ok()).cloned();
-        match (subject, email) {
-            (Some(subject), Some(email)) => Ok(Some(AdminSession { subject, email })),
-            _ => Ok(None),
-        }
+        Ok(session_from(out.item(), now.epoch_seconds()))
     }
 
     /// Deletes a session (logout).
@@ -265,6 +286,19 @@ fn session_id(now: ArrivalTime) -> Result<String, SessionError> {
             .into_uuid()
             .to_string(),
     )
+}
+
+/// A session's CSRF token (issue #243): 256 random bits, base64url. Drawn from
+/// the same RNG as the session id, and refused the same way when it fails.
+fn csrf_token() -> Result<String, SessionError> {
+    use aws_lc_rs::rand::{SecureRandom, SystemRandom};
+    use base64::Engine as _;
+
+    let mut bytes = [0u8; 32];
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| SessionError::Rng)?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
 }
 
 #[cfg(test)]
@@ -535,5 +569,65 @@ mod tests {
             earlier < later,
             "a UUIDv7 orders lexicographically by time: {earlier} then {later}"
         );
+    }
+
+    // ---- Session rows and their CSRF token (issue #243) ----
+
+    /// A session row shaped like the one `create_session` writes.
+    fn session_row(csrf: Option<&str>, expires_at: u64) -> HashMap<String, AttributeValue> {
+        let mut item = HashMap::from([
+            ("subject".to_string(), AttributeValue::S("sub".to_string())),
+            (
+                "email".to_string(),
+                AttributeValue::S("op@example.com".to_string()),
+            ),
+            (
+                "expires_at".to_string(),
+                AttributeValue::N(expires_at.to_string()),
+            ),
+        ]);
+        if let Some(csrf) = csrf {
+            item.insert("csrf".to_string(), AttributeValue::S(csrf.to_string()));
+        }
+        item
+    }
+
+    #[test]
+    fn a_session_row_carries_its_csrf_token() {
+        let item = session_row(Some("tok"), NOW + 60);
+        assert_eq!(
+            session_from(Some(&item), NOW),
+            Some(AdminSession {
+                subject: "sub".to_string(),
+                email: "op@example.com".to_string(),
+                csrf: "tok".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_session_row_without_a_csrf_token_is_no_session() {
+        // Otherwise an empty stored token would match an empty submitted one.
+        assert_eq!(session_from(Some(&session_row(None, NOW + 60)), NOW), None);
+        assert_eq!(
+            session_from(Some(&session_row(Some(""), NOW + 60)), NOW),
+            None
+        );
+    }
+
+    #[test]
+    fn an_expired_session_row_is_rejected() {
+        assert_eq!(
+            session_from(Some(&session_row(Some("tok"), NOW)), NOW),
+            None
+        );
+        assert_eq!(session_from(None, NOW), None);
+    }
+
+    #[test]
+    fn csrf_tokens_are_256_bits_and_differ() {
+        let (a, b) = (csrf_token().unwrap(), csrf_token().unwrap());
+        assert_eq!(a.len(), 43);
+        assert_ne!(a, b);
     }
 }

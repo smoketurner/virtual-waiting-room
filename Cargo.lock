@@ -2324,6 +2324,7 @@ dependencies = [
  "aws-config",
  "aws-lc-rs",
  "aws-sdk-dynamodb",
+ "aws-sdk-sqs",
  "lambda_runtime",
  "serde",
  "serde_dynamo",

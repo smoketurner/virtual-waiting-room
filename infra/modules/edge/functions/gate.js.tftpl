@@ -1,8 +1,7 @@
-// The admission gate, at viewer-request on the protected behaviour only
-// (issue #71). Decides locally: no backend call, no network access.
-//
-// Source bytes are a hard limit (10,240), so comments are kept to what stops
-// a specific bug being reintroduced; the reasoning is in ADR-0021.
+// The admission gate, viewer-request on the protected behaviour only (#71).
+// Decides locally: no backend call.
+// Source bytes are a hard limit (10,240): comments only where they stop a
+// specific bug coming back. Reasoning: ADR-0021.
 import cf from 'cloudfront';
 import crypto from 'crypto';
 
@@ -17,7 +16,7 @@ function stripSpoofableHeaders(request) {
   delete request.headers['x-wr-gate-failed'];
 }
 
-// No timing-safe compare here: HMAC both digests and compare those.
+// No timing-safe compare here: HMAC both digests, compare those.
 function macEquals(secret, a, b) {
   var ha = crypto.createHmac('sha256', secret);
   ha.update(a);
@@ -26,14 +25,14 @@ function macEquals(secret, a, b) {
   return ha.digest('base64url') === hb.digest('base64url');
 }
 
-// Keys derived per use, as wr_common::crypto::SigningKey does.
+// Keys derived per use, as SigningKey does.
 function derive(secret, label) {
   var h = crypto.createHmac('sha256', secret);
   h.update(label);
   return h.digest();
 }
 
-// #61: keyed tag of the viewer's IPv4, or IPv6 /64. Mirrors SigningKey::ip_tag.
+// #61: keyed tag of the viewer's IPv4 or IPv6 /64, as SigningKey::ip_tag.
 function ipTag(secret, ip) {
   var n = ip;
   if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) {
@@ -65,9 +64,8 @@ function decodeJson(segment) {
   }
 }
 
-// Verifies a compact JWS (RFC 7515) over the ASCII "header.payload". "alg" is
-// compared to the one value issued, never used to pick a verifier: alg:none
-// and downgrades are refused.
+// Compact JWS (RFC 7515). "alg" is compared to the one value issued, never
+// used to pick a verifier: alg:none and downgrades are refused.
 function verify(credential, secret) {
   var parts = credential.split('.');
   if (parts.length !== 3) {
@@ -94,24 +92,22 @@ function verify(credential, secret) {
   return { eventId: claims.aud, expiresAt: claims.exp, ip: claims.cip };
 }
 
-// Own-property only: a rule named "constructor" would otherwise be truthy
-// with no .value, throwing and passing every request through.
+// Own-property only: a rule named "constructor" would be truthy with no
+// .value, throwing and passing every request.
 function ownProperty(obj, key) {
   return Object.prototype.hasOwnProperty.call(obj, key) ? obj[key] : undefined;
 }
 
-// CloudFront sends the raw path to the origin, so a rule must not be evaded
-// by an encoding the origin treats as equivalent. Not a full RFC 3986
-// resolver: ".." segments are deliberately not resolved.
+// The origin gets the raw path, so a rule must not be evaded by an encoding
+// it treats as equivalent. What it might canonicalise is suspicious (#242).
 function hexVal(c) {
   return c >= 48 && c <= 57 ? c - 48
      : c >= 65 && c <= 70 ? c - 55
      : c >= 97 && c <= 102 ? c - 87
      : -1;
 }
-// Per-byte, as wr_common::rules::percent_decode; a malformed %XX stays literal.
-// Not decodeURIComponent: one bad escape threw and reverted the whole URI,
-// evading a PathPrefix (PR #120).
+// Per-byte, as wr_common::rules::percent_decode; a bad %XX stays literal.
+// Not decodeURIComponent: one bad escape threw and evaded the rule (PR #120).
 function percentDecode(uri) {
   var out = '';
   for (var i = 0; i < uri.length; ) {
@@ -128,12 +124,9 @@ function percentDecode(uri) {
   }
   return out;
 }
-// Collapse '//', drop '.' segments, until stable. Mirrors normalized_path.
-function normalizedPath(uri) {
-  var p = percentDecode(uri), q;
-  while ((q = p.replace(/\/\/+/g, '/').replace(/\/\.\//g, '/')) !== p) p = q;
-  return p.replace(/\/\.$/, '/').toLowerCase();
-}
+// #242: a dot segment, ";params" or a backslash. Origins disagree on these,
+// so any path rule covers them. Mirrors suspicious_path.
+var SUSPICIOUS_RE = /[;\\]|(^|\/)\.\.?(\/|$)/;
 
 function queryString(qs) {
   var parts = [];
@@ -145,13 +138,15 @@ function queryString(qs) {
   return parts.length ? '?' + parts.join('&') : '';
 }
 
-// ["p",prefix] | ["h",name,value] | ["c",name] | ["u",substring]. Mirrors
+// ["p",prefix] | ["h",name,value] | ["c",name] | ["u",substring], as
 // wr_common::rules::ProtectionRule::matches; vectors prove they agree.
 function matches(rule, request) {
   var headers = request.headers || {};
   var cookies = request.cookies || {};
   if (rule[0] === 'p') {
-    return normalizedPath(request.uri).indexOf(rule[1].toLowerCase()) === 0;
+    var p = percentDecode(request.uri);
+    return SUSPICIOUS_RE.test(p) ||
+      p.replace(/\/\/+/g, '/').toLowerCase().indexOf(rule[1].toLowerCase()) === 0;
   }
   if (rule[0] === 'h') {
     var h = ownProperty(headers, rule[1].toLowerCase());
@@ -207,34 +202,30 @@ function refuse(request, reason) {
 }
 
 async function handler(event) {
-  var request = event.request;
-  stripSpoofableHeaders(request);
+  var request = event.request, hit = false;
   try {
-    // cfg.r === [] is dormancy (#60): every request matches no rule.
+    stripSpoofableHeaders(request);
+    // cfg.r === [] is dormancy (#60).
     var cfg = await kvs.get('c', { format: 'json' });
     if (cfg.v !== 1) {
       throw new Error('unrecognized gate config version');
     }
 
-    var protectedByRule = false;
-    for (var i = 0; i < cfg.r.length; i++) {
-      if (matches(cfg.r[i], request)) {
-        protectedByRule = true;
-        break;
-      }
+    for (var i = 0; i < cfg.r.length && !hit; i++) {
+      hit = matches(cfg.r[i], request);
     }
-    if (!protectedByRule) {
+    if (!hit) {
       return request;
     }
 
     var now = Math.floor(Date.now() / 1000);
 
-    // enforce_from: one scheduled instant on every edge, not a window.
+    // enforce_from: one instant on every edge.
     if (cfg.s && now < cfg.s) {
       request.headers['x-wr-gate'] = { value: 'pending' };
       return request;
     }
-    // fail_open_until: skew can only delay relief, never shorten it.
+    // fail_open_until: skew only delays relief.
     if (cfg.f && now < cfg.f) {
       request.headers['x-wr-gate'] = { value: 'failopen' };
       return request;
@@ -248,6 +239,15 @@ async function handler(event) {
     var secret = await kvs.get('k', { format: 'string' });
     var session = verify(cookie.value, secret);
     if (!session) {
+      // #247: signed before a key rotation. Optional; read only once "k"
+      // has refused.
+      try {
+        secret = await kvs.get('kp', { format: 'string' });
+        session = verify(cookie.value, secret);
+      } catch (e) {
+      }
+    }
+    if (!session) {
       return refuse(request, 'signature');
     }
     if (session.eventId !== EVENT_ID) {
@@ -256,14 +256,23 @@ async function handler(event) {
     if (now >= session.expiresAt) {
       return refuse(request, 'expired');
     }
-    // #61, operator-enabled: a session redeemed from another network.
+    // #61, operator-enabled. Tagged under the key that signed it.
     if (cfg.b && session.ip !== ipTag(secret, event.viewer.ip)) {
       return refuse(request, 'ip');
     }
     return request;
   } catch (e) {
-    // The gate being broken, not #58: no network calls happen here.
     console.log('gate threw: ' + e);
+    // #242: past a rule match the request is protected, so a throw refuses.
+    // A literal: building a refusal may be what threw.
+    if (hit) {
+      return {
+        statusCode: 403,
+        statusDescription: 'Forbidden',
+        headers: { 'cache-control': { value: 'no-store' }, 'x-wr-reason': { value: 'error' } }
+      };
+    }
+    // Unreadable config: nothing says what is protected. Pass, marked.
     request.headers['x-wr-gate-failed'] = { value: 'true' };
     return request;
   }

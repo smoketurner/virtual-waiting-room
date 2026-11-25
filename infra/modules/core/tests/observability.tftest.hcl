@@ -31,7 +31,7 @@ variables {
   nojs_artifact_path            = "tests/fixtures/bootstrap.zip"
 
   oidc_client_id      = "test-client"
-  oidc_redirect_uri   = "https://example.invalid/admin/callback"
+  oidc_redirect_uri   = "https://example.invalid/_wr/admin/callback"
   oidc_allowed_emails = "operator@example.invalid"
 }
 
@@ -156,4 +156,122 @@ run "every_alarm_fires_on_a_single_occurrence" {
     condition     = aws_cloudwatch_metric_alarm.open_dlq_not_empty.threshold == 0
     error_message = "one message on the open dead-letter queue is one scheduled open retried to exhaustion and lost"
   }
+}
+
+run "the_service_metric_alarms_exist" {
+  command = plan
+
+  # One Errors and one Throttles alarm per function: a function added to the
+  # log groups without being added here fails silently in the two ways its own
+  # log cannot report.
+  assert {
+    condition     = length(aws_cloudwatch_metric_alarm.function) == 2 * length(aws_cloudwatch_log_group.lambda)
+    error_message = "every Lambda needs an Errors and a Throttles alarm (issue #246)"
+  }
+
+  assert {
+    condition = alltrue([
+      for a in aws_cloudwatch_metric_alarm.function :
+      a.namespace == "AWS/Lambda" && contains(keys(aws_cloudwatch_log_group.lambda), a.dimensions["FunctionName"])
+    ])
+    error_message = "each function alarm must watch a function this module deploys"
+  }
+
+  assert {
+    condition     = aws_cloudwatch_metric_alarm.join_queue_age.metric_name == "ApproximateAgeOfOldestMessage" && aws_cloudwatch_metric_alarm.join_queue_age.threshold == 60
+    error_message = "a join waiting over a minute for a position must alarm"
+  }
+
+  assert {
+    condition     = aws_cloudwatch_metric_alarm.schedule_target_errors.metric_name == "TargetErrorCount"
+    error_message = "a controller schedule that cannot invoke its target must alarm (issue #228)"
+  }
+
+  assert {
+    condition     = aws_cloudwatch_metric_alarm.api_5xx.metric_name == "5XXError"
+    error_message = "a 5XX from the API must alarm"
+  }
+
+  assert {
+    condition     = length(aws_cloudwatch_metric_alarm.table_write_throttles) == 3
+    error_message = "the three visitor-path tables need a write-throttle alarm"
+  }
+}
+
+run "the_alarm_count_stays_inside_the_idle_budget" {
+  command = plan
+
+  # Alarms are the module's one standing charge, $0.10 each a month against a
+  # $5 idle budget (N1). Raising this number is a cost decision: make it on
+  # purpose, and update the figure at the top of logging.tf with it.
+  assert {
+    condition = (
+      length(aws_cloudwatch_metric_alarm.event)
+      + length(aws_cloudwatch_metric_alarm.function)
+      + length(aws_cloudwatch_metric_alarm.table_write_throttles)
+      + 5
+    ) == 31
+    error_message = "the alarm count changed; each one bills $0.10 a month between events (N1)"
+  }
+}
+
+run "alarms_are_silent_without_a_topic" {
+  command = plan
+
+  assert {
+    condition = alltrue([
+      for a in concat(
+        values(aws_cloudwatch_metric_alarm.event),
+        values(aws_cloudwatch_metric_alarm.function),
+        values(aws_cloudwatch_metric_alarm.table_write_throttles),
+        [
+          aws_cloudwatch_metric_alarm.join_dlq_not_empty,
+          aws_cloudwatch_metric_alarm.open_dlq_not_empty,
+          aws_cloudwatch_metric_alarm.join_queue_age,
+          aws_cloudwatch_metric_alarm.api_5xx,
+          aws_cloudwatch_metric_alarm.schedule_target_errors,
+        ],
+      ) : length(coalesce(a.alarm_actions, [])) == 0 && length(coalesce(a.ok_actions, [])) == 0
+    ])
+    error_message = "with no topic configured no alarm may carry an action"
+  }
+}
+
+run "every_alarm_notifies_the_configured_topic" {
+  command = plan
+
+  variables {
+    alarm_sns_topic_arn = "arn:aws:sns:us-east-1:123456789012:vwr-alarms"
+  }
+
+  # An alarm with no action changes colour in a console nobody is watching.
+  assert {
+    condition = alltrue([
+      for a in concat(
+        values(aws_cloudwatch_metric_alarm.event),
+        values(aws_cloudwatch_metric_alarm.function),
+        values(aws_cloudwatch_metric_alarm.table_write_throttles),
+        [
+          aws_cloudwatch_metric_alarm.join_dlq_not_empty,
+          aws_cloudwatch_metric_alarm.open_dlq_not_empty,
+          aws_cloudwatch_metric_alarm.join_queue_age,
+          aws_cloudwatch_metric_alarm.api_5xx,
+          aws_cloudwatch_metric_alarm.schedule_target_errors,
+        ],
+      ) :
+      a.alarm_actions == toset([var.alarm_sns_topic_arn]) && a.ok_actions == toset([var.alarm_sns_topic_arn])
+      && a.treat_missing_data == "notBreaching"
+    ])
+    error_message = "every alarm must notify the topic on alarm and on recovery, and treat missing data as healthy (issue #246)"
+  }
+}
+
+run "a_malformed_topic_arn_is_refused" {
+  command = plan
+
+  variables {
+    alarm_sns_topic_arn = "vwr-alarms"
+  }
+
+  expect_failures = [var.alarm_sns_topic_arn]
 }

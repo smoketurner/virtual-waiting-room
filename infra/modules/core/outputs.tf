@@ -49,12 +49,12 @@ output "open_event_function_name" {
 }
 
 output "read_function_name" {
-  description = "Name of the read Lambda backing /v1/status and /v1/queue_num."
+  description = "Name of the read Lambda backing /_wr/v1/status and /_wr/v1/queue_num."
   value       = aws_lambda_function.read.function_name
 }
 
 output "admin_function_name" {
-  description = "Name of the admin Lambda backing the /admin control plane."
+  description = "Name of the admin Lambda backing the /_wr/admin control plane."
   value       = aws_lambda_function.admin.function_name
 }
 
@@ -106,6 +106,17 @@ output "edge_readiness_parameter_name" {
 
 output "api_origin_key" {
   description = "The API key every REST API method requires (ADR-0038). The edge module sends it as the x-api-key origin custom header; nothing else should hold it."
-  value       = aws_api_gateway_api_key.origin.value
+  value       = aws_api_gateway_api_key.origin[local.origin_key_current].value
   sensitive   = true
+}
+
+output "client_origin_secret" {
+  description = "Sent by the distribution to the client origin as the x-wr-origin-verify header (issue #241). The origin must refuse a request without it, or its hostname bypasses the room."
+  value       = random_password.client_origin_secret.result
+  sensitive   = true
+}
+
+output "admin_role_name" {
+  description = "Name of the admin Lambda's execution role. The edge module attaches the readiness panel's read of its own distribution to it, which core cannot scope because the distribution does not exist yet (issue #250)."
+  value       = aws_iam_role.admin.name
 }

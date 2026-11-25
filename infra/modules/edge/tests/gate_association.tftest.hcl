@@ -48,20 +48,38 @@ run "no_other_behaviour_carries_a_function_association" {
 }
 
 # The inverse of the assertions above, and the one that actually bit. A path
-# with no ordered behaviour of its own falls through to the DEFAULT behaviour,
-# which carries the gate — so /v1/join reaching it means the gate refuses every
-# visitor who has no session cookie yet, which is every visitor trying to join.
-# Nothing else notices: the refusal is a well-formed 403 from the edge and the
-# queue simply stays empty.
+# with no ordered behaviour of its own falls through to another one: once the
+# gated default, now the pages' /_wr/* behaviour (issue #251), which answers a
+# POST with S3's 403. Either way nobody can join and nothing else notices: the
+# refusal is well-formed and the queue simply stays empty.
 run "the_join_path_has_its_own_behaviour" {
   command = plan
 
   assert {
     condition = anytrue([
       for b in aws_cloudfront_distribution.this.ordered_cache_behavior :
-      b.path_pattern == "/v1/join"
+      b.path_pattern == "/_wr/v1/join"
     ])
-    error_message = "/v1/join needs its own ordered_cache_behavior; without one it falls through to the gated default behaviour and nobody can join"
+    error_message = "/_wr/v1/join needs its own ordered_cache_behavior; without one it falls through to the pages' behaviour and nobody can join"
+  }
+}
+
+# CloudFront takes the first ordered behaviour whose pattern matches. The
+# pages' pattern is the room's whole prefix (issue #251), so anywhere but last
+# it swallows the API and the operator console and sends them to S3.
+run "the_pages_behaviour_is_matched_last" {
+  command = plan
+
+  assert {
+    condition     = aws_cloudfront_distribution.this.ordered_cache_behavior[length(aws_cloudfront_distribution.this.ordered_cache_behavior) - 1].path_pattern == "/_wr/*"
+    error_message = "the /_wr/* behaviour must be the last ordered_cache_behavior, or it shadows /_wr/v1/*, /_wr/admin* and /_wr/static/*"
+  }
+
+  assert {
+    condition = alltrue([
+      for b in aws_cloudfront_distribution.this.ordered_cache_behavior : startswith(b.path_pattern, "/_wr/")
+    ])
+    error_message = "every path the room claims must sit under /_wr/, or it shadows the customer's own site"
   }
 }
 
@@ -127,5 +145,57 @@ run "the_readiness_parameter_is_written_where_core_reads_it" {
   assert {
     condition     = aws_ssm_parameter.readiness.type == "String" && aws_ssm_parameter.readiness.tier == "Standard"
     error_message = "a Standard String parameter bills nothing between events (N1); an Advanced one does"
+  }
+}
+
+# Issue #241: a customer origin is sent the verification header, so it can
+# refuse a request made straight to its hostname. The viewer cannot supply it:
+# CloudFront overwrites an origin custom header of the same name.
+run "the_client_origin_is_sent_the_verification_secret" {
+  command = plan
+
+  variables {
+    client_origin_domain_name = "origin.example.com"
+    client_origin_secret      = "test-client-origin-secret"
+  }
+
+  assert {
+    condition = anytrue([
+      for o in aws_cloudfront_distribution.this.origin :
+      o.domain_name == "origin.example.com" && anytrue([
+        for h in o.custom_header : h.name == "x-wr-origin-verify" && h.value == var.client_origin_secret
+      ])
+    ])
+    error_message = "the client origin must be sent x-wr-origin-verify, or its hostname bypasses the room"
+  }
+
+  assert {
+    condition = length([
+      for o in aws_cloudfront_distribution.this.origin : o
+      if anytrue([for h in o.custom_header : h.name == "x-wr-origin-verify"])
+    ]) == 1
+    error_message = "the client origin secret must be sent to the client origin only"
+  }
+}
+
+# Issue #250: the readiness panel reads this distribution and no other.
+run "the_admin_reads_only_this_distribution" {
+  command = plan
+
+  variables {
+    admin_role_name = "test-admin-role"
+  }
+
+  assert {
+    condition     = length(aws_iam_role_policy.admin_readiness) == 1 && aws_iam_role_policy.admin_readiness[0].role == "test-admin-role"
+    error_message = "the distribution read must be attached to the admin role"
+  }
+
+  assert {
+    condition = alltrue([
+      for s in data.aws_iam_policy_document.admin_readiness.statement :
+      alltrue([for a in s.actions : contains(["cloudfront:GetDistributionConfig", "cloudfront:GetCachePolicy"], a)])
+    ])
+    error_message = "the grant must stay read-only configuration"
   }
 }

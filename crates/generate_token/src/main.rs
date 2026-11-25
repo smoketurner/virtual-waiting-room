@@ -1,4 +1,4 @@
-//! Lambda entry point for `POST /v1/generate_token`.
+//! Lambda entry point for `POST /_wr/v1/generate_token`.
 //!
 //! A waiting visitor calls this once their position has been reached. It
 //! checks the queue state, records the arrival the controller measures
@@ -193,10 +193,13 @@ fn possession_secret(req: &Request) -> Option<PossessionSecret> {
 /// polling", everything else means "stop and show why".
 fn refusal(denied: &Denied) -> Result<Response<Body>, Error> {
     let status = match denied {
-        Denied::StillQueued { .. } => 425,
+        Denied::StillQueued { .. } | Denied::AtCapacity { .. } => 425,
         Denied::NotAdmitting | Denied::NotOpen => 409,
         Denied::NotRegistered => 404,
         Denied::NotHolder => 403,
+        // Gone: the place was used and its visit is over. The page takes a
+        // new one rather than asking again.
+        Denied::SessionExpired => 410,
         Denied::Corrupt => 500,
     };
     let mut payload = serde_json::json!({
@@ -225,7 +228,7 @@ mod tests {
 
     use std::sync::Mutex;
 
-    use generate_token::{AdmissionClaim, StoreError};
+    use generate_token::StoreError;
     use wr_common::{Counters, Phase, PositionStatus, PreQueueItem, SHARDS, Session, Shard};
 
     use super::*;
@@ -234,16 +237,14 @@ mod tests {
     /// "admitted and counted" from "admitted without counting".
     struct FakeStore {
         counters: Counters,
-        position: Option<generate_token::PositionRow>,
+        position: Mutex<Option<generate_token::PositionRow>>,
         prequeue: Option<PreQueueItem>,
-        /// How many times the admission has already been claimed. The first
-        /// claim wins, mirroring the conditional write.
-        claims: Mutex<u32>,
-        /// How many arrivals were recorded — the number that must not exceed
-        /// one release.
+        /// Units of admission budget left to take.
+        budget: Mutex<u32>,
+        /// How many units were taken — the number the controller reads.
         arrivals: Mutex<u32>,
-        /// When set, every claim fails as a store error rather than answering.
-        claim_fails: bool,
+        /// When set, marking the row admitted fails as a store error.
+        mark_fails: bool,
     }
 
     impl FakeStore {
@@ -263,11 +264,11 @@ mod tests {
                     fail_open_until: 0,
                     starts_at: None,
                 },
-                position: Some(row(3)),
+                position: Mutex::new(Some(row(3))),
                 prequeue: None,
-                claims: Mutex::new(0),
+                budget: Mutex::new(100),
                 arrivals: Mutex::new(0),
-                claim_fails: false,
+                mark_fails: false,
             }
         }
 
@@ -299,38 +300,42 @@ mod tests {
         ) -> impl std::future::Future<
             Output = Result<Option<generate_token::PositionRow>, StoreError>,
         > + Send {
-            std::future::ready(Ok(self.position.clone()))
+            std::future::ready(Ok(self.position.lock().unwrap().clone()))
         }
 
-        fn claim_admission(
+        fn take_slot(
+            &self,
+            _event_id: &str,
+            _shard: Shard,
+        ) -> impl std::future::Future<Output = Result<bool, StoreError>> + Send {
+            let mut budget = self.budget.lock().unwrap();
+            let took = *budget > 0;
+            if took {
+                *budget -= 1;
+                let mut arrivals = self.arrivals.lock().unwrap();
+                *arrivals = arrivals.saturating_add(1);
+            }
+            std::future::ready(Ok(took))
+        }
+
+        fn mark_admitted(
             &self,
             _request_id: &str,
             _position: u64,
             _digest: &wr_common::SecretDigest,
-            _now: u64,
-        ) -> impl std::future::Future<Output = Result<AdmissionClaim, StoreError>> + Send {
-            let result = if self.claim_fails {
-                Err(StoreError("claim unavailable".to_owned()))
+            now: u64,
+        ) -> impl std::future::Future<Output = Result<(), StoreError>> + Send {
+            let result = if self.mark_fails {
+                Err(StoreError("mark unavailable".to_owned()))
             } else {
-                let mut claims = self.claims.lock().unwrap();
-                *claims = claims.saturating_add(1);
-                Ok(if *claims == 1 {
-                    AdmissionClaim::First
-                } else {
-                    AdmissionClaim::Repeat
-                })
+                // Mirrors the conditional write: the row is admitted from here.
+                if let Some(row) = self.position.lock().unwrap().as_mut() {
+                    row.status = PositionStatus::Admitted;
+                    row.admitted_at = Some(now);
+                }
+                Ok(())
             };
             std::future::ready(result)
-        }
-
-        fn record_arrival(
-            &self,
-            _event_id: &str,
-            _shard: Shard,
-        ) -> impl std::future::Future<Output = Result<(), StoreError>> + Send {
-            let mut arrivals = self.arrivals.lock().unwrap();
-            *arrivals = arrivals.saturating_add(1);
-            std::future::ready(Ok(()))
         }
     }
 
@@ -359,15 +364,16 @@ mod tests {
             position,
             status: PositionStatus::Issued,
             digest: Some(PossessionSecret::parse(SECRET).unwrap().digest()),
+            admitted_at: None,
         }
     }
 
     #[tokio::test]
     async fn a_reloaded_page_is_admitted_again_but_counted_once() {
         // request_id travels in a URL and the waiting page polls, so the second
-        // call is the normal case, not the exceptional one. Both calls must
-        // hand out a working session; only the first may reach the counter the
-        // controller measures no-shows against.
+        // call is the normal case, not the exceptional one. Every call must
+        // hand out a working session; only the first may take a unit of the
+        // admission budget.
         let state = state(FakeStore::admitting());
 
         for _ in 0..3u8 {
@@ -384,12 +390,119 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unavailable_claim_counts_the_arrival_rather_than_losing_it() {
-        // The claim failed, so whether this arrival is already counted is
-        // unknown. Counting it understates the no-show rate and releases fewer
-        // people; missing it releases more than the origin agreed to serve.
+    async fn a_spent_budget_admits_nobody_and_says_to_keep_polling() {
+        // ADR-0039: the visitor's turn has come, but the origin has had its
+        // share for this interval. No cookie, no mark, and a 425 so the page
+        // asks again rather than giving up.
         let store = FakeStore {
-            claim_fails: true,
+            budget: Mutex::new(0),
+            ..FakeStore::admitting()
+        };
+        let state = state(store);
+
+        let response = handle(&state, request()).await.unwrap();
+
+        assert_eq!(response.status(), 425);
+        assert!(!response.headers().contains_key("set-cookie"));
+        assert_eq!(state.store.arrivals(), 0);
+        assert_eq!(
+            state
+                .store
+                .position
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .status,
+            PositionStatus::Issued
+        );
+    }
+
+    #[tokio::test]
+    async fn the_budget_bounds_how_many_distinct_visitors_are_admitted() {
+        // Two units, three visitors whose turn has come: the third waits.
+        let state = state(FakeStore {
+            budget: Mutex::new(2),
+            ..FakeStore::admitting()
+        });
+        let mut statuses = Vec::new();
+        for _ in 0..3u8 {
+            // A different visitor each time: the row is unmarked again.
+            *state.store.position.lock().unwrap() = Some(row(3));
+            statuses.push(handle(&state, request()).await.unwrap().status().as_u16());
+        }
+        assert_eq!(statuses, [200, 200, 425]);
+    }
+
+    #[tokio::test]
+    async fn an_admitted_visitor_gets_their_session_again_on_a_spent_budget() {
+        // They were charged for when they were first admitted; a reload must
+        // not strand them because the interval's budget has since run out.
+        let state = state(FakeStore {
+            budget: Mutex::new(1),
+            ..FakeStore::admitting()
+        });
+        assert_eq!(handle(&state, request()).await.unwrap().status(), 200);
+        assert_eq!(*state.store.budget.lock().unwrap(), 0);
+        let again = handle(&state, request()).await.unwrap();
+        assert_eq!(again.status(), 200);
+        assert!(again.headers().contains_key("set-cookie"));
+    }
+
+    #[tokio::test]
+    async fn a_session_asked_for_again_expires_when_the_first_one_did() {
+        // Issue #237: a place that reached the front can be handed around. If
+        // every call minted a full-length session, one admission would admit
+        // anyone for as long as the row lived.
+        let state = state(FakeStore::admitting());
+        let first = handle(&state, request()).await.unwrap();
+        let admitted_at = state
+            .store
+            .position
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .admitted_at
+            .unwrap();
+        // Half the lifetime has gone by.
+        state
+            .store
+            .position
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .admitted_at = Some(admitted_at - 1800);
+        let second = handle(&state, request()).await.unwrap();
+
+        let expiry = |response: &Response<Body>| {
+            let body: serde_json::Value = serde_json::from_slice(response.body().as_ref()).unwrap();
+            body["expires_at"].as_u64().unwrap()
+        };
+        assert_eq!(expiry(&first), admitted_at + 3600);
+        assert_eq!(expiry(&second), admitted_at - 1800 + 3600);
+    }
+
+    #[tokio::test]
+    async fn a_place_whose_session_has_run_out_mints_nothing() {
+        let state = state(FakeStore::admitting());
+        {
+            let mut position = state.store.position.lock().unwrap();
+            let row = position.as_mut().unwrap();
+            row.status = PositionStatus::Admitted;
+            row.admitted_at = Some(1_000);
+        }
+        let response = handle(&state, request()).await.unwrap();
+        assert_eq!(response.status(), 410);
+        assert!(!response.headers().contains_key("set-cookie"));
+        assert_eq!(state.store.arrivals(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_mark_still_admits_the_visitor_who_took_a_unit() {
+        let store = FakeStore {
+            mark_fails: true,
             ..FakeStore::admitting()
         };
         let state = state(store);
@@ -401,19 +514,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_visitor_whose_turn_has_not_come_claims_nothing() {
-        // The claim is made only after `decide` admits, so a visitor still in
-        // the queue leaves no row behind and no arrival counted -- otherwise
-        // polling would count an arrival for everyone waiting.
-        let mut store = FakeStore::admitting();
-        store.position = Some(row(70));
+    async fn a_visitor_whose_turn_has_not_come_takes_nothing() {
+        // The budget is touched only after `decide` admits, so a visitor still
+        // in the queue takes no unit and leaves no mark -- otherwise polling
+        // would spend the budget on everyone waiting.
+        let store = FakeStore::admitting();
+        *store.position.lock().unwrap() = Some(row(70));
         let state = state(store);
 
         let response = handle(&state, request()).await.unwrap();
 
         assert_eq!(response.status(), 425);
-        assert_eq!(*state.store.claims.lock().unwrap(), 0);
         assert_eq!(state.store.arrivals(), 0);
+        assert_eq!(
+            state
+                .store
+                .position
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .status,
+            PositionStatus::Issued
+        );
     }
 
     #[tokio::test]
@@ -439,7 +562,6 @@ mod tests {
             let text = std::str::from_utf8(response.body()).unwrap();
             assert!(!text.contains("position"), "{body}: {text}");
         }
-        assert_eq!(*state.store.claims.lock().unwrap(), 0);
         assert_eq!(state.store.arrivals(), 0);
     }
 

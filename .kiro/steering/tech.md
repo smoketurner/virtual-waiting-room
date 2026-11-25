@@ -19,11 +19,11 @@ costs the most, because it is loaded into every session.
 |---|---|---|
 | `assign_position` | SQS event source mapping | Claims a contiguous position range per batch, writes `Positions` rows |
 | `open_event` | EventBridge Scheduler, one-time `at()` set by the operator on the dashboard (issue #128) | One conditional `UpdateItem` at T−0: seed, offsets, count, phase |
-| `read` | API Gateway | `GET /v1/status`, `GET /v1/queue_num` |
+| `read` | API Gateway | `GET /_wr/v1/status`, `GET /_wr/v1/queue_num` |
 | `generate_token` | API Gateway | Checks the position against `serving_counter`, records the arrival, mints a signed session cookie the edge gate's CloudFront Function verifies (issue #71) |
 | `nojs` | API Gateway | The queue for a visitor without JavaScript (ADR-0037): a form-post join onto the same SQS queue, and a self-refreshing wait page that admits through `generate_token::admit`. Its own small reserved concurrency |
-| `controller` | EventBridge Scheduler, `rate(1 minute)` | Durable function: six 10-second passes per execution — no-show correction and `serving_counter`. Waits between passes suspend the execution rather than being billed |
-| `admin` | API Gateway | Axum app: operator UI and `/admin/*` actions, OIDC-authenticated |
+| `controller` | EventBridge Scheduler, `rate(1 minute)` | Durable function: six 10-second passes per execution — the admission budget (ADR-0039) and `serving_counter`. Waits between passes suspend the execution rather than being billed |
+| `admin` | API Gateway | Axum app: operator UI and `/_wr/admin/*` actions, OIDC-authenticated |
 
 ## Cargo workspace and crates
 
@@ -131,7 +131,7 @@ lands on boosted Init CPU rather than the first invoke.
 | **The admission gate** | CloudFront Function (`cloudfront-js-2.0`) at viewer-request on the protected behaviour only, deciding locally from a KeyValueStore (ADR-0021, issue #71); `generate_token` signs an HMAC-SHA256 session cookie the function verifies. Sub-millisecond compute at the edge, not zero, but no round trip to the origin |
 | Bot & abuse mitigation | The REST API requires an API key only the distribution holds, so nothing bypasses the edge. On a CloudFront flat-rate plan, the edge web ACL (`flat_rate_plan_tier`) requires a WAF challenge token on every JS API call, rate-limits per token and per IP (escalating to CAPTCHA), and runs Bot Control common, anti-DDoS, IP reputation and anonymous-IP rules in Count until promoted (ADR-0038). Nothing binds a place to a person: open-time demotion (ADR-0030) and entry tickets (ADR-0028) were removed. ASN matching is unbuilt |
 | Ingest | API Gateway **REST** (regional) with request validator → SQS |
-| Buffer | SQS standard queue + DLQ (`maxReceiveCount` 5), ESM `ReportBatchItemFailures` |
+| Buffer | SQS standard queue + DLQ (`maxReceiveCount` 10), ESM `ReportBatchItemFailures` |
 | Compute | Lambda (Rust, arm64) — the six functions above |
 | State | DynamoDB on-demand + PITR: `Counters`, `PreQueue`, `Positions`, `Tokens` |
 | Scheduling | EventBridge Scheduler (T−0 open, controller every minute × six passes via durable waits) |
@@ -143,9 +143,9 @@ endpoints). A VPC opt-in for ATO-constrained operators is not built (`tasks.md`)
 
 ### Public API surface as deployed
 
-`POST /v1/join` (direct SQS integration), `GET /v1/status`, `GET /v1/queue_num`,
-`POST /v1/generate_token`, `POST /v1/enter` and `GET /v1/wait` (the no-JavaScript queue, ADR-0037), plus `/admin`, `/admin/{proxy+}` and
-`/static/{proxy+}` fronting the admin Lambda. `/queue_pos_expiry` and `/public_key` were removed
+`POST /_wr/v1/join` (direct SQS integration), `GET /_wr/v1/status`, `GET /_wr/v1/queue_num`,
+`POST /_wr/v1/generate_token`, `POST /_wr/v1/enter` and `GET /_wr/v1/wait` (the no-JavaScript queue, ADR-0037), plus `/_wr/admin`, `/_wr/admin/{proxy+}` and
+`/_wr/static/{proxy+}` fronting the admin Lambda. `/queue_pos_expiry` and `/public_key` were removed
 by design with position expiry (ADR-0031) and signed URLs (ADR-0021).
 
 ## Infrastructure as code
@@ -155,6 +155,8 @@ by design with position expiry (ADR-0031) and signed URLs (ADR-0021).
 - No resource-count ceiling. N6 was retired: the number was satisfiable by rewriting the same
   infrastructure — thirteen alarms as thirteen blocks breached it, the identical thirteen as
   three `for_each` blocks did not. Judge an addition by **N1**, what it bills between events.
+  The 31 alarms now shipped cost about $3.10 a month, most of the $5 idle budget; a terraform test
+  pins the count so the next one is a decision.
 - API documented as **OpenAPI** (N8) — **not built**.
 
 ## Admin web interface
@@ -168,7 +170,7 @@ templates.
 - Auth is **OIDC Authorization Code + PKCE** with sessions and pending logins in the `Tokens`
   table (ADR-0016, superseding SigV4). API Gateway auth is `NONE` because the Lambda is the
   enforcement point.
-- Interactivity = plain HTML `<form>` POSTs to the same `/admin/*` actions plus a small
+- Interactivity = plain HTML `<form>` POSTs to the same `/_wr/admin/*` actions plus a small
   vanilla-JS metrics poller. Core actions work with JavaScript disabled.
 - The UI is a **thin server-rendered client over the admin Lambda's own logic** — it adds no
   capability the API lacks (F5.5 API-first still holds).

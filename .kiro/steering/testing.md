@@ -69,10 +69,15 @@ visible fairness failure at 1,000,000 people. Tests are the primary evidence.
 - **Edge gate decision-tree branches (ADR-0021)** — `infra/modules/edge/tests/gate.decision-tree.test.js`
   covers every branch against the shipped function: dormancy (`r: []`), `enforce_from` pending,
   `fail_open_until` active and lapsed, each refusal reason (`none`/`signature`/`event`/`expired`),
-  XHR-versus-navigation refusal shaping, spoofed `x-wr-gate*` headers stripped at entry, and the
-  throw-and-pass-through path (an unrecognised config version, a failed KeyValueStore read).
-- **No-show compensation** — with an injected no-show rate, measured origin arrivals converge
-  on the target rate.
+  XHR-versus-navigation refusal shaping, spoofed `x-wr-gate*` headers stripped at entry, the
+  throw-and-pass-through path before a rule match (an unrecognised config version, an unreadable
+  config), the refuse-on-throw path after one (an unreadable key, a throw inside the refusal: plain
+  403, reason `error`, #242), and the optional previous key `kp` (#247). Suspicious paths (a dot
+  segment, `;`, a backslash) matching any path rule are pinned by the cross-language vectors.
+- **No-show compensation, the admission bound and the backlog drain** — with an injected no-show
+  rate, admissions converge on the target rate; no window admits more than its time at that rate
+  plus the burst; and a spent budget holds the cursor back so visitors already invited drain
+  instead of persisting (ADR-0039).
 
 ## Not currently provable, and why
 
@@ -80,7 +85,7 @@ visible fairness failure at 1,000,000 people. Tests are the primary evidence.
   `fail_open_until` epoch the gate evaluates against its own clock, `resolve()` producing
   `AdmissionControl::FailOpen`, `apply_fail_open` writing both stores in the safe order), but
   nothing trips it automatically. Fail-open still depends on a human (or a watchdog that does
-  not exist yet) noticing the backend is down and calling `/admin/fail_open`. Do not write a
+  not exist yet) noticing the backend is down and calling `/_wr/admin/fail_open`. Do not write a
   test that asserts DynamoDB-unreachable automatically flips the gate open — nothing does that.
 
 ## To prove when the corresponding gap closes

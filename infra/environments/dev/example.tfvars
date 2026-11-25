@@ -35,8 +35,23 @@ acm_certificate_arn = ""
 #     --type SecureString --value '<secret>' --overwrite
 oidc_issuer         = "https://us.vouch.sh"
 oidc_client_id      = ""
-oidc_redirect_uri   = "" # e.g. https://<host>/admin/callback
+oidc_redirect_uri   = "" # e.g. https://<host>/_wr/admin/callback
 oidc_allowed_emails = "" # comma-separated; "" = deny all (fail closed)
+# oidc_require_email_verified = true # false only for a provider that omits the claim
+
+# --- Operations ---------------------------------------------------------------
+# alarm_sns_topic_arn            = ""    # SNS topic every alarm notifies; "" = alarms change state silently
+# table_deletion_protection      = false # true for a real event; must be false to change event_id
+# controller_reserved_concurrency = 2
+# api_join_throttle_rate_limit   = 7000  # below the account limit, so a join storm cannot starve admission and the console
+# api_join_throttle_burst_limit  = 3500
+# api_throttle_rate_limit        = 10000
+# api_throttle_burst_limit       = 5000
+# waf_nojs_wait_ip_limit         = 300   # only with flat_rate_plan_tier
+# signing_key_generation         = 1     # raise by one to rotate; previous sessions stay valid until they expire
+# origin_key_generation          = 1     # raise by one to rotate the CloudFront-to-API key without an outage
+# expected_join_rate             = 0     # peak joins/s; above 4000 the plan requires warm_throughput_write_units
+# waf_require_token_cookie       = true  # false counts instead of blocking; only with flat_rate_plan_tier
 
 # --- Adaptive poll policy (#69, ADR-0023) -------------------------------------
 # Published on /status; waiting.js clamps its poll interval to these, polling

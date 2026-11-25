@@ -82,7 +82,7 @@ variable "oidc_client_id" {
 }
 
 variable "oidc_redirect_uri" {
-  description = "OIDC callback URL registered with the provider — the CloudFront URL of /admin/callback."
+  description = "OIDC callback URL registered with the provider — the CloudFront URL of /_wr/admin/callback."
   type        = string
   default     = ""
 }
@@ -192,8 +192,91 @@ variable "waf_join_ip_limit" {
   default     = 100
 }
 
+variable "waf_nojs_wait_ip_limit" {
+  description = "Loads of the no-JavaScript waiting page (GET /_wr/v1/wait) per IP per 5 minutes before further ones are refused."
+  type        = number
+  default     = 300
+}
+
+variable "waf_require_token_cookie" {
+  description = "Whether a JavaScript API request holding a WAF token must carry it as the cookie. False counts such requests instead of blocking them."
+  type        = bool
+  default     = true
+}
+
 variable "nojs_enabled" {
   description = "Whether the no-JavaScript queue stays open on a flat-rate plan. false closes it at the edge for an event where it is being abused."
   type        = bool
   default     = true
+}
+
+# --- Operations ---------------------------------------------------------------
+# Validated in modules/core/variables.tf, which also carries the rationale.
+
+variable "alarm_sns_topic_arn" {
+  description = "SNS topic every CloudWatch alarm notifies, on alarm and on recovery. Empty attaches no action: the alarms evaluate and nobody is told."
+  type        = string
+  default     = ""
+}
+
+variable "table_deletion_protection" {
+  description = "DynamoDB deletion protection on all four tables. Off for dev stacks, which are destroyed. Must be off for the apply that follows a change of event_id, which recreates PreQueue and Positions."
+  type        = bool
+  default     = false
+}
+
+variable "controller_reserved_concurrency" {
+  description = "Reserved concurrency on the controller function, so a burst cannot starve admission. -1 leaves it unreserved."
+  type        = number
+  default     = 2
+}
+
+# --- REST API stage throttles (issue #245) ------------------------------------
+
+variable "signing_key_generation" {
+  description = "Generation of the session signing key. Raise by one to rotate; the previous generation's sessions stay valid until they expire."
+  type        = number
+  default     = 1
+}
+
+variable "origin_key_generation" {
+  description = "Generation of the API key CloudFront sends the REST API. Raise by one to rotate; the previous generation stays valid until the next rotation."
+  type        = number
+  default     = 1
+}
+
+variable "expected_join_rate" {
+  description = "Peak joins per second expected, or 0 if unknown. Above 4,000 the plan fails unless warm_throughput_write_units covers it."
+  type        = number
+  default     = 0
+}
+
+variable "oidc_require_email_verified" {
+  description = "Whether an admin login needs the provider's email_verified claim to be present and true. Turn off only for a provider that omits the claim and verifies every address."
+  type        = bool
+  default     = true
+}
+
+variable "api_join_throttle_rate_limit" {
+  description = "Requests per second POST /_wr/v1/join accepts before answering 429."
+  type        = number
+  default     = 7000
+}
+
+variable "api_join_throttle_burst_limit" {
+  description = "Token-bucket size for POST /_wr/v1/join."
+  type        = number
+  default     = 3500
+}
+
+variable "api_throttle_rate_limit" {
+  description = "Requests per second each other API method accepts before answering 429."
+  type        = number
+  default     = 10000
+}
+
+variable "api_throttle_burst_limit" {
+  description = "Token-bucket size for each API method other than POST /_wr/v1/join."
+  type        = number
+  default     = 5000
 }

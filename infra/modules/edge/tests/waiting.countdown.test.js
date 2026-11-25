@@ -19,7 +19,7 @@ const { loadClient, jsonResponse } = require("./vm-client");
 const NOW_MS = 1_700_000_000_000;
 const NOW_SECS = NOW_MS / 1000;
 
-/** A `/v1/status` body for a scheduled event that has not opened yet. */
+/** A `/_wr/v1/status` body for a scheduled event that has not opened yet. */
 function preQueueStatus(overrides) {
   return Object.assign(
     {
@@ -34,10 +34,10 @@ function preQueueStatus(overrides) {
 
 function route(statusBody) {
   return (url) => {
-    if (url.startsWith("/v1/status")) {
+    if (url.startsWith("/_wr/v1/status")) {
       return jsonResponse(200, statusBody);
     }
-    return jsonResponse(200, {}); // /v1/join
+    return jsonResponse(200, {}); // /_wr/v1/join
   };
 }
 
@@ -106,7 +106,7 @@ test("the countdown does not suppress pre-queue registration", async () => {
   });
   await client.flush();
   assert.equal(
-    client.calls.filter((c) => c.url.includes("/v1/join")).length,
+    client.calls.filter((c) => c.url.includes("/_wr/v1/join")).length,
     1,
     "a counting-down visitor must still register"
   );

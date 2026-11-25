@@ -36,7 +36,7 @@ impl IpBinding {
 
 /// The dashboard view. Optional fields render as "not set" when absent so the
 /// operator sees a label rather than a blank. Also serialized as JSON by the
-/// `/admin/state` poller endpoint.
+/// `/_wr/admin/state` poller endpoint.
 #[derive(Template, serde::Serialize)]
 #[template(path = "dashboard.html")]
 pub struct Dashboard {
@@ -106,6 +106,11 @@ pub struct Dashboard {
     /// state view (the poller endpoint reuses this struct).
     #[serde(skip)]
     pub csp_nonce: String,
+    /// The session's CSRF token (issue #243), echoed by a hidden `csrf` field
+    /// in every form. Set by the handler like `operator_email`. Not part of
+    /// the JSON state view: the poller has no use for it.
+    #[serde(skip)]
+    pub csrf_token: String,
     /// The current edge-gate ruleset (issue #71), one line per rule, for
     /// pre-filling the rules form. Read from the `KeyValueStore` separately
     /// from `ControlState` (rules live only there), so it defaults empty
@@ -278,6 +283,7 @@ impl Dashboard {
                 _ => "none yet".to_owned(),
             },
             csp_nonce: String::new(),
+            csrf_token: String::new(),
             operator_email: String::new(),
             rules_text: String::new(),
             ip_binding: IpBinding::Off,
@@ -350,6 +356,48 @@ mod tests {
             starts_at: None,
             starts_at_timezone: None,
         }
+    }
+
+    #[test]
+    fn every_form_carries_the_sessions_csrf_token() {
+        // Checked on the template source, so a form inside a branch this
+        // state does not render is counted too (issue #243). The field must
+        // sit directly inside the form's opening tag to count.
+        let source = include_str!("../templates/dashboard.html");
+        let forms = source.matches("<form").count();
+        assert!(forms >= 15, "{forms} forms");
+        let field = r#"<input type="hidden" name="csrf" value="{{ csrf_token }}">"#;
+        for (index, form) in source.split("<form").skip(1).enumerate() {
+            let after_tag = form.split_once('>').unwrap().1;
+            assert!(
+                form.starts_with(r#" method="post""#)
+                    || form.starts_with(r#" class="session" method="post""#),
+                "form {index} is not a post"
+            );
+            assert!(
+                after_tag.trim_start().starts_with(field),
+                "form {index} has no csrf field: {}",
+                &form[..form.len().min(120)]
+            );
+        }
+
+        let mut view = Dashboard::from_state(&state(), 0);
+        view.csrf_token = "tok-123".to_owned();
+        let html = view.render().unwrap();
+        assert_eq!(
+            html.matches("<form").count(),
+            html.matches(r#"<input type="hidden" name="csrf" value="tok-123">"#)
+                .count()
+        );
+        // Render-only, like the nonce: the poller's JSON never carries it.
+        assert!(!serde_json::to_string(&view).unwrap().contains("tok-123"));
+    }
+
+    #[test]
+    fn signing_out_is_a_form_post_not_a_link() {
+        let html = Dashboard::from_state(&state(), 0).render().unwrap();
+        assert!(html.contains(r#"method="post" action="/_wr/admin/logout""#));
+        assert!(!html.contains(r#"href="/_wr/admin/logout""#));
     }
 
     #[test]
@@ -473,7 +521,7 @@ mod tests {
         let html = Dashboard::from_state(&s, 0).render().unwrap();
 
         assert!(html.contains("Open now"));
-        assert!(html.contains("/admin/open_now"));
+        assert!(html.contains("/_wr/admin/open_now"));
         assert!(
             !html.contains("The event is over"),
             "a pre-queue event is not a finished one"
@@ -491,7 +539,7 @@ mod tests {
         // the button should not invite.
         let html = Dashboard::from_state(&state(), 0).render().unwrap();
 
-        assert!(!html.contains("/admin/open_now"));
+        assert!(!html.contains("/_wr/admin/open_now"));
         assert!(html.contains("Already open"));
     }
 
@@ -509,7 +557,7 @@ mod tests {
         let html = Dashboard::from_state(&s, 0).render().unwrap();
 
         assert!(
-            !html.contains(r#"action="/admin/open_now""#),
+            !html.contains(r#"action="/_wr/admin/open_now""#),
             "Open now must not be offered from idle (no pre-queue to close): {html}"
         );
         assert!(
@@ -541,7 +589,7 @@ mod tests {
         let html = Dashboard::from_state(&s, 0).render().unwrap();
 
         assert!(
-            !html.contains(r#"action="/admin/open_now""#),
+            !html.contains(r#"action="/_wr/admin/open_now""#),
             "Open now must not be offered from an unopened maintenance event: {html}"
         );
         assert!(
@@ -571,7 +619,7 @@ mod tests {
             s.participant_count = None;
             let html = Dashboard::from_state(&s, 0).render().unwrap();
             assert_eq!(
-                html.contains(r#"action="/admin/open_now""#),
+                html.contains(r#"action="/_wr/admin/open_now""#),
                 opens,
                 "phase {phase:?}: open-now form presence mismatch (expected {opens}): {html}"
             );
@@ -602,7 +650,7 @@ mod tests {
         let mut view = Dashboard::from_state(&state(), 0);
         view.rules_load_failed = true;
         let html = view.render().unwrap();
-        assert!(!html.contains("action=\"/admin/rules\""));
+        assert!(!html.contains("action=\"/_wr/admin/rules\""));
         assert!(html.contains("Could not read the current ruleset"));
     }
 
@@ -611,7 +659,7 @@ mod tests {
         let mut view = Dashboard::from_state(&state(), 0);
         view.rules_text = "p /checkout".to_owned();
         let html = view.render().unwrap();
-        assert!(html.contains("action=\"/admin/rules\""));
+        assert!(html.contains("action=\"/_wr/admin/rules\""));
         assert!(html.contains("p /checkout"));
         assert!(!html.contains("Could not read the current ruleset"));
     }
@@ -620,7 +668,7 @@ mod tests {
     fn the_ip_binding_state_and_its_toggle_are_rendered() {
         let mut view = Dashboard::from_state(&state(), 0);
         let off = view.render().unwrap();
-        assert!(off.contains("action=\"/admin/ip_binding\""));
+        assert!(off.contains("action=\"/_wr/admin/ip_binding\""));
         assert!(off.contains("IP binding: <strong>off</strong>"));
         assert!(off.contains(r#"name="binding" value="on""#));
 
@@ -630,12 +678,12 @@ mod tests {
         assert!(on.contains(r#"name="binding" value="off""#));
 
         view.rules_load_failed = true;
-        assert!(!view.render().unwrap().contains("/admin/ip_binding"));
+        assert!(!view.render().unwrap().contains("/_wr/admin/ip_binding"));
     }
 
     #[test]
     fn phase_renders_as_its_wire_string() {
-        // The badge label, the `status-{phase}` CSS class, and the /admin/state
+        // The badge label, the `status-{phase}` CSS class, and the /_wr/admin/state
         // JSON all read this one field, so it must be the wire string the
         // stylesheet and the transition dropdown already use. A `Debug`-derived
         // lowercase form drops the underscore on the two-word variants, giving
@@ -667,13 +715,13 @@ mod tests {
     #[test]
     fn core_actions_are_plain_form_posts_no_js() {
         let html = Dashboard::from_state(&state(), 0).render().unwrap();
-        // Every operator action is a POST form to its /admin route — works with
+        // Every operator action is a POST form to its /_wr/admin route — works with
         // JavaScript disabled.
         for action in [
-            "action=\"/admin/phase\"",
-            "action=\"/admin/rate\"",
-            "action=\"/admin/message\"",
-            "action=\"/admin/force_maintenance\"",
+            "action=\"/_wr/admin/phase\"",
+            "action=\"/_wr/admin/rate\"",
+            "action=\"/_wr/admin/message\"",
+            "action=\"/_wr/admin/force_maintenance\"",
         ] {
             assert!(html.contains(action), "missing form {action}");
         }
@@ -686,7 +734,7 @@ mod tests {
             "exactly one script (the poller) expected"
         );
         assert!(html.contains("<script nonce="));
-        assert!(html.contains("/admin/state"));
+        assert!(html.contains("/_wr/admin/state"));
     }
 
     #[test]
@@ -708,7 +756,7 @@ mod tests {
         s.stored_control = Open;
         let open = Dashboard::from_state(&s, 0).render().unwrap();
         assert!(!open.contains("pause-banner"));
-        assert!(open.contains("action=\"/admin/pause\""));
+        assert!(open.contains("action=\"/_wr/admin/pause\""));
         assert!(open.contains(">open<"));
 
         // Paused: banner, and the action offered is Resume, not Pause again.
@@ -716,8 +764,8 @@ mod tests {
         s.stored_control = Paused;
         let paused = Dashboard::from_state(&s, 0).render().unwrap();
         assert!(paused.contains("Admission is PAUSED"));
-        assert!(paused.contains("action=\"/admin/resume\""));
-        assert!(!paused.contains("action=\"/admin/pause\""));
+        assert!(paused.contains("action=\"/_wr/admin/resume\""));
+        assert!(!paused.contains("action=\"/_wr/admin/pause\""));
         assert!(paused.contains(">paused<"));
 
         // Fail open: its own banner and badge, never rendered as the normal
@@ -823,7 +871,7 @@ mod tests {
 
     #[test]
     fn admin_state_json_includes_serving_state_for_the_poller() {
-        // The poller can only refresh #s-serving_state if /admin/state actually
+        // The poller can only refresh #s-serving_state if /_wr/admin/state actually
         // serializes it. Guard the other half of the contract: serving_state is
         // NOT #[serde(skip)], unlike the render-only inputs it must stay apart
         // from.
@@ -831,7 +879,7 @@ mod tests {
         let json = serde_json::to_string(&view).unwrap();
         assert!(
             json.contains(r#""serving_state":"Running""#),
-            "/admin/state must serialise serving_state so the poller can write it; got: {json}"
+            "/_wr/admin/state must serialise serving_state so the poller can write it; got: {json}"
         );
         for render_only in [r#""message_raw""#, r#""operator_email""#, r#""csp_nonce""#] {
             assert!(
