@@ -59,7 +59,14 @@ VISITORS := 500
 SECONDS  := 30
 POLLING  := hold-position
 
-.PHONY: help build init plan apply destroy fmt validate clean load
+# The local stack: the shipped Lambda binaries against the AWS Emulator, with the
+# edge modelled by the harness (crates/harness/src/stack). Extra flags go in
+# STACK_ARGS, e.g. make stack STACK_ARGS="--visitors 20000 --rate 200".
+EMULATOR_HOME := $(CURDIR)/target/stack-emulator
+EMULATOR_PORT := 9297
+STACK_ARGS    :=
+
+.PHONY: help build init plan apply destroy fmt validate clean load stack-emulator stack
 
 help: ## Show this help.
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -96,3 +103,17 @@ clean: ## Remove staged Lambda artifacts.
 
 load: ## Generate waiting-room load locally and report origin requests per visitor.
 	cargo run -q -p harness -- --visitors $(VISITORS) --seconds $(SECONDS) --polling $(POLLING)
+
+stack-emulator: ## Build and start the AWS Emulator the local stack runs against.
+	docker build -q -t vwr-aws-emulator crates/harness/emulator
+	mkdir -p $(EMULATOR_HOME)
+	-docker rm -f vwr-aws-emulator >/dev/null 2>&1
+	docker run -d --name vwr-aws-emulator --memory=6g --memory-swap=6g \
+		-e HOME=$(EMULATOR_HOME) -v $(EMULATOR_HOME):$(EMULATOR_HOME) \
+		-p 127.0.0.1:$(EMULATOR_PORT):$(EMULATOR_PORT) \
+		vwr-aws-emulator -p $(EMULATOR_PORT) --auth off
+
+stack: ## Run the waiting room locally against the emulator and check the design's claims.
+	cargo run --release -q -p harness --bin stack -- \
+		--emulator https://127.0.0.1:$(EMULATOR_PORT) \
+		--emulator-ca $(EMULATOR_HOME)/.aws/emulator/$(EMULATOR_PORT)/ca.pem $(STACK_ARGS)

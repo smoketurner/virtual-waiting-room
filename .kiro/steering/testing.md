@@ -108,6 +108,11 @@ positions in one write, ≥10K/s (≥40K/s with quotas filed) live joins with ze
 `/status` origin RPS flat from 10K to 1M waiters, event isolation. Pre-warm and raise quotas
 *before* testing the live-join path or the test measures throttling, not the design.
 
+The local stack (`make stack`, `docs/LOCAL_STACK.md`) runs the shipped binaries and the shipped
+gate and page against the AWS Emulator and checks these claims on every run; it is the first
+place a change to admission, assignment or the client is proven. It does not replace a run
+against a deployment, which is the only proof of quotas, latency and many edge locations.
+
 ## Admin UI
 
 `askama` template unit tests plus a rendered-HTML snapshot / accessibility check. Verify core

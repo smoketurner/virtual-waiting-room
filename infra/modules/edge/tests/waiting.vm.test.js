@@ -506,6 +506,34 @@ test("a redemption answered 'at capacity' keeps polling and is admitted on a lat
   assert.equal(client.win.location.replacedTo, "/");
 });
 
+for (const status of [429, 502]) {
+  test(`a redemption answered ${status} backs off like 'at capacity'`, async () => {
+    const client = loadClient({
+      route: (url) => {
+        if (url.startsWith("/_wr/v1/status")) {
+          return jsonResponse(200, activeStatus({ serving_position: 100, poll_policy: POLICY }));
+        }
+        if (url.startsWith("/_wr/v1/queue_num")) {
+          return jsonResponse(200, { position: 50, live_join: true });
+        }
+        if (url.startsWith("/_wr/v1/generate_token")) {
+          return jsonResponse(status, { message: "busy" });
+        }
+        return jsonResponse(200, {});
+      },
+    });
+    const delays = [];
+    for (let i = 0; i < 3; i += 1) {
+      await client.flush();
+      const t = client.lastTimer();
+      delays.push(t.ms);
+      t.cancelled = true;
+      t.fn();
+    }
+    assert.ok(delays[1] > delays[0] * 1.2, JSON.stringify(delays));
+  });
+}
+
 test("repeated 'at capacity' answers are asked for less and less often", async () => {
   const client = loadClient({
     route: (url) => {

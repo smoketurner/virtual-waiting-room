@@ -921,8 +921,11 @@
       admitting = false;
       // Everyone whose turn has come is told 425 while the budget is spent,
       // and asks again. Each asks less often the longer it lasts, so a spent
-      // budget is not also a storm of refusals.
-      capacityMisses = res.status === 425 ? capacityMisses + 1 : 0;
+      // budget is not also a storm of refusals. A 429 or a 5xx is the same
+      // crowd meeting a throttle or an overloaded function, and retrying it
+      // at the floor only feeds the overload.
+      var busy = res.status === 425 || res.status === 429 || res.status >= 500;
+      capacityMisses = busy ? capacityMisses + 1 : 0;
       if (res.status === 403) {
         // The secret this browser holds is not the one the place was taken
         // with (issue #62). Nothing on this page can recover that.

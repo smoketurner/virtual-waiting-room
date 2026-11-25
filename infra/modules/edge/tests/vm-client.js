@@ -46,6 +46,10 @@ function loadClient({
   // localStorage contents present before the script runs, for what the page
   // reads once at load rather than on demand.
   stored,
+  // Real randomness for the page's identity. Tests leave it out and get a
+  // fixed fill; the local stack's page driver runs many pages at once, and
+  // they must not mint the same request id.
+  randomValues,
 }) {
   const clock = { now: now || 1_700_000_000_000 };
   const calls = [];
@@ -98,7 +102,7 @@ function loadClient({
     localStorage: storageOf("local"),
     sessionStorage: storageOf("session"),
     crypto: {
-      getRandomValues: (a) => a.fill(7),
+      getRandomValues: randomValues || ((a) => a.fill(7)),
       // Real SHA-256 (the page hashes its possession secret, issue #62), but
       // settled as a microtask: webcrypto's own digest runs on the thread
       // pool, which flush() does not wait for.
