@@ -110,7 +110,7 @@ Smaller artifact and a marginally faster cold start, at the cost of slower build
 panic and turns it into a 5xx while keeping the sandbox warm; `abort` would torch the execution
 environment on every panic. `opt-level = "z"` — the permutation HMAC and JSON parsing are billed
 CPU time, so size-over-speed is the wrong trade; `opt-level` 3-vs-`z` for cold start is
-scenario-dependent and is A/B-measured in the Phase 0 spike, not assumed.
+scenario-dependent and is to be A/B-measured (a Phase 3 item in `tasks.md`), not assumed.
 
 ### aws-lc-rs cold-start (jitter entropy)
 
@@ -139,14 +139,14 @@ lands on boosted Init CPU rather than the first invoke.
 | Metrics | CloudWatch. EMF emission and the shipped dashboard are **not built** (F5.1) |
 
 **No VPC by default** — all services are IAM-authenticated public endpoints (no NAT, no VPC
-endpoints). VPC is an opt-in variable for ATO-constrained operators; Lambda code is identical.
+endpoints). A VPC opt-in for ATO-constrained operators is not built (`tasks.md`).
 
 ### Public API surface as deployed
 
 `POST /v1/join` (direct SQS integration), `GET /v1/status`, `GET /v1/queue_num`,
 `POST /v1/generate_token`, `POST /v1/enter` and `GET /v1/wait` (the no-JavaScript queue, ADR-0037), plus `/admin`, `/admin/{proxy+}` and
-`/static/{proxy+}` fronting the admin Lambda. `/queue_pos_expiry` and `/public_key` appear in
-`docs/DESIGN.md` §8 but are **not routed**.
+`/static/{proxy+}` fronting the admin Lambda. `/queue_pos_expiry` and `/public_key` were removed
+by design with position expiry (ADR-0031) and signed URLs (ADR-0021).
 
 ## Infrastructure as code
 

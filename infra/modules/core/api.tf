@@ -10,12 +10,13 @@
 # --- Endpoint definitions -----------------------------------------------------
 # Public endpoints are PATH-VERSIONED under /v1 (the stage is the environment,
 # not the version - viewers hit /v1/status, forwarded to /<env>/v1/status).
-# The admin control plane is unversioned: it is the SigV4 operator surface, not
-# a public API contract.
+# The admin control plane is unversioned: it is the operator surface, not a
+# public API contract.
 #
 # parent: "v1" nests under the /v1 version prefix (public);
 #         "root" is a top-level path; "admin" nests under /admin.
-# auth:   "NONE" for public, "AWS_IAM" for the SigV4 admin surface (F3.10, F5.5).
+# auth:   "NONE" everywhere: the admin Lambda enforces its own OIDC session
+#         (ADR-0016), and every method requires the origin API key (ADR-0038).
 
 resource "aws_api_gateway_resource" "v1" {
   rest_api_id = aws_api_gateway_rest_api.this.id
@@ -104,8 +105,8 @@ resource "aws_api_gateway_integration" "admin_proxy" {
 }
 
 # Static assets (CSS) for the admin UI, served by the admin Lambda from its
-# embedded files. Public (no SigV4): a browser <link> cannot sign the request
-# and the stylesheets carry no secrets. Greedy {proxy+} under /static.
+# embedded files. Served without a login session: the stylesheets carry no
+# secrets and the login page needs them. Greedy {proxy+} under /static.
 resource "aws_api_gateway_resource" "static" {
   rest_api_id = aws_api_gateway_rest_api.this.id
   parent_id   = aws_api_gateway_rest_api.this.root_resource_id

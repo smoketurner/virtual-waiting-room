@@ -1,1075 +1,570 @@
 # Design
 
-How the virtual waiting room works. Requirements are in [`REQUIREMENTS.md`](./REQUIREMENTS.md);
-the reasoning behind each choice is in [`adr/`](./adr/). Constraints and their sources are in
-§14.
-
----
+How the virtual waiting room works, as built. Requirements are in
+[`REQUIREMENTS.md`](./REQUIREMENTS.md), the reasoning behind each choice is in [`adr/`](./adr/),
+and [`DYNAMODB.md`](./DYNAMODB.md) covers every access pattern in detail. Constraints and their
+sources are in §14.
 
 ## 1. Overview
 
-A virtual waiting room meters visitors into an origin at a rate the origin can sustain.
+The waiting room meters visitors into an origin at a rate the origin can sustain. It has two modes:
 
-Two operating modes, which may run simultaneously on one origin:
+- **Scheduled.** The start time is known. Early arrivals register during a countdown, and at T−0
+  they are assigned randomized positions
+  ([ADR-0001](adr/0001-randomize-pre-queue-assignment.md)).
+- **Standby.** The gate stays deployed with no protection rules, so every request passes
+  through. Once an operator writes rules, matching visitors are queued first-in, first-out.
 
-- **Scheduled** — a known start time. Early arrivals are held on a countdown page and
-  assigned randomized positions at the start ([ADR-0001](adr/0001-randomize-pre-queue-assignment.md)).
-- **Standby** — dormant until measured inflow crosses a threshold, then queues new visitors
-  first-in, first-out (FIFO).
-
-Admission is a signed session cookie, verified locally at the edge gate without a call to the
-waiting-room backend.
-
----
+Admission is a signed session cookie. A CloudFront Function at the edge verifies it locally, with
+no call to the backend.
 
 ## 2. Architecture
 
 ### 2.1 Scheduled event
 
 ```
-  T−n   Visitor → CloudFront → static countdown page (S3, cached)
-                                    │
-                                    │ POST /join — one PreQueue item per visitor,
-                                    │ spread across the pre-queue window
-                                    ▼
-                              DynamoDB PreQueue
+  T−n   Visitor → CloudFront → waiting page (S3, cached)
+                                    │ POST /v1/join — one PreQueue row per visitor,
+                                    ▼ spread across the countdown
+                              DynamoDB PreQueue {r, s, l, t, h}
 
-  T−0   EventBridge Scheduler → open_event (Rust, arm64)
-          ONE UpdateItem on Counters:
-            SET shuffle_seed = :seed, participant_count = :n, phase = :active
-            ConditionExpression: attribute_not_exists(shuffle_seed) AND phase = :pre_queue
-                                    │
-                                    ▼
-  T+    /queue_num reads (s, l) from PreQueue, seed/N/offsets from /status, returns
-        PRP(seed, offset[s]+l, N) — a keyed permutation evaluated per read
+  T−0   EventBridge Scheduler → open_event
+          BatchGetItem the 10 shard counters, then ONE UpdateItem on Counters:
+            SET shuffle_seed, participant_count = N, queue_counter = N,
+                prequeue_offsets, phase = active
+            ConditionExpression: attribute_not_exists(shuffle_seed) AND phase = pre_queue
+
+  T+    /v1/queue_num → read Lambda: PRP(seed, offset[s] + l, N), computed per read
 ```
 
 ### 2.2 Live join
 
 ```
-  CloudFront   polled behaviour: Min TTL 1 s, no cookies forwarded
+  CloudFront   /v1/join: uncached, x-api-key origin header added
         │
-  API Gateway  REST, regional
-               request validator (JSON Schema) → 400 on malformed body
-               type: aws → SQS SendMessage        ← no Lambda in the burst path
+  API Gateway  REST, regional; JSON Schema request validator → 400 on a malformed body
+               type: aws → SQS SendMessage          ← no Lambda in the burst path
         │
   SQS          standard queue + DLQ (maxReceiveCount 5)
-        │      ESM: BatchSize 100, MaximumBatchingWindowInSeconds 1,
-        │      FunctionResponseTypes: [ReportBatchItemFailures]
+        │      ESM: BatchSize 100, window 1 s, ReportBatchItemFailures
         ▼
-  assign_position (Rust, arm64)
-        1. partition records into valid / invalid (UUIDv7 parse)
-        2. UpdateItem ADD queue_counter :valid_count / ALL_NEW
-        3. PutItem ConditionExpression: attribute_not_exists(request_id)
-        4. return batchItemFailures for invalid or failed records
-        │
-        ▼
-  DynamoDB     Counters · PreQueue · Positions · Tokens
+  assign_position
+        1. classify records; drop malformed ones (counted and logged, never retried)
+        2. one strongly consistent GetItem of Counters picks the path for the whole batch
+        3. live join: UpdateItem ADD queue_counter :valid_count / ALL_NEW
+        4. PutItem per record, ConditionExpression attribute_not_exists(request_id)
+        5. return batchItemFailures for records whose write failed
 ```
 
 ### 2.3 Admission
 
 ```
-  Outflow controller (EventBridge Scheduler, rate(1 minute) × six 10 s passes)
-        1. sum arrivals#0..9 and released count
-        2. no_show_rate = 1 − (arrivals / released)
-        3. release = target_rate / (1 − smoothed_no_show_rate), bounded
-        4. UpdateItem serving_counter
+  controller (EventBridge Scheduler rate(1 minute); a durable execution of six 10 s passes)
+        measure arrivals against releases → EWMA no-show rate → bounded release
+        → UpdateItem serving_counter
         │
-        ▼
-  Visitor polls /status → serving_counter ≥ own position
+  Visitor polls /v1/status until serving_position ≥ own position
         │
-  POST /v1/generate_token → generate_token (Rust)
-        1. position reached, event admitting (resolved from StoredControl +
-           fail_open_until, issue #71), position still a live claim?
-        2. ADD arrivals#(hash % 10)
-        3. sign an HMAC-SHA256 session credential (wr_common::crypto)
-        4. Set-Cookie: <session_cookie_name>=<credential>  (Path=/, Secure,
-                        HttpOnly, SameSite=Lax, Max-Age)
+  POST /v1/generate_token (request_id + possession secret, ADR-0035)
+        1. event admitting? (phase active, resolve(stored control, fail_open_until, now))
+        2. position reached?
+        3. claim the admission once (Positions.status issued → admitted, ADR-0033);
+           on the first claim, ADD n on a randomly drawn arrivals shard
+        4. sign the session (HS256 JWS, wr_common::crypto) → Set-Cookie
+           (Path=/, Secure, HttpOnly, SameSite=Lax, Max-Age)
         │
-        ▼
-  CloudFront Function, viewer-request, protected behaviour only  ← the gate
-     1. no configured rule matches       → pass through (dormancy, #60)
-     2. enforce_from/fail_open_until in the future → pass through, marked
-     3. valid session cookie             → pass through
-     4. missing or invalid               → refuse with a reason (#73):
-                                            302 to /_wr/waiting.html for
-                                            navigation, 403 JSON for XHR (#72)
-     5. the gate itself throws           → pass through, marked (not #58 —
-                                            see below)
+  CloudFront Function, viewer-request, protected behaviour only   ← the gate
+        1. no rule matches                         → pass through (dormancy, #60)
+        2. now < enforce_from                      → pass through, marked pending
+        3. now < fail_open_until                   → pass through, marked failopen
+        4. cookie missing / bad signature / other event / expired / IP mismatch
+                                                   → refuse with a reason (#73):
+                                                     302 to /_wr/waiting.html for
+                                                     navigation, 403 JSON for XHR (#72)
+        5. valid session                           → pass through
+        6. the function throws                     → pass through, marked failed
 ```
 
-A CloudFront Function (ADR-0021, issue #71) replaced the earlier trusted-key-group gate: it reads its whole configuration and the signing secret from one
-CloudFront KeyValueStore, so it decides locally instead of only verifying a signature. Still no
-compute in the *origin* request path — the function runs at the edge in sub-millisecond time,
-never calling the origin or any backend.
-
-**Fail-open (#58) is a mechanism, not yet an automatic response.** `Counters.fail_open_until` is
-an epoch the gate evaluates against its own clock and `/admin/fail_open` sets it (mirrored to the
-KeyValueStore, admin-writer-first on entry so a crash leaves the edge minting and counting rather
-than blocked). What is not delivered is a watchdog that trips it automatically on a DynamoDB
-outage — engaging fail-open still depends on a human, or a future watchdog, noticing the backend
-is down.
-
-**Dormancy (#60) is delivered.** An empty ruleset (`r: []` in the KeyValueStore config, which is
-also what a fresh stack is seeded with) matches no request, so every visitor passes straight
-through — standby mode. `/admin/rules` writes the ruleset (validated per-field and re-encoded
-through `wr_common::rules::validate_rule_fields` + `encode_gate_config`, audited on `Counters` as
-`rules_digest`/`rules_count`), so an operator leaves dormancy from the dashboard. Scheduled
-activation into enforcement uses `enforce_from`, a timestamp every edge compares against its own
-clock, so propagation skew can only delay enforcement, never skip it; there is no `/admin` route
-yet that writes `enforce_from` itself, so an operator edits the KeyValueStore directly for that
-one field.
-
----
+The gate reads its configuration (`c`: version, `enforce_from`, `fail_open_until`, rules, IP
+binding) and the signing secret (`k`) from one CloudFront KeyValueStore
+([ADR-0021](adr/0021-edge-function-gate.md)); `event_id` and the cookie name are templated into
+its source. Terraform seeds `c` from `gate_rules`, with `enforce_from = 0`. `/admin/rules` is the
+ruleset's only writer after that: it validates and re-encodes through `wr_common::rules`, writes
+the KeyValueStore (the ruleset's only store) by read-modify-write, and stamps `rules_digest` /
+`rules_count` on `Counters`. No admin route writes `enforce_from`.
 
 ## 3. Event lifecycle
 
 ```
-  IDLE ──────────► PRE-QUEUE ──────────► ACTIVE ──────────► POST-EVENT
-  info page        countdown page        queue + admission   outcome page
-  (static)         (static, cached)      (metered)           (static)
-                                                │
-                                    MAINTENANCE ┘  (any phase, operator-forced)
+  IDLE ──────► PRE-QUEUE ──────► ACTIVE ──────► POST-EVENT
+                                     │
+                         MAINTENANCE ┘   (any phase, operator-forced)
 ```
 
-Three of the four phases serve a static operator-authored page from content delivery network
-(CDN) cache. Only `ACTIVE` runs the queueing machinery.
-
 | Concern | Mechanism |
 |---|---|
-| Phase state | Attribute on the `Counters` item; one conditional `UpdateItem` transitions a phase |
-| Scheduled transitions | EventBridge Scheduler invoking `open_event` at T−0. Terraform creates the schedule disabled; the operator sets T−0 and its timezone on the dashboard, which arms it (ADR-0025) |
-| Manual transitions | `/admin/phase` on the admin Lambda, writing the same conditional `UpdateItem`. Not `active`: the open owns that one, and `/admin/open_now` invokes it (ADR-0025) |
-| Phase pages | Client HTML in S3, served through CloudFront with a long time to live (TTL) |
-| Current phase for clients | `/status`, cached 5 s globally |
-| Maintenance mode | A phase override attribute checked before `phase` |
+| Phase state | The `phase` attribute on the event's `Counters` item. `maintenance` is one of its values, not a separate override |
+| Seed | Terraform writes the item at `idle`, or at `pre_queue` when `starts_at` is set, then ignores changes to it |
+| Scheduled open | An EventBridge Scheduler `at()` schedule invokes `open_event`. It is created disabled unless `starts_at` is set, and `/admin/start_time` arms it ([ADR-0025](adr/0025-operator-owned-seal-schedule.md)) |
+| Manual transitions | `/admin/phase` makes any transition except to `active`, which only the open writes. `/admin/open_now` invokes `open_event` |
+| Visitor-facing state | `/v1/status` carries `phase` and a derived `serving_state` ([ADR-0019](adr/0019-visitor-facing-serving-state.md)) |
 
-A visitor in `IDLE` or `POST-EVENT` generates one CloudFront cache hit and nothing else.
+**Protection rules** (path, header, cookie or user agent, evaluated at the gate) select what is
+queued; an unmatched request never is.
 
-### Modes
+Scheduled events randomize because a published start makes arrival order measure latency, not
+intent; standby is FIFO because an unplanned spike's arrival order carries information.
 
-**Scheduled** — idle → pre-queue → randomized assignment at T−0 → active (§4).
-
-**Standby** — the gate evaluates every request but its action is *continue* until inflow
-crosses a threshold, then new visitors are queued FIFO.
-
-Fairness differs by mode: scheduled events randomize because the start time is published, so
-arrival order measures connection latency rather than intent; standby is FIFO because the
-spike is unplanned and arrival order carries information.
-
-**Protection rules** declare which requests are subject to queueing, matching on path,
-header, cookie, or user agent, evaluated locally at the gate. Unmatched requests are never
-queued in any phase or mode.
-
-### Standby activation
-
-CloudFront publishes a `Requests` metric per distribution to CloudWatch in `us-east-1` at
-1-minute granularity, at no additional charge and without counting against CloudWatch quotas.
-
-| Concern | Mechanism |
-|---|---|
-| Inflow measurement | CloudWatch alarm on `AWS/CloudFront` `Requests`, `Sum`, 60 s period |
-| Activation | Alarm → EventBridge rule → phase transition to `ACTIVE` — **not built** ([#60](https://github.com/smoketurner/virtual-waiting-room/issues/60)) |
-| Propagation | The gate reads its configuration from the KeyValueStore |
-| Deactivation | Second alarm on sustained low `Requests`, longer evaluation period |
-| Manual override | Admin API sets a forced phase suppressing both alarms |
-
-**Activation latency is bounded at approximately 125 seconds** — up to 60 s metric
-publication, up to 60 s alarm evaluation, up to 5 s cache TTL. Standby protects against a
-spike persisting for minutes. It does not protect against one that saturates an origin in
-under two minutes; scheduled mode exists for events with a known start time.
-
----
+**Not built:** automatic standby activation (a CloudWatch alarm on CloudFront `Requests` →
+EventBridge; [#60](https://github.com/smoketurner/virtual-waiting-room/issues/60), [`tasks.md`](../.kiro/specs/virtual-waiting-room/tasks.md)
+Phase 1b). Today an operator leaves dormancy by writing rules.
 
 ## 4. Pre-queue and position assignment
 
 ### 4.1 Registration
 
-A visitor arriving during the pre-queue calls `POST /join` — the same ingest path as a live
-join (§6): API Gateway writes the request straight to SQS, and `assign_position` consumes the
-batch. It reads the event's `Counters` item once per batch to decide which path the whole batch
-takes: opened, or any phase but pre-queue, takes the live-join path below (§4.5); otherwise it
-groups the batch's valid records by shard and claims one contiguous block of local indices per
-shard, then writes one `PreQueue` item per record
-([ADR-0015](adr/0015-stripe-prequeue-counter.md)):
+A pre-queue join uses the ingest path (§6). `assign_position` decides per batch, on the open
+outputs rather than phase alone: opened → live join (any phase); unopened and `pre_queue` →
+pre-queue; unopened in any other phase → the batch fails and claims nothing.
 
-| Attribute | Value |
-|---|---|
-| `r` (partition key) | `request_id`, a client-supplied universally unique identifier, version 7 (UUIDv7) |
-| `s` | shard, `hash(request_id) % 10` |
-| `l` | local index within shard `s`, claimed from the shard's own item |
-| `t` | server-stamped registration time |
+On the pre-queue path, the batch draws one shard **at random** (`Shard::random`, issue #59) and
+claims a contiguous block of local indices with one `UpdateItem ADD n :count` on that shard's
+counter item, `EVT#{event_id}#PQ#{s}`. It then writes one `PreQueue {r, s, l, t, h}` row per
+record (§5.5) with `attribute_not_exists(r)`, after deduplicating the batch. Each shard is a separate item because the 1,000-write/s ceiling is per partition key, so
+ten items lift registration to about 10,000/s
+([ADR-0015](adr/0015-stripe-prequeue-counter.md)).
 
-Written with `ConditionExpression: attribute_not_exists(r)`, so a duplicate join consumes no
-index. `prequeue_counter` is striped across 10 shards, each its **own item** (partition key
-`EVT#{event_id}#PQ#{s}`, count held in attribute `n`) rather than 10 attributes on one shared
-item — a striped item shares nothing, where striped attributes would still share that item's
-single 1,000-write/s ceiling. One `UpdateItem SET s = :shard ADD n :count` claims a whole
-shard's share of a batch in a single round trip, raising the registration ceiling from the
-~1,000/s single-item limit to ~10,000/s. Each shard counts its own local indices `0..count_s`;
-the contiguous global index `i` is assembled at T−0 (§4.2), not at registration. Registration
-writes spread across the pre-queue window — minutes to hours — rather than concentrating at
-T−0.
+**Stragglers.** A registration landing after `open_event` read its shard is invisible to the
+open. The batch re-reads `Counters` after its writes and, if the event opened underneath it, gives
+each row it wrote a live-join position; `/v1/queue_num` covers any it missed (§4.2).
 
-A registration that lands after `open_event` has already read that shard's count is a
-straggler: it is invisible to the open, so nothing assigns it a pre-queue position. The batch
-that wrote it checks for this once its writes land (one more consistent read of `Counters`) and,
-if the event opened underneath it, gives it a real live-join position instead. `/queue_num` (§4.2)
-falls back to the same live-join lookup for any straggler that step missed, so a visitor is
-never stuck polling a row that will never resolve.
-
-The countdown page is static HTML and JavaScript in S3 behind CloudFront, polling `/status` every
-few seconds throughout the countdown. Page views generate no origin requests — that poll and every
-page load are served from cache. Registration is the one write in the whole countdown: a single
-`POST /join`, made once per visitor and deduplicated client-side across reloads, wherever the
-browser permits persistent storage (see F1.1/F1.2's acceptance note on private browsing).
+The waiting page is static, served from S3 through CloudFront. Its only countdown write is one
+`POST /v1/join` per visitor, deduplicated client-side across reloads where storage allows.
 
 ### 4.2 Assignment
 
-Queue order is a bijection from registration index to queue position, realised as a keyed
-**pseudorandom permutation (PRP)** rather than stored rows
-([ADR-0002](adr/0002-seeded-permutation-not-materialised-shuffle.md)).
+Queue order is a keyed **pseudorandom permutation (PRP)** evaluated on read. The order is never
+stored ([ADR-0002](adr/0002-seeded-permutation-not-materialised-shuffle.md)).
 
-At T−0 `open_event` performs one `UpdateItem` on `Counters`. It reads the 10 shard count items
-(`EVT#{event_id}#PQ#0`–`#9`), computes the prefix offsets `offset[s] = Σ counts[0..s)` and the
-cohort size `N = Σ counts`, and writes them alongside the seed, phase, and the live-join
-sequence's starting value in the same conditional write
-([ADR-0015](adr/0015-stripe-prequeue-counter.md)):
-
-```
-UpdateExpression: SET shuffle_seed = :seed, participant_count = :n,
-                      queue_counter = :n, prequeue_offsets = :offsets, phase = :active
-ConditionExpression: attribute_not_exists(shuffle_seed) AND phase = :pre_queue
-```
-
-`queue_counter = :n` is in the same write for a reason, not an afterthought: the live-join
-sequence has to start at the cohort size, or the first post-open live joiner collides with
-position 0 of the pre-queue cohort. Nothing else is written. Assignment is complete when this
-single conditional write succeeds, so there is no interval during which some participants hold
-positions and others do not.
-
-A participant's **global registration index** is `i = offset[s] + l`, where `s` and `l` are the
-shard and local index in their `PreQueue` item. Because the shards partition the cohort and the
-offsets are a prefix sum, the global indices are exactly the contiguous range `[0, N)` (where
-`N` is the number of indices *issued*; a burned index maps to an unclaimed position, F2.3) —
-the permutation domain is unchanged by striping.
-
-Position is derived on read:
+At T−0 `open_event` computes `offset[s] = Σ counts[0..s)` and `N = Σ counts` from the ten shard
+counters and writes them in the one conditional `UpdateItem` of §2.1. `queue_counter = N` in the
+same write numbers live joiners behind the cohort; the guard makes a double-fire open once.
+Assignment is complete when that write lands, so no participant ever holds a position while
+another does not (C2). A participant's index is `i = offset[s] + l`, exactly `[0, N)`; a burned
+index maps to a position nobody holds (F2.3).
 
 ```
-queue_position = PRP(shuffle_seed, i, participant_count)     // i = offset[s] + l
+queue_position = PRP(shuffle_seed, i, participant_count)
 ```
 
-
-`/queue_num` reads the visitor's `PreQueue` item for `(s, l)` and the seed, count, and offsets
-from `/status`; it reconstructs `i` with one addition. All three are already being fetched. A
-join that raced the open is a **straggler**, but that is a per-shard fact, not a global one:
-`l` is checked against shard `s`'s own issued count (`offset[s+1] - offset[s]`, or `N -
-offset[s]` for the last shard), and only a local index at or past that count is a straggler.
-Testing the reconstructed `i ≥ N` instead would miss it — an over-count on an interior shard can
-reconstruct to an `i` that still lands inside `[0, N)`, because that index range legitimately
-belongs to a *later* shard, and treating it as pre-queue would resolve two visitors to the same
-position. `/queue_num` never evaluates `PRP` out of domain for a straggler: `assign_position`'s
-own fix-up (§4.1) already gives most stragglers a real live-join position by the time anyone
-polls, so `/queue_num` falls through to that `Positions` row — 200 with the live-join position
-if the fix-up (or a subsequent re-join) has landed one, 404 if it has not yet. The 404 is not
-final: the client treats it as a miss and, after enough consecutive misses, re-joins with the
-same request id, which then does get a live-join position.
+`/v1/queue_num` reads the `PreQueue` row and `Counters` and computes the position (409 before
+the open). The straggler test is **per shard**: `l` at or past shard `s`'s issued count
+(`offset[s+1] − offset[s]`, or `N − offset[s]` for the last). A global `i ≥ N` test would miss an
+over-count on an interior shard, whose index range belongs to a later shard, and give two
+visitors one position. A straggler never reaches `PRP`: it falls through to `Positions` — 200
+with a live-join position if one exists, else 404, which the client answers by re-joining with
+the same `request_id` (§6).
 
 ### 4.3 The permutation
 
-A balanced Feistel network over a power-of-two domain, with cycle-walking to restrict output
-to `[0, N)` — the standard small-domain construction underlying format-preserving encryption
-(FPE).
+A balanced Feistel network over the smallest power-of-four domain ≥ N, cycle-walked into
+`[0, N)` — the small-domain format-preserving encryption construction (NIST SP 800-38G).
 
 ```
-b        = ceil(bit_length(N-1) / 2)         // half-width
-domain   = 2^(2b)                            // smallest power of 4 >= N
-F(r, x)  = HMAC-SHA256(seed, r || x)[0..4) & (2^b - 1)
-
-enc(v):  L, R = v >> b, v & mask
-         repeat 4 rounds:  L, R = R, L XOR F(round, R)
-         return (L << b) | R
-
-PRP(seed, i, N):  v = i
-                  loop: v = enc(v); if v < N return v      // cycle-walk
+b        = ceil(bit_length(N-1) / 2)
+F(r, x)  = be_u32(HMAC-SHA256(seed, r || x)[0..4]) & (2^b - 1)
+enc(v):  L, R = v >> b, v & mask;  4 rounds of  L, R = R, L XOR F(round, R);  (L << b) | R
+PRP(seed, i, N):  v = i;  loop { v = enc(v); if v < N return v }
 ```
 
 #### Frozen wire encoding (audit contract)
 
-The permutation is part of the audit contract: a third party must recompute every position
-byte-for-byte. The following encoding is **frozen** — an implementation that deviates produces
-different positions and breaks auditability (§4.4). All multi-byte integers are **big-endian**.
+The permutation is part of the audit contract: a third party must be able to recompute every
+position byte for byte. The following encoding is **frozen**. An implementation that deviates
+produces different positions and breaks auditability (§4.4). All multi-byte integers are
+**big-endian**.
 
 - **Domain.** `b = ceil(bit_length(N - 1) / 2)`; `domain = 2^(2b)`; `mask = 2^b - 1`. Both
-  halves are exactly `b` bits. `N = 1` is a degenerate single-element identity (no rounds run).
+  halves are exactly `b` bits. `N ≤ 1` is the identity (no rounds run). An index `i ≥ N` is
+  returned unchanged and never permuted.
 - **Rounds.** Exactly **4** rounds, `round ∈ {0, 1, 2, 3}` in ascending order.
 - **HMAC key.** The 256-bit `shuffle_seed`, used verbatim as the HMAC-SHA256 key. It is the key,
   never part of the message.
-- **Message `r || x`.** The concatenation of exactly two fixed-width fields, total **5 bytes**:
-  - `r` — the round number as **1 byte** (`0x00`–`0x03`).
-  - `x` — the right half `R` as a **4-byte big-endian `u32`** (zero-padded; `R < 2^b ≤ 2^32`,
-    since `b ≤ 32` for `N ≤ 2^64`).
-- **Output → integer.** Take the **first 4 bytes** of the 32-byte HMAC output, interpret as a
-  big-endian `u32`, then `& mask`. `F(r, x) = be_u32(HMAC-SHA256(seed, r ‖ x)[0..4]) & mask`.
-- **Split / combine.** `L = v >> b`, `R = v & mask`; one round is `L, R = R, L XOR F(round, R)`;
-  recombine `(L << b) | R`.
-- **Cycle-walk.** Re-apply `enc` until the result is `< N`; return it.
+- **Message `r || x`.** Exactly two fixed-width fields, **5 bytes** in total:
+  - `r`: the round number as **1 byte** (`0x00`–`0x03`).
+  - `x`: the right half `R` as a **4-byte big-endian `u32`**, zero-padded (`R < 2^b ≤ 2^32`).
+- **Output → integer.** Take the **first 4 bytes** of the 32-byte HMAC output, read them as a
+  big-endian `u32`, then apply `& mask`. That is, `F(r, x) = be_u32(HMAC-SHA256(seed, r ‖ x)[0..4]) & mask`.
+- **Split / combine.** `L = v >> b`, `R = v & mask`. One round is `L, R = R, L XOR F(round, R)`.
+  Recombine as `(L << b) | R`.
+- **Cycle-walk.** Re-apply `enc` until the result is `< N`, then return it.
 
-A "determinism across processes" property test pins this encoding with fixed `(seed, i, N)` →
-`position` vectors so any drift in field width, byte order, or the HMAC key/message split fails
-the build.
+`frozen_wire_encoding_vectors` and `frozen_round_function_encoding` pin the encoding with fixed
+`(seed, i, N) → position` vectors. Any drift in field width, byte order or the key/message split
+fails the build.
 
-| Property | Evidence |
+| Property | Evidence (`crates/wr-common/src/permutation/mod.rs`) |
 |---|---|
-| Bijective | Feistel networks are invertible by construction; cycle-walking preserves this on the restricted domain. Verified: 200,000 samples at N=1,000,000 gave 200,000 distinct positions |
-| Uniform | Verified at N=10,000 across 10 deciles: exactly 1,000 each, χ² = 0.0 against a 16.9 critical value at p=0.05, df=9 |
-| Deterministic | Same seed, index and N always yield the same position |
-| Cheap | Expected cycle-walk iterations = `domain / N`, bounded by 4 and equal to 1.05 at N=1,000,000. Four hash-based message authentication code (HMAC) evaluations per iteration |
+| Bijective | Feistel networks are invertible by construction, and cycle-walking preserves that on `[0, N)`. `prop_bijective` checks the full image for random seeds and `N < 2000`; `bijective_over_small_domains` for fixed `N` up to 1,000 |
+| In domain | `prop_in_domain`: every output `< N`, for `N < 100,000` |
+| Deterministic | `prop_deterministic`, `deterministic_across_calls` |
+| Seed-dependent | `distinct_seeds_generally_differ`, `seed_scrambles_the_identity` |
+| Uniform | `prop_uniform_by_decile` asserts χ² < 27.88 (p = 0.001, df = 9) over deciles at N = 10,000. A bijection onto `[0, N)` fills every decile exactly, so this follows from bijectivity and says nothing further about randomness |
+| Cheap | Expected cycle-walk iterations are `domain / N`: at most 4, and 1.05 at N = 1,000,000. Each iteration is four HMACs |
 
-**The seed does not exist before T−0.** No participant can compute their position early or
-select a favourable registration index. The seed is written at T−0 and published in `/status`
-from that moment.
+**The seed does not exist before T−0.** Nobody can compute a position early or choose a
+favourable index. The open writes the seed, and `/v1/status` publishes it from that moment.
 
 ### 4.4 Auditability
 
-Given `shuffle_seed`, `participant_count`, `prequeue_offsets`, and the `(request_id, s, l)`
-tuples in `PreQueue`, any third party recomputes every global index `i = offset[s] + l` and
-every position, and confirms the ordering.
-
-The first three come from `/status`, where `shuffle_seed` is the 32 key bytes as lowercase hex
-and all three appear only once the open has written them.
-
-Positions are written to `Positions` lazily, when a visitor is admitted, carrying
-`entry_time`, `status` and `expires_at` for the outflow controller. Only visitors who reach
-the front generate a row.
+Once the open has written them, `/v1/status` publishes `shuffle_seed` (lowercase hex),
+`participant_count` and `prequeue_offsets`. With the `(r, s, l)` tuples in `PreQueue`, anyone can
+recompute every position.
 
 ### 4.5 Live joins after opening
 
-A visitor joining after T−0 has no pre-queue registration and takes a position from
-`queue_counter`, which starts at `participant_count`. Live joins are ordered
-first-come-first-served behind every pre-queue participant, using the batch range allocation
-in §5.2. The permutation applies only to the pre-queue cohort.
-
----
+A post-open joiner takes the next `queue_counter` value, which starts at `participant_count`:
+first-come-first-served behind the whole cohort. The permutation applies only to the cohort.
 
 ## 5. Counters and data
 
 ### 5.1 Atomic sequence
 
-`UpdateItem` with `ADD` and `ReturnValues: ALL_NEW` generates the position sequence. Writes
-to a single item are applied serially, so each value is returned exactly once
+`UpdateItem ADD … ReturnValues: ALL_NEW` generates positions. DynamoDB serializes writes to one
+item, so each value is returned exactly once
 ([ADR-0003](adr/0003-dynamodb-counters-not-elasticache.md)).
 
 ### 5.2 Batch range allocation
 
-One increment claims a batch's worth of positions:
-
-```rust
-let n = valid.len() as i64;
-let end = ddb.update_item()
-    .update_expression("ADD queue_counter :n")
-    .expression_attribute_values(":n", N(n.to_string()))
-    .return_values(ReturnValue::AllNew)
-    .send().await?;
-let start = end - n + 1;              // this batch owns [start, end]
-```
-
-Increment by the count of **valid** records, never `records.len()`; otherwise malformed
-payloads consume positions without producing queue members.
+A batch claims `[end − n + 1, end]` with one increment by the count of **valid** records, never
+`records.len()`, so malformed records consume nothing. Each row is then a `PutItem` with
+`attribute_not_exists(request_id)` ([ADR-0004](adr/0004-putitem-not-batchwriteitem.md)).
 
 ### 5.3 Throughput
 
-| Limit | Value | Adjustable |
-|---|---|---|
-| DynamoDB per-table write, on-demand | 40,000 write request units (WRU)/s | Yes — Service Quotas; explicitly not a maximum |
-| Cold or long-idle table | ~4,000 writes/s | Yes — pre-warming |
-| Single-partition write | 1,000 write capacity units (WCU)/s | No — irrelevant; `request_id` keys are distributed |
-| Counter item | 1,000 WCU/s ÷ batch size | Not binding at batch ≥ 10 |
-
-The live-join ceiling is ~40,000/s at default quotas. `BatchSize` above ~40 buys counter
-headroom that `Positions` cannot use. Default is 100 with a 1-second window.
-
-On-demand tables serve ~4,000 writes/s when new and grow to twice their previous peak. A
-waiting room is idle by definition and has no meaningful previous peak, so **tables are
-pre-warmed before every event** (O1). Pre-queue assignment needs no pre-warming, being one
-write.
+The live-join ceiling is the per-table on-demand quota: 40,000 WRU/s by default, adjustable. The
+1,000 WCU/s per-partition-key ceiling does not bind, because `request_id` keys are spread and the
+counter takes one write per batch. A new or long-idle table serves only ~4,000 writes/s, and a
+waiting room has no previous peak to grow from, so **tables are pre-warmed before every event**
+through the `warm_throughput_*` variables (O1). The open is one write and needs none.
 
 ### 5.4 Sequences and statistics
 
-| Counter | Kind | Write sharding |
-|---|---|---|
-| `queue_counter`, `serving_counter` | sequence | never — sharding destroys ordering |
-| `prequeue_counter` | index (order-free) | sharded ×10 — reassembled to `[0, N)` at T−0 |
-| `arrivals` | statistic | sharded ×10 — hot at high admission rates |
-| `token_counter`, `completed_counter`, `abandoned_counter`, `expired_queue_counter` | statistic | permitted if hot |
+`queue_counter` and `serving_counter` are sequences and are never sharded: summing shards cannot
+yield an ordered unique value. The pre-queue index (order-free, reassembled into `[0, N)` at T−0)
+and `arrivals` (a statistic) are striped across ten items. This is write sharding for throughput,
+not shuffle sharding for isolation ([ADR-0008](adr/0008-partition-isolation-not-shuffle-sharding.md)).
 
-A sequence must yield a unique ordered value; summing shards cannot produce one, so
-`queue_counter` and `serving_counter` stay single-item. `prequeue_counter` is the exception: the
-permutation needs registration indices only to be **unique and within `[0, N)`**, not to arrive
-in order, so it is striped ×10 for throughput and reassembled into a contiguous range by prefix
-offsets at T−0 ([ADR-0015](adr/0015-stripe-prequeue-counter.md)). Write sharding here is a
-throughput technique, distinct from shuffle sharding, which is an isolation technique
-([ADR-0008](adr/0008-partition-isolation-not-shuffle-sharding.md)).
-
-Positions may contain gaps. A retry after a 5xx, or a function dying between the counter
-increment and the position write, burns positions without issuing them. No user observes a
-skipped number.
+Positions may have gaps: a retry after a 5xx, or a function dying between increment and write,
+burns positions. No user sees a skipped number.
 
 ### 5.5 Tables
 
-**`Counters`** — partition key `event_id`. One item per event, `EVT#{event_id}`:
+There are four tables, all on-demand with PITR. Each has a single partition key and no sort key.
+Keys are built only in `wr_common::expr`.
 
-| Attribute | Type | Purpose |
-|---|---|---|
-| `queue_counter` | N | Live-join position sequence |
-| `prequeue_offsets` | L | Per-shard prefix offsets, written at T−0 to assemble `[0, N)` |
-| `serving_counter` | N | Admission high-water mark |
-| `phase` | S | `idle` / `pre_queue` / `active` / `post_event` / `maintenance` |
-| `admission_control` | S | The *stored* control (ADR-0019, ADR-0021 issue #71): `open` / `paused` only — never `fail_open`. Combined with `fail_open_until` by `wr_common::resolve(stored, fail_open_until, now)` into the three-valued resolved control that, with `phase`, derives the visitor-facing `ServingState` |
-| `fail_open_until` | N | Epoch-seconds fail-open deadline (issue #71); `0` = no window in force. Mirrored to the edge gate's KeyValueStore |
-| `target_rate` | N | Operator-set admission rate, in visitors per second |
-| `shuffle_seed` | B | 256-bit permutation key, written once at T−0 |
-| `participant_count` | N | Pre-queue cohort size, the permutation domain |
-| `message` | S | Delivered in `/status` |
+**`Counters`** (PK `event_id`). The event item `EVT#{event_id}` holds:
 
-The two striped counters — the pre-queue registration index and the arrivals count — are
-**not** attributes on this item. Each shard is its own item in the same table, keyed
-`EVT#{event_id}#PQ#{shard}` and `EVT#{event_id}#AR#{shard}` respectively, holding one attribute
-`n` (ADR-0015). Striping across attribute names on one item would put all ten shards
-back under that item's single 1,000-write/s ceiling and distribute nothing.
+| Attribute | Purpose |
+|---|---|
+| `phase` | `idle` / `pre_queue` / `active` / `post_event` / `maintenance` |
+| `queue_counter`, `serving_counter` | Live-join sequence; admission cursor |
+| `shuffle_seed`, `participant_count`, `prequeue_offsets` | Open outputs, written once at T−0 |
+| `admission_control` | The stored control, `open` or `paused` only, never `fail_open` (issue #71) |
+| `fail_open_until` | Fail-open deadline in epoch seconds. `0` means no window |
+| `target_rate` | Operator admission rate, in visitors per second |
+| `message` | Operator broadcast, delivered in `/v1/status` |
+| `starts_at` | Scheduled start, which the waiting page counts down to |
+| controller state, `rules_digest`/`rules_count` | Smoothed no-show rate and last pass; ruleset audit |
 
-**`PreQueue`** — partition key `r`. Attributes `s` (shard), `l` (local index) and `t`
-(registration time). Short attribute names because `DynamoDB` bills them on every write and
-there is one row per visitor. The global registration index `i = offset[s] + l` is derived on
-read, never stored. Read by `/queue_num` as a single `GetItem`; never scanned on the hot path.
+`wr_common::resolve(stored, fail_open_until, now)` is the only producer of
+`AdmissionControl::FailOpen`. The shard items `EVT#{event_id}#PQ#{s}` and
+`EVT#{event_id}#AR#{s}` hold one attribute each, `n`. `event_id` may not contain `#`.
 
-**`Positions`** — partition key `request_id`. Attributes `event_id`, `queue_position`,
-`entry_time`, `status`, `expires_at`, `ttl`. Written with
-`ConditionExpression: attribute_not_exists(request_id)`. `entry_time` is server-stamped and
-authoritative; the UUIDv7 timestamp is client-supplied and untrusted.
+**`PreQueue`** (PK `r`) has the attributes `s`, `l`, `t` and `h`. The names are short because
+DynamoDB bills attribute names on every write and the table holds one row per visitor. The table
+is never scanned.
 
-**`Tokens`** — partition key `request_id`. Admission-token metadata and session status.
+**`Positions`** (PK `request_id`) has the attributes `queue_position`, `entry_time`
+(server-stamped and authoritative), `status` (`issued` / `admitted`, [ADR-0033](adr/0033-admission-claimed-once-per-visitor.md)),
+`h` and `ttl`. A live joiner gets a row at join. A pre-queue member gets one at admission.
+`ttl` only reclaims storage. It is never an admission deadline
+([ADR-0031](adr/0031-remove-controller-driven-expiry.md)).
 
-All tables use on-demand capacity with point-in-time recovery (PITR), and carry
-`warm_throughput_write_units` sized to the event's target rate.
-
----
+**`Tokens`** (PK `request_id`) holds operator OIDC sessions (`SESS#`) and pending PKCE logins
+(`PKCE#`), reclaimed by TTL on `expires_at`
+([ADR-0016](adr/0016-admin-oidc-dynamodb-sessions.md)).
 
 ## 6. Ingest
 
-Regional Representational State Transfer (REST) API with an `AWS` service integration to
-Simple Queue Service (SQS) `SendMessage`. No Lambda in the burst path, so no cold start and
-no concurrency ceiling at ingest ([ADR-0005](adr/0005-rest-api-not-http-api.md)).
+A regional REST API with an `AWS` integration to SQS `SendMessage`: no Lambda in the burst path,
+so no cold start and no concurrency ceiling at ingest
+([ADR-0005](adr/0005-rest-api-not-http-api.md)). The 29 s REST timeout, SQS throughput and the
+6 MB Lambda payload are far from binding; the ESM batch is 100 with a 1 s window, hard-coded.
 
-| Limit | Value | Effect here |
-|---|---|---|
-| REST API integration timeout | 29 s, hard | Irrelevant: `SendMessage` is single-digit ms |
-| REST API request payload | 10 MB | Join payload is ~100 bytes |
-| SQS standard throughput | "nearly unlimited API calls per second, per action" | Not a constraint |
-| Lambda ESM `BatchSize` | 10,000 (>10 requires window ≥1 s) | Default 100 / 1 s |
-| Lambda sync invocation payload | 6 MB | ~500 B/record caps a batch near 10–12K records |
+**Duplicates and ordering.** SQS standard is at-least-once with best-effort ordering. A duplicate
+fails `attribute_not_exists` and consumes nothing; order is irrelevant because positions come from
+the counter. Visibility timeout is 6 × function timeout + batching window; after 5 receives a
+record goes to the DLQ, which alarms.
 
-### Duplicates and failures
+**Validation.** The gateway's JSON Schema model requires `request_id`, `event_id` and `h`, and
+returns 400 synchronously when any is missing or malformed. `assign_position` checks again: the
+body must parse, the `request_id` must have the canonical UUID shape (no version-nibble check)
+and the `event_id` must match. A record that fails is **dropped**: counted in `join_dropped`,
+logged, and never retried or dead-lettered, because no redelivery can make it valid.
 
-SQS standard queues are at-least-once with best-effort ordering. Both are acceptable:
-
-- **Duplicates** fail the `attribute_not_exists(request_id)` condition and consume no
-  position.
-- **Ordering** does not matter; positions come from an atomic counter, not message sequence.
-
-The event source mapping (ESM) sets `FunctionResponseTypes: [ReportBatchItemFailures]`, so
-only failed record identifiers return to the queue. Visibility timeout is six times the
-function timeout plus `MaximumBatchingWindowInSeconds`. `maxReceiveCount` is 5, after which
-records move to the dead-letter queue (DLQ).
-
-### Validation
-
-A gateway request validator with a JSON Schema model rejects a malformed or missing
-`request_id` with 400, synchronously. The Lambda re-validates, parsing the identifier and
-checking the version nibble, which JSON Schema cannot express.
-
-### Recovery
-
-Invalid records reach the DLQ. The client's subsequent `GET /queue_num` returns 404, which
-the client treats as "re-join with the same request id" — deliberately the same id, not a fresh
-one: the retried join's `attribute_not_exists` guard passes precisely because no row exists yet
-for it, and a fresh id would abandon whatever the first attempt eventually resolves to. API
-Gateway returning 200 means *accepted into the queue*, not *position assigned*; the 404-and-rejoin
-loop makes that asymmetry safe and is part of the client contract.
-
-What 200 does mean is that `SendMessage` succeeded. The success integration response claims only
-the status codes SQS returns on success, and a second, default integration response maps every
-other outcome to a 502 with a fixed body. Without that split the success response is itself the
-default and a rejected `SendMessage` is reported as a successful join, leaving the visitor polling
-for a position no one will ever write — an absence with no error, no log line and no row, whose
-first symptom is the event starting with an empty queue. The client treats the 502 as a failed
-attempt and backs off, the same path a validation rejection already takes. The straggler self-heal
-(§4.1, §8) rides on the same recovery loop and the same "same id" re-join.
-
----
+**Recovery (F4.4).** A 200 from `/v1/join` means `SendMessage` succeeded, not that a position
+exists; any other SQS outcome maps to a 502, which the client retries with backoff. A
+`/v1/queue_num` 404 means re-join with the **same** `request_id`: the guard passes because no row
+exists, and a fresh id would abandon whatever the first attempt resolves to. The straggler
+self-heal (§4.1) rides the same loop.
 
 ## 7. Outflow control
 
-The operator declares a capacity — say 500 arrivals per minute. A fraction of visitors whose
-turn arrives never click through, so releasing exactly 500 positions delivers fewer than 500
-arrivals. The controller closes the loop:
+Some visitors whose turn arrives never click through, so the controller closes the loop on the
+operator's target rate:
 
 ```
-observed_arrival_rate = arrivals in the last interval
-no_show_rate          = 1 − (observed_arrival_rate / released_last_interval)
-release_next          = target_rate / (1 − smoothed_no_show_rate)
+no_show_rate  = 1 − arrivals_last_interval / released_last_interval
+smoothed      = 0.3 · no_show_rate + 0.7 · smoothed          (EWMA_ALPHA)
+release_next  = min(target_rate / (1 − smoothed), 2 × target_rate)
 ```
 
+The controller is a Lambda durable function: Scheduler starts one execution a minute, which runs
+six checkpointed passes separated by 10 s durable waits. A wait suspends the execution, so it is
+not billed, and a replayed pass returns its checkpoint rather than advancing `serving_counter`
+twice ([ADR-0022](adr/0022-durable-controller-cadence.md)). A pass advances only while the phase
+is `active` and the resolved control is `Open`; after a gap of two intervals or more it releases
+exactly `target_rate`. All arithmetic is checked or saturating.
 
-The rate is smoothed across intervals to avoid oscillation and the correction is bounded, so
-a transient measurement error cannot release a damaging burst.
+**Arrivals** are counted by `generate_token`, once per visitor (ADR-0033), across ten shard items
+(60,000 admissions a minute would otherwise hit the 1,000 writes/s item ceiling). Reading them is
+ten reads per pass. **The controller expires nothing** and never scans; the no-show correction
+compensates for absentees ([ADR-0031](adr/0031-remove-controller-driven-expiry.md)).
 
-An EventBridge Scheduler rule starts one controller execution every minute — the scheduler's
-finest granularity — and that execution runs six 10-second passes, so the control interval is 10
-seconds while the schedule is one per minute. Each pass sums the arrival shards, reads the
-released count, computes the correction, and writes `serving_counter` with one `UpdateItem`.
-
-The gap between passes is a **durable wait**, not a sleep: it suspends the execution instead of
-holding the invocation open, so the controller is not billed for the 50 seconds it spends
-waiting ([ADR-0022](adr/0022-durable-controller-cadence.md)). Each pass is a durable step,
-checkpointed so replay returns its result
-rather than advancing `serving_counter` a second time.
-
-**Counting arrivals.** `generate_token` increments an arrival counter when it mints a session —
-one write per admitted visitor. At a 60,000/minute admission
-rate that is 1,000 writes/s, the single-item ceiling, so the counter is sharded across 10
-items chosen by `hash(request_id) % 10`. Cost: 10 reads per interval, independent of event
-size.
-
-**No position expiry.** A position lives until DynamoDB TTL reclaims its row a day after it
-was written ([ADR-0031](adr/0031-remove-controller-driven-expiry.md)). The controller does not expire anything and performs no `Scan`: the
-no-show correction is what compensates for people who never arrive, measuring arrivals against
-releases and releasing more to cover the gap.
-
----
+**Not built:** a concurrency term. Nothing reports when a session completes, so origin
+concurrency drifts with session length
+([#65](https://github.com/smoketurner/virtual-waiting-room/issues/65)).
 
 ## 8. API surface, caching, and security
 
-### Public endpoints
+### Endpoints and cache behaviours
 
-| Path | Min TTL | Cache key | Cookies | Purpose |
+| Behaviour | Paths | Caching / cookies | Origin | Purpose |
 |---|---|---|---|---|
-| `/status` | 1 s | path only | none | Phase, serving position, admission rate, operator message, adaptive poll policy ([#69](https://github.com/smoketurner/virtual-waiting-room/issues/69), ADR-0023); after T−0 also `shuffle_seed`, `participant_count`, `prequeue_offsets` |
-| `/queue_num` | 1 s | path + `event_id`, `request_id` | none | Own position; 404 means re-join |
-| `/join` | uncached | — | none | Join the queue or pre-queue |
-| `/generate_token` | uncached | — | none | Exchange a served position (and the possession secret, ADR-0035) for the session cookie |
-| `/enter`, `/wait` | uncached | — | none | The queue without JavaScript: a form post that joins, and a self-refreshing page that admits (ADR-0037) |
+| Polled | `/v1/status` | Min TTL 1 s, key is the path; no cookies | API Gateway → `read` | Phase, `serving_state`, `serving_position`, `target_rate`, message, `starts_at`, `poll_policy` ([ADR-0023](adr/0023-adaptive-poll-interval.md)); after T−0 the seed, count and offsets |
+| Polled | `/v1/queue_num` | Min TTL 1 s, key adds `event_id` + `request_id`; no cookies | API Gateway → `read` | Own position. 404 means re-join; 409 means not yet open |
+| Join | `/v1/join` | uncached; no cookies | API Gateway → SQS | Join the queue or the pre-queue |
+| Write | `/v1/generate_token`, `/v1/enter`, `/v1/wait` | uncached; all cookies | API Gateway → `generate_token`, `nojs` | Mint the session; the no-JavaScript queue ([ADR-0037](adr/0037-no-javascript-queue.md)) |
+| Admin | `/admin`, `/admin/*`, `/static/*` | uncached; all cookies | API Gateway → `admin` | Operator UI and API |
+| Waiting page | `/_wr/*` | cached; no cookies | S3 | Ungated: where a refused visitor lands |
+| Protected | `/*` (default) | uncached; allow-listed cookies | Client origin | Behind the gate |
 
-### Cache behaviours
-
-| Behaviour | Path pattern | Caching | Cookies | Origin |
-|---|---|---|---|---|
-| Polled | `/status`, `/queue_num` | Min TTL 1 s | none | API Gateway |
-| Write | `/join`, `/generate_token`, `/enter`, `/wait` | disabled | all (Set-Cookie survives) except `/join` | API Gateway |
-| Protected origin | `/*` (default) | disabled | session cookie forwarded | Operator origin, gated by a CloudFront Function at viewer-request (ADR-0021, issue #71) |
-| Waiting page | `/_wr/*` | cached | none | S3, deliberately ungated — this is what a refused visitor sees |
-
-Minimum TTL must exceed zero and polled behaviours must forward no cookies, or CloudFront
+The polled behaviours need a Min TTL above zero and no forwarded cookies. Otherwise CloudFront
 disables request collapsing and every poll reaches the origin
-([ADR-0013](adr/0013-cache-behaviour-separation.md)). `stale-while-revalidate` on `/status`
-serves the previous value if the origin is slow.
+([ADR-0013](adr/0013-cache-behaviour-separation.md)). The gate is associated with the default
+behaviour only, because a Function bills per invocation.
 
-### Admin endpoints (OIDC session, ADR-0016)
+### Admin endpoints
+
+Served by `admin` (Axum, askama templates) behind an OIDC Authorization Code + PKCE session
+([ADR-0016](adr/0016-admin-oidc-dynamodb-sessions.md), [ADR-0018](adr/0018-admin-vouch-design-language.md));
+every action works without JavaScript and no action needs the AWS console.
 
 | Path | Purpose |
 |---|---|
-| `/admin/phase` | Transition phase; force or clear maintenance mode. Refuses `active`, which only the open writes |
-| `/admin/open_now` | Open the event immediately, by invoking the function the schedule invokes |
-| `/admin/rate` | Set target admission rate |
-| `/admin/message` | Publish an operator message to waiting visitors |
-| `/admin/force_maintenance` | The emergency full-stop: forces the maintenance phase |
-| `/admin/pause` | Pause admissions (reversible; queue and configured rate preserved) |
-| `/admin/resume` | Resume admissions, restoring the configured rate |
-| `/admin/fail_open` | Engage the fail-open break-glass epoch for a given duration (issue #71) |
-| `/admin/recover` | Clear the fail-open epoch — not "resume": a queued pause still applies once it clears |
-| `/admin/rules` | Replaces the edge gate's ruleset, one rule per line. Written directly to the KeyValueStore — it is the sole store for `rules`, never DynamoDB — with an audit record (`rules_digest`, `rules_count`) stamped on `Counters` after the write lands. `enforce_from` is still Terraform-only. |
-
-Every operator action is here; the scheduled paths call the same Lambdas. No capability
-requires a console.
+| `/admin`, `/admin/state`, `/admin/login`, `/admin/callback`, `/admin/logout` | Dashboard with the readiness panel (issue #70), its state as JSON, the OIDC session |
+| `/admin/phase`, `/admin/open_now`, `/admin/start_time` | Any transition except to `active`; open now; set T−0 and arm the schedule |
+| `/admin/rate`, `/admin/message` | Target rate; broadcast message |
+| `/admin/pause`, `/admin/resume`, `/admin/force_maintenance` | Hold or resume admission (queue and rate kept); emergency full stop ([ADR-0017](adr/0017-andon-cord-emergency-controls.md)) |
+| `/admin/fail_open`, `/admin/recover` | Set (≤ 1,440 min) or clear the fail-open epoch; a pause still in force applies once it clears |
+| `/admin/rules`, `/admin/ip_binding` | Replace the gate ruleset (§2.3); session IP binding on/off ([ADR-0036](adr/0036-optional-session-ip-binding.md)) |
 
 ### Credentials
 
-One credential ([ADR-0011](adr/0011-session-cookie-after-token.md), [ADR-0024](adr/0024-jws-credentials.md)):
+One credential: the session cookie, an HS256 JWS (`aud` event id, `sub` request id, `iat`,
+`exp`) signed under a key *derived* from the deployment secret, so a future second kind cannot
+validate as a session ([ADR-0011](adr/0011-session-cookie-after-token.md),
+[ADR-0024](adr/0024-jws-credentials.md)). `generate_token` mints it only for the holder of the
+`request_id`'s possession secret (ADR-0035); the gate refuses one for another event, and, with IP
+binding on, one whose network tag does not match. The admission token and origin authorizer are
+gone ([ADR-0032](adr/0032-remove-the-origin-authorizer.md)). **Not built:** revocation
+([#63](https://github.com/smoketurner/virtual-waiting-room/issues/63)).
 
-- **Session cookie** — one HMAC-SHA256 credential (`wr_common::crypto`), event-scoped, minted by
-  `generate_token` once a visitor's position is reached and checked by the edge gate. It is
-  signed under a key derived from the deployment secret rather than the secret itself, so a
-  future second credential kind cannot validate as a session. The admission token that used to
-  precede it was removed with the origin authorizer (ADR-0032). It is scoped by `event_id` (the
-  gate refuses a credential minted for another event), carries a keyed tag of the visitor's
-  network that the gate enforces while the operator has IP binding on (ADR-0036,
-  [#61](https://github.com/smoketurner/virtual-waiting-room/issues/61)), and cannot be revoked
-  ([#63](https://github.com/smoketurner/virtual-waiting-room/issues/63), no design chosen).
-  `generate_token` mints it only for a caller holding the possession secret the `request_id`
-  joined with (ADR-0035, [#62](https://github.com/smoketurner/virtual-waiting-room/issues/62)).
+`random_bytes.signing_key` is generated at apply and written to both readers: an SSM SecureString
+for the Lambdas (free idle, unlike Secrets Manager) and KeyValueStore key `k` for the gate.
+Regenerating it invalidates every issued cookie.
 
-The signing key is per-deployment, held in an SSM Parameter Store SecureString (a SecureString is free where a Secrets Manager secret is $0.40/mo, which N1 does not allow). Its compromise permits minting
-admission for every event in that deployment.
+### Entry gating and bots
 
-### Entry gating
-
-None. `request_id` is client-supplied, so nothing binds a position to a person: a client that
-mints N identifiers takes N places, and randomization converts that volume into expected share
-of the front of the queue linearly. Without the edge web ACL every deployment is a bare raffle;
-with it, each ten places cost a browser challenge solve
-([ADR-0038](adr/0038-edge-web-acl-on-flat-rate-plan.md)).
-
-An earlier design verified a customer-signed entry ticket and derived `request_id` from its
-subject. It was removed: it required the customer to build and host a signing endpoint against a
-login they already ran, so no deployment could use it without that upstream work, and it bounded
-identifier minting rather than volume — a farm with N legitimate accounts still took N
-positions. Bounding volume needs a mechanism that costs the client something: proof of work, or
-behavioural classification over signals the join path would have to collect. The first is what
-the edge web ACL's challenge amounts to, where it is on (see WAF below); the second is not built.
-
-### Deferred bot enforcement
-
-**Nothing is built.** Where an operator can identify likely bots during the pre-queue, the
-decision would be deferred to randomization rather than applied on arrival, so detection is not
-revealed while there is still time to modify a client and rejoin.
-
-Open-time demotion implemented this and was removed without ever being enabled
-([ADR-0030](adr/0030-remove-open-time-demotion.md)). It grouped the cohort by join-time telemetry under operator `signal:max`
-rules and served matched groups behind the rest of the cohort. Two things sank it: the signals
-are weak individually — every honest user of one browser release shares one JA4 — so the
-thresholds had to be the operator's and the default had to be observe-only, which meant nobody
-ever turned it on; and a client posting to the regional API Gateway URL rather than through
-CloudFront carried no viewer telemetry at all, so the control was blind to exactly the traffic
-it was aimed at. Requirement F6.3 is retired.
-
-WAF Bot Control's labels, and the anonymous-IP and hosting-provider reputation lists, are a
-later input to the same mechanism: another attribute on the row, another signal in the rules,
-acted on at the same open. The edge web ACL now carries them where it is on (see WAF below), but as
-edge actions on the request, not as input to a deferred decision.
+Nothing binds a position to a person: a client that mints N `request_id`s takes N places.
+Entry tickets ([ADR-0028](adr/0028-remove-entry-tickets.md)) and open-time bot demotion
+([ADR-0030](adr/0030-remove-open-time-demotion.md), F6.3) were removed; the edge web ACL below is
+what remains. **Not built:** a per-visitor position limit
+([#59](https://github.com/smoketurner/virtual-waiting-room/issues/59)).
 
 ### Web Application Firewall (WAF)
 
-**The REST API answers only CloudFront.** Every method, public and admin, requires an API key
-that Terraform generates and only the distribution holds: CloudFront sends it to the API origin
-as the `x-api-key` origin custom header, which replaces any value a viewer sends. A request
-straight to `execute-api` is refused with a 403 before any integration runs, and API Gateway does
-not bill it. This is unconditional ([ADR-0038](adr/0038-edge-web-acl-on-flat-rate-plan.md)).
-It is not a public API key: a key on a page served to browsers ships in client-side JavaScript,
-and this one never leaves the distribution's configuration.
+**The REST API answers only CloudFront** ([ADR-0038](adr/0038-edge-web-acl-on-flat-rate-plan.md)):
+every method requires an API key (`core/origin_key.tf`) that only the distribution sends, as an
+`x-api-key` origin header. A direct `execute-api` request gets an unbilled 403.
 
-**The edge web ACL comes with a CloudFront flat-rate plan** (`flat_rate_plan_tier`,
-`modules/edge/waf.tf` and `plan.tf`). On pay-as-you-go WAF bills $0.60 per million requests inspected against
-the same request count CloudFront serves, mostly the system's own polling. At 1M visitors that
-exceeds the CloudFront bill (§12), and the ACL bills a monthly fee per ACL and per rule between
-events, which N1 does not allow. A flat-rate plan (Business and above) bundles the ACL, its rules,
-AWS managed rules and WAF request fees, doesn't count blocked requests against its allowance, and
-requires a web ACL. The ACL makes a place in the queue cost a browser challenge:
+**The edge web ACL exists only with a flat-rate plan** (`flat_rate_plan_tier` = `BUSINESS` or
+`PREMIUM`; `edge/waf.tf`, `edge/plan.tf`), which bundles its cost. On pay-as-you-go it would bill
+per request and per rule between events, breaking N1.
 
 | Rule | Paths | Action |
 |---|---|---|
-| Verify-page challenge | `/_wr/verify.html` | Challenge: a silent interstitial on navigation, which issues the `aws-waf-token` cookie and returns the visitor to the waiting page. Not on `waiting.html`, which also serves the no-JS form |
-| Token required | `/v1/join`, `/v1/status`, `/v1/queue_num`, `/v1/generate_token` | Challenge: without a valid token WAF answers 202 with `x-amzn-waf-action`, and `waiting.js` goes to the verify page to earn one |
-| Joins per token | `/v1/join` | Block (429) past 10 per 10 min: what one challenge solve buys |
-| Requests per token | the four JS API paths | Block (429) past `waf_api_token_limit` per 5 min: far above an honest page's polling, below a script forcing `/v1/queue_num` origin misses |
-| Token requests + joins per IP | `/_wr/verify.html`, `/v1/join` | CAPTCHA past `waf_join_ip_limit` per 5 min. Escalates rather than blocks, because a carrier NAT holds many real buyers |
-| Anonymous / hosting-provider IP | verify page and join | CAPTCHA (Count until promoted) |
-| No-JS joins per IP | `/v1/enter` | Block past `waf_nojs_ip_limit` per 5 min, since the path cannot run a challenge ([ADR-0037](adr/0037-no-javascript-queue.md)) |
+| Verify-page challenge | `/_wr/verify.html` | Challenge. Issues `aws-waf-token` and returns the visitor to the waiting page |
+| Token required | `/v1/join`, `/v1/status`, `/v1/queue_num`, `/v1/generate_token` | Challenge: a 202 with `x-amzn-waf-action`, which `waiting.js` treats as "renew on the verify page" |
+| Joins per token | `/v1/join` | Block (429) past 10 per 10 min |
+| Requests per token | the four JS API paths | Block (429) past `waf_api_token_limit` per 5 min |
+| Token requests + joins per IP | verify page, `/v1/join` | CAPTCHA past `waf_join_ip_limit` per 5 min. It escalates rather than blocks, because carrier NAT puts many real buyers behind one IP |
+| Anonymous / hosting IP | verify page, join | CAPTCHA (Count until promoted) |
+| No-JS joins per IP | `/v1/enter` | Block past `waf_nojs_ip_limit` per 5 min |
 | Anonymous IP, no JS | `/v1/enter` | Block (Count until promoted) |
 | No-JS closed | `/v1/enter`, `/v1/wait` | Block, only when `nojs_enabled = false` |
-| Managed: Anti-DDoS, IP reputation, Bot Control common | ACL-wide (Anti-DDoS) or the room's paths | Count until `waf_managed_rules_mode = "enforce"` (O5, [ADR-0012](adr/0012-anti-ddos-count-mode.md)) |
+| Managed: Anti-DDoS, IP reputation, Bot Control common | ACL-wide or the room's paths | Count until `waf_managed_rules_mode = "enforce"` (O5, [ADR-0012](adr/0012-anti-ddos-count-mode.md)) |
 
-The no-JavaScript paths are never challenged: their visitors cannot solve one. A Terraform test
-reads `waiting.js` and fails if it calls a `/v1` path the token rule does not cover.
-
-Only rules a flat-rate plan accepts are used: individual rules, no rule groups of our own, no
-Targeted Bot Control, no ATP/ACFP. Thirteen rules (fourteen with the no-JS queue closed), within
-the Business plan's fifty. Autonomous System Number (ASN) matching is not built. Terraform
-subscribes the distribution, the web ACL and the gate's KeyValueStore to the plan, approved at
-apply. A subscribed distribution cannot be deleted or shed its web ACL until the billing cycle
-in which the plan is cancelled ends.
-
-What this does not do is bind a place to a person. It raises the price of a place from nothing to
-a browser session. A farm running real browsers through residential proxies still wins places,
-at a cost.
-
----
+The no-JavaScript paths and `waiting.html` are never challenged; a Terraform test fails if
+`waiting.js` calls a `/v1` path the token rule misses. This raises the price of a place to one
+browser session; it does not bind a place to a person.
 
 ## 9. Operator surface
 
 | Capability | Mechanism |
 |---|---|
-| Live metrics | Metric filters over the Lambdas' structured logs publish the conditions that are otherwise silent, each with an alarm at threshold zero (`modules/core/logging.tf`). Inflow comes from the `AWS/CloudFront` `Requests` metric. There is no dashboard resource; the alarms are the signal |
-| Metrics for client tooling | CloudWatch metrics and alarms published from the Lambdas' own log events (`modules/core/logging.tf`) |
-| Branding | Client HTML, CSS and assets in S3 behind CloudFront; the module ships a reference theme |
-| Operator messaging | A `Counters` attribute delivered in the existing `/status` payload |
-| Position and estimated wait | `/queue_num` returns position; the client computes wait from the measured admission rate in `/status` |
-| Operator actions | Admin REST API and server-rendered UI on the admin Lambda, authenticated by an OIDC Authorization Code + PKCE session (ADR-0016), backed by the same writes as the scheduled paths |
+| Alerting | Metric filters over the Lambdas' structured logs, each with an alarm at threshold zero, plus alarms on DLQ depth (`core/logging.tf`). No dashboard resource ships |
+| Pre-event readiness | The dashboard's diagnostics panel, which makes read-only checks against the deployment (issue #70, [`RUNBOOK.md`](./RUNBOOK.md)) |
+| Branding | Waiting-page HTML, CSS and JS in S3 behind CloudFront |
+| Messaging | `/admin/message` makes one `UpdateItem`, and every waiter sees it within one `/v1/status` TTL |
+| Position and wait | `/v1/queue_num` gives the position. The client estimates the wait from the measured movement of the cursor, falling back to `target_rate` |
 
-Broadcasting a message to 1,000,000 waiting visitors costs one `UpdateItem` and zero
-additional requests; delivery completes within one cache TTL. Estimated wait is computed from
-the measured admission rate, so it tracks operator rate changes during an event.
+`waiting.js` polls adaptively (ADR-0023): the interval scales with the visitor's distance to the
+front, between a floor and a ceiling set in Terraform (`poll_floor_ms`, `poll_ceiling_ms`,
+`poll_divisor`). A visitor near the front sees a pause or a fail-open within the floor. A
+deep-queue visitor can see it up to about 39 s late (the ceiling plus jitter). The O4 runbook
+accepts that delay.
 
-**Pause/resume and `fail_open` propagation ([#69](https://github.com/smoketurner/virtual-waiting-room/issues/69), ADR-0023).** The adaptive poll interval widens how long a paused
-visitor can go before noticing a change: a near-front visitor's paused interval stays bounded by
-their own distance to the front (as short as the floor), but a deep-queue visitor sits at the
-poll ceiling. If the operator resolves a pause into `fail_open`, a deep-queue visitor can see it
-up to the ceiling's ~39 s late (30 s interval plus jitter) rather than the old fixed ~6.5 s. This
-is accepted for the O4 runbook: those visitors were already waiting far longer than 39 s, and a
-near-front visitor — the one for whom a fast reaction matters most — still sees it promptly.
-
----
+**Not built:** live metrics for F5.1 (queue depth, admitted, no-show rate). See [`tasks.md`](../.kiro/specs/virtual-waiting-room/tasks.md),
+Phase 1h.
 
 ## 10. Failure behaviour
 
-If the waiting room's backend is unreachable, an operator can engage fail-open and the edge
-passes every request through until the window lapses
-([ADR-0009](adr/0009-fail-open.md)). Configurable to fail closed per client.
+**Fail-open** ([ADR-0009](adr/0009-fail-open.md)): `/admin/fail_open` sets `fail_open_until` on
+`Counters` and in the KeyValueStore, and the gate passes protected requests until its own clock
+passes it. The gate also passes through when it throws (unreadable config, unknown version).
+**Not built:** automatic fail-open on a backend outage
+([#58](https://github.com/smoketurner/virtual-waiting-room/issues/58)); there is no fail-closed
+setting. The failure domain is one region ([ADR-0034](adr/0034-single-region-failure-domain.md)).
 
-API Gateway's account throttle is a token bucket: tokens refill at the requests per second
-(RPS) quota, the bucket holds at most 5,000. Steady-state capacity comes from the refill
-rate; the bucket absorbs instantaneous arrivals above it and sheds 429s when empty. The burst
-quota is not directly adjustable — AWS derives it from the RPS quota — so raising RPS is the
-only lever.
-
-This is a smoothing buffer, not a ceiling on event size. A 200,000-visitor burst against a
-50,000 RPS quota drains and refills within seconds. The client must retry 429s with jittered
-backoff; a client that fails closed on 429 turns a brief smoothing event into a visible
-outage.
-
----
+**429s.** API Gateway's account throttle is a token bucket that refills at the RPS quota and
+holds 5,000; raising the RPS quota is the only lever. It smooths rather than caps: a
+200,000-visitor burst against 50,000 RPS drains in seconds. The client retries 429s with jittered
+backoff (F4.5); treating one as fatal would turn smoothing into an outage.
 
 ## 11. Deployment
 
-Single-tenant, deployed into the client's own AWS account
-([ADR-0007](adr/0007-single-tenant-deployment.md)). No component runs anywhere else.
+The system is single-tenant and deploys into the client's own AWS account
+([ADR-0007](adr/0007-single-tenant-deployment.md)). `infra/environments/dev` is the only
+deployable root, built from the `core` and `edge` modules plus an optional `demo-origin`. Every
+function deploys a real build, and a missing zip fails at plan. The apply seeds the `Counters`
+item, the gate ruleset and the open schedule, so a fresh stack works without manual setup steps.
+See [`DEPLOY.md`](./DEPLOY.md).
 
-**No virtual private cloud (VPC).** DynamoDB, SQS, SSM Parameter Store, EventBridge and Lambda
-are all Identity and Access Management (IAM) authenticated public-endpoint services, reached
-with no network address translation (NAT) gateway and no VPC endpoints. A VPC is available as
-an opt-in variable for clients whose Authority to Operate (ATO) boundary mandates
-private-subnet compute regardless of IAM; the Lambda code is identical either way.
-
-**Origin protection.** CloudFront VPC origins place the client origin in a private subnet
-with CloudFront as the sole ingress. VPC origins forbid Lambda@Edge origin triggers, require
-an internet gateway present but unused, and do not evaluate inbound network ACLs.
-
-**Event isolation.** A deployment serves one event and is torn down after it, so isolation
-between events is isolation between whole stacks: separate queues, tables, functions and
-distribution ([ADR-0008](adr/0008-partition-isolation-not-shuffle-sharding.md)). Within a
-deployment, `assign_position` carries reserved concurrency so the ingest burst cannot draw down
-the account pool the control plane and the controller also run in.
-
-### GovCloud variant
-
-CloudFront, CloudFront Functions, Lambda@Edge, and CloudFront VPC origins are all unavailable
-in GovCloud — the VPC origins supported-region list covers 34 commercial regions and neither
-GovCloud region appears. AWS public-sector guidance places CloudFront in a commercial region
-pointing at GovCloud origins, which raises a data-boundary question for the client's
-Authorizing Official (AO).
-
-Consequences: no edge gating, no managed origin protection, and no CDN request collapsing for
-`/status` inside the boundary. Origin protection is built from primitives — an internal
-Application Load Balancer (ALB), security groups and IAM, plus a gate that does not exist yet —
-the one that filled that role was removed (ADR-0032). This is a different topology, not a
-configuration flag, and is priced separately.
-
----
+- **No VPC.** DynamoDB, SQS, SSM, EventBridge and Lambda are reached over IAM-authenticated
+  public endpoints, so there is no NAT gateway and no VPC endpoints.
+- **Client origin.** A custom origin addressed by domain name. Restricting the origin to
+  CloudFront, for example with VPC origins, is not built by this module.
+- **Event isolation.** One deployment serves one event, so isolation between events is isolation
+  between stacks ([ADR-0008](adr/0008-partition-isolation-not-shuffle-sharding.md)). Within a
+  deployment, `assign_position` and `nojs` have reserved concurrency so that ingest cannot drain
+  the account pool the control plane uses.
+- **GovCloud** is out of scope (N4). It has no CloudFront, so it has no edge gate and no request
+  collapsing. A GovCloud variant would be a different topology, tracked in
+  [`tasks.md`](../.kiro/specs/virtual-waiting-room/tasks.md) Phase 5.
 
 ## 12. Cost
 
-For a 1,000,000-visitor event. `waiting.js` polls adaptively since
-[#69](https://github.com/smoketurner/virtual-waiting-room/issues/69) (ADR-0023): the interval
-scales with a visitor's own distance to the front rather than staying fixed, which is why this
-section is a model with named assumptions rather than one number — the request volume it
-produces genuinely depends on how the cohort behaves, not just on how many visitors there are.
+Edge request volume dominates cost, and the poll interval sets it. The mechanism is
+[ADR-0023](adr/0023-adaptive-poll-interval.md); the model lives here.
 
-### Model and baseline
+**Model.** 1,000,000 visitors; a 60-minute countdown with late arrival (mean 10 minutes on the
+page before the open, drawn from `u^0.2`); a 20-minute drain at 833/s (mean wait 10 minutes).
+One-shot requests (join, `queue_num`, `generate_token`, assets) add ~6M. The **baseline** is a
+fixed-interval client whose hidden tabs poll at Chrome's throttled ~60 s, the assumption most
+favourable to it. The adaptive client sends nothing while hidden, apart from one poll on return
+and ~5 requests per iOS discard-and-reload.
 
-1,000,000 visitors, a 60-minute countdown with a late-arrival shape (mean 10 minutes on the page
-before the open, drawn from `u^0.2`), then a 20-minute drain at 833/s (mean wait 10 minutes) —
-1.2×10⁹ visitor-seconds spent on the page in total. Per-visitor one-shot costs (join,
-`queue_num`, `generate_token`, the HTML/CSS/JS themselves) add roughly 6M requests, independent
-of how the wait is spent.
-
-The **baseline** is a hidden tab polling at the throttled rate Chrome 88+ applies after five
-minutes hidden (roughly 60 s): the assumption most favourable to the baseline, since Safari and
-Firefox throttle less aggressively and a less-throttled hidden tab only makes the baseline worse
-relative to the adaptive client. The adaptive client sends **zero** requests while a tab is
-hidden (§3 of ADR-0023) — with the caveats in the next section.
-
-### Both bounds: foreground-only upper bound, and the hidden-share sensitivity
-
-The harness (`crates/harness`) models all-foreground visitors — it has no way to represent a
-backgrounded tab — so the table below is a **model figure, not something the harness reproduces
-directly**. What the harness settles is the mechanism the table is built on, not its blended
-magnitude: a run shaped like this section's polling model (`--visitors 4000 --seconds 60
---countdown 30 --target-rate 1 --arrival late`) measures **4.60x** on `/status` alone (24,683
-hold-position requests against 5,362 under backoff), against this section's modelled
-polling-component ratio of 209M/49M ≈ **4.27x** — genuine, checkable corroboration. One named
-end-to-end configuration (`--visitors 300 --seconds 40 --countdown 15 --target-rate 2 --arrival
-late`) measures **2.14x** blended (1,769 → 827 client requests), below the table's 3.9x: a
-minutes-long harness run gives each visitor only a handful of polls where the model's hour-long
-event gives hundreds, so the harness's fixed one-shot costs (join, `queue_num`, `generate_token`)
-are a structurally larger share of its total than of the model's — a property of measuring at
-harness timescales, not evidence against the table below. (The harness also always drives
-`intervalForPosition` off the fixed `--target-rate` rather than a locally measured rate the way
-`waiting.js` itself prefers once it has 30 s of samples — benign against the harness's own stub,
-which ramps `serving_position` at exactly that constant rate, but it means a harness run cannot
-show what happens when a real controller's admitted rate diverges from its published
-`target_rate`.)
-
-**Mind the settings when running the harness yourself.** This issue's own "Measuring it"
-guidance — `make load VISITORS=1000000 SECONDS=90` — measures only **1.83x**, not because the
-design underperforms but because a 90-second run is dominated by the ~60-second first-ask spread
-window (`FIRST_ASK_MAX_SPREAD_MS`): no visitor's position is known yet during it, so hold-position
-and backoff poll identically at the floor, and the run ends before most visitors leave that
-window. Stopping at the literal reference command and its 1.83x would understate the design's own
-effect.
-
-**Measured, the countdown component comes in below this model.** The two configurations that
-genuinely exercise it — a countdown long enough that visitors spend real time inside `closed`,
-drained at the 833/s this section models — measure **2.66x** (`--countdown 180 --arrival late
---target-rate 833 --seconds 480`, 58,323,285 → 21,916,029) and **2.88x** (the same with
-`--arrival uniform`, 68,757,884 → 23,878,829). Both are below the blended 3.9x above, and well
-below the 6.0x this section attributes to the countdown alone. A third configuration
-(`--countdown 60 --arrival late --target-rate 200 --seconds 560`) measures 3.83x, but it should
-**not** be read as confirming the model: a 200/s drain leaves the queue barely moving, so that run
-is dominated by deep-queue visitors sitting at the ceiling, and its closeness to 3.9x is a
-coincidence of the queue component rather than corroboration of the countdown one.
-
-Treat the table below as a model whose direction is measured and whose magnitude is optimistic.
-Substituting the measured 2.66x-2.88x for its modelled 3.9x, against its own ~215M baseline,
-lands adaptive nearer 75-81M — still inside the Business allowance, but with roughly 35-40%
-headroom rather than the 56% the table states. The full-event baseline itself has not been
-re-derived from measurement; an 80-100 minute event is impractical to simulate, so these runs are
-8-9 minute slices of it.
-
-Arrival shape moved this the opposite way from the intuition, for the second time in this
-project's measurements (the first was [#84](https://github.com/smoketurner/virtual-waiting-room/issues/84)):
-**uniform arrival saves more than late arrival**, 2.88x against 2.66x. Late arrivers turn up near
-the end of the countdown, so they see only a short slice of `closed` before it flips — about one
-ceiling-length poll either way, whatever interval they chose. Uniform arrivers sit inside
-`closed` longer, so the floor-versus-ceiling difference compounds across more polls.
-
-One further limit bounds what the harness can be asked to show: it counts requests only, with no
-per-visitor admission timestamps, so it cannot measure time-to-admission at all. That the
-near-front cadence does not regress is therefore an argument from the code rather than a
-measurement — the floor is an unconditional lower bound, identical to the fixed interval this
-client used before, on both the client and the harness's mirror of it.
-
-| hidden share | baseline | adaptive | ratio | vs. Business 125M/month |
+| Hidden share | Baseline | Adaptive | Ratio | vs. Business 125M/month |
 |---|---|---|---|---|
-| 0 — **foreground-only upper bound** | ~215M | ~55M | 3.9x | baseline **1.7x over**; adaptive has 56% headroom |
+| 0 (foreground-only upper bound) | ~215M | ~55M | 3.9x | baseline 1.7x over; adaptive 56% headroom |
 | 0.25 | ~168M | ~43M | 3.9x | baseline 1.3x over |
-| 0.5 | ~120M | ~31M | 3.9x | baseline lands just under the allowance |
+| 0.5 | ~120M | ~31M | 3.9x | baseline just under |
 
-**The ratio is invariant in the hidden share, scoped to the desktop-Chrome throttle used for the
-baseline above.** The adaptive client removes hidden requests entirely while the baseline keeps
-paying the throttled rate, and those two effects happen to cancel out across hidden share for
-this model — arithmetic the model states directly, independent of what a foreground-only harness
-can measure.
+- **Scope every figure to its model.** "1.7x over" holds at hidden share 0, not at 0.5.
+- **Components differ:** countdown polling saves 6.0x, queue polling 3.25x, so the blend depends
+  on arrival shape. Early arrival (mean 50 minutes) gives ~632M → ~125M, 5.0x, exactly the
+  Business allowance.
+- **iOS** suspends hidden tabs, compressing the ratio to 3.62x at hidden share 0.5 and 3.19x at
+  0.75. Mobile is plausibly the majority of a consumer drop.
+- **Measured, the saving is smaller.** The harness (`crates/harness`, foreground only) measures
+  4.60x on `/status` alone against 4.27x modelled (`--visitors 4000 --seconds 60 --countdown 30
+  --target-rate 1 --arrival late`), but 2.66x (late) and 2.88x (uniform) end to end at 833/s with
+  a 180 s countdown. That puts adaptive at ~75–81M, inside Business with 35–40% headroom. Short
+  runs understate the saving: `make load VISITORS=1000000 SECONDS=90` reads 1.83x because the
+  ~60 s first-ask spread dominates it. The harness cannot measure time-to-admission.
+- **No T−0 herd.** Open discovery spreads over the ~39 s ceiling jitter plus `scheduleFirstAsk`'s
+  60 s, so peak `/v1/queue_num` load is no higher than the 60 s spread alone
+  ([#84](https://github.com/smoketurner/virtual-waiting-room/issues/84)).
 
-**It does move under a harsher throttle, and the harsher direction is the one that matters.**
-iOS Safari suspends a backgrounded tab's JavaScript within seconds and may discard and reload the
-page entirely on return — there the baseline pays close to zero while hidden too, same as the
-adaptive client, and the ratio compresses: 3.90 at hidden share 0, **3.62 at 0.5, 3.19 at 0.75**,
-falling toward 1.0 in the limit of an all-hidden cohort. The design still clears N10 comfortably
-at every point on this range — the point is that mobile is plausibly the majority on a consumer
-ticket drop, and mobile is where the ratio is weakest, not strongest.
+**Pricing** (baseline, foreground-only bound, pay-as-you-go, US/Europe):
 
-**"Hidden costs zero" is not quite accurate.** It is zero requests while hidden, plus one poll on
-every return to the tab (the rate-guarded `visibilitychange` handler, ADR-0023), plus roughly
-five requests (HTML, CSS, JS, `/status`, `/queue_num`) on every iOS tab discard-and-reload.
-Negligible for a visitor who checks back a handful of times; not negligible for one who is
-constantly flapping between tabs, which is exactly the flapping case the rate guard bounds at the
-floor rather than the interval collapsing further.
+| Component | Baseline |
+|---|---|
+| CloudFront requests ($0.0100 per 10,000) | $215 |
+| WAF + Bot Control Common (pay-as-you-go only) | $129 + $123; Targeted bot detection is Custom pricing only (~$1,230) |
+| API Gateway (cache misses, ~3 per visitor) | $10 |
+| DynamoDB pre-warming | per event |
+| SQS, Lambda, DynamoDB writes | negligible |
 
-**Scope every absolute and every ratio to the model that produced it.** "Exceeds Business by
-1.7x" is true at hidden share 0 and false at 0.5 — it must not be stated as if it always holds.
+Adaptive polling divides the CloudFront and WAF rows by the ratio above; do not assume more
+than 3.9x. For a large event a **flat-rate plan** is usually cheaper and caps exposure: Business
+is $200/month for 125M requests and bundles the web ACL, managed rules and WAF fees, with blocked
+requests not counted. It is **not the default** because it bills monthly, which breaks N1 between
+events, and a subscribed distribution outlives `make destroy` until the billing cycle ends. The
+per-client choices are open in [`adr/README.md`](adr/README.md).
 
-### Component ratios: shape-independent; the blend is not
-
-Countdown-phase polling and drain-phase (queue) polling see different ratios under the same
-adaptive rule — 6.0x for the countdown component, 3.25x for the queue component — because the two
-phases put very different distributions of "distance to the front" in front of visitors: queue
-waits are uniform over `[0, 1200 s]` as a direct consequence of the fixed 20-minute drain, not of
-any assumption about arrival timing. The blended ratio for a whole event therefore ranges from
-3.25x (a cohort that is all queue, no countdown) to 6.0x (all countdown), depending on the mix —
-and the mix depends on the arrival shape. An **early**-arrival shape (mean 50 minutes on the page,
-rather than the late-arrival 10 minutes used above) gives roughly 632M baseline and 125M adaptive
-requests: a 5.0x blend that lands exactly on the Business plan's allowance. Every ratio quoted
-anywhere in this document is for a named component or a named mix; a bare ratio with neither
-named is not comparable to any of these.
-
-### No T−0 herd
-
-Open discovery — when a pre-queue registrant first learns their position — is spread uniformly
-over roughly 39 seconds. The open itself is a single instant, not spread over time; the spread
-comes from every registrant's poll phase already being uniformly distributed across their own
-30–39 second ceiling interval (`policy.ceilingMs` plus proportional jitter) at the moment the open
-lands, because each client started polling — and so picked its own random phase — at whatever
-point during the countdown it registered. `scheduleFirstAsk` then layers an independent uniform
-60-second spread on top of that. The convolution of the two has a peak density of 1/60 per
-second: the same as today's spread alone, never higher, with a wider total spread. Peak
-`/queue_num` requests per second is therefore unchanged by this design, addressing the herd
-concern raised against an earlier version of this design
-([#84](https://github.com/smoketurner/virtual-waiting-room/issues/84)).
-
-### Pricing corrections
-
-CloudFront's Business and Premium plans bundle **self-identifying bots only** in their flat
-Bot Control allowance — a crawler that announces itself. The "$1,230 Targeted" figure below is
-for **advanced, obfuscated bot detection**, which is Custom-pricing only and cannot be purchased
-on a plan at any tier; only WAF's own charge is bundled by the plans.
-
-Recomputed against the model above at the foreground-only bound (215M baseline requests), the
-rate PAYG CloudFront charges for HTTPS requests
-([$0.0100 per 10,000](https://aws.amazon.com/cloudfront/pricing/), US/Europe price class), and
-the $0.60-per-million WAF inspection fee stated in §8:
-
-| Component | Driver | Approximate (baseline, no adaptive polling) |
-|---|---|---|
-| CloudFront requests | poll interval × visitors × wait (see model above) | $215 |
-| WAF + Bot Control | same request volume | $129 + $123 (Common, bundled bot detection) or $1,230 (Targeted, Custom pricing only) |
-| DynamoDB pre-warming | target write rate | billed per event |
-| API Gateway | cache misses only, ~3/visitor | $10 |
-| SQS, Lambda, DynamoDB writes | joins | negligible |
-
-These two rows are the *baseline* — what the same event costs **without** this design's adaptive
-polling, at the foreground-only bound. The client poll interval remains the dominant variable,
-multiplying CloudFront and WAF charges together (Bot Control's flat tiers do not scale with
-request volume); adaptive polling divides that multiplier by the ratios in the sensitivity table
-above rather than eliminating it — so the deployed CloudFront and WAF lines are these figures
-divided by roughly 3.9x at hidden share 0. That divisor drifts slightly higher across the tabled
-hidden shares under the desktop-Chrome throttle the table assumes (3.90 → 3.95 → 4.01), but it
-moves the other way under the iOS suspension case above — 3.62x at hidden share 0.5, 3.19x at
-0.75 — and mobile is plausibly the majority of a consumer ticket drop, so do not assume the
-larger divisor.
-
-Two choices are computed per client rather than assumed: CloudFront flat-rate versus
-pay-as-you-go (PAYG) pricing, and Bot Control Common versus Targeted. Both are recorded as
-open in [`adr/README.md`](adr/README.md).
-
-For a large planned event a **CloudFront flat-rate plan is often the better fit** — a
-predictable monthly charge over the event window is usually cheaper than PAYG at the request
-volumes a full waiting room drives, and it caps cost exposure. It is **not the default**,
-because it is monthly: an idle deployment on PAYG stays under N1, and one on a plan does not.
-`flat_rate_plan_tier` subscribes the distribution for an event; `make destroy` cancels it, and
-the O4 runbook covers the billing cycle that follows.
-
-**On a flat-rate plan the WAF rows above are bundled.** The Business plan ($200/month) covers
-the edge web ACL, its rules, AWS managed rules (Bot Control at the common level included) and
-WAF request fees, and requests WAF blocks do not count against its 125M allowance
-([ADR-0038](adr/0038-edge-web-acl-on-flat-rate-plan.md)). That is why the web ACL exists
-only with `flat_rate_plan_tier`: on PAYG the same ACL bills per
-request inspected during an event and per ACL and rule every month between events. Two costs
-follow from the subscription rather than the traffic: it is monthly, and a subscribed
-distribution cannot be deleted until the billing cycle ends, so the stack outlives the event
-until then.
-
-### The floor is a client-side guard, not an anti-abuse control
-
-Every number in this section assumes a client that honours `policy.floorMs`. Nothing server-side
-enforces it: `Date.now()` is visitor-controlled, and a client that ignores the floor — or one
-whose clock is moved forward — polls as fast as it likes. This cost model therefore rests on a
-client-side constant, the same way it already rests on browsers actually running the shipped
-`waiting.js` rather than a hand-written poller. Rate limiting at true abuse volumes is the edge's
-job (WAF, above), not the floor's; the floor exists to keep an honest client's own request rate
-proportional to its wait, not to stop a dishonest one.
-
-### Rolling back a bad policy
-
-Because `adoptPolicy` keeps the last good policy rather than reverting to the fixed interval on a
-later bad read (ADR-0023, "last-known-good on withdrawal"), an already-adaptive client cannot be
-walked back to the fixed interval by simply removing the `poll_floor_ms`/`poll_ceiling_ms`/
-`poll_divisor` entries from `terraform.tfvars` — every client that already adopted the old policy
-keeps using it. The rollback procedure for a bad policy is to **publish corrected values**, not to
-withdraw them: a client that already adopted a policy adopts the correction on its next `/status`
-poll, the same way it adopted the original.
-
----
+**Caveats.** The model assumes clients honour `policy.floorMs`; nothing server-side enforces it,
+so abuse is the edge's job (§8). Clients keep the last good policy when one is withdrawn, so a bad
+policy is rolled back by publishing corrected values, not by removing them.
 
 ## 13. Requirement coverage
 
-Which section implements which requirement from [`REQUIREMENTS.md`](./REQUIREMENTS.md).
-
-| Requirement | Section |
+| Requirements | Section |
 |---|---|
-| F0.1, F0.2, F0.8 — lifecycle phases, phase pages, maintenance mode | §3 |
-| F0.3, F0.5 — scheduled mode, coexistence | §3, §4 |
-| F0.4, F0.7 — standby activation and override | §3 |
-| F0.6 — protection rules | §3 |
-| F1.1, F1.2 — countdown page, no origin load | §4.1 |
-| F1.3, F1.4 — randomized assignment, prompt completion | §4.2, §4.3 |
-| F1.5 — auditability | §4.4 |
-| F2.1 — live joins ordered behind pre-queue | §4.5 |
-| F2.2, F2.3 — unique positions, gaps permitted | §5.1, §5.2, §5.4 |
-| F2.4, F2.5, F2.6 — client identifier, idempotent retry, malformed joins | §6 |
-| F3.1 — read position and serving position | §8 |
-| F3.2, F3.8 — admission rate control, no-show compensation | §7 |
-| F3.3, F3.4, F3.6, F3.7 — token, origin rejection, distinct signing, session lifetime | §8 |
-| F3.5 — session established after token validation | §2.3, §8 |
-| F3.10 — session completion and abandonment | §8 |
-| F4.1, F4.2, F4.3 — fail open, bounded bypass, configurable | §10 |
-| F4.4 — recovery from a lost join | §6 |
-| F4.5 — client retries 429 with jitter | §10 |
-| F5.1, F5.2, F5.3, F5.4, F5.5 — metrics, branding, messaging, wait estimate, API-first | §9 |
-| F6.1, F6.2 — entry gating on a client-signed identifier | §8 |
-| F6.3 — deferred bot enforcement | §8 |
-| C1, C2 — pre-queue scale, atomic assignment | §4.2 |
-| C3 — live-join throughput | §5.3 |
-| C4 — polling load independent of visitor count | §8 |
-| C5 — burst absorbed without dropping joins | §2.2, §6 |
-| N1, N2, N3 — idle cost, client account, no shared infrastructure | §11 |
-| N4 — commercial and GovCloud | §11 |
-| N5 — Terraform, no manual console steps | §11 |
-| N7 — edge bot mitigation | §8 |
-| N8 — OpenAPI specification | §8 |
-| N9 — event isolation | §11 |
-| N10 — client polling cost scales with distance to the front | §8, §12 |
-| O1 — pre-warming | §5.3 |
-| O2, O3, O6 — quota increases, load test, cost model | §12 |
-| O4 — mid-event operator control | §9 |
-| O5 — Count-then-Block promotion | §8 |
+| F0.1–F0.8: lifecycle, modes, protection rules, maintenance (standby auto-activation not built) | §2.3, §3 |
+| F1.1–F1.5, C1, C2: pre-queue, randomized atomic assignment, auditability | §4 |
+| F2.1–F2.6, C3, C5: live join, uniqueness, gaps, idempotent and malformed joins | §4.5, §5, §6 |
+| F3.1–F3.5, F3.8: position, rate control, session, gate, no-show compensation | §2.3, §7, §8 |
+| F4.1–F4.5: fail-open, lost-join recovery, 429 retry | §6, §10 |
+| F5.1–F5.5, O4: operator surface | §8, §9 |
+| C4, N7, N10, O5: polling load, edge mitigation, Count-then-Block | §8, §12 |
+| N1–N5, N9, O1–O3, O6: deployment, isolation, pre-warming, cost | §5.3, §11, §12 |
 
----
+Retired requirements are listed in [`REQUIREMENTS.md`](./REQUIREMENTS.md#retired-requirements).
 
 ## 14. Constraints and sources
 
 | Claim | Source |
 |---|---|
-| DynamoDB per-table on-demand quota 40,000 read/write request units, adjustable, "not maximum limits" | [Quotas in DynamoDB](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/ServiceQuotas.html) |
-| No account-level throughput quota in on-demand mode | same |
-| DynamoDB tables per region: 2,500 default, 10,000 on request | same |
-| DynamoDB writes billed in 1 KB units rounded up, 1 WCU minimum | same |
-| New tables 4,000 writes/s, 12,000 reads/s; growth to 2× previous peak | [On-demand capacity mode](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/on-demand-capacity-mode.html) |
-| Single-partition 1,000 WCU/s | [Partition key design](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-partition-key-design.html) |
-| Warm throughput and pre-warming | [Pre-warming DynamoDB tables](https://aws.amazon.com/blogs/database/pre-warming-amazon-dynamodb-tables-with-warm-throughput/) |
-| `UpdateItem` `ADD` atomic counter; serialized per item; each value returned once | [UpdateItem API reference](https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_UpdateItem.html), [Implement auto-increment with DynamoDB](https://aws.amazon.com/blogs/database/implement-auto-increment-with-amazon-dynamodb/) |
-| `BatchWriteItem`: 25 items, 16 MB, no conditional expressions, `UnprocessedItems` | [BatchWriteItem API reference](https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_BatchWriteItem.html) |
-| `Scan`: 1 MB page limit, `LastEvaluatedKey` pagination, parallel segments | [Scanning tables in DynamoDB](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Scan.html) |
-| TTL deletes "within a few days"; expired items remain readable; use filter expressions | [Using time to live in DynamoDB](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/TTL.html) |
-| API Gateway 10,000 RPS account throttle; 5,000 burst not customer-adjustable | [API Gateway quotas](https://docs.aws.amazon.com/apigateway/latest/developerguide/limits.html) |
-| REST API integration timeout 29 s hard; request payload 10 MB | [REST API quotas](https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-execution-service-limits-table.html) |
-| Request validators are REST-only | [Request validation](https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-method-request-validation.html) |
-| HTTP API response mapping limited to headers and status code | [HTTP API parameter mapping](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-parameter-mapping.html) |
-| SQS standard "nearly unlimited API calls per second, per action"; at-least-once; best-effort ordering | [SQS message quotas](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/quotas-messages.html), [Using Lambda with SQS](https://docs.aws.amazon.com/lambda/latest/dg/with-sqs.html) |
-| ESM `BatchSize` to 10,000; window ≥1 s above 10; +300/min to 1,250 pollers | [SQS event source mapping](https://docs.aws.amazon.com/lambda/latest/dg/services-sqs-configure.html) |
-| Provisioned Mode: 2–200/2–2000 pollers, 1,000 concurrent/min, 20,000 max | [Provisioned Mode for SQS ESM](https://aws.amazon.com/about-aws/whats-new/2025/11/aws-lambda-provisioned-mode-sqs-esm) |
-| Lambda timeout 900 s; sync invocation payload 6 MB; memory 10,240 MB | [Lambda quotas](https://docs.aws.amazon.com/lambda/latest/dg/gettingstarted-limits.html) |
-| CloudFront default metrics: 1-minute granularity, `us-east-1`, no additional charge | [Monitor CloudFront metrics](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/monitoring-using-cloudwatch.html) |
+| DynamoDB on-demand 40,000 RU/WU per table, adjustable; new tables ~4,000 writes/s; 1,000 WCU/s per partition | [Quotas](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/ServiceQuotas.html), [On-demand](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/on-demand-capacity-mode.html), [Partition keys](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-partition-key-design.html), [Pre-warming](https://aws.amazon.com/blogs/database/pre-warming-amazon-dynamodb-tables-with-warm-throughput/) |
+| `UpdateItem ADD` is atomic and serialized per item; `BatchWriteItem` takes no conditions | [UpdateItem](https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_UpdateItem.html), [BatchWriteItem](https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_BatchWriteItem.html) |
+| API Gateway 10,000 RPS throttle, 5,000 burst not adjustable; REST timeout 29 s; validators REST-only | [Quotas](https://docs.aws.amazon.com/apigateway/latest/developerguide/limits.html), [REST quotas](https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-execution-service-limits-table.html), [Request validation](https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-method-request-validation.html) |
+| SQS standard: nearly unlimited, at-least-once, best-effort order; ESM batch up to 10,000 | [SQS quotas](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/quotas-messages.html), [SQS ESM](https://docs.aws.amazon.com/lambda/latest/dg/services-sqs-configure.html) |
 | Request collapsing disabled by Min TTL 0 or cookie forwarding | [DDoS resilience with HTTP caching](https://repost.aws/articles/ARTocYphbwQnWtTz8FXrwqew/ddos-resilience-with-http-caching-on-cloudfront) |
-| VPC origins: supported regions exclude GovCloud; no Lambda@Edge origin triggers; inbound NACLs not evaluated | [Restrict access with VPC origins](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-vpc-origins.html) |
-| CloudFront unavailable in GovCloud | [CloudFront with GovCloud resources](https://docs.aws.amazon.com/govcloud-us/latest/UserGuide/setting-up-cloudfront.html) |
-| Anti-DDoS rule group; baselines during attack take 2–3× longer | [Anti-DDoS managed rule group](https://docs.aws.amazon.com/waf/latest/developerguide/waf-anti-ddos-rg-using.html) |
-| WAF pricing: $5 access control list (ACL), $1 rule, $0.60/M; Bot Control $10/mo + $1/M or $10/M | [AWS WAF pricing](https://aws.amazon.com/waf/pricing) |
-| CloudFront flat-rate tiers and allowances | [CloudFront pricing](https://aws.amazon.com/cloudfront/pricing/) |
-| Small-domain FPE: Feistel construction, cycle-walking, domain size | [NIST SP 800-38G Rev. 1](https://csrc.nist.gov/pubs/sp/800/38/g/r1/2pd) |
-| Pre-queue randomization; FIFO for safety-net; redirect-and-token model; Direct Pass fail-open | [How Queue-it Works](https://www.queue-it.com/developers/how-queue-it-works), [Queue-it virtual waiting room](https://queue-it.com/virtual-waiting-room) |
-| Distributed FIFO, open-window outflow control, no-show compensation, DynamoDB backbone | [Smooth Scaling ep. 17](https://queue-it.com/smooth-scaling-podcast/ep017-virtual-waiting-room-architecture/) |
-| Two-credential model; sliding vs fixed session validity; local validation | [Queue-it's architecture](https://blog.crawlex.net/blog/queue-it-architecture/) |
-| Queue Token software development kit (SDK); Hype Event Protection | [Queue-it Connectors](https://queue-it.com/developers/connectors/), [bad bot protection](https://www.queue-it.com/bad-bot-protection) |
-| Shuffle sharding requires an operator-assigned node pool | [Workload isolation using shuffle-sharding](https://builder.aws.com/content/3F06NpJ8YeoIGP8VHTw4n81pFn8/workload-isolation-using-shuffle-sharding) |
-| FedRAMP cost and timeline | Published third-party assessment organization and FedRAMP advisory pricing, cross-checked |
+| CloudFront unavailable in GovCloud | [CloudFront with GovCloud](https://docs.aws.amazon.com/govcloud-us/latest/UserGuide/setting-up-cloudfront.html) |
+| WAF and CloudFront flat-rate pricing | [WAF pricing](https://aws.amazon.com/waf/pricing), [CloudFront pricing](https://aws.amazon.com/cloudfront/pricing/) |
+| Small-domain FPE: Feistel, cycle-walking | [NIST SP 800-38G Rev. 1](https://csrc.nist.gov/pubs/sp/800/38/g/r1/2pd) |
+| Prior art: pre-queue randomization, FIFO safety net, no-show compensation | [How Queue-it Works](https://www.queue-it.com/developers/how-queue-it-works), [Smooth Scaling ep. 17](https://queue-it.com/smooth-scaling-podcast/ep017-virtual-waiting-room-architecture/) |
+| Shuffle sharding needs an operator-assigned node pool | [Shuffle-sharding](https://builder.aws.com/content/3F06NpJ8YeoIGP8VHTw4n81pFn8/workload-isolation-using-shuffle-sharding) |

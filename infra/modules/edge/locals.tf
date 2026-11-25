@@ -42,9 +42,8 @@ locals {
   polled_keyed_paths = ["/v1/queue_num"]
 
   # Uncached write behaviour path patterns: token minting. /v1/join has its
-  # own behaviour below (issue #59) because it alone needs the CloudFront-
-  # generated viewer headers, which are not viewer headers the managed
-  # AllViewerExceptHostHeader policy forwards.
+  # own behaviour and origin request policy, which forwards only content-type:
+  # the SQS integration needs nothing else from the viewer.
   # The no-JavaScript queue (issue #67) mints the same session through the
   # same admission path, so it needs what generate_token needs.
   write_paths = ["/v1/generate_token", "/v1/enter", "/v1/wait"]

@@ -4,15 +4,17 @@
 
 ```
 docs/                         Human-facing narrative (source of the SDD)
-  REQUIREMENTS.md             Numbered requirements + acceptance criteria
+  ARCHITECTURE.md             What the deployed system does, read from the code — start here
   DESIGN.md                   How the system works, with sourced constraints (§14)
-  PLAN.md                     Phased implementation plan
-  DEPLOY.md                   Deployment and operations
+  DYNAMODB.md                 Table design, access patterns, ceilings
+  REQUIREMENTS.md             Numbered requirements + acceptance criteria
+  DEPLOY.md                   Deployment
+  RUNBOOK.md                  Operating a live event
   adr/                        Architecture decision records — why it works that way
 .kiro/
   specs/virtual-waiting-room/ SDD source of truth (agent-facing)
     requirements.md           EARS-form requirements; IDs mirror docs/REQUIREMENTS.md
-    design.md                 Design mirroring docs/DESIGN.md; §4.3 expanded; admin-UI section
+    design.md                 Agent-facing design summary; points into docs/DESIGN.md
     tasks.md                  Checkbox tasks tracing to requirement IDs — the build-state record
   steering/                   Persistent rules loaded into every session (this dir)
 ```
