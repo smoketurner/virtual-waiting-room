@@ -499,7 +499,7 @@
     el.note.textContent = message;
   }
 
-  function join() {
+  function join(countdown) {
     if (joinedId === requestId || readStored(JOINED_KEY) === requestId) {
       joinedId = requestId;
       return Promise.resolve();
@@ -550,12 +550,13 @@
       // Exponential, capped. The cap bounds the rate; MAX_JOIN_ATTEMPTS is what
       // bounds the total. Spread by half either way, because every visitor
       // turned away in the same second would otherwise come back in the same
-      // second, and the gateway would sit idle in between.
+      // second, and the gateway would sit idle in between. A throttled
+      // registration during the countdown does not grow: it has to land before
+      // the open counts the cohort, or the visitor is numbered behind all of it.
+      var exponent =
+        countdown && res.status === 429 ? 0 : Math.min(joinAttempts + joinThrottles, 7) - 1;
       var backoff =
-        Math.min(
-          JOIN_BACKOFF_CEILING_MS,
-          policy.floorMs * Math.pow(2, Math.min(joinAttempts + joinThrottles, 7) - 1)
-        ) *
+        Math.min(JOIN_BACKOFF_CEILING_MS, policy.floorMs * Math.pow(2, exponent)) *
         (0.5 + Math.random());
       joinBlockedUntil = Date.now() + backoff;
     });
@@ -921,8 +922,11 @@
       admitting = false;
       // Everyone whose turn has come is told 425 while the budget is spent,
       // and asks again. Each asks less often the longer it lasts, so a spent
-      // budget is not also a storm of refusals.
-      capacityMisses = res.status === 425 ? capacityMisses + 1 : 0;
+      // budget is not also a storm of refusals. A 429 or a 5xx is the same
+      // crowd meeting a throttle or an overloaded function, and retrying it
+      // at the floor only feeds the overload.
+      var busy = res.status === 425 || res.status === 429 || res.status >= 500;
+      capacityMisses = busy ? capacityMisses + 1 : 0;
       if (res.status === 403) {
         // The secret this browser holds is not the one the place was taken
         // with (issue #62). Nothing on this page can recover that.
@@ -1084,7 +1088,15 @@
             // churn the catch handler. Must return the promise chain, or a
             // rejected join never reaches tick()'s catch and schedule()
             // never runs again.
-            return join().then(schedule);
+            return join(true)
+              .then(function () {
+                // Until the registration lands, ask again at the floor rather
+                // than the closed event's ceiling.
+                if (joinedId !== requestId) {
+                  nextIntervalMs = policy.floorMs;
+                }
+              })
+              .then(schedule);
           }
           return schedule();
         }

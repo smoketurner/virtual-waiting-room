@@ -28,6 +28,8 @@ make build           # cargo lambda build --release --output-format zip, per cra
 make plan            # terraform plan against the built artifacts
 make validate        # terraform validate the dev root
 make fmt             # terraform fmt -recursive across infra/
+make stack-emulator  # start the AWS Emulator (Docker) the local stack runs against
+make stack           # run the shipped binaries locally and check the design (docs/LOCAL_STACK.md)
 make apply           # real deploy — only when explicitly asked
 prek run             # pre-commit hooks (fmt, actionlint, zizmor, shellcheck)
 ```
@@ -280,7 +282,7 @@ rather than mocking logic.
 
 ## Documentation layers
 
-`docs/` is the human narrative (`ARCHITECTURE.md`, `DESIGN.md`, `DYNAMODB.md`, `REQUIREMENTS.md`, `DEPLOY.md`, `RUNBOOK.md`, `adr/`).
+`docs/` is the human narrative (`ARCHITECTURE.md`, `DESIGN.md`, `DYNAMODB.md`, `REQUIREMENTS.md`, `DEPLOY.md`, `RUNBOOK.md`, `LOCAL_STACK.md`, `adr/`).
 `.kiro/specs/virtual-waiting-room/` is the agent-facing SDD (EARS requirements, design,
 tasks). Requirement IDs (`F*`, `C*`, `N*`, `O*`) are the join key: when a requirement changes,
 update both layers and keep the ID stable. Neither layer restates a decision's rationale —

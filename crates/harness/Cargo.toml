@@ -11,12 +11,24 @@ publish = false
 name = "harness"
 path = "src/main.rs"
 
+[[bin]]
+name = "stack"
+path = "src/stack/main.rs"
+
 [dependencies]
 anyhow = { workspace = true, features = ["std"] }
+aws-config = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+aws-sdk-dynamodb = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+aws-sdk-ssm = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+axum = { workspace = true, features = ["http1", "tokio"] }
+base64 = { workspace = true, features = ["std"] }
+controller = { workspace = true }
+serde = { workspace = true, features = ["derive", "std"] }
 reqwest = { workspace = true, features = ["json", "rustls-tls-webpki-roots-no-provider", "http2"] }
 rustls = { workspace = true, features = ["aws_lc_rs", "std", "tls12"] }
 serde_json = { workspace = true, features = ["std"] }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync", "process", "net", "io-util", "fs"] }
+wr-common = { workspace = true }
 
 [dev-dependencies]
 # Paused virtual time for the end-to-end poll-count comparison test: it drives

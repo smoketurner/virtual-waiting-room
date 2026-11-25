@@ -42,6 +42,8 @@ All run from the repository root against `infra/environments/dev`. `plan`, `appl
 | `make fmt`      | `terraform fmt -recursive` across `infra/`.                           |
 | `make clean`    | Remove `.artifacts/`.                                                 |
 | `make load`     | Run the local load harness (`VISITORS`, `SECONDS`, `POLLING`).        |
+| `make stack-emulator` | Build and start the AWS Emulator the local stack runs against.  |
+| `make stack`    | Run the whole system locally and check the design ([`LOCAL_STACK.md`](LOCAL_STACK.md)). |
 | `make help`     | List the targets.                                                     |
 
 ## Configuration

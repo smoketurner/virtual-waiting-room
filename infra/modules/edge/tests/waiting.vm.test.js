@@ -506,6 +506,34 @@ test("a redemption answered 'at capacity' keeps polling and is admitted on a lat
   assert.equal(client.win.location.replacedTo, "/");
 });
 
+for (const status of [429, 502]) {
+  test(`a redemption answered ${status} backs off like 'at capacity'`, async () => {
+    const client = loadClient({
+      route: (url) => {
+        if (url.startsWith("/_wr/v1/status")) {
+          return jsonResponse(200, activeStatus({ serving_position: 100, poll_policy: POLICY }));
+        }
+        if (url.startsWith("/_wr/v1/queue_num")) {
+          return jsonResponse(200, { position: 50, live_join: true });
+        }
+        if (url.startsWith("/_wr/v1/generate_token")) {
+          return jsonResponse(status, { message: "busy" });
+        }
+        return jsonResponse(200, {});
+      },
+    });
+    const delays = [];
+    for (let i = 0; i < 3; i += 1) {
+      await client.flush();
+      const t = client.lastTimer();
+      delays.push(t.ms);
+      t.cancelled = true;
+      t.fn();
+    }
+    assert.ok(delays[1] > delays[0] * 1.2, JSON.stringify(delays));
+  });
+}
+
 test("repeated 'at capacity' answers are asked for less and less often", async () => {
   const client = loadClient({
     route: (url) => {
@@ -565,6 +593,52 @@ test("a throttled join is retried for as long as it takes, and no number is aske
     0,
     "no position is asked for before a join has been accepted"
   );
+});
+
+// A registration throttled in the countdown's last seconds has to land before
+// the open counts the cohort, or the visitor is numbered behind all of it.
+test("a throttled registration during the countdown is retried at the floor, without growing", async () => {
+  let accept = false;
+  const client = loadClient({
+    route: (url) => {
+      if (url.startsWith("/_wr/v1/status")) {
+        return jsonResponse(200, {
+          event_id: "e",
+          phase: "pre_queue",
+          serving_state: "closed",
+          starts_at: Math.floor(Date.now() / 1000) + 3600,
+          poll_policy: POLICY,
+        });
+      }
+      if (url.startsWith("/_wr/v1/join")) {
+        return jsonResponse(accept ? 200 : 429, {});
+      }
+      return jsonResponse(404, {});
+    },
+  });
+  const joins = () => client.calls.filter((c) => c.url.startsWith("/_wr/v1/join")).length;
+  for (let i = 0; i < 10; i += 1) {
+    await client.flush();
+    const t = client.lastTimer();
+    assert.ok(t.ms <= FLOOR * 1.3, `poll ${i} waits ${t.ms} ms`);
+    client.clock.now += t.ms;
+    t.cancelled = true;
+    t.fn();
+  }
+  await client.flush();
+  // Each retry waits half to one and a half floors, so at least every other
+  // poll at the floor asks again.
+  assert.ok(joins() >= 5, "retried: " + joins());
+
+  accept = true;
+  client.clock.now += 2 * FLOOR;
+  client.fireLastTimer();
+  await client.flush();
+  const settled = joins();
+  client.fireLastTimer();
+  await client.flush();
+  assert.equal(joins(), settled, "an accepted registration is not repeated");
+  assert.ok(client.lastTimer().ms >= CEILING, "and the countdown polls at the ceiling again");
 });
 
 // --- issue #61: re-minting a session refused for another network ----------

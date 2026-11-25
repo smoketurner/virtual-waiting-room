@@ -154,7 +154,15 @@ are furthest behind. So the open first polls the join queue's waiting count
 opens whatever it found. Joins still queued are numbered behind the cohort, and
 `open_drain_timed_out` or `open_drain_unreadable` is logged
 ([#239](https://github.com/smoketurner/virtual-waiting-room/issues/239)). In-flight batches are
-not waited for: they are the straggler case.
+not waited for: they are the straggler case. While joins keep arriving the queue rarely reads empty
+twice, so under continuous traffic at T−0 the wait runs its full length: the open lands 10–15 s
+after the published start, and everyone who joins in that time is in the cohort
+([local stack](LOCAL_STACK.md#findings)).
+
+A join refused with a 429 is not queued at all. During the countdown the page retries it at the poll
+floor, about every 5 s, without backing off, so a registration throttled in the last seconds lands
+inside the drain wait and is in the cohort. With the arrival model in §12, 44% of a cohort arrives
+in the last second of the countdown, which at the default join throttle is more than 7,000/s.
 
 **Stragglers.** A registration landing after `open_event` read its shard is invisible to the
 open. The batch re-reads `Counters` after its writes and, if the event opened underneath it, gives
@@ -671,14 +679,19 @@ Over the whole event: roughly 3.5M API Gateway requests, 3M write units and 3–
 
 The model above assumes people arrive during the countdown. If nobody does, the open writes a
 cohort of zero and the event is a live-join queue from its first second: all 1,000,000 visitors
-post `/_wr/v1/join` when they arrive. Modelled for arrival within 10 s of T:
+post `/_wr/v1/join` when they arrive. Run on the [local stack](LOCAL_STACK.md#findings) at
+one-tenth scale (100,000 visitors within 10 s of T, 83 admissions/s, every API Gateway limit at a
+tenth), which keeps the crowd's size relative to the throttles:
 
-| | Default quotas, tables not pre-warmed | API Gateway quota 50,000/s, tables pre-warmed |
-|---|---|---|
-| Joins offered at peak | ~100,000/s against 7,000/s accepted | the same against the join throttle |
-| Half the crowd has a position by | ~2.3 min | ~1.3 min |
-| 99% have a position by | ~6 min | ~3.6 min |
-| Requests answered 429 | ~1.1M | none at the account limit |
+| | Measured, default quotas at one-tenth scale |
+|---|---|
+| Half the crowd has a position by | 2.7 min |
+| 90% / 99% have a position by | 4.4 / 6.3 min |
+| Join requests answered 429 | 3.4 per visitor |
+| Admission | 83.7/s against 83/s, nobody lost, no duplicate position |
+
+Raising the account's API Gateway quota and the join throttle shortens the first two rows in
+proportion.
 
 - **The ceiling is API Gateway, and it is a rate, not a capacity.** The join path has no compute
   to exhaust, so the crowd is taken at the join throttle (7,000/s by default, kept under the

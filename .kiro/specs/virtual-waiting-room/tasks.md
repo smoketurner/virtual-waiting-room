@@ -108,7 +108,7 @@ The build-state record for requirements.md. Requirement IDs in brackets; decisio
 
 ## Phase 3 — Load validation
 
-- [ ] Repeatable load harness [O3] — Partial: `crates/harness` counts origin requests per waiter locally (C4, N10); it generates no load against a deployment.
+- [ ] Repeatable load harness [O3] — Partial: `make stack` runs the shipped binaries, gate and page against the AWS Emulator and checks the design's claims ([LOCAL_STACK.md](../../../docs/LOCAL_STACK.md)), and `crates/harness` counts origin requests per waiter (C4, N10); nothing generates load against a deployment yet.
 - [ ] Pre-queue: 1M registrations; bijectivity over the full cohort, no correlation with registration time, seed absent before T−0 [F1.3, F1.4, C1, C2]
 - [ ] Live join: 10K/s at default quotas, 40K/s with increases; zero duplicates; gap rate measured [F2.2, C3]
 - [ ] Raise quotas and pre-warm before testing above defaults [O1, O2]
