@@ -289,9 +289,8 @@ resource "aws_lambda_function" "assign_position" {
   tags = var.tags
 }
 
-# Event-source mapping. Enabled only when a real assign_position artifact is
-# deployed, so the live join batch is
-# consumed by a non-functional handler. BatchSize 100 / batching window 1s,
+# Event-source mapping, created unconditionally: every function deploys a real
+# build, so there is no stub handler to consume joins. BatchSize 100 / batching window 1s,
 # ReportBatchItemFailures so only failed record IDs return to the queue.
 # batch_size is 100 because each invocation makes exactly ONE `ADD queue_counter`
 # no matter how many joins are in the batch, and that counter is a single

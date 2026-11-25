@@ -54,7 +54,7 @@ output "read_function_name" {
 }
 
 output "admin_function_name" {
-  description = "Name of the admin Lambda backing the SigV4 /admin control plane."
+  description = "Name of the admin Lambda backing the /admin control plane."
   value       = aws_lambda_function.admin.function_name
 }
 

@@ -106,7 +106,7 @@ resource "aws_lambda_permission" "read_apigw" {
   source_arn    = "${aws_api_gateway_rest_api.this.execution_arn}/*/*"
 }
 
-# --- admin (SigV4 control plane) ----------------------------------------------
+# --- admin (OIDC control plane) -----------------------------------------------
 
 resource "aws_iam_role" "admin" {
   name               = "${local.admin_name}-role"
@@ -182,14 +182,15 @@ resource "aws_lambda_function" "admin" {
   #
   # The redirect URI cannot be derived here: it is a path on the CloudFront
   # distribution, and edge consumes core's KeyValueStore ARN, so core cannot
-  # depend on edge without a cycle. Apply once to create the distribution, read
-  # cloudfront_domain_name, then set these three -- which is the one sequencing
-  # step the deployment genuinely has, and it now fails loudly instead of
-  # silently.
+  # depend on edge without a cycle. The check runs at plan, so the first apply
+  # sets placeholders (any non-empty client id and redirect URI) and a real
+  # allowlist; once cloudfront_domain_name is known, set the real values and
+  # apply again (docs/DEPLOY.md). That is the one sequencing step the
+  # deployment has, and it fails loudly instead of silently.
   lifecycle {
     precondition {
       condition     = var.oidc_client_id != "" && var.oidc_redirect_uri != ""
-      error_message = "oidc_client_id and oidc_redirect_uri must both be set, or the admin Lambda deploys and then fails at Init on every invoke. The redirect URI is https://<cloudfront_domain_name>/admin/callback -- apply once to create the distribution, then set them and apply again."
+      error_message = "oidc_client_id and oidc_redirect_uri must both be set, or the admin Lambda deploys and then fails at Init on every invoke. The redirect URI is https://<cloudfront_domain_name>/admin/callback -- on a first deploy, set placeholders (e.g. \"pending\" and https://pending.invalid/admin/callback), apply, then set the real values and apply again (docs/DEPLOY.md)."
     }
 
     precondition {
@@ -204,7 +205,8 @@ resource "aws_lambda_function" "admin" {
   depends_on = [aws_cloudwatch_log_group.lambda]
 }
 
-# API Gateway invokes the admin Lambda for the SigV4 /admin routes. /metrics and
+# API Gateway invokes the admin Lambda for the /admin routes (OIDC session auth
+# in the Lambda, ADR-0016). /metrics and
 # /update_session were removed with the origin authorizer (ADR-0032): the first
 # was routed with no handler behind it, the second returned 501.
 resource "aws_lambda_permission" "admin_apigw" {

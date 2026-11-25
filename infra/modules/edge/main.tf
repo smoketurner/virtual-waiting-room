@@ -39,7 +39,7 @@ resource "aws_cloudfront_cache_policy" "polled_status" {
 
 resource "aws_cloudfront_cache_policy" "polled_keyed" {
   name        = "${var.name_prefix}-polled-keyed"
-  comment     = "Polled /queue_num, /queue_pos_expiry: cache key adds event_id + request_id, no cookies."
+  comment     = "Polled /queue_num: cache key adds event_id + request_id, no cookies."
   min_ttl     = var.polled_min_ttl_seconds
   default_ttl = local.polled_default_ttl
   max_ttl     = local.polled_default_ttl
@@ -307,7 +307,7 @@ resource "aws_cloudfront_distribution" "this" {
     compress               = true
   }
 
-  # Polled: /queue_num, /queue_pos_expiry (cache key adds event_id + request_id).
+  # Polled: /queue_num (cache key adds event_id + request_id).
   dynamic "ordered_cache_behavior" {
     for_each = toset(local.polled_keyed_paths)
     content {
