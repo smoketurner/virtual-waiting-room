@@ -80,8 +80,8 @@ On the day (**manual**):
       protected URL in a private window and confirm you land on the waiting page. **An empty
       ruleset passes every request through**, which looks exactly like a working deployment.
 - [ ] **The admission rate is what the origin can serve**, not the seeded default.
-- [ ] **Alarms reach someone.** Terraform creates the alarms below with no actions. Subscribe a
-      destination, or watch them in CloudWatch.
+- [ ] **Alarms reach someone.** The alarms below notify only when `alarm_sns_topic_arn` is set to
+      a topic with a subscriber. Without it they change state in CloudWatch and tell nobody.
 - [ ] **Someone who can act is watching.**
 
 ### Deciding the admission rate
@@ -184,7 +184,7 @@ operation.
 | Alarm | What happened | What to do |
 |---|---|---|
 | `join_dropped` | A join reached SQS and was discarded (malformed body, or an `event_id` that does not match). The visitor got a 200 | Check `event_id` in `terraform.tfvars` against the event item. A mismatch drops **every** join |
-| `join-dlq-not-empty` | A join was retried to exhaustion and lost | Check `assign_position`'s logs. The messages are in the dead-letter queue and can be redriven |
+| `join-dlq-not-empty` | A join was received 10 times without being written and was dead-lettered | Check `assign_position`'s logs. The messages are in the dead-letter queue and can be redriven |
 | `arrival_record_failed` | A unit of the admission budget could not be taken, so the visitor was **not** admitted and will ask again | Harmless once. If continuous, admission has stopped: check `generate_token`'s logs and its grant on the `Counters` table |
 | `arrival_shard_draw_failed` | Same, one step earlier | As above |
 | `admission_claim_failed` | The write that marks a visitor admitted did not land; they were admitted anyway | Harmless once. If continuous, every reload takes a second unit of budget, so fewer people are admitted than the rate allows, never more |
@@ -194,6 +194,11 @@ operation.
 | `nojs_join_failed` | A no-JavaScript join was not enqueued | The visitor was told and can retry. If continuous, check the `nojs` function's logs and its SQS grant |
 | `open_event_error` | The open failed, usually because the event was not in the pre-queue phase | Check the phase. The scheduler retries for up to 10 minutes; or fix the phase and **Open now** |
 | `open-dlq-not-empty` | A scheduled open failed every retry | The event is **not open** and the one-time schedule is spent. Fix the cause, then **Open now** |
+| `join-queue-age` | The oldest join has waited over 60 s: `assign_position` is not keeping up, or is failing | Check its `Errors`/`Throttles` alarms and its reserved concurrency. Joins are safe in the queue; visitors see "Getting your place" until it drains |
+| `<function>-errors`, `<function>-throttles` | A function failed or was throttled (one pair per function) | Read that function's log. A throttle on `read` or `generate_token` is the account concurrency limit; on `assign_position` or `nojs`, its reservation |
+| `counters-write-throttles`, `prequeue-write-throttles`, `positions-write-throttles` | DynamoDB refused writes on that table | The table was not pre-warmed for this rate. Raise `warm_throughput_write_units`; throttled joins retry from the queue |
+| `api-5xx` | The REST API answered a 5XX | Check the function alarms; a `/v1/join` 5XX means SQS refused the message |
+| `schedule-target-errors` | EventBridge Scheduler could not invoke a target. The metric is for the default schedule group, so any schedule in it counts | Usually the controller: nobody is being admitted. Check the schedule's role and the function's reserved concurrency (#228) |
 
 These are logged (`$.fields.event`) without an alarm of their own:
 

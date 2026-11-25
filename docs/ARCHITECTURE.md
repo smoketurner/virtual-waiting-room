@@ -30,7 +30,7 @@ flat-rate plan only, a WAF web ACL.
 | Function | Trigger | Timeout | What it does |
 |---|---|---|---|
 | `assign_position` | SQS event source mapping | 30 s | Consumes join batches; claims pre-queue indices or live positions; writes rows |
-| `open_event` | EventBridge Scheduler one-shot, or `/admin/open_now` | 10 s | Folds the shard counts into offsets and writes the open |
+| `open_event` | EventBridge Scheduler one-shot, or `/admin/open_now` | 30 s | Folds the shard counts into offsets and writes the open |
 | `read` | API Gateway | 10 s | `GET /v1/status`, `GET /v1/queue_num` |
 | `controller` | EventBridge Scheduler `rate(1 minute)` | 30 s | Durable function; meters admission in six 10 s passes |
 | `generate_token` | API Gateway | 10 s | Checks the position, claims the admission, records the arrival, signs the session cookie |
@@ -98,7 +98,7 @@ all required, no other properties. The integration sends the body as the SQS mes
 SQS maps to 200, anything else to a fixed 502.
 
 The queue has a 181 s visibility timeout (6 × 30 s + the 1 s window) and moves a message to the DLQ
-after 5 receives. The event source mapping uses `BatchSize` 100, a 1 s batching window and
+after 10 receives. The event source mapping uses `BatchSize` 100, a 1 s batching window and
 `ReportBatchItemFailures`, with `maximum_concurrency` capped at the function's reserved
 concurrency.
 
@@ -197,7 +197,10 @@ EventBridge Scheduler fires `rate(1 minute)` through the universal `aws-sdk:lamb
 with `InvocationType: Event` and a qualified function name; a durable execution is pinned to the
 version that started it. Each execution runs six passes ten seconds apart, and each gap is a
 durable wait that suspends the execution instead of billing it
-([ADR-0022](adr/0022-durable-controller-cadence.md)); `execution_timeout = 120`, retention 7 days.
+([ADR-0022](adr/0022-durable-controller-cadence.md)); `execution_timeout = 60`, retention 7 days. The schedule and the
+async invoke both retry zero times and drop an invoke older than 60 s, so a late start is skipped
+rather than bunched with the next; the function has reserved concurrency
+(`controller_reserved_concurrency`).
 
 A pass runs only when `phase = active` and the resolved admission control is `Open`; otherwise it
 writes nothing. A pass that fails is skipped (`controller_pass_failed`) and the

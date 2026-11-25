@@ -51,6 +51,16 @@ operators.
 The key is unconditional, with no opt-in. It costs nothing and closes the bypass on every
 deployment, flat-rate or not.
 
+**Amendment ([#245](https://github.com/smoketurner/virtual-waiting-room/issues/245)).** The usage
+plan still carries no throttle, but the stage now does: per-method settings for `POST /v1/join`
+and for every other method (`api_join_throttle_*`, `api_throttle_*`), with or without the web ACL,
+so one path cannot drain the account's shared bucket on pay-as-you-go. In the web ACL, every
+URI-path match now applies `URL_DECODE` then `NORMALIZE_PATH`; `/v1/wait` has its own per-IP limit
+(`waf_nojs_wait_ip_limit`); and a rule requires the `aws-waf-token` cookie on the JavaScript API
+paths, so a token sent only in the `x-aws-waf-token` header cannot escape the cookie-keyed rate
+limits. That rule runs in Count until `waf_managed_rules_mode = "enforce"`: its effect on a
+first, token-less request has not been observed against a deployment.
+
 ### The web ACL (with a flat-rate plan, `flat_rate_plan_tier`)
 
 The web ACL exists only on a flat-rate plan, which requires it. On pay-as-you-go it bills

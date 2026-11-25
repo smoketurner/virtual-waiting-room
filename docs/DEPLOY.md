@@ -62,6 +62,11 @@ the full shape. The values you will normally set:
 | `oidc_issuer` | `https://us.vouch.sh` | OIDC issuer for the admin login. |
 | `oidc_client_id`, `oidc_redirect_uri`, `oidc_allowed_emails` | `""` | **Required; the plan fails without them.** See [OIDC](#oidc-the-one-sequencing-step). The client secret goes in SSM, not here. |
 | `oidc_require_email_verified` | `true` | A login needs the provider's `email_verified` claim to be true. Set `false` only for a provider that omits the claim; an explicit `false` is still refused. |
+| `alarm_sns_topic_arn` | `""` | SNS topic every alarm notifies on alarm and on recovery. Empty leaves the alarms changing state with nobody told. |
+| `table_deletion_protection` | `false` | Deletion protection on the four tables. Turn on for a real event; it must be off to change `event_id` or to destroy. |
+| `controller_reserved_concurrency` | `2` | Concurrency reserved for the controller so ingest cannot starve it. |
+| `api_join_throttle_rate_limit`, `api_join_throttle_burst_limit` | `10000`, `5000` | Stage throttle on `POST /v1/join`. Raise the account quota before raising these. |
+| `api_throttle_rate_limit`, `api_throttle_burst_limit` | `10000`, `5000` | Stage throttle on every other method. Lower to cap what the read and admission functions can be asked for. |
 | `admission_rate` | `5` | Visitors per second, seeded onto the event. Changed live from the dashboard. |
 | `gate_rules` | `""` | Which requests the gate covers, one rule per line, same grammar as the dashboard's rules form (`p /checkout`, `c <cookie>`, `u <agent substring>`, `h <header> <value>`). Empty is dormant: everything passes through. |
 | `starts_at`, `starts_at_timezone` | `""`, `UTC` | When the event opens, local date-time with no zone, and its IANA zone. Set, the first apply seeds the event in the pre-queue phase and arms the open schedule. Empty leaves the event idle until an operator presses **Open now**. |
@@ -71,10 +76,16 @@ the full shape. The values you will normally set:
 | `flat_rate_plan_tier` | `null` | `BUSINESS` or `PREMIUM` subscribes to a CloudFront flat-rate plan and attaches the edge web ACL. See [Edge protection](#edge-protection-on-a-flat-rate-plan). |
 | `waf_managed_rules_mode` | `count` | `count` or `enforce` for the managed rules (plan only). |
 | `waf_join_ip_limit` | `100` | Token requests plus joins per IP per 5 minutes before a CAPTCHA (plan only). |
+| `waf_nojs_wait_ip_limit` | `300` | No-JavaScript waiting-page requests per IP per 5 minutes before a 429 (plan only). |
 | `nojs_enabled` | `true` | `false` closes the no-JavaScript queue at the edge (plan only). |
 
 Terraform seeds `admission_rate`, `gate_rules` and the open schedule once; after that the
 dashboard owns them.
+
+**Running another event on the same stack.** Change `event_id` and apply. Terraform re-seeds the
+event item and recreates the `PreQueue` and `Positions` tables empty, since their rows carry no
+event and a returning browser's old row would otherwise resolve against the new cohort. Turn
+`table_deletion_protection` off first. `scripts/reset-env.py` remains a test convenience.
 
 **`ARCH`** is the one `make`-level override. `make build` reads `lambda_architecture` from
 `terraform.tfvars` (falling back to `arm64`), so the build and the deployed functions agree by

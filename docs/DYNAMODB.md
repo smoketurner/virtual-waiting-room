@@ -301,8 +301,10 @@ no TTL.
 
 - **The `Tokens` key is named `request_id`** but holds session ids and PKCE states. Renaming a
   hash key replaces the table, so the name stays; `expr.rs` documents it.
-- **`Positions` rows carry no `event_id`.** Isolation comes from the deployment being single-event.
-  A second event sharing these tables would need the attribute, checked by every reader.
+- **`Positions` and `PreQueue` rows carry no `event_id`.** Isolation comes from the deployment
+  being single-event. Running another event means changing `event_id` and applying: Terraform
+  re-seeds the event item and recreates both tables empty (#248), so no reader has to check an
+  attribute. `table_deletion_protection` must be `false` for that apply.
 
 ## Appendix A — Ceilings
 

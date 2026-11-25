@@ -35,7 +35,7 @@ The build-state record for requirements.md. Requirement IDs in brackets; decisio
 
 ### 1d. Live join
 
-- [x] REST API `AWS` integration → SQS `SendMessage`, JSON Schema validator, DLQ (`maxReceiveCount` 5), `ReportBatchItemFailures`, visibility timeout ≥ 6× function timeout + window [F2.1, F2.4, C5]
+- [x] REST API `AWS` integration → SQS `SendMessage`, JSON Schema validator, DLQ (`maxReceiveCount` 10), `ReportBatchItemFailures`, visibility timeout ≥ 6× function timeout + window [F2.1, F2.4, C5]
 - [ ] `BatchSize` / `MaximumBatchingWindowInSeconds` as variables — Partial: hardcoded at 100 / 1 s.
 - [ ] SQS ESM Provisioned Mode as an opt-in variable, default off
 - [ ] Per-event partition: one queue and one function per event, each with reserved concurrency (ADR-0008) [N9] — Partial: `assign_position` has reserved concurrency; a deployment serves one `event_id`.
@@ -95,7 +95,7 @@ The build-state record for requirements.md. Requirement IDs in brackets; decisio
 - [x] REST API answers only CloudFront: every method requires the origin API key (ADR-0038) [N7]
 - [x] Flat-rate plan subscription via `flat_rate_plan_tier` (ADR-0038) [O6]
 - [ ] `modules/edge` — three cache behaviours (ADR-0013), the gate, and WAF [N7, O5, C4] — Partial: all built, with the web ACL behind `flat_rate_plan_tier` and managed rules in Count; ASN matching is not built.
-- [ ] CloudWatch alarms and a shipped dashboard — Partial: alarms on log-metric filters and both DLQs are built; no dashboard.
+- [ ] CloudWatch alarms and a shipped dashboard — Partial: alarms on log-metric filters, both DLQs, join-queue age, function errors and throttles, table write throttles, API 5XX and the controller schedule are built, with an optional SNS topic; no dashboard.
 - [ ] `var.enable_vpc` for ATO-constrained clients — Partial: not built; no VPC variable exists.
 - [ ] OpenAPI specification for public and admin surfaces [N8]
 - [ ] `examples/` and generated variable reference

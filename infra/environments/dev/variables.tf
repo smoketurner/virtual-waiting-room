@@ -248,11 +248,11 @@ variable "api_join_throttle_burst_limit" {
 variable "api_throttle_rate_limit" {
   description = "Requests per second each other API method accepts before answering 429."
   type        = number
-  default     = 50000
+  default     = 10000
 }
 
 variable "api_throttle_burst_limit" {
   description = "Token-bucket size for each API method other than POST /v1/join."
   type        = number
-  default     = 1000
+  default     = 5000
 }

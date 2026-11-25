@@ -46,7 +46,7 @@ no call to the backend.
   API Gateway  REST, regional; JSON Schema request validator → 400 on a malformed body
                type: aws → SQS SendMessage          ← no Lambda in the burst path
         │
-  SQS          standard queue + DLQ (maxReceiveCount 5)
+  SQS          standard queue + DLQ (maxReceiveCount 10)
         │      ESM: BatchSize 100, window 1 s, ReportBatchItemFailures
         ▼
   assign_position
@@ -328,8 +328,9 @@ so no cold start and no concurrency ceiling at ingest
 
 **Duplicates and ordering.** SQS standard is at-least-once with best-effort ordering. A duplicate
 fails `attribute_not_exists` and consumes nothing; order is irrelevant because positions come from
-the counter. Visibility timeout is 6 × function timeout + batching window; after 5 receives a
-record goes to the DLQ, which alarms.
+the counter. Visibility timeout is 6 × function timeout + batching window; after 10 receives a
+record goes to the DLQ, which alarms. Ten, not five, so a table throttling at the open does not
+dead-letter joins that a later receive would have written.
 
 **Validation.** The gateway's JSON Schema model requires `request_id`, `event_id` and `h`, and
 returns 400 synchronously when any is missing or malformed. `assign_position` checks again: the
@@ -445,7 +446,10 @@ gone ([ADR-0032](adr/0032-remove-the-origin-authorizer.md)). **Not built:** revo
 
 `random_bytes.signing_key` is generated at apply and written to both readers: an SSM SecureString
 for the Lambdas (free idle, unlike Secrets Manager) and KeyValueStore key `k` for the gate.
-Regenerating it invalidates every issued cookie.
+Regenerating it invalidates every issued cookie. The functions that read the key (`generate_token`,
+`nojs`) read it once at init, so a non-secret `SIGNING_KEY_FINGERPRINT` in their environment changes
+with the key: a rotation publishes new configuration and retires the warm environments still
+holding the old one ([#247](https://github.com/smoketurner/virtual-waiting-room/issues/247)).
 
 ### Entry gating and bots
 
@@ -459,7 +463,9 @@ what remains. **Not built:** a per-visitor position limit
 
 **The REST API answers only CloudFront** ([ADR-0038](adr/0038-edge-web-acl-on-flat-rate-plan.md)):
 every method requires an API key (`core/origin_key.tf`) that only the distribution sends, as an
-`x-api-key` origin header. A direct `execute-api` request gets an unbilled 403.
+`x-api-key` origin header. A direct `execute-api` request gets an unbilled 403. Per-method stage
+throttles (`api_join_throttle_*`, `api_throttle_*`) apply with or without the web ACL, so one path
+cannot drain the account's shared bucket.
 
 **The edge web ACL exists only with a flat-rate plan** (`flat_rate_plan_tier` = `BUSINESS` or
 `PREMIUM`; `edge/waf.tf`, `edge/plan.tf`), which bundles its cost. On pay-as-you-go it would bill
@@ -473,12 +479,15 @@ per request and per rule between events, breaking N1.
 | Requests per token | the four JS API paths | Block (429) past `waf_api_token_limit` per 5 min |
 | Token requests + joins per IP | verify page, `/v1/join` | CAPTCHA past `waf_join_ip_limit` per 5 min. It escalates rather than blocks, because carrier NAT puts many real buyers behind one IP |
 | Anonymous / hosting IP | verify page, join | CAPTCHA (Count until promoted) |
+| Token cookie required | the four JS API paths | Block a request with no `aws-waf-token` cookie, so a token sent only by header cannot escape the per-token limits. Count until `waf_managed_rules_mode = "enforce"` |
 | No-JS joins per IP | `/v1/enter` | Block past `waf_nojs_ip_limit` per 5 min |
+| No-JS waits per IP | `/v1/wait` | Block (429) past `waf_nojs_wait_ip_limit` per 5 min |
 | Anonymous IP, no JS | `/v1/enter` | Block (Count until promoted) |
 | No-JS closed | `/v1/enter`, `/v1/wait` | Block, only when `nojs_enabled = false` |
 | Managed: Anti-DDoS, IP reputation, Bot Control common | ACL-wide or the room's paths | Count until `waf_managed_rules_mode = "enforce"` (O5, [ADR-0012](adr/0012-anti-ddos-count-mode.md)) |
 
-The no-JavaScript paths and `waiting.html` are never challenged; a Terraform test fails if
+Every path match decodes and normalises the URI first (`URL_DECODE`, `NORMALIZE_PATH`), so an
+encoded path does not slip past a rule. The no-JavaScript paths and `waiting.html` are never challenged; a Terraform test fails if
 `waiting.js` calls a `/v1` path the token rule misses. This raises the price of a place to one
 browser session; it does not bind a place to a person.
 
@@ -486,7 +495,7 @@ browser session; it does not bind a place to a person.
 
 | Capability | Mechanism |
 |---|---|
-| Alerting | Metric filters over the Lambdas' structured logs, each with an alarm at threshold zero, plus alarms on DLQ depth (`core/logging.tf`). No dashboard resource ships |
+| Alerting | Metric filters over the Lambdas' structured logs, each with an alarm at threshold zero, plus metric alarms on DLQ depth, join-queue age, each function's `Errors` and `Throttles`, table write throttles, API 5XX and the controller schedule's target errors (`core/logging.tf`). They notify the SNS topic in `alarm_sns_topic_arn` when one is set, and nobody otherwise. No dashboard resource ships |
 | Pre-event readiness | The dashboard's diagnostics panel, which makes read-only checks against the deployment (issue #70, [`RUNBOOK.md`](./RUNBOOK.md)) |
 | Branding | Waiting-page HTML, CSS and JS in S3 behind CloudFront |
 | Messaging | `/admin/message` makes one `UpdateItem`, and every waiter sees it within one `/v1/status` TTL |
@@ -536,9 +545,18 @@ See [`DEPLOY.md`](./DEPLOY.md).
   refuse requests without it, or its hostname bypasses the room ([`DEPLOY.md`](./DEPLOY.md)).
   Network-level restriction, for example with VPC origins, is not built by this module.
 - **Event isolation.** One deployment serves one event, so isolation between events is isolation
-  between stacks ([ADR-0008](adr/0008-partition-isolation-not-shuffle-sharding.md)). Within a
-  deployment, `assign_position` and `nojs` have reserved concurrency so that ingest cannot drain
-  the account pool the control plane uses.
+  between stacks ([ADR-0008](adr/0008-partition-isolation-not-shuffle-sharding.md)). To run
+  another event on the same stack, change `event_id` and apply: Terraform re-seeds the event item
+  and recreates the `PreQueue` and `Positions` tables, whose rows carry no event
+  ([#248](https://github.com/smoketurner/virtual-waiting-room/issues/248)). Within a deployment,
+  `assign_position` and `nojs` have reserved concurrency so that ingest cannot drain the account
+  pool the control plane uses, and the controller and `open_event` have their own so they are
+  never starved by it.
+- **Least privilege.** Each function's `UpdateItem` on `Counters` is scoped by leading key to the
+  items it writes: the event item, the pre-queue shards or the arrivals shards
+  ([#250](https://github.com/smoketurner/virtual-waiting-room/issues/250)).
+- **Error caching.** The distribution caches a 404, 429 or 5xx for one second, not CloudFront's
+  default ten, so one failed poll does not pin an error on a whole edge location.
 - **GovCloud** is out of scope (N4). It has no CloudFront, so it has no edge gate and no request
   collapsing. A GovCloud variant would be a different topology, tracked in
   [`tasks.md`](../.kiro/specs/virtual-waiting-room/tasks.md) Phase 5.

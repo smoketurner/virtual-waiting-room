@@ -131,7 +131,7 @@ lands on boosted Init CPU rather than the first invoke.
 | **The admission gate** | CloudFront Function (`cloudfront-js-2.0`) at viewer-request on the protected behaviour only, deciding locally from a KeyValueStore (ADR-0021, issue #71); `generate_token` signs an HMAC-SHA256 session cookie the function verifies. Sub-millisecond compute at the edge, not zero, but no round trip to the origin |
 | Bot & abuse mitigation | The REST API requires an API key only the distribution holds, so nothing bypasses the edge. On a CloudFront flat-rate plan, the edge web ACL (`flat_rate_plan_tier`) requires a WAF challenge token on every JS API call, rate-limits per token and per IP (escalating to CAPTCHA), and runs Bot Control common, anti-DDoS, IP reputation and anonymous-IP rules in Count until promoted (ADR-0038). Nothing binds a place to a person: open-time demotion (ADR-0030) and entry tickets (ADR-0028) were removed. ASN matching is unbuilt |
 | Ingest | API Gateway **REST** (regional) with request validator → SQS |
-| Buffer | SQS standard queue + DLQ (`maxReceiveCount` 5), ESM `ReportBatchItemFailures` |
+| Buffer | SQS standard queue + DLQ (`maxReceiveCount` 10), ESM `ReportBatchItemFailures` |
 | Compute | Lambda (Rust, arm64) — the six functions above |
 | State | DynamoDB on-demand + PITR: `Counters`, `PreQueue`, `Positions`, `Tokens` |
 | Scheduling | EventBridge Scheduler (T−0 open, controller every minute × six passes via durable waits) |
@@ -155,6 +155,8 @@ by design with position expiry (ADR-0031) and signed URLs (ADR-0021).
 - No resource-count ceiling. N6 was retired: the number was satisfiable by rewriting the same
   infrastructure — thirteen alarms as thirteen blocks breached it, the identical thirteen as
   three `for_each` blocks did not. Judge an addition by **N1**, what it bills between events.
+  The 31 alarms now shipped cost about $3.10 a month, most of the $5 idle budget; a terraform test
+  pins the count so the next one is a decision.
 - API documented as **OpenAPI** (N8) — **not built**.
 
 ## Admin web interface

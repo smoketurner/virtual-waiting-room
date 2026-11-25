@@ -186,6 +186,12 @@ so the next one is owed what the failed one did not grant. Any other failure sti
 execution. Whether the durable service lets a handler continue past a failed step in every case
 has been read from the SDK, not measured against a deployment.
 
+The execution's bounds changed with it. `execution_timeout` is 60 s, not 120: an execution cut off
+before its last pass loses nothing, because the next execution's first pass is owed those seconds.
+The schedule's `retry_policy` and the function's async invoke config both retry zero times and
+drop an invoke older than 60 s, so a delayed start is skipped instead of running beside the next
+one. The function has reserved concurrency so ingest cannot starve it.
+
 An execution whose first pass finds the phase `idle` or `post_event` ends there. Such an event only
 becomes active by way of `pre_queue` and an open, so the remaining passes and waits were most of
 what the controller cost between events (N1). The price: an operator who goes
