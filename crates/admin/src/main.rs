@@ -111,6 +111,25 @@ async fn refuse_cross_site_writes(
     next.run(request).await
 }
 
+/// Whether a login needs the provider's `email_verified` claim to be present.
+///
+/// On unless `OIDC_REQUIRE_EMAIL_VERIFIED` is exactly `false`. The claim is
+/// optional in `OpenID` Connect, and a provider that only ever issues verified
+/// addresses may omit it; requiring it there would refuse every operator.
+fn email_verified_required() -> bool {
+    std::env::var("OIDC_REQUIRE_EMAIL_VERIFIED").as_deref() != Ok("false")
+}
+
+/// The verification a login is judged on. With the requirement off an absent
+/// claim counts as verified; an explicit `false` never does.
+fn effective_email_verified(claim: Option<bool>, required: bool) -> Option<bool> {
+    match (claim, required) {
+        (Some(verified), _) => Some(verified),
+        (None, true) => None,
+        (None, false) => Some(true),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     tracing_subscriber::fmt()
@@ -391,7 +410,7 @@ async fn callback(
     let email = match operator::admit_login(
         state.gate.allowlist(),
         claims.email().map(|e| e.as_str()),
-        claims.email_verified(),
+        effective_email_verified(claims.email_verified(), email_verified_required()),
     ) {
         Ok(email) => email,
         Err(refusal) => {
@@ -886,4 +905,22 @@ fn finish(result: Result<(), ApplyError>) -> Response {
 fn server_error(msg: &str) -> Response {
     tracing::error!(error = %msg, "admin handler error");
     (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::effective_email_verified;
+
+    #[test]
+    fn an_absent_claim_counts_as_verified_only_when_the_requirement_is_off() {
+        assert_eq!(effective_email_verified(None, true), None);
+        assert_eq!(effective_email_verified(None, false), Some(true));
+    }
+
+    #[test]
+    fn an_explicitly_unverified_address_is_never_accepted() {
+        assert_eq!(effective_email_verified(Some(false), true), Some(false));
+        assert_eq!(effective_email_verified(Some(false), false), Some(false));
+        assert_eq!(effective_email_verified(Some(true), true), Some(true));
+    }
 }

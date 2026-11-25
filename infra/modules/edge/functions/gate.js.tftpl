@@ -1,8 +1,7 @@
-// The admission gate, at viewer-request on the protected behaviour only
-// (issue #71). Decides locally: no backend call, no network access.
-//
-// Source bytes are a hard limit (10,240), so comments are kept to what stops
-// a specific bug being reintroduced; the reasoning is in ADR-0021.
+// The admission gate, viewer-request on the protected behaviour only (#71).
+// Decides locally: no backend call.
+// Source bytes are a hard limit (10,240): comments only where they stop a
+// specific bug coming back. Reasoning: ADR-0021.
 import cf from 'cloudfront';
 import crypto from 'crypto';
 
@@ -17,7 +16,7 @@ function stripSpoofableHeaders(request) {
   delete request.headers['x-wr-gate-failed'];
 }
 
-// No timing-safe compare here: HMAC both digests and compare those.
+// No timing-safe compare here: HMAC both digests, compare those.
 function macEquals(secret, a, b) {
   var ha = crypto.createHmac('sha256', secret);
   ha.update(a);
@@ -26,14 +25,14 @@ function macEquals(secret, a, b) {
   return ha.digest('base64url') === hb.digest('base64url');
 }
 
-// Keys derived per use, as wr_common::crypto::SigningKey does.
+// Keys derived per use, as SigningKey does.
 function derive(secret, label) {
   var h = crypto.createHmac('sha256', secret);
   h.update(label);
   return h.digest();
 }
 
-// #61: keyed tag of the viewer's IPv4, or IPv6 /64. Mirrors SigningKey::ip_tag.
+// #61: keyed tag of the viewer's IPv4 or IPv6 /64, as SigningKey::ip_tag.
 function ipTag(secret, ip) {
   var n = ip;
   if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) {
@@ -65,9 +64,8 @@ function decodeJson(segment) {
   }
 }
 
-// Verifies a compact JWS (RFC 7515) over the ASCII "header.payload". "alg" is
-// compared to the one value issued, never used to pick a verifier: alg:none
-// and downgrades are refused.
+// Compact JWS (RFC 7515). "alg" is compared to the one value issued, never
+// used to pick a verifier: alg:none and downgrades are refused.
 function verify(credential, secret) {
   var parts = credential.split('.');
   if (parts.length !== 3) {
@@ -94,24 +92,22 @@ function verify(credential, secret) {
   return { eventId: claims.aud, expiresAt: claims.exp, ip: claims.cip };
 }
 
-// Own-property only: a rule named "constructor" would otherwise be truthy
-// with no .value, throwing and passing every request through.
+// Own-property only: a rule named "constructor" would be truthy with no
+// .value, throwing and passing every request.
 function ownProperty(obj, key) {
   return Object.prototype.hasOwnProperty.call(obj, key) ? obj[key] : undefined;
 }
 
-// CloudFront sends the raw path to the origin, so a rule must not be evaded
-// by an encoding the origin treats as equivalent. Not an RFC 3986 resolver:
-// what an origin might canonicalise is suspicious instead (#242).
+// The origin gets the raw path, so a rule must not be evaded by an encoding
+// it treats as equivalent. What it might canonicalise is suspicious (#242).
 function hexVal(c) {
   return c >= 48 && c <= 57 ? c - 48
      : c >= 65 && c <= 70 ? c - 55
      : c >= 97 && c <= 102 ? c - 87
      : -1;
 }
-// Per-byte, as wr_common::rules::percent_decode; a malformed %XX stays literal.
-// Not decodeURIComponent: one bad escape threw and reverted the whole URI,
-// evading a PathPrefix (PR #120).
+// Per-byte, as wr_common::rules::percent_decode; a bad %XX stays literal.
+// Not decodeURIComponent: one bad escape threw and evaded the rule (PR #120).
 function percentDecode(uri) {
   var out = '';
   for (var i = 0; i < uri.length; ) {
@@ -128,8 +124,8 @@ function percentDecode(uri) {
   }
   return out;
 }
-// #242: a "." or ".." segment, ";params" or a backslash. No origin agrees
-// on what these mean, so any path rule covers them. Mirrors suspicious_path.
+// #242: a dot segment, ";params" or a backslash. Origins disagree on these,
+// so any path rule covers them. Mirrors suspicious_path.
 var SUSPICIOUS_RE = /[;\\]|(^|\/)\.\.?(\/|$)/;
 
 function queryString(qs) {
@@ -142,7 +138,7 @@ function queryString(qs) {
   return parts.length ? '?' + parts.join('&') : '';
 }
 
-// ["p",prefix] | ["h",name,value] | ["c",name] | ["u",substring]. Mirrors
+// ["p",prefix] | ["h",name,value] | ["c",name] | ["u",substring], as
 // wr_common::rules::ProtectionRule::matches; vectors prove they agree.
 function matches(rule, request) {
   var headers = request.headers || {};
@@ -209,7 +205,7 @@ async function handler(event) {
   var request = event.request, hit = false;
   try {
     stripSpoofableHeaders(request);
-    // cfg.r === [] is dormancy (#60): every request matches no rule.
+    // cfg.r === [] is dormancy (#60).
     var cfg = await kvs.get('c', { format: 'json' });
     if (cfg.v !== 1) {
       throw new Error('unrecognized gate config version');
@@ -224,12 +220,12 @@ async function handler(event) {
 
     var now = Math.floor(Date.now() / 1000);
 
-    // enforce_from: one scheduled instant on every edge, not a window.
+    // enforce_from: one instant on every edge.
     if (cfg.s && now < cfg.s) {
       request.headers['x-wr-gate'] = { value: 'pending' };
       return request;
     }
-    // fail_open_until: skew can only delay relief, never shorten it.
+    // fail_open_until: skew only delays relief.
     if (cfg.f && now < cfg.f) {
       request.headers['x-wr-gate'] = { value: 'failopen' };
       return request;
@@ -243,8 +239,8 @@ async function handler(event) {
     var secret = await kvs.get('k', { format: 'string' });
     var session = verify(cookie.value, secret);
     if (!session) {
-      // #247: a session signed before a key rotation. "kp" is optional, and
-      // read only once "k" has refused, so the hot path is one read.
+      // #247: signed before a key rotation. Optional; read only once "k"
+      // has refused.
       try {
         secret = await kvs.get('kp', { format: 'string' });
         session = verify(cookie.value, secret);
@@ -260,17 +256,15 @@ async function handler(event) {
     if (now >= session.expiresAt) {
       return refuse(request, 'expired');
     }
-    // #61, operator-enabled: a session redeemed from another network. Tagged
-    // under the key that signed it.
+    // #61, operator-enabled. Tagged under the key that signed it.
     if (cfg.b && session.ip !== ipTag(secret, event.viewer.ip)) {
       return refuse(request, 'ip');
     }
     return request;
   } catch (e) {
-    // The gate being broken, not #58: no network calls happen here.
     console.log('gate threw: ' + e);
-    // #242: past a rule match the request is known protected, so a throw
-    // refuses. A literal, since building a refusal may be what threw.
+    // #242: past a rule match the request is protected, so a throw refuses.
+    // A literal: building a refusal may be what threw.
     if (hit) {
       return {
         statusCode: 403,
