@@ -159,10 +159,10 @@ twice, so under continuous traffic at T−0 the wait runs its full length: the o
 after the published start, and everyone who joins in that time is in the cohort
 ([local stack](LOCAL_STACK.md#findings)).
 
-A join refused with a 429 is not queued at all, so the drain cannot help it. A visitor who arrived
-before T−0 but whose join was throttled is placed behind the cohort when the retry lands after the
-open. With the arrival model in §12, 44% of a cohort arrives in the last second of the countdown,
-which at the default join throttle is more than 7,000/s.
+A join refused with a 429 is not queued at all. During the countdown the page retries it at the poll
+floor, about every 5 s, without backing off, so a registration throttled in the last seconds lands
+inside the drain wait and is in the cohort. With the arrival model in §12, 44% of a cohort arrives
+in the last second of the countdown, which at the default join throttle is more than 7,000/s.
 
 **Stragglers.** A registration landing after `open_event` read its shard is invisible to the
 open. The batch re-reads `Counters` after its writes and, if the event opened underneath it, gives

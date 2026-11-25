@@ -499,7 +499,7 @@
     el.note.textContent = message;
   }
 
-  function join() {
+  function join(countdown) {
     if (joinedId === requestId || readStored(JOINED_KEY) === requestId) {
       joinedId = requestId;
       return Promise.resolve();
@@ -550,12 +550,13 @@
       // Exponential, capped. The cap bounds the rate; MAX_JOIN_ATTEMPTS is what
       // bounds the total. Spread by half either way, because every visitor
       // turned away in the same second would otherwise come back in the same
-      // second, and the gateway would sit idle in between.
+      // second, and the gateway would sit idle in between. A throttled
+      // registration during the countdown does not grow: it has to land before
+      // the open counts the cohort, or the visitor is numbered behind all of it.
+      var exponent =
+        countdown && res.status === 429 ? 0 : Math.min(joinAttempts + joinThrottles, 7) - 1;
       var backoff =
-        Math.min(
-          JOIN_BACKOFF_CEILING_MS,
-          policy.floorMs * Math.pow(2, Math.min(joinAttempts + joinThrottles, 7) - 1)
-        ) *
+        Math.min(JOIN_BACKOFF_CEILING_MS, policy.floorMs * Math.pow(2, exponent)) *
         (0.5 + Math.random());
       joinBlockedUntil = Date.now() + backoff;
     });
@@ -1087,7 +1088,15 @@
             // churn the catch handler. Must return the promise chain, or a
             // rejected join never reaches tick()'s catch and schedule()
             // never runs again.
-            return join().then(schedule);
+            return join(true)
+              .then(function () {
+                // Until the registration lands, ask again at the floor rather
+                // than the closed event's ceiling.
+                if (joinedId !== requestId) {
+                  nextIntervalMs = policy.floorMs;
+                }
+              })
+              .then(schedule);
           }
           return schedule();
         }

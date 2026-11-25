@@ -75,9 +75,10 @@ What the runs changed:
 - **Admission at the open is lumpier than the design said.** The budget bounds it, but inside an
   interval nothing shapes it, so the origin should expect up to about 6× the target for a second
   at the open. ADR-0039 now gives the measured figures.
-- **Throttled registrants lose their place in the cohort.** A join refused at the end of a
-  countdown is retried after the open and numbered behind everyone. DESIGN §4.1 records it; the
-  remedy is a join throttle and account quota sized to the countdown's last second.
+- **Throttled registrants lost their place in the cohort.** The page retried a join refused at the
+  end of a countdown at its 30 s closed-event interval, so it landed after the open and was numbered
+  behind everyone. The page now retries a throttled registration at the 5 s floor without backing
+  off, which lands it inside the open's drain wait.
 - **The open's drain wait always runs its length under continuous traffic.** DESIGN §4.1 records
   it.
 - **The page retried a 429 or a 5xx from `/generate_token` at its 5 s floor.** It now backs off as

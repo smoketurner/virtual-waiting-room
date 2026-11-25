@@ -22,6 +22,14 @@ const JITTER_FRACTION: f64 = 0.3;
 const MAX_JOIN_ATTEMPTS: u32 = 8;
 const MAX_REJOIN_CYCLES: u32 = 3;
 const JOIN_BACKOFF_CEILING_MS: f64 = 120_000.0;
+
+/// When a join is made: during the countdown, a throttled join is retried at
+/// the floor rather than backed off.
+#[derive(Debug, Clone, Copy)]
+enum Joining {
+    Countdown,
+    Open,
+}
 const MAX_MISSES: u32 = 8;
 const FIRST_ASK_TARGET_RPS: f64 = 5000.0;
 const FIRST_ASK_MAX_SPREAD_MS: f64 = 120_000.0;
@@ -286,7 +294,7 @@ impl Visitor<'_> {
     }
 
     /// The page's `join()`.
-    async fn join(&mut self) -> Result<(), &'static str> {
+    async fn join(&mut self, when: Joining) -> Result<(), &'static str> {
         if self.joined {
             return Ok(());
         }
@@ -318,7 +326,12 @@ impl Visitor<'_> {
             self.join_attempts -= 1;
             self.join_throttles += 1;
         }
-        let exponent = (self.join_attempts + self.join_throttles).min(7);
+        // A registration throttled during the countdown does not grow: it has
+        // to land before the open counts the cohort.
+        let exponent = match when {
+            Joining::Countdown if res.status == 429 => 1,
+            Joining::Countdown | Joining::Open => (self.join_attempts + self.join_throttles).min(7),
+        };
         let backoff = (self.policy.floor * 2f64.powi(i32::try_from(exponent).unwrap_or(7) - 1))
             .min(JOIN_BACKOFF_CEILING_MS)
             * (0.5 + self.rng.unit());
@@ -368,10 +381,13 @@ impl Visitor<'_> {
                 "closed" => {
                     known = None;
                     self.next_ms = self.policy.ceiling;
-                    if s.get("phase").and_then(|v| v.as_str()) == Some("pre_queue")
-                        && let Err(why) = self.join().await
-                    {
-                        return Outcome::GaveUp(why);
+                    if s.get("phase").and_then(|v| v.as_str()) == Some("pre_queue") {
+                        if let Err(why) = self.join(Joining::Countdown).await {
+                            return Outcome::GaveUp(why);
+                        }
+                        if !self.joined {
+                            self.next_ms = self.policy.floor;
+                        }
                     }
                     self.pause().await;
                     continue;
@@ -396,7 +412,7 @@ impl Visitor<'_> {
                 let delay = (self.rng.unit() * spread).floor();
                 self.first_ask_at = Some(Instant::now() + Duration::from_secs_f64(delay / 1000.0));
             }
-            if let Err(why) = self.join().await {
+            if let Err(why) = self.join(Joining::Open).await {
                 return Outcome::GaveUp(why);
             }
             let position = if let Some(p) = known {
