@@ -14,7 +14,7 @@ The build-state record for requirements.md. Requirement IDs in brackets; decisio
 - [x] `Counters` event item: sequences, `phase` (incl. `maintenance`), `target_rate`, `shuffle_seed`, `operator_message`, `admission_control` + `fail_open_until`; `prequeue_counter` and `arrivals` striped ×10 as separate items (ADR-0015)
 - [x] Batch range claim via one `UpdateItem ADD` / `ALL_NEW`, incremented by the **valid** count only [F2.2, F2.6]
 - [x] Every position write guarded by `attribute_not_exists(request_id)` [F2.5]
-- [ ] `max_throughput_*` table variables (DESIGN §6.7) — Partial: not built.
+- [ ] `max_throughput_*` table variables (DESIGN §5.5) — Partial: not built.
 
 ### 1b. Event lifecycle and modes
 

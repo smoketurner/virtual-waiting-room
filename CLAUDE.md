@@ -68,7 +68,7 @@ origin load is independent of how many people are waiting.
 Position assignment has two paths:
 
 - **Pre-queue (scheduled).** Registration writes `PreQueue {r, s, l, t}`: shard
-  `s = hash(request_id) % 10`, local index `l` from a striped counter (ADR-0015). At T−0
+  `s` drawn at random per ingest batch (issue #59), local index `l` from a striped counter (ADR-0015). At T−0
   `open_event` folds the ten shard counts into prefix offsets and a cohort size and writes
   seed + offsets + count + phase in **one conditional `UpdateItem`** guarded by
   `attribute_not_exists(shuffle_seed)`, so a double-fire opens exactly once. A visitor's
