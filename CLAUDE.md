@@ -258,7 +258,7 @@ rather than mocking logic.
 
 ## Documentation layers
 
-`docs/` is the human narrative (`REQUIREMENTS.md`, `DESIGN.md`, `PLAN.md`, `adr/`).
+`docs/` is the human narrative (`ARCHITECTURE.md`, `DESIGN.md`, `DYNAMODB.md`, `REQUIREMENTS.md`, `DEPLOY.md`, `RUNBOOK.md`, `adr/`).
 `.kiro/specs/virtual-waiting-room/` is the agent-facing SDD (EARS requirements, design,
 tasks). Requirement IDs (`F*`, `C*`, `N*`, `O*`) are the join key: when a requirement changes,
 update both layers and keep the ID stable. Neither layer restates a decision's rationale —

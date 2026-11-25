@@ -84,14 +84,14 @@ Two things are ours:
 What they have that we do not, and it is not only breadth:
 
 - **Identity.** One position per person, enforced — visitor identification keys, invite-only
-  rooms, enqueue tokens, IP binding, proof-of-work, reputation, deferred bot mitigation at
+  rooms, enqueue tokens, proof-of-work, reputation, deferred bot mitigation at
   randomization. Randomization converts volume into expected share, so a raffle without
   identity is a raffle a bot farm wins (#59). The edge web ACL (ADR-0038) makes each place cost
   a browser challenge solve, which prices out a script but not a farm running real browsers.
   This is still the gap that matters most.
 - **A gate that can observe the backend.** Their connector and Cloudflare's Worker can call
   home; our CloudFront Function makes no network calls. That is why automatic fail-open (#58)
-  and revocation (#63) are open, and the no-JavaScript path (#67) is open too.
+  and revocation (#63) are open.
 
 The difference is therefore **architecture as well as deployment model**, and the consequences
 above are the cost of ADR-0021.
