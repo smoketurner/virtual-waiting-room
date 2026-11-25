@@ -8,12 +8,12 @@ use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
 use aws_sdk_dynamodb::types::AttributeValue;
 use wr_common::expr::{
     Condition, ENTRY_TIME_ATTR, Key, POSITION_TTL_SECS, POSITIONS_KEY_ATTR, POSITIONS_TTL_ATTR,
-    POSSESSION_DIGEST_ATTR, QUEUE_POSITION_ATTR, SHARD_COUNT_ATTR, SHARD_INDEX_ATTR, STATUS_ATTR,
+    POSSESSION_DIGEST_ATTR, QUEUE_POSITION_ATTR, SHARD_CAP_ATTR, SHARD_COUNT_ATTR, STATUS_ATTR,
     Update,
 };
 use wr_common::{Counters, PositionStatus, PreQueueItem, SecretDigest, Shard};
 
-use crate::{AdmissionClaim, PositionRow, Store, StoreError};
+use crate::{PositionRow, Store, StoreError};
 
 /// A live store bound to the three tables the admission check reads.
 pub struct DynamoStore {
@@ -89,13 +89,13 @@ impl Store for DynamoStore {
         Ok(out.item().and_then(position_from_item))
     }
 
-    async fn claim_admission(
+    async fn mark_admitted(
         &self,
         request_id: &str,
         position: u64,
         digest: &SecretDigest,
         now: u64,
-    ) -> Result<AdmissionClaim, StoreError> {
+    ) -> Result<(), StoreError> {
         // One `UpdateItem` serves both populations. A live joiner already has
         // the row, written at registration with `status = issued`; a pre-queue
         // member has none, and this creates it. The guard is the disjunction of
@@ -153,42 +153,59 @@ impl Store for DynamoStore {
             .await;
 
         match result {
-            Ok(_) => Ok(AdmissionClaim::First),
+            Ok(_) => Ok(()),
             Err(SdkError::ServiceError(se))
                 if matches!(
                     se.err(),
                     UpdateItemError::ConditionalCheckFailedException(_)
                 ) =>
             {
-                Ok(AdmissionClaim::Repeat)
+                // Already marked by a concurrent call for the same visitor.
+                Ok(())
             }
-            Err(e) => Err(StoreError(format!("update_item claim admission: {e}"))),
+            Err(e) => Err(StoreError(format!("update_item mark admitted: {e}"))),
         }
     }
 
-    async fn record_arrival(&self, event_id: &str, shard: Shard) -> Result<(), StoreError> {
-        // Stamps the shard's own index alongside the +1 so a reader that
-        // fetched a batch of shards knows which is which.
+    async fn take_slot(&self, event_id: &str, shard: Shard) -> Result<bool, StoreError> {
         let bump = Update::new()
-            .set(
-                SHARD_INDEX_ATTR,
-                AttributeValue::N(shard.index().to_string()),
-            )
             .add(SHARD_COUNT_ATTR, AttributeValue::N("1".to_owned()))
             .build();
-        // The shard is its own item, so arrivals at the admission rate do not
-        // contend with the queue_counter claims on the Counters item.
-        self.client
+        // Allowed only below the cap the controller last wrote (ADR-0039). A
+        // shard with no cap yet -- an event the controller has not passed over
+        // -- fails the comparison and admits nobody, which is the right answer
+        // before anyone has been granted anything.
+        let guard = Condition::attr_less_than(SHARD_COUNT_ATTR, SHARD_CAP_ATTR).build();
+
+        let mut names = bump.names;
+        names.extend(guard.names);
+
+        // The shard is its own item, so admissions do not contend with the
+        // queue_counter claims on the event's item.
+        let result = self
+            .client
             .update_item()
             .table_name(&self.counters_table)
             .set_key(Some(Key::ArrivalsShard { event_id, shard }.build()))
             .update_expression(bump.expression)
-            .set_expression_attribute_names(Some(bump.names))
+            .condition_expression(guard.expression)
+            .set_expression_attribute_names(Some(names))
             .set_expression_attribute_values(Some(bump.values))
             .send()
-            .await
-            .map_err(|e| StoreError(format!("update_item arrivals: {e}")))?;
-        Ok(())
+            .await;
+
+        match result {
+            Ok(_) => Ok(true),
+            Err(SdkError::ServiceError(se))
+                if matches!(
+                    se.err(),
+                    UpdateItemError::ConditionalCheckFailedException(_)
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(StoreError(format!("update_item admission slot: {e}"))),
+        }
     }
 }
 

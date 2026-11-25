@@ -1,6 +1,8 @@
 # ADR-0033: Admission is claimed once per visitor, and a repeat still admits
 
-**Status:** Accepted
+**Status:** Accepted. Amended by [0039](0039-meter-admissions-not-the-cursor.md): the claim is now a
+mark made after a unit of the admission budget is taken, and the arrival count it protected is that
+budget. A repeat still admits.
 
 ## 1. Context
 

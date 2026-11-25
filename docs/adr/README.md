@@ -25,7 +25,7 @@ One record per decision. Each states the context, the decision, and its conseque
 | [0018](0018-admin-vouch-design-language.md) | Style the admin UI with the Vouch design language (supersedes 0014's styling) |
 | [0019](0019-visitor-facing-serving-state.md) | Express the visitor-facing serving state as one enum |
 | [0021](0021-edge-function-gate.md) | Gate the protected origin with a CloudFront Function |
-| [0022](0022-durable-controller-cadence.md) | Build the controller's 10-second cadence from durable waits |
+| [0022](0022-durable-controller-cadence.md) | Build the controller's 10-second cadence from durable waits (control law amended by 0039) |
 | [0023](0023-adaptive-poll-interval.md) | Scale the client poll interval with distance to the front |
 | [0024](0024-jws-credentials.md) | Carry credentials as a JWS (amends 0011; amended by 0032) |
 | [0025](0025-operator-owned-seal-schedule.md) | The operator owns the open schedule's time; Terraform owns the schedule (revised: Open now, and `active` is not operator-settable) |
@@ -36,12 +36,13 @@ One record per decision. Each states the context, the decision, and its conseque
 | [0030](0030-remove-open-time-demotion.md) | Remove open-time demotion: never enabled, sixteen concepts, and a room-wide refusal if one chunk item went unread |
 | [0031](0031-remove-controller-driven-expiry.md) | Remove controller-driven expiry: an unbounded Scan six times a minute that could not see the pre-queue cohort |
 | [0032](0032-remove-the-origin-authorizer.md) | Remove the origin authorizer: nothing invoked it, and as wired it forwarded every request |
-| [0033](0033-admission-claimed-once-per-visitor.md) | Admission is claimed once per visitor, and a repeat still admits |
+| [0033](0033-admission-claimed-once-per-visitor.md) | Admission is claimed once per visitor, and a repeat still admits (amended by 0039) |
 | [0034](0034-single-region-failure-domain.md) | The waiting room is single-region, and fails open around a regional impairment |
 | [0035](0035-request-id-proof-of-possession.md) | A request id is redeemed only with the secret it joined with (amends 0010) |
 | [0036](0036-optional-session-ip-binding.md) | Sessions can be bound to the visitor's network, off by default |
 | [0037](0037-no-javascript-queue.md) | A visitor without JavaScript queues through a small server-rendered path |
 | [0038](0038-edge-web-acl-on-flat-rate-plan.md) | A place in the queue costs a WAF challenge, and the API answers only CloudFront |
+| [0039](0039-meter-admissions-not-the-cursor.md) | Meter admissions with a budget taken at issuance; the no-show estimator is removed (amends 0022, 0033) |
 
 ## Open
 
@@ -53,5 +54,4 @@ Decisions deferred until measurement or a client engagement supplies the input.
 | Flat-rate versus pay-as-you-go CloudFront pricing | Flat-rate is the path for an event that runs the edge web ACL: the plan bundles its cost ([ADR-0038](0038-edge-web-acl-on-flat-rate-plan.md)). `flat_rate_plan_tier` creates the subscription. PAYG stays the default for a deployment without the web ACL; the crossover is otherwise non-monotonic in event size, poll interval and Bot Control tier. |
 | Signing key rotation | Compromise permits minting admission for every event in the deployment. |
 | Standby inflow measurement placement | Authorizer-local versus centrally aggregated. |
-| No-show controller tuning | Smoothing window and correction bounds need a real event's data. |
 | Connector breadth | Product scope: the competitor ships 25+ platform connectors; we ship a CloudFront/origin authorizer. |

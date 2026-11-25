@@ -1,8 +1,9 @@
 //! The `aws-sdk-dynamodb`-backed [`Store`] for the controller.
 //!
-//! The controller reads and writes one table. The event's own state is a single-item `GetItem`/`UpdateItem`. The arrivals
-//! shards are separate items under their own partition keys, so summing them
-//! is a `BatchGetItem` rather than attributes already in hand.
+//! The controller reads and writes one table. The event's own state is a
+//! single-item `GetItem`/`UpdateItem`. The arrivals shards are separate items
+//! under their own partition keys, read with one `BatchGetItem` and each given
+//! its cap with its own `UpdateItem`.
 
 use std::collections::HashMap;
 
@@ -10,15 +11,15 @@ use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
 use aws_sdk_dynamodb::types::AttributeValue;
-use wr_common::expr::Key;
-use wr_common::{Phase, SHARDS, StoredControl};
-use wr_common::{Shard, shard_count_of, shard_index_of};
+use wr_common::expr::{Key, SHARD_CAP_ATTR, SHARD_COUNT_ATTR, SHARD_INDEX_ATTR, Update};
+use wr_common::{Phase, SHARDS, Shard, StoredControl};
+use wr_common::{shard_cap_of, shard_count_of, shard_index_of};
 
 use crate::{
-    ControllerState, NoShowState, ReleaseDecision, ReleaseInputs, ReleaseOutcome, Store, StoreError,
+    ControllerState, PassDecision, PassInputs, ReleaseOutcome, ShardBudget, Store, StoreError,
 };
 
-/// A live `DynamoDB` store bound to the counters and positions tables.
+/// A live `DynamoDB` store bound to the counters table.
 pub struct DynamoStore {
     client: Client,
     counters_table: String,
@@ -34,11 +35,14 @@ impl DynamoStore {
             event_id,
         }
     }
+
+    #[must_use]
+    pub fn event_id(&self) -> &str {
+        &self.event_id
+    }
 }
 
-/// Reads a numeric `Counters` attribute as `u64`, defaulting to 0 when absent or
-/// unparsable (an attribute a fresh event has never written).
-fn num(item: &std::collections::HashMap<String, AttributeValue>, attr: &str) -> u64 {
+fn num(item: &HashMap<String, AttributeValue>, attr: &str) -> u64 {
     item.get(attr)
         .and_then(|v| v.as_n().ok())
         .and_then(|s| s.parse::<u64>().ok())
@@ -61,20 +65,15 @@ impl Store for DynamoStore {
             .item()
             .ok_or_else(|| StoreError(format!("no Counters item for event {event_id}")))?;
 
-        // A stored phase that fails to parse resolves to Idle, gating the
-        // controller off rather than acting on a garbage phase.
         let phase = item
             .get("phase")
             .and_then(|v| v.as_s().ok())
             .and_then(|s| s.parse::<Phase>().ok())
             .unwrap_or(Phase::Idle);
 
-        // One rule, shared with every other reader: absent is normal
-        // admission, present-and-unreadable holds. This is the component that
-        // would act on a misread by releasing people into an origin an
-        // operator was trying to protect, so it says so under a stable event
-        // name -- a controller that silently stops releasing looks exactly
-        // like one with nothing to release.
+        // An unreadable control decays to `Paused` in `stored_control_of`; say
+        // so, because a controller that silently holds looks like one that is
+        // working.
         let stored_control = wr_common::stored_control_of(item);
         if stored_control == StoredControl::Paused
             && item.get("admission_control").and_then(|v| v.as_s().ok())
@@ -87,47 +86,24 @@ impl Store for DynamoStore {
             );
         }
 
-        let fail_open_until = num(item, "fail_open_until");
-
-        // target_rate absent (never set by the operator) means no admission
-        // target yet; treat as 0 so the controller releases nothing.
-        let target_rate = u32::try_from(num(item, "target_rate")).unwrap_or(0);
-
-        let prev_no_show = item
-            .get("no_show_rate")
-            .and_then(|v| v.as_n().ok())
-            .and_then(|s| s.parse::<f64>().ok())
-            .filter(|r| r.is_finite() && (0.0..=1.0).contains(r))
-            .map(|smoothed_rate| NoShowState { smoothed_rate });
-
-        let arrivals = self.read_arrivals(event_id).await?;
-
         Ok(ControllerState {
             phase,
             stored_control,
-            fail_open_until,
-            inputs: ReleaseInputs {
-                arrivals,
-                last_arrivals_total: num(item, "last_arrivals_total"),
-                last_serving_counter: num(item, "last_serving_counter"),
+            fail_open_until: num(item, "fail_open_until"),
+            inputs: PassInputs {
+                shards: self.read_shards(event_id).await?,
                 serving_counter: num(item, "serving_counter"),
                 queue_counter: num(item, "queue_counter"),
-                target_rate,
-                // Absent on a fresh event (defaults to 0): `now - 0` is huge,
-                // so the first post-deploy open pass falls back to the raw
-                // `target` rather than seeding the EWMA off `0/0`. Benign —
-                // and self-correcting, since the first `write_release` landing
-                // sets it for everything that follows.
+                target_rate: u32::try_from(num(item, "target_rate")).unwrap_or(0),
                 last_open_pass_at: num(item, "last_open_pass_at"),
             },
-            prev_no_show,
         })
     }
 
     async fn write_release(
         &self,
         event_id: &str,
-        decision: &ReleaseDecision,
+        decision: &PassDecision,
         expected_serving_counter: u64,
     ) -> Result<ReleaseOutcome, StoreError> {
         let result = self
@@ -135,13 +111,7 @@ impl Store for DynamoStore {
             .update_item()
             .table_name(&self.counters_table)
             .set_key(Some(Key::Event { event_id }.build()))
-            .update_expression(
-                "SET serving_counter = :next, last_serving_counter = :last_serving, \
-                 last_arrivals_total = :arrivals_total, no_show_rate = :no_show, \
-                 last_open_pass_at = :last_open_pass",
-            )
-            // Guard against a lost race: only advance if serving_counter is still
-            // what we read, so two overlapping invokes cannot double-advance.
+            .update_expression("SET serving_counter = :next, last_open_pass_at = :at")
             .condition_expression(
                 "attribute_not_exists(serving_counter) OR serving_counter = :expected",
             )
@@ -149,29 +119,8 @@ impl Store for DynamoStore {
                 ":next",
                 AttributeValue::N(decision.next_serving_counter.to_string()),
             )
-            // The cursor as it was BEFORE this release. Writing the value after
-            // it makes the next interval measure a release of zero, which takes
-            // the "nothing to measure" branch every time and leaves the
-            // controller running open-loop at the raw target forever.
             .expression_attribute_values(
-                ":last_serving",
-                AttributeValue::N(decision.previous_serving_counter.to_string()),
-            )
-            .expression_attribute_values(
-                ":arrivals_total",
-                AttributeValue::N(decision.arrivals_total.to_string()),
-            )
-            .expression_attribute_values(
-                ":no_show",
-                AttributeValue::N(decision.no_show.smoothed_rate.to_string()),
-            )
-            // The epoch at which this open pass ran, read back next interval as
-            // `last_open_pass_at` for the staleness check in `compute_release`.
-            // Written here — the sole writer — so the `Held` path stays a pure
-            // read, and the baselines freeze across a `Paused`/`FailOpen` hold
-            // exactly as they did before, only now the resume pass can tell.
-            .expression_attribute_values(
-                ":last_open_pass",
+                ":at",
                 AttributeValue::N(decision.last_open_pass_at.to_string()),
             )
             .expression_attribute_values(
@@ -189,24 +138,45 @@ impl Store for DynamoStore {
                     UpdateItemError::ConditionalCheckFailedException(_)
                 ) =>
             {
-                // Another invoke advanced first; this pass's release is stale
-                // and did not persist. Returning `LostRace` rather than `Ok`
-                // lets `run_pass` report that it released nobody instead of
-                // claiming the release the winner actually made.
-                tracing::info!(event_id, "release write lost the race; skipping");
                 Ok(ReleaseOutcome::LostRace)
             }
             Err(e) => Err(StoreError(format!("update_item release: {e}"))),
         }
     }
+
+    async fn write_caps(&self, event_id: &str, caps: &[u64; SHARDS]) -> Result<(), StoreError> {
+        for (index, cap) in caps.iter().enumerate() {
+            let shard = Shard::new(index)
+                .ok_or_else(|| StoreError(format!("shard index {index} out of range")))?;
+            // The count is created at zero beside the cap: `generate_token`
+            // takes budget with `n < c`, and a comparison against an absent
+            // attribute is false, so a shard with a cap and no count would
+            // admit nobody.
+            let grant = Update::new()
+                .set(SHARD_CAP_ATTR, AttributeValue::N(cap.to_string()))
+                .set(SHARD_INDEX_ATTR, AttributeValue::N(index.to_string()))
+                .set_if_not_exists(SHARD_COUNT_ATTR, AttributeValue::N("0".to_owned()))
+                .build();
+            self.client
+                .update_item()
+                .table_name(&self.counters_table)
+                .set_key(Some(Key::ArrivalsShard { event_id, shard }.build()))
+                .update_expression(grant.expression)
+                .set_expression_attribute_names(Some(grant.names))
+                .set_expression_attribute_values(Some(grant.values))
+                .send()
+                .await
+                .map_err(|e| StoreError(format!("update_item shard {index} cap: {e}")))?;
+        }
+        Ok(())
+    }
 }
 
 impl DynamoStore {
-    /// Sums the arrivals shards. They are separate items under their own
-    /// partition keys so that recording an arrival never contends with the
-    /// sequences on the `Counters` item, which means reading them is a
-    /// `BatchGetItem` rather than attributes already in hand.
-    async fn read_arrivals(&self, event_id: &str) -> Result<[u64; SHARDS], StoreError> {
+    /// One `BatchGetItem` over the ten arrivals shards, read consistently: the
+    /// caps written from this read are `taken` plus a share, so a stale count
+    /// would re-grant budget that has already been spent.
+    async fn read_shards(&self, event_id: &str) -> Result<[ShardBudget; SHARDS], StoreError> {
         let keys: Vec<_> = (0..SHARDS)
             .filter_map(Shard::new)
             .map(|shard| Key::ArrivalsShard { event_id, shard }.build())
@@ -214,6 +184,7 @@ impl DynamoStore {
 
         let request = aws_sdk_dynamodb::types::KeysAndAttributes::builder()
             .set_keys(Some(keys))
+            .consistent_read(true)
             .build()
             .map_err(|e| StoreError(format!("build arrivals keys: {e}")))?;
 
@@ -225,115 +196,113 @@ impl DynamoStore {
             .await
             .map_err(|e| StoreError(format!("batch_get_item arrivals: {e}")))?;
 
-        let items = out
-            .responses()
-            .and_then(|r| r.get(&self.counters_table))
-            .map_or_default(Vec::as_slice);
-        let arrivals = arrivals_from_shard_items(items)?;
-        // An incomplete batch under-counts arrivals, which reads as a higher
-        // no-show rate and releases more. Better to skip the pass than to
-        // over-release on a partial read.
+        // A partial batch must not be folded: a shard that was not returned
+        // would read as holding no budget and having admitted nobody.
         if out
             .unprocessed_keys()
             .is_some_and(|u| u.contains_key(&self.counters_table))
         {
             return Err(StoreError("arrivals read incomplete; retry".to_owned()));
         }
-        Ok(arrivals)
+        let items = out
+            .responses()
+            .and_then(|r| r.get(&self.counters_table))
+            .map_or_default(Vec::as_slice);
+        shards_from_items(items)
     }
 }
 
-/// Folds a batch-get response's arrivals shard items into per-shard counts.
+/// Folds `BatchGetItem` responses into the per-shard budgets. A shard with no
+/// item has admitted nobody and holds no budget.
 ///
-/// The arrivals shards mirror the pre-queue shards the open reads: each is its
-/// own item under its own partition key, so a `BatchGetItem` response only
-/// contains one when something has written it. A present item whose count
-/// attribute (`n`) cannot be read is therefore corruption, not an empty shard
-/// — reading it as zero would under-count that shard's arrivals, which reads
-/// as a higher no-show rate and over-releases, exactly the outcome the
-/// `unprocessed_keys` check guards against for the partial-read case. An
-/// unreadable count is a hard error rather than a silent zero.
-///
-/// An item whose shard index (`s`) cannot be read still has no home in
-/// `[0, SHARDS)`; it is skipped as before, since there is no count to
-/// misattribute it to.
-fn arrivals_from_shard_items(
+/// An item with a readable index and an unreadable count is corruption, and an
+/// error: defaulting it to zero would grant that shard a cap far below what it
+/// has already taken, closing it. An absent cap is not -- `generate_token`
+/// creates a shard's count only through a cap, but a shard never granted one
+/// is a legitimate state for the first pass to find.
+fn shards_from_items(
     items: &[HashMap<String, AttributeValue>],
-) -> Result<[u64; SHARDS], StoreError> {
-    let mut arrivals = [0u64; SHARDS];
+) -> Result<[ShardBudget; SHARDS], StoreError> {
+    let mut shards = [ShardBudget::default(); SHARDS];
     for item in items {
-        let Some(shard) = shard_index_of(item) else {
+        let Some(index) = shard_index_of(item) else {
             continue;
         };
-        arrivals[shard] = shard_count_of(item)
+        let taken = shard_count_of(item)
             .ok_or_else(|| StoreError("arrivals item has an unreadable count".to_owned()))?;
+        if let Some(slot) = shards.get_mut(index) {
+            *slot = ShardBudget {
+                taken,
+                cap: shard_cap_of(item).unwrap_or(0),
+            };
+        }
     }
-    Ok(arrivals)
-}
-
-/// The `event_id` this store is bound to, for the handler's logging.
-impl DynamoStore {
-    #[must_use]
-    pub fn event_id(&self) -> &str {
-        &self.event_id
-    }
+    Ok(shards)
 }
 
 #[cfg(test)]
 mod tests {
     #![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
 
-    use wr_common::expr::{SHARD_COUNT_ATTR, SHARD_INDEX_ATTR};
-
     use super::*;
 
-    fn shard_item(shard: usize, count: u64) -> HashMap<String, AttributeValue> {
-        HashMap::from([
+    fn shard_item(shard: usize, taken: u64, cap: Option<u64>) -> HashMap<String, AttributeValue> {
+        let mut item = HashMap::from([
             (
                 SHARD_INDEX_ATTR.to_owned(),
                 AttributeValue::N(shard.to_string()),
             ),
             (
                 SHARD_COUNT_ATTR.to_owned(),
-                AttributeValue::N(count.to_string()),
+                AttributeValue::N(taken.to_string()),
             ),
-        ])
+        ]);
+        if let Some(cap) = cap {
+            item.insert(
+                SHARD_CAP_ATTR.to_owned(),
+                AttributeValue::N(cap.to_string()),
+            );
+        }
+        item
     }
 
     #[test]
-    fn a_shard_with_no_arrivals_item_counts_zero() {
-        // `BatchGetItem` returns no item for an arrivals shard nothing has
-        // written; the fold must still report zero for it, not fail.
-        let items = vec![shard_item(0, 3), shard_item(2, 5)];
-        let arrivals = arrivals_from_shard_items(&items).unwrap();
-        assert_eq!(arrivals, [3, 0, 5, 0, 0, 0, 0, 0, 0, 0]);
+    fn a_shard_with_no_item_has_taken_nothing_and_holds_no_budget() {
+        let items = vec![shard_item(0, 3, Some(5)), shard_item(2, 5, Some(5))];
+        let shards = shards_from_items(&items).unwrap();
+        assert_eq!(shards[0], ShardBudget { taken: 3, cap: 5 });
+        assert_eq!(shards[1], ShardBudget::default());
+        assert_eq!(shards[2].unused(), 0);
     }
 
     #[test]
-    fn an_arrivals_item_with_an_unreadable_count_is_an_error_not_a_zero_count() {
-        // A present item with a readable index `s` but a missing count `n` is
-        // corruption — the item exists, so something wrote both — yet the
-        // silent default would zero `arrivals[shard]`, under-count arrivals for
-        // that shard, read it as a higher no-show rate, and over-release.
+    fn a_shard_without_a_cap_holds_no_budget() {
+        let shards = shards_from_items(&[shard_item(4, 9, None)]).unwrap();
+        assert_eq!(shards[4], ShardBudget { taken: 9, cap: 0 });
+        assert_eq!(shards[4].unused(), 0);
+    }
+
+    #[test]
+    fn an_item_with_an_unreadable_count_is_an_error_not_a_zero_count() {
         let corrupt = HashMap::from([(
             SHARD_INDEX_ATTR.to_owned(),
             AttributeValue::N("3".to_owned()),
         )]);
-        let items = vec![shard_item(0, 3), corrupt];
-        assert!(arrivals_from_shard_items(&items).is_err());
+        assert!(shards_from_items(&[shard_item(0, 3, Some(4)), corrupt]).is_err());
     }
 
     #[test]
-    fn an_arrivals_item_with_an_unreadable_index_is_skipped_not_an_error() {
-        // An item with an unreadable shard index has no home in
-        // `[0, SHARDS)`; it is skipped rather than failing the whole batch,
-        // matching the prior `continue`.
+    fn an_item_with_an_unreadable_index_is_skipped() {
         let corrupt = HashMap::from([(
             SHARD_COUNT_ATTR.to_owned(),
             AttributeValue::N("9".to_owned()),
         )]);
-        let items = vec![shard_item(0, 3), corrupt];
-        let arrivals = arrivals_from_shard_items(&items).unwrap();
-        assert_eq!(arrivals, [3, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let shards = shards_from_items(&[shard_item(0, 3, Some(4)), corrupt]).unwrap();
+        assert_eq!(shards[0], ShardBudget { taken: 3, cap: 4 });
+        assert_eq!(unused_total(shards), 1);
+    }
+
+    fn unused_total(shards: [ShardBudget; SHARDS]) -> u64 {
+        crate::unused_budget(shards)
     }
 }

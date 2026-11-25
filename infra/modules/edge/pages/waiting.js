@@ -17,10 +17,8 @@
   "use strict";
 
   // "<request_id>.<secret>" as one value, so the id is never recovered
-  // without the secret that proves it (issue #62). Replaces vwr_request_id,
-  // which held the id alone and is cleared on sight.
+  // without the secret that proves it (issue #62).
   var IDENTITY_KEY = "vwr_identity";
-  var LEGACY_ID_KEY = "vwr_request_id";
   var IDENTITY_RE = /^([0-9a-f-]{36})\.([A-Za-z0-9_-]{43})$/;
   var JOINED_KEY = "vwr_joined";
   var AHEAD_AT_START_KEY = "vwr_ahead_at_start";
@@ -275,8 +273,7 @@
   // Resolves the identity this page queues under, before the first poll. The
   // id and its secret survive a reload together through the storage chain
   // above; a visitor whose every tier fails mints a fresh pair and so takes a
-  // new place rather than recovering their old one. A legacy bare id cannot
-  // be redeemed (it has no secret behind it), so it is replaced, not reused.
+  // new place rather than recovering their old one.
   function resolveIdentity() {
     var match = IDENTITY_RE.exec(readStored(IDENTITY_KEY) || "");
     if (match) {
@@ -284,7 +281,6 @@
       secret = match[2];
       return;
     }
-    removeStored(LEGACY_ID_KEY);
     var bytes = new Uint8Array(32);
     crypto.getRandomValues(bytes);
     requestId = uuidv7();
@@ -864,8 +860,9 @@
         window.location.replace(nextDestination());
         return;
       }
-      // Not admitted after all: the cursor moved back, the position expired, or
-      // the operator paused. Fall back to polling rather than hammering.
+      // Not admitted this time: the origin has had its share for the moment
+      // (a 425 while the admission budget is spent, ADR-0039), or the operator
+      // paused. Fall back to polling rather than hammering.
       admitting = false;
       if (res.status === 403) {
         // The secret this browser holds is not the one the place was taken

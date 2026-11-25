@@ -278,6 +278,9 @@ pub fn outcome(admission: Admission) -> WaitOutcome {
                 position,
                 ahead: position.saturating_sub(serving),
             },
+            // Their turn has come and the origin is full for the moment: the
+            // front of the line, refreshing at the short interval.
+            Denied::AtCapacity { position } => WaitPage::Queued { position, ahead: 0 },
             Denied::NotRegistered => WaitPage::Joining,
             Denied::NotAdmitting | Denied::NotOpen => WaitPage::Holding,
             Denied::NotHolder => WaitPage::Lost,

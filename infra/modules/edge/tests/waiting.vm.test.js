@@ -437,10 +437,8 @@ test("the join carries SHA-256 of the secret, and only redemption carries the se
   }
 });
 
-test("the id and its secret are stored together, and a bare legacy id is replaced", async () => {
-  const legacy = "018f3a2b-7c9d-7e1f-abcd-0123456789ab";
+test("the id and its secret are stored together", async () => {
   const client = loadClient({ route: admittedRoute() });
-  client.win.localStorage.setItem("vwr_request_id", legacy);
   await client.flush();
 
   const stored = client.win.localStorage.getItem("vwr_identity");
@@ -469,6 +467,27 @@ test("a redemption refused as not the holder stops, rather than polling forever"
   assert.equal(client.win.location.replacedTo, undefined);
   assert.equal(client.lastTimer(), undefined, "nothing left scheduled");
   assert.match(client.elements.headline.textContent, /couldn't confirm/);
+});
+
+// ADR-0039: the visitor's turn has come but the admission budget is spent.
+test("a redemption answered 'at capacity' keeps polling and is admitted on a later try", async () => {
+  const admitted = admittedRoute();
+  let full = true;
+  const client = loadClient({
+    route: (url) =>
+      url.startsWith("/v1/generate_token") && full
+        ? jsonResponse(425, { admitted: false, error: "at capacity; position 50 is next" })
+        : admitted(url),
+  });
+  await client.flush();
+  assert.equal(client.win.location.replacedTo, undefined);
+  const retry = client.lastTimer();
+  assert.ok(retry, "a poll is still scheduled");
+
+  full = false;
+  retry.fn();
+  await client.flush();
+  assert.equal(client.win.location.replacedTo, "/");
 });
 
 // --- issue #61: re-minting a session refused for another network ----------

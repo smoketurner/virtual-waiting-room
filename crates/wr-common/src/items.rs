@@ -355,6 +355,17 @@ pub fn shard_count_of<S: std::hash::BuildHasher>(
         .and_then(|n| n.parse::<u64>().ok())
 }
 
+/// Reads an arrivals shard's admission cap (ADR-0039). `None` for a shard that
+/// has never been granted one, which holds no budget.
+#[must_use]
+pub fn shard_cap_of<S: std::hash::BuildHasher>(
+    item: &HashMap<String, AttributeValue, S>,
+) -> Option<u64> {
+    item.get(crate::expr::SHARD_CAP_ATTR)
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<u64>().ok())
+}
+
 #[cfg(test)]
 mod tests {
     #![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]

@@ -247,7 +247,7 @@ mod tests {
 
     use std::sync::Mutex;
 
-    use generate_token::{AdmissionClaim, PositionRow, StoreError};
+    use generate_token::{PositionRow, StoreError};
     use nojs::{IDENTITY_COOKIE, QueueError};
     use wr_common::{
         Counters, Phase, PositionStatus, PossessionSecret, PreQueueItem, SHARDS, Session, Shard,
@@ -298,19 +298,19 @@ mod tests {
         {
             std::future::ready(Ok(self.position.clone()))
         }
-        fn claim_admission(
+        fn take_slot(
+            &self,
+            _event_id: &str,
+            _shard: Shard,
+        ) -> impl std::future::Future<Output = Result<bool, StoreError>> + Send {
+            std::future::ready(Ok(true))
+        }
+        fn mark_admitted(
             &self,
             _request_id: &str,
             _position: u64,
             _digest: &wr_common::SecretDigest,
             _now: u64,
-        ) -> impl std::future::Future<Output = Result<AdmissionClaim, StoreError>> + Send {
-            std::future::ready(Ok(AdmissionClaim::First))
-        }
-        fn record_arrival(
-            &self,
-            _event_id: &str,
-            _shard: Shard,
         ) -> impl std::future::Future<Output = Result<(), StoreError>> + Send {
             std::future::ready(Ok(()))
         }

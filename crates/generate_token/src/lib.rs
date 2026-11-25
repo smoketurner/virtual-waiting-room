@@ -51,32 +51,34 @@ pub trait Store {
         request_id: &str,
     ) -> impl Future<Output = Result<Option<PositionRow>, StoreError>> + Send;
 
-    /// Claims this visitor's one admission, reporting whether this call was the
-    /// one that claimed it.
+    /// Takes one unit of the admission budget from `shard`, reporting whether
+    /// there was one to take (ADR-0039).
     ///
-    /// One conditional write on the visitor's `Positions` row, creating it for
-    /// a pre-queue member who has none. It is what makes the arrival countable
-    /// exactly once: `record_arrival` is an unconditional `ADD`, and
-    /// `request_id` travels in a URL, so without a claim a reloaded page counts
-    /// a second arrival against one release.
+    /// One conditional `ADD` on the arrivals shard, allowed only while its
+    /// count is below the cap the controller last wrote. It is both the meter
+    /// and the count: the controller reads the same number to see how much of
+    /// what it granted was used.
+    fn take_slot(
+        &self,
+        event_id: &str,
+        shard: Shard,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send;
+
+    /// Marks the visitor's `Positions` row admitted, creating it for a
+    /// pre-queue member who has none.
+    ///
+    /// The mark is what lets a later call -- a reload, a second tab, a retried
+    /// request -- be recognised as a visitor who has already taken their unit
+    /// of budget and must not take another.
     ///
     /// `digest` is the one the presented secret was verified against. It is
-    /// written onto a row this claim creates, so a pre-queue member's later
-    /// calls — which read `Positions` first — still have one to verify.
-    fn claim_admission(
+    /// written onto a row this creates.
+    fn mark_admitted(
         &self,
         request_id: &str,
         position: u64,
         digest: &SecretDigest,
         now: u64,
-    ) -> impl Future<Output = Result<AdmissionClaim, StoreError>> + Send;
-
-    /// `ADD arrivals#<shard> :one` — records that this visitor showed up, which
-    /// is what the controller measures its no-show rate against.
-    fn record_arrival(
-        &self,
-        event_id: &str,
-        shard: Shard,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 }
 
@@ -88,20 +90,6 @@ pub struct PositionRow {
     /// Absent only on a row written before issue #62, which cannot be
     /// redeemed.
     pub digest: Option<SecretDigest>,
-}
-
-/// Whether an admission claim was this call's to make.
-///
-/// Not a refusal either way: a repeat still gets a session. It decides only
-/// whether the arrival is counted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AdmissionClaim {
-    /// This call claimed the admission. Count the arrival.
-    First,
-    /// Someone already claimed it — a reload, a retried request, a second tab.
-    /// The arrival is already counted; counting it again would tell the
-    /// controller more people showed up than it released.
-    Repeat,
 }
 
 /// Why a visitor is not being admitted right now.
@@ -122,22 +110,33 @@ pub enum Denied {
     /// The stored registration is corrupt.
     #[error("corrupt registration")]
     Corrupt,
+    /// The visitor's turn has come, but the origin is taking no more people
+    /// this moment: the admission budget is spent until the controller's next
+    /// pass (ADR-0039). Not a refusal of the visitor -- they ask again.
+    #[error("at capacity; position {position} is next")]
+    AtCapacity { position: u64 },
     /// The caller does not hold the secret this `request_id` joined with
     /// (issue #62): knowing the id is not enough to be admitted as it.
     #[error("not the holder of this place in line")]
     NotHolder,
 }
 
-/// An admitted visitor: the position that was reached. The arrival shard is no
-/// longer carried here (issue #59) — it is drawn at random by the caller
-/// rather than derived from `request_id`, which would make `decide` depend on
-/// an RNG and stop being a pure function of the queue state.
+/// A visitor whose turn has come: the position that was reached.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Grant {
     pub position: u64,
-    /// The digest the secret was verified against, for the admission claim.
+    /// The digest the secret was verified against, for the admitted mark.
     pub digest: SecretDigest,
+    /// Whether this visitor has been admitted before. They are entitled to
+    /// their session again, and have already taken their unit of budget.
+    pub already_admitted: bool,
 }
+
+/// How many shards one admission tries before answering "at capacity". The
+/// budget is spread evenly and takes land at random, so near the end of an
+/// interval one shard can be spent while others are not; a few draws find the
+/// room without turning a spent budget into ten refused writes per request.
+pub const SLOT_ATTEMPTS: u32 = 3;
 
 /// What a minted session is signed with and scoped to.
 pub struct Minting<'a> {
@@ -164,15 +163,14 @@ pub enum Admission {
     SignFailed,
 }
 
-/// The whole admission: load the rows, [`decide`], claim the admission,
-/// record the arrival, and sign the session. Shared by `/v1/generate_token`
-/// and the no-JavaScript waiting page (issue #67), so there is one path by
-/// which a session is minted.
+/// The whole admission: load the rows, [`decide`], take a unit of the
+/// admission budget, mark the visitor admitted, and sign the session. Shared by
+/// `/v1/generate_token` and the no-JavaScript waiting page (issue #67), so
+/// there is one path by which a session is minted.
 ///
 /// # Errors
 ///
-/// A store failure reading the queue state. Failures after the decision --
-/// the claim, the arrival record -- are logged and do not refuse the visitor.
+/// A store failure reading the queue state.
 pub async fn admit<S: Store>(
     store: &S,
     minting: &Minting<'_>,
@@ -205,53 +203,25 @@ pub async fn admit<S: Store>(
         Err(denied) => return Ok(Admission::Refused(denied)),
     };
 
-    // Claim the visitor's one admission, so their arrival is counted once
-    // however many times they call. A reload, a second tab or a retried
-    // request all arrive here again; `record_arrival` is an unconditional
-    // `ADD`, and a second one tells the controller more people showed up than
-    // it released, understating the no-show rate and under-releasing for the
-    // rest of the event.
-    //
-    // A failed claim leaves it unknown whether the arrival has been counted, so
-    // it is counted: over-counting understates the no-show rate and releases
-    // fewer people, while missing it releases more than the origin agreed to
-    // serve. Neither refuses the visitor -- the claim governs the count, not
-    // admission.
-    let claim = match store
-        .claim_admission(request_id, grant.position, &grant.digest, now)
-        .await
-    {
-        Ok(claim) => claim,
-        Err(e) => {
-            tracing::error!(error = %e, event = "admission_claim_failed", "could not claim the admission; counting the arrival and admitting anyway");
-            AdmissionClaim::First
+    // A visitor is admitted against the budget once. A reload, a second tab or
+    // a retried request arrives here again with the row already marked, and
+    // gets its session without taking a second unit -- the origin was already
+    // charged for this person.
+    if !grant.already_admitted {
+        if !take_any_slot(store, minting.event_id).await {
+            return Ok(Admission::Refused(Denied::AtCapacity {
+                position: grant.position,
+            }));
         }
-    };
-
-    match claim {
-        // The shard is drawn at random per admission (issue #59) rather than
-        // hashed from `request_id`, so it is drawn here rather than by
-        // `decide`, which stays a pure function of the queue state. A draw
-        // failure is logged and swallowed for the same reason a record failure
-        // is: the controller tolerates a missed arrival better than the visitor
-        // tolerates being refused at their turn.
-        AdmissionClaim::First => match Shard::random() {
-            Ok(shard) => {
-                if let Err(e) = store.record_arrival(minting.event_id, shard).await {
-                    // Cumulative and silent: every uncounted arrival inflates
-                    // the measured no-show rate, and the controller answers by
-                    // releasing more people than the origin agreed to serve.
-                    // The metric filter and alarm on `arrival_record_failed`
-                    // live in modules/core/logging.tf.
-                    tracing::error!(error = %e, event = "arrival_record_failed", "failed to record arrival; admitting anyway");
-                }
-            }
-            Err(e) => {
-                tracing::error!(error = %e, event = "arrival_shard_draw_failed", "failed to draw a random shard; admitting without recording arrival");
-            }
-        },
-        // Already counted. The visitor still gets their session.
-        AdmissionClaim::Repeat => {}
+        // The unit is taken, so the visitor is admitted whether or not the
+        // mark lands. A mark that fails costs one extra unit if they call
+        // again: fewer people admitted than intended, never more.
+        if let Err(e) = store
+            .mark_admitted(request_id, grant.position, &grant.digest, now)
+            .await
+        {
+            tracing::error!(error = %e, event = "admission_claim_failed", "could not mark the visitor admitted; admitting anyway");
+        }
     }
 
     let expires_at = now.saturating_add(minting.session_ttl_secs);
@@ -267,9 +237,8 @@ pub async fn admit<S: Store>(
     // A signing failure must not become an empty cookie: an empty string is
     // not a well-formed JWS, so the gate would refuse it and the visitor would
     // bounce between the origin and the waiting page while being told they
-    // were admitted. The arrival was already counted, which is the safer
-    // order: counted-but-not-admitted under-releases, the opposite
-    // over-releases.
+    // were admitted. The unit of budget is already taken, which is the safer
+    // order: taken-but-not-admitted admits one fewer, the opposite one more.
     let Ok(credential) = session.sign(minting.key) else {
         tracing::error!(
             event = "session_sign_failed",
@@ -282,6 +251,33 @@ pub async fn admit<S: Store>(
         expires_at,
         credential,
     })
+}
+
+/// Tries up to [`SLOT_ATTEMPTS`] randomly drawn shards for a unit of budget.
+///
+/// A failure to draw or to write is "no unit", not "admit anyway": the budget
+/// is what keeps the origin at its rate, so an admission that cannot be
+/// metered is not made. The visitor asks again on their next poll. Both
+/// failures are alarmed, because one that persists stops admission entirely.
+async fn take_any_slot<S: Store>(store: &S, event_id: &str) -> bool {
+    for _ in 0..SLOT_ATTEMPTS {
+        let shard = match Shard::random() {
+            Ok(shard) => shard,
+            Err(e) => {
+                tracing::error!(error = %e, event = "arrival_shard_draw_failed", "failed to draw a random shard; not admitting");
+                return false;
+            }
+        };
+        match store.take_slot(event_id, shard).await {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(e) => {
+                tracing::error!(error = %e, event = "arrival_record_failed", "failed to take a unit of the admission budget; not admitting");
+                return false;
+            }
+        }
+    }
+    false
 }
 
 /// The `Set-Cookie` that carries a minted session. `Path=/` because the gate
@@ -354,7 +350,17 @@ pub fn decide(
         });
     }
 
-    Ok(Grant { position, digest })
+    Ok(Grant {
+        position,
+        digest,
+        already_admitted: matches!(
+            position_row,
+            Some(PositionRow {
+                status: PositionStatus::Admitted,
+                ..
+            })
+        ),
+    })
 }
 
 /// The cohort position of a pre-queue row that the open counted, if it is one.
@@ -403,8 +409,8 @@ fn resolve_position(
             // Refusing one would strand a visitor whose first response never
             // arrived, or who reloaded the page, for a mistake that was not
             // theirs -- and the cookie they are asking for is one they are
-            // entitled to. What the status governs is the arrival count, not
-            // admission; the claim in `main.rs` is where it is read.
+            // entitled to. What the status governs is whether a unit of the
+            // admission budget is taken, not admission; `admit` reads it.
             PositionStatus::Issued | PositionStatus::Admitted => Ok(position),
         };
     }
@@ -609,14 +615,18 @@ mod tests {
         // Their first response may never have reached them, or they reloaded.
         // Refusing would strand a visitor holding a position that is still
         // theirs, for a failure that was not theirs. What being admitted
-        // already governs is whether the arrival is counted a second time, and
-        // that is the claim's job, not this one's.
-        for status in [PositionStatus::Issued, PositionStatus::Admitted] {
+        // already governs is whether a second unit of budget is taken, which
+        // the grant reports and `admit` acts on.
+        for (status, already_admitted) in [
+            (PositionStatus::Issued, false),
+            (PositionStatus::Admitted, true),
+        ] {
             assert_eq!(
                 decide(&counters(10), None, Some(&row(3, status)), &secret(), 0).unwrap(),
                 Grant {
                     position: 3,
-                    digest: digest()
+                    digest: digest(),
+                    already_admitted,
                 }
             );
         }
