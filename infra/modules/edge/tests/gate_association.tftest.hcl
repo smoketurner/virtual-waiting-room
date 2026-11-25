@@ -159,3 +159,25 @@ run "the_client_origin_is_sent_the_verification_secret" {
     error_message = "the client origin secret must be sent to the client origin only"
   }
 }
+
+# Issue #250: the readiness panel reads this distribution and no other.
+run "the_admin_reads_only_this_distribution" {
+  command = plan
+
+  variables {
+    admin_role_name = "test-admin-role"
+  }
+
+  assert {
+    condition     = length(aws_iam_role_policy.admin_readiness) == 1 && aws_iam_role_policy.admin_readiness[0].role == "test-admin-role"
+    error_message = "the distribution read must be attached to the admin role"
+  }
+
+  assert {
+    condition = alltrue([
+      for s in data.aws_iam_policy_document.admin_readiness.statement :
+      alltrue([for a in s.actions : contains(["cloudfront:GetDistributionConfig", "cloudfront:GetCachePolicy"], a)])
+    ])
+    error_message = "the grant must stay read-only configuration"
+  }
+}

@@ -120,6 +120,12 @@ variable "event_id" {
 
 # --- Readiness panel (issue #70) --------------------------------------------
 
+variable "admin_role_name" {
+  description = "Name of the admin Lambda's execution role (modules/core's admin_role_name output). This module grants it read access to this distribution's configuration for the readiness panel. Empty attaches nothing."
+  type        = string
+  default     = ""
+}
+
 variable "readiness_parameter_name" {
   description = "Name of the SSM parameter this module writes the distribution id, the gate function's ARN and the polled /status path to (modules/core's edge_readiness_parameter_name output). The admin Lambda's readiness panel reads it; core names it because edge depends on core, not the reverse."
   type        = string
@@ -176,14 +182,20 @@ variable "waf_managed_rules_mode" {
 }
 
 variable "waf_token_immunity_seconds" {
-  description = "How long a solved challenge or CAPTCHA is honoured. Long enough to cover a visitor's whole wait: when it lapses the next API call is challenged and the waiting page reloads to renew it, keeping the visitor's place."
+  description = "How long a solved challenge or CAPTCHA is honoured. It is also what one solve is worth: a token may join waf_join_token_limit times every ten minutes for as long as it lives, and WAF has no lifetime quota, so a shorter life is the only way to make a solve buy fewer places (issue #245). When it lapses the next API call is challenged and the waiting page renews it silently, keeping the visitor's place."
   type        = number
-  default     = 14400
+  default     = 3600
 
   validation {
     condition     = var.waf_token_immunity_seconds >= 60 && var.waf_token_immunity_seconds <= 259200
     error_message = "waf_token_immunity_seconds must be between 60 and 259200 (WAF's bounds)."
   }
+}
+
+variable "waf_require_token_cookie" {
+  description = "Whether a JavaScript API request holding a WAF token must carry it as the cookie, so the per-token limits that key on the cookie cannot be skipped by sending the token in a header (issue #245). False counts such requests instead of blocking them."
+  type        = bool
+  default     = true
 }
 
 variable "waf_join_token_limit" {

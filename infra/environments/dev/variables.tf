@@ -227,6 +227,24 @@ variable "controller_reserved_concurrency" {
 
 # --- REST API stage throttles (issue #245) ------------------------------------
 
+variable "signing_key_generation" {
+  description = "Generation of the session signing key. Raise by one to rotate; the previous generation's sessions stay valid until they expire."
+  type        = number
+  default     = 1
+}
+
+variable "origin_key_generation" {
+  description = "Generation of the API key CloudFront sends the REST API. Raise by one to rotate; the previous generation stays valid until the next rotation."
+  type        = number
+  default     = 1
+}
+
+variable "expected_join_rate" {
+  description = "Peak joins per second expected, or 0 if unknown. Above 4,000 the plan fails unless warm_throughput_write_units covers it."
+  type        = number
+  default     = 0
+}
+
 variable "oidc_require_email_verified" {
   description = "Whether an admin login needs the provider's email_verified claim to be present and true. Turn off only for a provider that omits the claim and verifies every address."
   type        = bool

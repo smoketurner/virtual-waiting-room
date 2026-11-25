@@ -31,6 +31,9 @@ module "core" {
   oidc_redirect_uri           = var.oidc_redirect_uri
   oidc_allowed_emails         = var.oidc_allowed_emails
   oidc_require_email_verified = var.oidc_require_email_verified
+  signing_key_generation      = var.signing_key_generation
+  origin_key_generation       = var.origin_key_generation
+  expected_join_rate          = var.expected_join_rate
 
   # Adaptive poll policy (#69), published on /status.
   poll_floor_ms   = var.poll_floor_ms
@@ -107,6 +110,7 @@ module "edge" {
   # Where the distribution's facts are published for the admin's readiness
   # panel (issue #70). core names it; edge writes it.
   readiness_parameter_name = module.core.edge_readiness_parameter_name
+  admin_role_name          = module.core.admin_role_name
 
   # The customer's own hostname, or empty for the *.cloudfront.net default.
   aliases             = var.aliases

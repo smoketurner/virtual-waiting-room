@@ -48,6 +48,10 @@ oidc_allowed_emails = "" # comma-separated; "" = deny all (fail closed)
 # api_throttle_rate_limit        = 10000
 # api_throttle_burst_limit       = 5000
 # waf_nojs_wait_ip_limit         = 300   # only with flat_rate_plan_tier
+# signing_key_generation         = 1     # raise by one to rotate; previous sessions stay valid until they expire
+# origin_key_generation          = 1     # raise by one to rotate the CloudFront-to-API key without an outage
+# expected_join_rate             = 0     # peak joins/s; above 4000 the plan requires warm_throughput_write_units
+# waf_require_token_cookie       = true  # false counts instead of blocking; only with flat_rate_plan_tier
 
 # --- Adaptive poll policy (#69, ADR-0023) -------------------------------------
 # Published on /status; waiting.js clamps its poll interval to these, polling

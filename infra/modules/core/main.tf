@@ -233,8 +233,21 @@ resource "aws_dynamodb_table" "tokens" {
 # This puts the key in Terraform state, which the S3 backend encrypts. That is
 # the same trade the retired tls_private_key made for the RSA key this one
 # replaces, so it is not a new exposure.
+#
+# One key per generation, the current and the one before it (issue #247).
+# Raising `signing_key_generation` creates the new generation's key and keeps
+# the previous one, which the gate goes on accepting (edge_gate.tf, 'kp'): a
+# session minted before the rotation stays good until it expires instead of
+# every admitted visitor being thrown back to the waiting page at once. The
+# generation before that is destroyed, so after two rotations a key is gone.
+locals {
+  signing_key_current  = tostring(var.signing_key_generation)
+  signing_key_previous = tostring(var.signing_key_generation - 1)
+}
+
 resource "random_bytes" "signing_key" {
-  length = 32
+  for_each = toset([local.signing_key_current, local.signing_key_previous])
+  length   = 32
 }
 
 # A function reads the key once, at Init, and a warm environment keeps what it
@@ -249,14 +262,14 @@ resource "random_bytes" "signing_key" {
 # environment from the plan: 64 bits of a SHA-256 over a random 256-bit key
 # say nothing about the key and cannot be searched for.
 locals {
-  signing_key_fingerprint = nonsensitive(substr(sha256(random_bytes.signing_key.hex), 0, 16))
+  signing_key_fingerprint = nonsensitive(substr(sha256(random_bytes.signing_key[local.signing_key_current].hex), 0, 16))
 }
 
 resource "aws_ssm_parameter" "signing_key" {
   name        = "/${var.name_prefix}/signing-key"
   description = "Virtual Waiting Room per-deployment signing key (admission tokens + session cookies)."
   type        = "SecureString"
-  value       = random_bytes.signing_key.base64
+  value       = random_bytes.signing_key[local.signing_key_current].base64
 
   tags = var.tags
 }

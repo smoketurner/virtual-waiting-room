@@ -313,22 +313,23 @@ run "a_token_without_its_cookie_is_refused_only_after_the_challenge" {
     condition = length(one([
       for r in aws_wafv2_web_acl.this[0].rule : r.action[0].block if r.name == "api-token-cookie-required"
     ])) == 1
-    error_message = "in enforce mode a tokened request without the cookie must be blocked (issue #245)"
+    error_message = "a tokened request without the cookie must be blocked by default (issue #245)"
   }
 }
 
-run "the_token_cookie_requirement_observes_until_promoted" {
+run "the_token_cookie_requirement_can_be_dropped_to_count" {
   command = plan
 
   variables {
-    flat_rate_plan_tier = "BUSINESS"
+    flat_rate_plan_tier      = "BUSINESS"
+    waf_require_token_cookie = false
   }
 
   assert {
     condition = length(one([
       for r in aws_wafv2_web_acl.this[0].rule : r.action[0].count if r.name == "api-token-cookie-required"
     ])) == 1
-    error_message = "the cookie requirement refuses real visitors if it is wrong, so it runs in Count by default (O5)"
+    error_message = "with the requirement switched off the rule must count, not block"
   }
 }
 

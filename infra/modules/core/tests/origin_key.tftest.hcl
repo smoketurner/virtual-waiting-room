@@ -64,7 +64,14 @@ run "the_key_is_bound_to_the_stage" {
   }
 
   assert {
-    condition     = aws_api_gateway_usage_plan_key.origin.key_type == "API_KEY"
+    condition     = alltrue([for k in aws_api_gateway_usage_plan_key.origin : k.key_type == "API_KEY"])
     error_message = "the origin key must be attached to its usage plan"
+  }
+
+  # Issue #251: the key the distribution is about to stop sending has to keep
+  # working until it has, so two generations are attached at once.
+  assert {
+    condition     = length(aws_api_gateway_usage_plan_key.origin) == 2
+    error_message = "the current and the previous origin key must both be valid, or a rotation is an outage for as long as CloudFront takes to deploy"
   }
 }

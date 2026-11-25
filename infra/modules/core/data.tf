@@ -338,23 +338,9 @@ data "aws_iam_policy_document" "admin" {
   }
 
   # The distribution and its cache policies are created by the edge module,
-  # which depends on this one, so their ids cannot be referenced here without
-  # a module cycle -- which is also why this cannot be narrowed to this
-  # deployment's own distribution (issue #250): its ARN exists only after edge
-  # has consumed core's outputs. Scoped to this account's distributions and
-  # cache policies rather than "*"; both actions only read configuration.
-  statement {
-    sid    = "ReadinessDistribution"
-    effect = "Allow"
-    actions = [
-      "cloudfront:GetDistributionConfig",
-      "cloudfront:GetCachePolicy",
-    ]
-    resources = [
-      "arn:${local.aws_partition}:cloudfront::${local.aws_account_id}:distribution/*",
-      "arn:${local.aws_partition}:cloudfront::${local.aws_account_id}:cache-policy/*",
-    ]
-  }
+  # which depends on this one, so their ARNs cannot be named here. The edge
+  # module attaches that grant to this role itself, scoped to its own
+  # distribution (issue #250, edge/main.tf).
 
   # "Open now" starts the event without waiting for the schedule, by invoking
   # the function the schedule invokes. The same grant the scheduler's own role

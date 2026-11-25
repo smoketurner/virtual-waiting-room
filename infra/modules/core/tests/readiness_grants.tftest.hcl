@@ -176,17 +176,15 @@ run "the_admin_role_holds_every_readiness_grant" {
     error_message = "the admin must be able to read the edge readiness parameter, and only that one, for the CloudFront rows"
   }
 
+  # Issue #250: the distribution read is granted by the edge module, which
+  # can name the one distribution. Core must not carry an account-wide one.
   assert {
-    condition = anytrue([
-      for s in data.aws_iam_policy_document.admin.statement :
-      s.effect == "Allow"
-      && toset(s.actions) == toset(["cloudfront:GetDistributionConfig", "cloudfront:GetCachePolicy"])
-      && toset(s.resources) == toset([
-        "arn:aws:cloudfront::123456789012:distribution/*",
-        "arn:aws:cloudfront::123456789012:cache-policy/*",
-      ])
-    ])
-    error_message = "the admin must be able to read distribution and cache policy config (C4, N7), scoped to this account"
+    condition = alltrue(flatten([
+      for s in data.aws_iam_policy_document.admin.statement : [
+        for a in s.actions : !startswith(a, "cloudfront:")
+      ]
+    ]))
+    error_message = "core must not grant the admin cloudfront:* reads; edge grants GetDistributionConfig on its own distribution"
   }
 
   # Diagnostics only: nothing the panel added may write. Every readiness

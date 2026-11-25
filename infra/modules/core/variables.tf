@@ -29,6 +29,11 @@ variable "warm_throughput_write_units" {
     condition     = var.warm_throughput_write_units == 0 || var.warm_throughput_write_units >= 4000
     error_message = "warm_throughput_write_units must be 0 (no pre-warm) or >= 4000 (AWS DynamoDB warm-throughput minimum)."
   }
+
+  validation {
+    condition     = var.expected_join_rate <= 4000 || var.warm_throughput_write_units >= var.expected_join_rate
+    error_message = "expected_join_rate is above the 4,000 writes/s an un-warmed on-demand table serves: set warm_throughput_write_units to at least expected_join_rate."
+  }
 }
 
 variable "warm_throughput_read_units" {
@@ -158,6 +163,39 @@ variable "oidc_allowed_emails" {
   description = "Comma-separated allowlist of operator emails permitted to hold an admin session. Empty = deny all (the admin Lambda fails closed)."
   type        = string
   default     = ""
+}
+
+variable "signing_key_generation" {
+  description = "Generation of the session signing key. Raise it by one to rotate: the new key signs from then on and the gate still accepts the previous generation's sessions until they expire (issue #247). Rotating twice within one session lifetime invalidates the oldest sessions."
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.signing_key_generation >= 1 && floor(var.signing_key_generation) == var.signing_key_generation
+    error_message = "signing_key_generation must be a whole number of at least 1."
+  }
+}
+
+variable "origin_key_generation" {
+  description = "Generation of the API key CloudFront sends the REST API. Raise it by one to rotate: the previous generation stays valid until the next rotation, so the API keeps answering while the distribution deploys the new key (issue #251)."
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.origin_key_generation >= 1 && floor(var.origin_key_generation) == var.origin_key_generation
+    error_message = "origin_key_generation must be a whole number of at least 1."
+  }
+}
+
+variable "expected_join_rate" {
+  description = "The peak joins per second this event is expected to take, or 0 if unknown. Above 4,000, the on-demand tables' cold ceiling, the plan fails unless warm_throughput_write_units covers it: a throttled join is retried and can land behind the cohort it registered for (issue #251)."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.expected_join_rate >= 0
+    error_message = "expected_join_rate must be 0 (unknown) or a positive rate."
+  }
 }
 
 variable "oidc_require_email_verified" {

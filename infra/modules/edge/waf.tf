@@ -390,17 +390,18 @@ resource "aws_wafv2_web_acl" "this" {
   # holds a valid token reaches this rule. Before it, this would refuse every
   # visitor's first call instead of sending them to the verify page.
   #
-  # Count until promoted, with the managed rules (O5): it refuses real visitors
-  # if a browser ever holds a token without the cookie, and only an event's
-  # worth of data says none does. An oversized cookie header counts as carrying
-  # the cookie, for the same reason.
+  # Enforced by default. A browser that got its token from the interstitial
+  # holds the cookie, and one with cookies disabled never gets a token at all,
+  # so nothing honest reaches this rule without it. `waf_require_token_cookie`
+  # drops it to Count for a deployment that wants to watch first. An oversized
+  # cookie header counts as carrying the cookie.
   rule {
     name     = "api-token-cookie-required"
     priority = 12
 
     action {
       dynamic "block" {
-        for_each = local.waf_enforce_managed ? [1] : []
+        for_each = var.waf_require_token_cookie ? [1] : []
         content {
           custom_response {
             response_code = 403
@@ -408,7 +409,7 @@ resource "aws_wafv2_web_acl" "this" {
         }
       }
       dynamic "count" {
-        for_each = local.waf_enforce_managed ? [] : [1]
+        for_each = var.waf_require_token_cookie ? [] : [1]
         content {}
       }
     }

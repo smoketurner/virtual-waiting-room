@@ -452,3 +452,35 @@ resource "aws_ssm_parameter" "readiness" {
 
   tags = var.tags
 }
+
+# The readiness panel reads this distribution's configuration and the cache
+# policies its behaviours name (issue #70). Granted here rather than in core
+# so it can name this one distribution: core cannot, because the distribution
+# is created from core's outputs (issue #250). Both actions only read
+# configuration; the cache policies include AWS-managed ones, which is why
+# that half is not narrowed further.
+data "aws_caller_identity" "readiness" {}
+data "aws_partition" "readiness" {}
+
+data "aws_iam_policy_document" "admin_readiness" {
+  statement {
+    sid       = "ReadinessDistribution"
+    effect    = "Allow"
+    actions   = ["cloudfront:GetDistributionConfig"]
+    resources = [aws_cloudfront_distribution.this.arn]
+  }
+
+  statement {
+    sid       = "ReadinessCachePolicies"
+    effect    = "Allow"
+    actions   = ["cloudfront:GetCachePolicy"]
+    resources = ["arn:${data.aws_partition.readiness.partition}:cloudfront::${data.aws_caller_identity.readiness.account_id}:cache-policy/*"]
+  }
+}
+
+resource "aws_iam_role_policy" "admin_readiness" {
+  count  = var.admin_role_name == "" ? 0 : 1
+  name   = "${var.name_prefix}-admin-readiness-distribution"
+  role   = var.admin_role_name
+  policy = data.aws_iam_policy_document.admin_readiness.json
+}
