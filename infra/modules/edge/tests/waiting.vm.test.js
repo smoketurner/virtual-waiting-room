@@ -32,7 +32,8 @@ function activeStatus(overrides) {
       serving_state: "running",
       serving_position: 90,
       participant_count: 0,
-      target_rate: 100,
+      origin_concurrency: 100,
+      session_seconds: 1,
     },
     overrides
   );
@@ -322,18 +323,18 @@ test("measuredRate becomes non-null once a ceiling-length interval has elapsed",
   );
 });
 
-test("target_rate absent, position known and ahead > 0: interval is the floor", async () => {
+test("origin_concurrency absent, position known and ahead > 0: interval is the floor", async () => {
   const status = activeStatus({ poll_policy: POLICY });
-  delete status.target_rate;
+  delete status.origin_concurrency;
   const client = loadClient({ route: route(status, 1_000_000) });
   await client.flush();
   const ms = client.lastTimer().ms;
   assert.ok(ms >= FLOOR && ms <= FLOOR * 1.3, `expected the floor with no rate, got ${ms}`);
 });
 
-test("target_rate is zero, position known and ahead > 0: interval is the floor", async () => {
+test("origin_concurrency is zero, position known and ahead > 0: interval is the floor", async () => {
   const client = loadClient({
-    route: route(activeStatus({ poll_policy: POLICY, target_rate: 0 }), 1_000_000),
+    route: route(activeStatus({ poll_policy: POLICY, origin_concurrency: 0 }), 1_000_000),
   });
   await client.flush();
   const ms = client.lastTimer().ms;
@@ -534,7 +535,9 @@ for (const status of [429, 502]) {
   });
 }
 
-test("repeated 'at capacity' answers are asked for less and less often", async () => {
+test("repeated 'at capacity' answers are asked again at the floor", async () => {
+  // A 425 is a slot not yet free, and the people asking are only those
+  // released for the next slots: backing off would leave the slot empty.
   const client = loadClient({
     route: (url) => {
       if (url.startsWith("/_wr/v1/status")) {
@@ -549,18 +552,29 @@ test("repeated 'at capacity' answers are asked for less and less often", async (
       return jsonResponse(200, {});
     },
   });
-  const delays = [];
-  for (let i = 0; i < 4; i += 1) {
+  for (let i = 0; i < 6; i += 1) {
     await client.flush();
     const t = client.lastTimer();
-    delays.push(t.ms);
+    assert.ok(t.ms <= POLICY.floor_ms * 1.3, `try ${i} waits ${t.ms} ms`);
     t.cancelled = true;
     t.fn();
   }
-  // Jitter is +/-20%, so each doubling still clears the one before it until
-  // the ceiling is reached.
-  assert.ok(delays[1] > delays[0] * 1.2, JSON.stringify(delays));
-  assert.ok(delays[3] <= POLICY.ceiling_ms * 1.3, JSON.stringify(delays));
+});
+
+test("a visitor within one origin's worth of the front polls at the floor", async () => {
+  // Sessions ending release them without the cursor's measured speed saying
+  // so in advance. Further back, the interval follows the wait.
+  const near = loadClient({
+    route: route(activeStatus({ poll_policy: POLICY, origin_concurrency: 500, session_seconds: 900 }), 400),
+  });
+  await near.flush();
+  assert.ok(near.lastTimer().ms <= POLICY.floor_ms * 1.3, `near waits ${near.lastTimer().ms} ms`);
+
+  const far = loadClient({
+    route: route(activeStatus({ poll_policy: POLICY, origin_concurrency: 500, session_seconds: 900 }), 100_000),
+  });
+  await far.flush();
+  assert.ok(far.lastTimer().ms >= POLICY.ceiling_ms, `far waits ${far.lastTimer().ms} ms`);
 });
 
 // The whole crowd arriving at once: the gateway answers most joins 429.

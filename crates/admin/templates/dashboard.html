@@ -71,7 +71,7 @@
           <div class="kpi"><div class="label">Serving position</div><div class="value" id="s-serving_counter">{{ serving_counter }}</div></div>
           <div class="kpi"><div class="label">Queue counter</div><div class="value" id="s-queue_counter">{{ queue_counter }}</div></div>
           <div class="kpi"><div class="label">Participants</div><div class="value" id="s-participant_count">{{ participant_count }}</div></div>
-          <div class="kpi"><div class="label">Target rate /s</div><div class="value" id="s-target_rate">{{ target_rate }}</div></div>
+          <div class="kpi"><div class="label">Origin concurrency</div><div class="value" id="s-origin_concurrency">{{ origin_concurrency }}</div></div>
         </div>
         <dl class="kv-pairs">
           <div>
@@ -189,21 +189,21 @@
       </div>
     </section>
 
-    <!-- Admission rate -->
+    <!-- Origin concurrency -->
     <section class="card">
       <div class="card-header">
-        <h2>Admission rate</h2>
-        <p class="sub">Target visitors admitted to the origin per second.</p>
+        <h2>Origin concurrency</h2>
+        <p class="sub">How many visitors the origin takes at once.</p>
       </div>
       <div class="card-body">
-        <form method="post" action="/_wr/admin/rate">
+        <form method="post" action="/_wr/admin/concurrency">
           <input type="hidden" name="csrf" value="{{ csrf_token }}">
           <div class="form-field">
-            <label for="rate">Target rate (visitors per second)</label>
-            <input id="rate" name="rate" type="number" min="1" required value="{{ target_rate_raw }}" title="Target visitors admitted to the origin per second.">
-            <span class="help">Currently <strong>{{ target_rate }}</strong>. Set this to the requests per second the origin sustains, as a whole number from 1 to the deployment ceiling. The controller releases this many per second, correcting upward for no-shows to at most twice it. To stop admission use <strong>Pause</strong>; rate 0 is rejected.</span>
+            <label for="concurrency">Visitors on the origin at once</label>
+            <input id="concurrency" name="concurrency" type="number" min="1" required value="{{ origin_concurrency_raw }}" title="How many visitors the origin takes at once.">
+            <span class="help">Currently <strong>{{ origin_concurrency }}</strong>. No more admitted visitors than this hold a live session at any moment; each session lasts the deployment's session length, and its slot goes to the next in line when it ends. Lowering it admits nobody until enough sessions have ended. To stop admission use <strong>Pause</strong>; 0 is rejected.</span>
           </div>
-          <button type="submit" title="Store the target admission rate.">Set rate</button>
+          <button type="submit" title="Store the origin concurrency.">Set concurrency</button>
         </form>
       </div>
     </section>
@@ -351,7 +351,7 @@
         }
       });
     });
-    var nums = ["serving_counter", "queue_counter", "participant_count", "target_rate", "message", "serving_state", "starts_at"];
+    var nums = ["serving_counter", "queue_counter", "participant_count", "origin_concurrency", "message", "serving_state", "starts_at"];
     function refresh() {
       fetch("/_wr/admin/state", { headers: { "Accept": "application/json" }, credentials: "same-origin" })
         .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })

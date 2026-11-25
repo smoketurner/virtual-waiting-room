@@ -20,11 +20,6 @@ use wr_common::{
 
 pub mod dynamo;
 
-/// How long a minted session stays valid when the environment does not say.
-/// Long enough to finish a purchase, short enough that a leaked cookie is not
-/// a standing bypass.
-pub const DEFAULT_SESSION_TTL_SECS: u64 = 3600;
-
 /// A store failure worth retrying.
 #[derive(Debug, thiserror::Error)]
 #[error("generate_token store error: {0}")]
@@ -484,7 +479,7 @@ mod tests {
             participant_count: Some(opened.participant_count()),
             prequeue_offsets: Some(offsets),
             message: None,
-            target_rate: None,
+            origin_concurrency: None,
             stored_control: StoredControl::Open,
             fail_open_until: 0,
             starts_at: None,

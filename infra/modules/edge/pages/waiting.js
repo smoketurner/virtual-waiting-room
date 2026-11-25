@@ -715,6 +715,14 @@
     return rate !== null ? rate : targetRate;
   }
 
+  // What the room expects to admit a second before any movement has been
+  // seen: a full origin turns over once per session length.
+  function expectedRate(s) {
+    return s.origin_concurrency > 0 && s.session_seconds > 0
+      ? s.origin_concurrency / s.session_seconds
+      : 0;
+  }
+
   // How this client turns "distance to the front" into a poll interval (#69).
   // Proportional to the wait this visitor can see, floored so the
   // front of the queue stays responsive, and capped so a visitor deep in a
@@ -920,12 +928,13 @@
       // (a 425 while the admission budget is spent, ADR-0039), or the operator
       // paused. Fall back to polling rather than hammering.
       admitting = false;
-      // Everyone whose turn has come is told 425 while the budget is spent,
-      // and asks again. Each asks less often the longer it lasts, so a spent
-      // budget is not also a storm of refusals. A 429 or a 5xx is the same
-      // crowd meeting a throttle or an overloaded function, and retrying it
-      // at the floor only feeds the overload.
-      var busy = res.status === 425 || res.status === 429 || res.status >= 500;
+      // A 425 is a slot not yet free: the controller releases the people for
+      // a slot a little before its session ends. Ask again at the floor, so the
+      // slot is taken within seconds of coming free; the crowd asking is only
+      // the people released for the next slots, so this is not a storm. A 429
+      // or a 5xx is a throttle or an overloaded function, and retrying it at
+      // the floor only feeds the overload, so that backs off.
+      var busy = res.status === 429 || res.status >= 500;
       capacityMisses = busy ? capacityMisses + 1 : 0;
       if (res.status === 403) {
         // The secret this browser holds is not the one the place was taken
@@ -1115,7 +1124,7 @@
           nextIntervalMs =
             pausedAhead === null
               ? policy.ceilingMs
-              : intervalForPosition(pausedAhead, currentRate(s.target_rate));
+              : intervalForPosition(pausedAhead, currentRate(expectedRate(s)));
           return schedule();
         }
         if (s.serving_state === "fail_open") {
@@ -1200,7 +1209,7 @@
               q.body.position,
               s.serving_position,
               s.participant_count,
-              s.target_rate
+              expectedRate(s)
             );
             if (q.body.position < s.serving_position) {
               nextIntervalMs = policy.floorMs;
@@ -1218,10 +1227,13 @@
               });
             }
             var ahead = aheadNow(s.serving_position);
+            // Within one origin's worth of the front, the visitor is released
+            // as soon as the next sessions end, which the wait estimate cannot
+            // see coming: ask at the floor so the slot is not left waiting.
             nextIntervalMs =
-              ahead === 0
+              ahead === 0 || ahead <= s.origin_concurrency
                 ? policy.floorMs
-                : intervalForPosition(ahead, currentRate(s.target_rate));
+                : intervalForPosition(ahead, currentRate(expectedRate(s)));
             return schedule();
           });
       })

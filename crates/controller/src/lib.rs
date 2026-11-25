@@ -1,23 +1,27 @@
 //! Outflow controller.
 //!
-//! Admission is metered where it happens, not where it is offered
+//! The origin takes `origin_concurrency` visitors at once, so that is the most
+//! sessions that may be live at any moment (issue #65). A session ends exactly
+//! `session_secs` after its admission -- re-minting it keeps the same end
+//! (issue #237) -- so the controller can count the live ones without anyone
+//! reporting a departure: they are the admissions made in the last
+//! `session_secs`. It keeps an [`AdmissionLog`] of the total admitted at each
+//! pass for that.
+//!
+//! Admission is metered where it happens
 //! ([`ADR-0039`](../../../docs/adr/0039-meter-admissions-not-the-cursor.md)).
 //! `generate_token` takes one unit of an **admission budget** for every visitor
 //! it admits, and refuses when there is none. Each pass, the controller:
 //!
-//! 1. grants budget for the time that has passed -- `target_rate` a second --
-//!    on top of whatever went unused, up to [`BURST_INTERVALS`] intervals'
-//!    worth, and
-//! 2. advances `serving_counter` by the same amount, plus the budget that went
-//!    unused beyond a small slack -- so people who never show up are replaced
-//!    by the people behind them -- or minus the shortfall when the budget was
-//!    spent, so that a backlog of people already invited drains.
-//!
-//! The first bounds what the origin receives: over any window of `t` seconds no
-//! more than `target_rate * t` plus the burst can be admitted, whoever turns up
-//! and whenever. The second is the whole no-show correction. Budget left
-//! unspent is, exactly, admissions the origin was promised and did not get, so
-//! it is what the cursor has to make up; there is no rate to estimate.
+//! 1. sets the budget to the free slots, `origin_concurrency` minus the live
+//!    sessions, so however many people turn up and whenever, no more than
+//!    `origin_concurrency` sessions are ever live, and
+//! 2. advances `serving_counter` by the slots that will have come free by the
+//!    next pass, one pass early so the people released for them are already
+//!    asking when the slots are granted, plus half of the slots that stayed
+//!    free through the last pass -- the people released for those did not
+//!    come, so the people behind them are released in their place. That is
+//!    the whole no-show correction.
 //!
 //! The controller expires nothing. A position lives until `DynamoDB` TTL
 //! reclaims its row
@@ -46,29 +50,6 @@ pub const INTERVAL_SECS: u64 = 10;
 /// one execution started by the `rate(1 minute)` schedule covers a full minute.
 pub const PASSES_PER_INVOKE: u32 = 6;
 
-/// A prior open pass at least this old is not owed for.
-///
-/// On the regular cadence a pass grants budget for the seconds since the last
-/// one. After a hold, a missed minute, or on a fresh event, that gap is not
-/// admission anyone is owed: paying it out would hand a paused event its whole
-/// pause as a burst on resume. Such a pass grants one interval and carries on.
-pub const STALE_OPEN_PASS_SECS: u64 = 2 * INTERVAL_SECS;
-
-/// The most budget that can ever be outstanding, in intervals of `target_rate`.
-///
-/// It is the burst the origin can be asked to absorb on top of the steady rate,
-/// and it is also what bounds the no-show correction: unused budget is what the
-/// cursor makes up, so with at most one interval carried over the cursor moves
-/// at no more than twice the target, which covers a no-show rate up to one
-/// half.
-pub const BURST_INTERVALS: u64 = 2;
-
-/// The share of a pass's budget the cursor is steered to leave unused, as a
-/// divisor: a quarter. It is the controller's margin for telling a backlog
-/// from a balance (see [`release_for`]), and also the most a pass holds back
-/// when the budget is spent.
-pub const SLACK_DIVISOR: u64 = 4;
-
 /// One arrivals shard as the controller reads it: how many admissions it has
 /// recorded, and the cap `generate_token` may take it up to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -88,8 +69,56 @@ impl ShardBudget {
     }
 }
 
-/// Inputs read from the `Counters` table for one pass.
+/// One pass's reading: at `at`, `admitted` visitors had been admitted in all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogEntry {
+    pub at: u64,
+    pub admitted: u64,
+}
+
+/// What the controller carries from pass to pass.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AdmissionLog {
+    /// The total admitted at each recent pass, oldest first: what live
+    /// sessions are counted from.
+    pub entries: Vec<LogEntry>,
+    /// How many slots the cursor has been moved for, in all: the limit at the
+    /// last pass plus every session due to have ended by the pass after it.
+    pub provided: u64,
+}
+
+impl AdmissionLog {
+    /// How many had been admitted by `horizon`: the latest entry at or before
+    /// it, or nobody when there is none. Anyone admitted after that entry is
+    /// counted as still live, so a gap in the log admits fewer, never more.
+    #[must_use]
+    pub fn admitted_by(&self, horizon: u64) -> u64 {
+        let mut admitted = 0;
+        for entry in &self.entries {
+            if entry.at > horizon {
+                break;
+            }
+            admitted = entry.admitted;
+        }
+        admitted
+    }
+
+    /// This log with `entry` recorded and `provided` carried, keeping only the
+    /// entries a pass at or after `horizon` can need: those after it, and the
+    /// latest one at or before it.
+    #[must_use]
+    pub fn recorded(&self, entry: LogEntry, horizon: u64, provided: u64) -> Self {
+        let mut entries = self.entries.clone();
+        entries.push(entry);
+        entries.sort_by_key(|e| e.at);
+        let keep_from = entries.iter().rposition(|e| e.at <= horizon).unwrap_or(0);
+        entries.drain(..keep_from);
+        Self { entries, provided }
+    }
+}
+
+/// Inputs read for one pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PassInputs {
     /// The ten arrivals shards.
     pub shards: [ShardBudget; SHARDS],
@@ -99,28 +128,38 @@ pub struct PassInputs {
     /// after an open it starts at the cohort size, so this is the end of the
     /// line however the positions were assigned.
     pub queue_counter: u64,
-    /// Operator target rate in visitors per second (the `/_wr/admin/rate` value).
-    pub target_rate: u32,
-    /// Epoch seconds of the last pass that ran while admission was open, `0`
-    /// if there has never been one.
-    pub last_open_pass_at: u64,
+    /// How many sessions the origin takes at once.
+    pub origin_concurrency: u32,
+    /// How long a session lasts, the same value `generate_token` mints with.
+    pub session_secs: u64,
+    /// The total admitted at each recent pass.
+    pub log: AdmissionLog,
+    /// The whole epoch second, rounded down, at which the shards were read.
+    /// Every admission they count began at or before it: a session starts at
+    /// its request's whole second, and the request took its unit before the
+    /// read. So this is the latest any of their sessions can end, less
+    /// `session_secs`, and what the pass is logged at.
+    pub shards_read_at: u64,
 }
 
 /// What one pass decided.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PassDecision {
     /// Positions released: the distance the cursor moved, which is less than
     /// was computed when the end of the line is reached.
     pub release: u64,
     /// The new `serving_counter`.
     pub next_serving_counter: u64,
-    /// The admission budget outstanding after this pass, across all shards.
+    /// Sessions live as this pass read the shards.
+    pub live: u64,
+    /// The admission budget after this pass, across all shards: the free
+    /// slots.
     pub budget: u64,
     /// The cap to write on each shard: what it has taken, plus its share of
     /// `budget`.
     pub caps: [u64; SHARDS],
-    /// Epoch seconds at which this pass ran, persisted for the next one.
-    pub last_open_pass_at: u64,
+    /// The admission log with this pass recorded.
+    pub log: AdmissionLog,
 }
 
 /// Budget granted and not yet taken, across all shards.
@@ -131,22 +170,12 @@ pub fn unused_budget(shards: [ShardBudget; SHARDS]) -> u64 {
         .fold(0u64, |total, shard| total.saturating_add(shard.unused()))
 }
 
-/// The admissions owed for the time since the last open pass.
-///
-/// `target_rate` times the elapsed seconds, so the total granted follows the
-/// wall clock however many passes run (issue #236): an overlapping execution's
-/// extra pass is owed only the seconds since the one before it, and nothing if
-/// it ran in the same second. A stale or absent prior pass, or a clock that
-/// reads behind it, is owed one interval -- see [`STALE_OPEN_PASS_SECS`].
+/// Admissions recorded across all shards.
 #[must_use]
-pub fn owed(target_rate: u32, last_open_pass_at: u64, now: u64) -> u64 {
-    let rate = u64::from(target_rate);
-    match now.checked_sub(last_open_pass_at) {
-        Some(elapsed) if last_open_pass_at != 0 && elapsed < STALE_OPEN_PASS_SECS => {
-            rate.saturating_mul(elapsed)
-        }
-        Some(_) | None => rate.saturating_mul(INTERVAL_SECS),
-    }
+pub fn admitted(shards: [ShardBudget; SHARDS]) -> u64 {
+    shards
+        .iter()
+        .fold(0u64, |total, shard| total.saturating_add(shard.taken))
 }
 
 /// Decides one pass: how far the cursor moves and what budget stands after it.
@@ -154,19 +183,29 @@ pub fn owed(target_rate: u32, last_open_pass_at: u64, now: u64) -> u64 {
 /// A pure function of its inputs and `now`, so the cadence is testable with
 /// time injected.
 #[must_use]
-pub fn compute_pass(inputs: PassInputs, now: u64) -> PassDecision {
-    let owed = owed(inputs.target_rate, inputs.last_open_pass_at, now);
+pub fn compute_pass(inputs: &PassInputs, now: u64) -> PassDecision {
+    let admitted = admitted(inputs.shards);
+    let horizon = now.saturating_sub(inputs.session_secs);
+    let live = admitted.saturating_sub(inputs.log.admitted_by(horizon));
+    let limit = u64::from(inputs.origin_concurrency);
+    let free = limit.saturating_sub(live);
     let unused = unused_budget(inputs.shards);
-    let burst = u64::from(inputs.target_rate)
-        .saturating_mul(INTERVAL_SECS)
-        .saturating_mul(BURST_INTERVALS);
 
-    // What may be admitted from here until the next pass. Capped, so budget
-    // nobody took does not pile up into a burst: an event that sat idle for an
-    // hour has the same budget as one that sat idle for twenty seconds.
-    let budget = unused.saturating_add(owed).min(burst);
-
-    let positions = release_for(owed, unused);
+    // Every slot is released for once: the limit, and each session as it is
+    // due to end, counted a pass ahead. A lowered limit releases nobody until
+    // enough sessions have ended to make up the difference. A slot granted at
+    // the last pass and still untaken had someone released for it who has not
+    // come, so half as many again are released in their place: a slot nobody
+    // takes is refilled within a few passes, while one whose person is merely
+    // slow does not draw many more.
+    let provided = limit.saturating_add(
+        inputs
+            .log
+            .admitted_by(horizon.saturating_add(INTERVAL_SECS)),
+    );
+    let positions = provided
+        .saturating_sub(inputs.log.provided)
+        .saturating_add(unused.min(free).div_ceil(2));
 
     // The cursor is exclusive -- position p is admitted once p < serving_counter
     // -- and queue_counter is the highest position ever issued, so one past it
@@ -183,37 +222,17 @@ pub fn compute_pass(inputs: PassInputs, now: u64) -> PassDecision {
     PassDecision {
         release: next_serving_counter.saturating_sub(inputs.serving_counter),
         next_serving_counter,
-        budget,
-        caps: caps_for(inputs.shards, budget),
-        last_open_pass_at: now,
-    }
-}
-
-/// How far the cursor moves for a pass that is owed `owed` admissions and found
-/// `unused` budget.
-///
-/// The cursor is steered to keep a little budget unused: `owed /
-/// SLACK_DIVISOR`. Unused budget is the one thing the controller can see about
-/// demand, and it only says anything while it is above zero. A pass that finds
-/// the budget fully spent cannot tell "exactly enough people asked" from "forty
-/// thousand people are asking and being refused", and a law that released the
-/// full amount in that case kept such a backlog for the whole event, every one
-/// of them retrying. So:
-///
-/// - more unused than the slack: people are not showing up. Release that many
-///   extra, at most doubling the pass -- the no-show correction.
-/// - less: demand is at or over the budget. Release that many fewer, down to
-///   three quarters of the pass, so whoever is already waiting is admitted
-///   ahead of new releases and a backlog drains.
-///
-/// Both terms scale with `owed`, so a pass that is owed nothing (it ran in the
-/// same second as another) releases nothing.
-fn release_for(owed: u64, unused: u64) -> u64 {
-    let slack = owed.checked_div(SLACK_DIVISOR).unwrap_or(0);
-    if unused >= slack {
-        owed.saturating_add(unused.saturating_sub(slack).min(owed))
-    } else {
-        owed.saturating_sub(slack.saturating_sub(unused))
+        live,
+        budget: free,
+        caps: caps_for(inputs.shards, free),
+        log: inputs.log.recorded(
+            LogEntry {
+                at: inputs.shards_read_at,
+                admitted,
+            },
+            horizon,
+            provided,
+        ),
     }
 }
 
@@ -266,22 +285,29 @@ pub struct ControllerState {
 /// The persistence port the controller drives. A trait seam so the pipeline runs
 /// AWS-free in tests (the `dynamo` module supplies the live implementation).
 pub trait Store {
-    /// Reads the event's `Counters` item and its ten arrivals shards.
+    /// Reads the event's `Counters` item, its ten arrivals shards and the
+    /// admission log.
     fn read_state(
         &self,
         event_id: &str,
     ) -> impl Future<Output = Result<ControllerState, StoreError>> + Send;
 
-    /// Advances `serving_counter` to `decision.next_serving_counter` and stamps
-    /// `last_open_pass_at`, guarded on the cursor still being
-    /// `expected_serving_counter` so two passes cannot both advance from the
-    /// same read. A lost race is not an error.
+    /// Advances `serving_counter` to `decision.next_serving_counter`, guarded
+    /// on the cursor still being `expected_serving_counter` so two passes
+    /// cannot both advance from the same read. A lost race is not an error.
     fn write_release(
         &self,
         event_id: &str,
         decision: &PassDecision,
         expected_serving_counter: u64,
     ) -> impl Future<Output = Result<ReleaseOutcome, StoreError>> + Send;
+
+    /// Replaces the admission log.
+    fn write_log(
+        &self,
+        event_id: &str,
+        log: &AdmissionLog,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
     /// Writes each shard's cap. The caps are absolute, so writing them twice
     /// grants nothing twice.
@@ -311,11 +337,11 @@ pub enum PassOutcome {
 /// Runs one controller pass for the event: read state, gate on `Active` and on
 /// the operator's admission override, then move the cursor and grant budget.
 ///
-/// The cursor is written first and the budget second. A pass that loses the
-/// cursor race writes no budget: the winner computed the same grant from the
-/// same state. A pass whose budget write fails has moved the cursor without
-/// granting for it, which admits fewer people than intended until the next
-/// pass makes it up -- the safe direction.
+/// The cursor is written first, then the log, then the budget. A pass that
+/// loses the cursor race writes neither: the winner computed the same grant
+/// from the same state. Every later failure errs towards admitting fewer: a
+/// log that misses a pass counts its admissions live for longer, and caps left
+/// from the last pass grant only slots that were free then.
 ///
 /// # Errors
 ///
@@ -346,7 +372,7 @@ pub async fn run_pass<S: Store>(
         }
     }
 
-    let decision = compute_pass(state.inputs, now);
+    let decision = compute_pass(&state.inputs, now);
     match store
         .write_release(event_id, &decision, state.inputs.serving_counter)
         .await?
@@ -361,12 +387,14 @@ pub async fn run_pass<S: Store>(
             return Ok(PassOutcome::Ran { released: 0 });
         }
     }
+    store.write_log(event_id, &decision.log).await?;
     store.write_caps(event_id, &decision.caps).await?;
 
     tracing::info!(
         event_id,
         released = decision.release,
         serving_counter = decision.next_serving_counter,
+        live = decision.live,
         unused_budget = unused_budget(state.inputs.shards),
         budget = decision.budget,
         "controller pass"
@@ -385,151 +413,251 @@ mod tests {
     use super::*;
 
     const NOW: u64 = 1_000_000;
+    // Not a multiple of the interval, so sessions end between passes.
+    const SESSION: u64 = 605;
 
-    /// A mid-event state in balance: the last pass ran one interval ago, and
-    /// the slack -- a quarter of an interval's budget -- is what went unused.
-    fn inputs(serving: u64, rate: u32) -> PassInputs {
-        let mut shards = [ShardBudget::default(); SHARDS];
-        shards[9] = ShardBudget {
-            taken: 0,
-            cap: u64::from(rate) * INTERVAL_SECS / SLACK_DIVISOR,
-        };
+    fn inputs(concurrency: u32) -> PassInputs {
         PassInputs {
-            shards,
-            serving_counter: serving,
+            shards: [ShardBudget::default(); SHARDS],
+            serving_counter: 0,
             queue_counter: u64::MAX - 1,
-            target_rate: rate,
-            last_open_pass_at: NOW - INTERVAL_SECS,
+            origin_concurrency: concurrency,
+            session_secs: SESSION,
+            log: AdmissionLog::default(),
+            shards_read_at: NOW,
         }
     }
 
-    /// The same, with exactly `unused` budget left over, all on shard 0.
-    fn with_unused(mut i: PassInputs, unused: u64) -> PassInputs {
+    /// `taken` admissions so far, all on shard 0, with `unused` budget left on
+    /// it from the last pass.
+    fn with_taken(mut i: PassInputs, taken: u64, unused: u64) -> PassInputs {
         i.shards = [ShardBudget::default(); SHARDS];
         i.shards[0] = ShardBudget {
-            taken: 100,
-            cap: 100 + unused,
+            taken,
+            cap: taken + unused,
         };
         i
     }
 
-    fn total_cap_headroom(shards: [ShardBudget; SHARDS], caps: [u64; SHARDS]) -> u64 {
-        caps.iter()
-            .zip(shards)
-            .map(|(cap, shard)| cap - shard.taken)
-            .sum()
+    fn entry(at: u64, admitted: u64) -> LogEntry {
+        LogEntry { at, admitted }
     }
 
-    // --- the grant -----------------------------------------------------------
+    fn log_of(entries: Vec<LogEntry>) -> AdmissionLog {
+        AdmissionLog {
+            entries,
+            provided: 0,
+        }
+    }
+
+    // --- the admission log ---------------------------------------------------
 
     #[test]
-    fn a_regular_pass_grants_and_releases_one_interval() {
-        let d = compute_pass(inputs(1000, 50), NOW);
-        assert_eq!(d.budget, 625); // 50/s * 10 s, on top of the 125 slack
-        assert_eq!(d.release, 500);
-        assert_eq!(d.next_serving_counter, 1500);
-        assert_eq!(d.last_open_pass_at, NOW);
+    fn the_log_reads_the_latest_entry_at_or_before_the_horizon() {
+        let log = log_of(vec![entry(100, 5), entry(110, 9), entry(120, 14)]);
+        assert_eq!(log.admitted_by(99), 0);
+        assert_eq!(log.admitted_by(100), 5);
+        assert_eq!(log.admitted_by(119), 9);
+        assert_eq!(log.admitted_by(10_000), 14);
+    }
+
+    #[test]
+    fn recording_keeps_only_what_a_later_pass_can_need() {
+        let log = log_of(vec![entry(100, 5), entry(110, 9), entry(120, 14)]);
+        let next = log.recorded(entry(130, 20), 115, 0);
+        assert_eq!(
+            next.entries,
+            vec![entry(110, 9), entry(120, 14), entry(130, 20)]
+        );
+        // Whatever horizon a later pass uses, it reads what it would have
+        // read from the whole log.
+        for horizon in 115..200 {
+            let mut whole = log.entries.clone();
+            whole.push(entry(130, 20));
+            assert_eq!(
+                next.admitted_by(horizon),
+                log_of(whole).admitted_by(horizon)
+            );
+        }
+    }
+
+    #[test]
+    fn an_entry_from_a_clock_behind_the_log_is_put_in_order() {
+        let log = log_of(vec![entry(100, 5), entry(120, 14)]);
+        let next = log.recorded(entry(110, 9), 0, 0);
+        assert_eq!(
+            next.entries,
+            vec![entry(100, 5), entry(110, 9), entry(120, 14)]
+        );
+    }
+
+    // --- one pass ------------------------------------------------------------
+
+    #[test]
+    fn the_first_pass_fills_every_slot() {
+        let d = compute_pass(&inputs(100), NOW);
+        assert_eq!(d.live, 0);
+        assert_eq!(d.budget, 100);
+        assert_eq!(d.release, 100);
+        assert_eq!(d.caps.iter().sum::<u64>(), 100);
+        assert_eq!(d.log.entries, vec![entry(NOW, 0)]);
+        assert_eq!(d.log.provided, 100);
+    }
+
+    /// The log the pass before `NOW` left, having filled the origin.
+    fn after_the_open() -> AdmissionLog {
+        AdmissionLog {
+            entries: vec![entry(NOW - 10, 0)],
+            provided: 100,
+        }
+    }
+
+    #[test]
+    fn a_pass_is_logged_at_the_second_its_shards_were_read() {
+        // A request that took its unit just before the read started its
+        // session in that second, after the pass itself began.
+        let mut i = with_taken(inputs(100), 7, 0);
+        i.shards_read_at = NOW + 1;
+        let d = compute_pass(&i, NOW);
+        assert_eq!(d.log.entries, vec![entry(NOW + 1, 7)]);
+    }
+
+    #[test]
+    fn a_full_origin_grants_nothing_and_releases_nobody() {
+        let mut i = with_taken(inputs(100), 100, 0);
+        i.log = after_the_open();
+        let d = compute_pass(&i, NOW);
+        assert_eq!(d.live, 100);
+        assert_eq!(d.budget, 0);
+        assert_eq!(d.release, 0);
+    }
+
+    #[test]
+    fn a_session_frees_its_slot_once_its_length_has_passed() {
+        // 100 admitted at the open, 30 more ten seconds later.
+        let mut i = with_taken(inputs(100), 130, 0);
+        let opened = NOW - SESSION;
+        i.log = log_of(vec![entry(opened - 10, 0), entry(opened, 100)]);
+        let d = compute_pass(&i, NOW);
+        // The first 100 have ended; the 30 are live.
+        assert_eq!(d.live, 30);
+        assert_eq!(d.budget, 70);
+        // A second earlier, they had not.
+        let d = compute_pass(&i, NOW - 1);
+        assert_eq!(d.live, 130);
+        assert_eq!(d.budget, 0);
+    }
+
+    #[test]
+    fn replacements_are_released_a_pass_before_sessions_end() {
+        // 100 admitted at the open, which ends a session length later.
+        let opened = NOW - SESSION;
+        let mut i = with_taken(inputs(100), 100, 0);
+        i.log = AdmissionLog {
+            entries: vec![entry(opened - 10, 0), entry(opened, 100)],
+            provided: 100,
+        };
+        // A pass before they end: nothing is granted yet, but the 100 behind
+        // them are released.
+        let before = compute_pass(&i, NOW - INTERVAL_SECS);
+        assert_eq!((before.live, before.budget, before.release), (100, 0, 100));
+        // When they end, the slots are granted and nobody more is released.
+        i.log = before.log;
+        let at = compute_pass(&i, NOW);
+        assert_eq!((at.live, at.budget, at.release), (0, 100, 0));
+    }
+
+    #[test]
+    fn a_slot_left_untaken_releases_a_replacement() {
+        // 60 admitted and live, 40 slots granted last pass and still free.
+        let mut i = with_taken(inputs(100), 60, 40);
+        i.log = after_the_open();
+        let d = compute_pass(&i, NOW);
+        assert_eq!(d.budget, 40);
+        assert_eq!(d.release, 20);
+        // One slot nobody takes still draws someone.
+        let mut i = with_taken(inputs(100), 99, 1);
+        i.log = after_the_open();
+        assert_eq!(compute_pass(&i, NOW).release, 1);
+    }
+
+    #[test]
+    fn lowering_the_limit_below_the_live_sessions_admits_nobody() {
+        let mut i = with_taken(inputs(100), 80, 20);
+        i.log = after_the_open();
+        i.origin_concurrency = 50;
+        let d = compute_pass(&i, NOW);
+        assert_eq!(d.budget, 0);
+        assert_eq!(d.release, 0);
+        for (cap, shard) in d.caps.iter().zip(i.shards) {
+            assert_eq!(*cap, shard.taken);
+        }
+    }
+
+    #[test]
+    fn a_zero_limit_grants_and_releases_nothing() {
+        let d = compute_pass(&inputs(0), NOW);
+        assert_eq!((d.budget, d.release), (0, 0));
     }
 
     #[test]
     fn the_caps_hand_out_exactly_the_budget_on_top_of_what_was_taken() {
-        let mut i = inputs(1000, 5); // budget 50 + unused
+        let mut i = inputs(57);
         for (index, shard) in i.shards.iter_mut().enumerate() {
             *shard = ShardBudget {
                 taken: 10 * index as u64,
                 cap: 10 * index as u64,
             };
         }
-        i.shards[3].cap += 7; // 7 unused
-        let d = compute_pass(i, NOW);
+        i.origin_concurrency = 57 + 450;
+        let d = compute_pass(&i, NOW);
         assert_eq!(d.budget, 57);
-        assert_eq!(total_cap_headroom(i.shards, d.caps), 57);
-        // As even as whole numbers allow: 5 each, and one more on the first 7.
         for (index, (cap, shard)) in d.caps.iter().zip(i.shards).enumerate() {
-            let expected = if index < 7 { 6 } else { 5 };
+            let expected = 5 + u64::from(index < 7);
             assert_eq!(cap - shard.taken, expected, "shard {index}");
         }
     }
 
     #[test]
-    fn unused_budget_is_carried_but_never_past_the_burst() {
-        // 300 unused + 500 owed fits under the 1000 burst.
-        let d = compute_pass(with_unused(inputs(1000, 50), 300), NOW);
-        assert_eq!(d.budget, 800);
-        // 900 unused + 500 owed does not.
-        let d = compute_pass(with_unused(inputs(1000, 50), 900), NOW);
-        assert_eq!(d.budget, 1000);
+    fn the_cursor_stops_at_the_end_of_the_line() {
+        let mut i = inputs(100);
+        i.queue_counter = 40;
+        let d = compute_pass(&i, NOW);
+        assert_eq!(d.next_serving_counter, 41);
+        assert_eq!(d.release, 41);
     }
 
     #[test]
-    fn an_idle_event_banks_no_more_than_the_burst() {
-        // Nobody is in line for an hour of passes. The budget does not grow
-        // past the burst, so the crowd that then arrives is metered from its
-        // first second rather than walking through an hour of saved-up credit.
-        let mut i = inputs(1, 50);
-        i.queue_counter = 0;
-        for step in 0..360u64 {
-            let now = NOW + step * INTERVAL_SECS;
-            let d = compute_pass(i, now);
-            assert_eq!(d.release, 0);
-            assert!(d.budget <= 1000);
-            for (shard, cap) in i.shards.iter_mut().zip(d.caps) {
-                shard.cap = cap;
-            }
-            i.last_open_pass_at = now;
-        }
-        assert_eq!(unused_budget(i.shards), 1000);
-    }
-
-    #[test]
-    fn lowering_the_rate_shrinks_budget_already_granted() {
-        // 1000 unused at 50/s; the operator drops to 5/s. The burst is now 100,
-        // and that is all that stands.
-        let d = compute_pass(with_unused(inputs(1000, 5), 1000), NOW);
-        assert_eq!(d.budget, 100);
-    }
-
-    #[test]
-    fn a_zero_rate_grants_and_releases_nothing() {
-        let d = compute_pass(with_unused(inputs(1000, 0), 400), NOW);
-        assert_eq!(d.budget, 0);
+    fn a_queue_counter_behind_the_cursor_never_rewinds_admission() {
+        let mut i = inputs(100);
+        i.serving_counter = 500;
+        i.queue_counter = 10;
+        let d = compute_pass(&i, NOW);
+        assert_eq!(d.next_serving_counter, 500);
         assert_eq!(d.release, 0);
     }
 
-    // --- the release ---------------------------------------------------------
+    // --- the loop ------------------------------------------------------------
 
-    #[test]
-    fn unused_budget_releases_extra_positions() {
-        // 200 of last interval's admissions were not taken. 125 of that is the
-        // slack the cursor aims to leave; the other 75 are people who did not
-        // show, so 75 more are invited.
-        let d = compute_pass(with_unused(inputs(1000, 50), 200), NOW);
-        assert_eq!(d.release, 575);
-    }
-
-    #[test]
-    fn a_spent_budget_holds_the_cursor_back_so_a_backlog_drains() {
-        // Nothing went unused: at least as many people asked as there was
-        // budget for. The cursor gives up its slack, and those already waiting
-        // are admitted ahead of new releases.
-        let d = compute_pass(with_unused(inputs(1000, 50), 0), NOW);
-        assert_eq!(d.release, 375);
-        assert_eq!(d.budget, 500);
-    }
-
-    #[test]
-    fn a_backlog_of_invited_visitors_drains_instead_of_persisting() {
-        // Forty thousand people are past the cursor and asking. Each pass
-        // admits a full budget and releases three quarters of one, so the
-        // backlog shrinks by an eighth of a thousand a pass until it is gone.
-        let mut i = with_unused(inputs(1, 50), 0);
-        let mut backlog = 4_000u64;
-        for step in 0..60u64 {
+    /// Runs `passes` regular passes in which a fixed share of the people
+    /// released show up, at the next pass, and take a slot while there is one.
+    /// Returns the live sessions as each pass's admissions land.
+    fn simulate(concurrency: u32, show_per_thousand: u64, passes: u64) -> (Vec<u64>, u64) {
+        let mut i = inputs(concurrency);
+        let mut waiting = 0u64;
+        let mut admissions: Vec<(u64, u64)> = Vec::new();
+        let mut live_after = Vec::new();
+        for step in 0..passes {
             let now = NOW + step * INTERVAL_SECS;
-            let d = compute_pass(i, now);
-            backlog += d.release;
-            let take = backlog.min(d.budget);
-            backlog -= take;
+            i.shards_read_at = now;
+            let d = compute_pass(&i, now);
+            let take = waiting.min(d.budget);
+            waiting -= take;
+            waiting += d.release * show_per_thousand / 1000;
+            // Taken during the interval and counted by the next pass: at the
+            // latest, the moment that pass reads them, which is the case that
+            // would let a session outlive the controller's count.
+            admissions.push((now + INTERVAL_SECS, take));
             let mut left = take;
             for (shard, cap) in i.shards.iter_mut().zip(d.caps) {
                 let used = (cap - shard.taken).min(left);
@@ -540,176 +668,58 @@ mod tests {
                 };
             }
             i.serving_counter = d.next_serving_counter;
-            i.last_open_pass_at = now;
+            i.log = d.log;
+            // Live the moment this pass's takes land, right after the grant:
+            // every earlier session that has not yet run its length, each
+            // taken as late as its log entry allows, plus the takes.
+            let running: u64 = admissions
+                .iter()
+                .rev()
+                .skip(1)
+                .filter(|(at, _)| at + SESSION > now)
+                .map(|(_, n)| n)
+                .sum();
+            live_after.push(running + take);
         }
-        assert!(backlog < 500, "backlog still {backlog} after ten minutes");
+        (live_after, i.serving_counter)
     }
 
     #[test]
-    fn the_correction_never_exceeds_what_is_owed() {
-        // However much is unused, the cursor moves at most twice the target.
-        let d = compute_pass(with_unused(inputs(1000, 50), 900), NOW);
-        assert_eq!(d.release, 1000);
-    }
-
-    #[test]
-    fn the_cursor_stops_at_the_end_of_the_line() {
-        let mut i = inputs(1000, 50);
-        i.queue_counter = 1200;
-        let d = compute_pass(i, NOW);
-        assert_eq!(d.next_serving_counter, 1201);
-        assert_eq!(d.release, 201);
-    }
-
-    #[test]
-    fn a_queue_counter_behind_the_cursor_never_rewinds_admission() {
-        let mut i = inputs(1000, 50);
-        i.queue_counter = 10;
-        let d = compute_pass(i, NOW);
-        assert_eq!(d.next_serving_counter, 1000);
-        assert_eq!(d.release, 0);
-    }
-
-    // --- elapsed time (issue #236) -------------------------------------------
-
-    #[test]
-    fn a_fresh_event_is_owed_one_interval() {
-        // No budget has ever been granted, so none is unused: the first pass
-        // grants an interval and holds the slack back from the cursor.
-        let mut i = with_unused(inputs(0, 50), 0);
-        i.last_open_pass_at = 0;
-        let d = compute_pass(i, 1_788_000_000);
-        assert_eq!(d.budget, 500);
-        assert_eq!(d.release, 375);
-    }
-
-    #[test]
-    fn a_pass_after_a_hold_is_owed_one_interval_not_the_hold() {
-        for gap in [STALE_OPEN_PASS_SECS, 600, 86_400] {
-            let mut i = inputs(1000, 50);
-            i.last_open_pass_at = NOW - gap;
-            let d = compute_pass(i, NOW);
-            assert_eq!(d.budget, 625, "gap {gap}");
-            assert_eq!(d.release, 500, "gap {gap}");
-        }
-    }
-
-    #[test]
-    fn a_late_pass_is_owed_the_seconds_it_ran_late() {
-        // 750 owed; its slack is 187, and exactly that went unused.
-        let mut i = with_unused(inputs(1000, 50), 187);
-        i.last_open_pass_at = NOW - 15;
-        assert_eq!(compute_pass(i, NOW).release, 750);
-    }
-
-    #[test]
-    fn a_pass_in_the_same_second_as_the_last_grants_and_releases_nothing_new() {
-        // An overlapping execution's pass lands on top of the regular one.
-        let mut i = with_unused(inputs(1000, 50), 300);
-        i.last_open_pass_at = NOW;
-        let d = compute_pass(i, NOW);
-        assert_eq!(d.release, 0);
-        assert_eq!(d.budget, 300);
-    }
-
-    #[test]
-    fn a_clock_behind_the_last_pass_is_owed_one_interval() {
-        let mut i = inputs(1000, 50);
-        i.last_open_pass_at = NOW + 10;
-        assert_eq!(compute_pass(i, NOW).release, 500);
-    }
-
-    #[test]
-    fn interleaved_executions_grant_what_one_cadence_would() {
-        // Two executions five seconds out of phase run twelve passes in the
-        // minute one would run six in. Everyone shows up and takes their
-        // admission at once, so nothing is carried.
-        let mut i = with_unused(inputs(1, 50), 0);
-        i.last_open_pass_at = NOW;
-        let (mut released, mut granted) = (0u64, 0u64);
-        for step in 1..=12u64 {
-            let now = NOW + step * 5;
-            let d = compute_pass(i, now);
-            released += d.release;
-            granted += d.budget;
-            for (shard, cap) in i.shards.iter_mut().zip(d.caps) {
-                *shard = ShardBudget { taken: cap, cap };
+    fn no_more_sessions_are_ever_live_than_the_origin_takes() {
+        for show in [1000, 700, 300, 50] {
+            let (live, _) = simulate(100, show, 600);
+            for (pass, n) in live.iter().enumerate() {
+                assert!(*n <= 100, "show {show} pass {pass}: {n} live");
             }
-            i.serving_counter = d.next_serving_counter;
-            i.last_open_pass_at = now;
         }
-        // The budget is the clock's, however many passes hand it out. The
-        // cursor holds its slack back each time, because the budget was spent.
-        assert_eq!(granted, 50 * 60);
-        assert!(
-            (50 * 60 * 3 / 4..=50 * 60).contains(&released),
-            "{released}"
-        );
-    }
-
-    // --- the loop ------------------------------------------------------------
-
-    /// Runs `passes` regular passes in which a fixed share of the people
-    /// released each pass show up, and take budget while there is any.
-    /// Returns the admissions in each pass.
-    fn simulate(show_per_thousand: u64, passes: u64) -> Vec<u64> {
-        let rate = 50u32;
-        let mut i = inputs(1, rate);
-        let mut waiting = 0u64; // released, will show, not yet admitted
-        let mut admitted = Vec::new();
-        for step in 0..passes {
-            let now = NOW + step * INTERVAL_SECS;
-            let d = compute_pass(i, now);
-            waiting += d.release * show_per_thousand / 1000;
-            let take = waiting.min(d.budget);
-            waiting -= take;
-            admitted.push(take);
-            // Spread the takes over the shards the way the caps were.
-            let mut left = take;
-            for (shard, cap) in i.shards.iter_mut().zip(d.caps) {
-                let room = cap - shard.taken;
-                let used = room.min(left);
-                left -= used;
-                *shard = ShardBudget {
-                    taken: shard.taken + used,
-                    cap,
-                };
-            }
-            i.serving_counter = d.next_serving_counter;
-            i.last_open_pass_at = now;
-        }
-        admitted
     }
 
     #[test]
-    fn admissions_converge_on_the_target_despite_no_shows() {
-        // F3.8: with 30% of released visitors never arriving, the origin still
-        // receives the target rate once the correction has settled.
-        let admitted = simulate(700, 60);
-        for (pass, count) in admitted.iter().enumerate().skip(20) {
+    fn the_origin_stays_nearly_full_despite_no_shows() {
+        // A slot is seen free up to a pass after its session ends, and with
+        // no-shows the people released for it are topped up over a few passes,
+        // so the origin runs a little under its limit at each turnover.
+        for (show, at_least) in [(1000, 95), (700, 90)] {
+            let (live, _) = simulate(100, show, 600);
+            let settled = &live[30..];
+            let total: u64 = settled.iter().sum();
             assert!(
-                (495..=505).contains(count),
-                "pass {pass} admitted {count}, expected ~500"
+                total >= at_least * settled.len() as u64,
+                "show {show}: {total} over {} passes",
+                settled.len()
             );
         }
     }
 
     #[test]
-    fn no_window_admits_more_than_its_time_plus_the_burst() {
-        for show in [1000, 700, 500, 300] {
-            let admitted = simulate(show, 120);
-            for (pass, count) in admitted.iter().enumerate() {
-                assert!(*count <= 1000, "show {show} pass {pass}: {count}");
-            }
-            for start in 0..admitted.len() {
-                let mut total = 0u64;
-                for (width, count) in admitted.iter().skip(start).enumerate() {
-                    total += count;
-                    let allowed = 500 * (width as u64 + 1) + 500;
-                    assert!(total <= allowed, "show {show} window {start}+{width}");
-                }
-            }
-        }
+    fn sessions_ending_are_replaced_at_their_rate() {
+        // Everyone shows: the origin is refilled as each session ends, so the
+        // cursor moves concurrency per session length, plus the open's fill.
+        let passes = 600;
+        let (_, served) = simulate(100, 1000, passes);
+        let sessions = passes * INTERVAL_SECS / (SESSION + INTERVAL_SECS);
+        assert!(served >= 100 * sessions, "{served}");
+        assert!(served <= 100 * (sessions + 2), "{served}");
     }
 
     // --- run_pass ------------------------------------------------------------
@@ -717,6 +727,7 @@ mod tests {
     #[derive(Default)]
     struct Writes {
         release: Option<PassDecision>,
+        log: Option<AdmissionLog>,
         caps: Option<[u64; SHARDS]>,
     }
 
@@ -753,8 +764,17 @@ mod tests {
             if self.lose_release {
                 return std::future::ready(Ok(ReleaseOutcome::LostRace));
             }
-            self.writes.lock().unwrap().release = Some(*decision);
+            self.writes.lock().unwrap().release = Some(decision.clone());
             std::future::ready(Ok(ReleaseOutcome::Advanced))
+        }
+
+        fn write_log(
+            &self,
+            _event_id: &str,
+            log: &AdmissionLog,
+        ) -> impl Future<Output = Result<(), StoreError>> + Send {
+            self.writes.lock().unwrap().log = Some(log.clone());
+            std::future::ready(Ok(()))
         }
 
         fn write_caps(
@@ -772,27 +792,29 @@ mod tests {
             phase: Phase::Active,
             stored_control: StoredControl::Open,
             fail_open_until: 0,
-            inputs: inputs(20_000, 50),
+            inputs: inputs(100),
         }
     }
 
     #[tokio::test]
-    async fn an_open_pass_moves_the_cursor_and_grants_budget() {
+    async fn an_open_pass_moves_the_cursor_records_the_pass_and_grants_the_free_slots() {
         let store = FakeStore::new(active_state());
         let outcome = run_pass(&store, "evt", NOW).await.unwrap();
-        assert_eq!(outcome, PassOutcome::Ran { released: 500 });
+        assert_eq!(outcome, PassOutcome::Ran { released: 100 });
         let writes = store.writes.lock().unwrap();
-        assert_eq!(writes.release.unwrap().next_serving_counter, 20_500);
-        assert_eq!(writes.caps.unwrap().iter().sum::<u64>(), 625);
+        assert_eq!(writes.release.as_ref().unwrap().next_serving_counter, 100);
+        assert_eq!(writes.log.as_ref().unwrap().entries, vec![entry(NOW, 0)]);
+        assert_eq!(writes.caps.unwrap().iter().sum::<u64>(), 100);
     }
 
     #[tokio::test]
-    async fn a_lost_release_race_releases_nobody_and_grants_nothing() {
+    async fn a_lost_release_race_releases_nobody_and_writes_nothing_else() {
         let mut store = FakeStore::new(active_state());
         store.lose_release = true;
         let outcome = run_pass(&store, "evt", NOW).await.unwrap();
         assert_eq!(outcome, PassOutcome::Ran { released: 0 });
-        assert!(store.writes.lock().unwrap().caps.is_none());
+        let writes = store.writes.lock().unwrap();
+        assert!(writes.log.is_none() && writes.caps.is_none());
     }
 
     #[tokio::test]
@@ -859,39 +881,51 @@ mod tests {
         )
     }
 
+    fn log() -> impl Strategy<Value = AdmissionLog> {
+        proptest::collection::vec((count(), count()), 0..8).prop_map(|mut pairs| {
+            pairs.sort_unstable();
+            log_of(
+                pairs
+                    .into_iter()
+                    .map(|(at, admitted)| LogEntry { at, admitted })
+                    .collect(),
+            )
+        })
+    }
+
     proptest! {
         #[test]
-        fn a_pass_never_panics_rewinds_or_exceeds_its_bounds(
+        fn a_pass_never_panics_rewinds_or_grants_past_the_limit(
             shards in shards(),
             serving in count(),
             queue in count(),
-            rate in any::<u32>(),
-            last in count(),
+            concurrency in any::<u32>(),
+            session in count(),
+            log in log(),
             now in count(),
+            read_at in count(),
         ) {
             let inputs = PassInputs {
                 shards,
                 serving_counter: serving,
                 queue_counter: queue,
-                target_rate: rate,
-                last_open_pass_at: last,
+                origin_concurrency: concurrency,
+                session_secs: session,
+                log,
+                shards_read_at: read_at,
             };
-            let d = compute_pass(inputs, now);
-            let interval = u64::from(rate).saturating_mul(INTERVAL_SECS);
-            let burst = interval.saturating_mul(BURST_INTERVALS);
+            let d = compute_pass(&inputs, now);
 
-            // The cursor never rewinds, never passes the end of the line unless
-            // it already had, and never moves more than twice what is owed.
             prop_assert!(d.next_serving_counter >= serving);
             prop_assert!(d.next_serving_counter <= serving.max(queue.saturating_add(1)));
-            prop_assert!(d.release <= owed(rate, last, now).saturating_mul(2));
 
-            // The budget never exceeds the burst, and no cap takes a shard
-            // backwards.
-            prop_assert!(d.budget <= burst);
+            // Live sessions plus the budget never exceed the limit, and no cap
+            // takes a shard backwards.
+            prop_assert!(d.budget <= u64::from(concurrency).saturating_sub(d.live));
             for (cap, shard) in d.caps.iter().zip(shards) {
                 prop_assert!(*cap >= shard.taken);
             }
+            prop_assert!(d.log.entries.windows(2).all(|w| w[0].at <= w[1].at));
         }
     }
 }

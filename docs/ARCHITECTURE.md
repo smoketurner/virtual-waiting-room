@@ -1,7 +1,7 @@
 # Architecture
 
-A virtual waiting room holds visitors during a traffic spike and releases them into an origin at
-a rate the origin can sustain. This document is a tour of the deployed system as built, read from
+A virtual waiting room holds visitors during a traffic spike and releases them into an origin
+no faster than the origin can serve them: never more at once than `origin_concurrency`. This document is a tour of the deployed system as built, read from
 `crates/` and `infra/`. [`DESIGN.md`](./DESIGN.md) gives the design, [`DYNAMODB.md`](./DYNAMODB.md)
 the data layer, and [`adr/`](./adr/) the reasoning behind each decision.
 
@@ -172,7 +172,8 @@ failure; redelivery takes the live path, and the visitor holds both a counted `P
 
 `GET /_wr/v1/status` returns `event_id`, `phase`, `serving_state`, `serving_position`, and, when set,
 `participant_count`, `prequeue_offsets`, `shuffle_seed` (hex, only after the open), `message`,
-`target_rate` (visitors per second), `starts_at` and `poll_policy`. `serving_state` is derived from
+`origin_concurrency` (how many visitors the origin takes at once), `starts_at` and `poll_policy`,
+and always `session_seconds`. `serving_state` is derived from
 phase and admission control on every read ([ADR-0019](adr/0019-visitor-facing-serving-state.md)).
 Publishing the seed with the offsets and `N` lets anyone audit the whole ordering; a visitor's own
 shard and index come from `GET /_wr/v1/queue_num`.
@@ -184,7 +185,10 @@ shard and index come from `GET /_wr/v1/queue_num`.
 - delays that first ask by a random slice of `min(120 s, participants / 5000 s⁻¹)` so the cohort
   does not ask at once (at 1,000,000 participants that is about 8,500 requests/s, under the
   default 10,000/s API Gateway account throttle);
-- asks again less and less often, doubling to the ceiling, while a redemption is answered 425;
+- asks again at the floor while a redemption is answered 425, a slot not yet free, and backs off,
+  doubling to the ceiling, on a 429 or a 5xx;
+- polls at the floor while within `origin_concurrency` of the front, since it is released as soon
+  as the next sessions end;
 - polls at `clamp(floor, ceiling, secondsAhead × 1000 / divisor)` plus up to 30 % jitter, from the
   Terraform-set `poll_policy` ([ADR-0023](adr/0023-adaptive-poll-interval.md)), defaulting to a
   fixed 5 s;
@@ -192,6 +196,8 @@ shard and index come from `GET /_wr/v1/queue_num`.
   floor;
 - re-joins with the same request id after eight consecutive 404s from `/_wr/v1/queue_num`, enough to
   clear the event source mapping's 20 s worst case;
+- estimates the wait from how fast it has measured `serving_position` moving, falling back to
+  `origin_concurrency / session_seconds` before it has a measurement;
 - treats any response carrying `x-amzn-waf-action` as "renew the WAF token on `/_wr/verify.html`",
   never as success.
 
@@ -210,31 +216,39 @@ rather than bunched with the next; the function has reserved concurrency
 
 A pass runs only when `phase = active` and the resolved admission control is `Open`; otherwise it
 writes nothing. A pass that fails is skipped (`controller_pass_failed`) and the
-cadence carries on, the next pass being owed the seconds the failed one did not grant. An
+cadence carries on; the next pass computes the same free slots from the same state. An
 execution whose first pass finds the phase `idle` or `post_event` ends there, since such an event
 only becomes active through `pre_queue` and an open; that is most of the controller's cost
 between events (N1), and it means an operator who goes idle → pre_queue → open inside one minute
 waits for the next execution before admission starts.
 
+The origin takes `origin_concurrency` visitors at once, and that is the most sessions the
+controller lets be live ([ADR-0041](adr/0041-meter-origin-concurrency.md)). A session ends exactly
+`session_ttl_seconds` after its admission, so the live ones are the admissions of the last session
+length, counted from the **admission log** `EVT#{event_id}#LOG`: the total admitted at each recent
+pass, and `provided`, how many slots the cursor has been moved for. Each open pass:
+
 ```
-owed     = target_rate × (now − last_open_pass_at)            // one interval if ≥ 20 s or never
+admitted = Σ shards n                                          // logged at the shard read's second
+horizon  = now − session_ttl_seconds
+live     = admitted − log[horizon]                             // latest entry at or before it
 unused   = Σ shards (c − n)
-budget   = min(unused + owed, 2 × target_rate × 10)           // caps: c = n + an even share
-slack    = owed / 4
-release  = owed + clamp(unused − slack, −slack, owed)
+budget   = origin_concurrency − live                           // caps: c = n + an even share
+provided = origin_concurrency + log[horizon + 10 s]
+release  = provided − log.provided + ⌈min(unused, budget) / 2⌉
 next     = clamp(serving_counter + release, serving_counter, queue_counter + 1)
 ```
 
-The budget is what `generate_token` may admit before the next pass; unused budget is carried, up
-to the two-interval burst. The cursor is steered to leave a quarter of a pass's budget unused:
-more than that is people not showing, and that many extra positions are released, at most
-doubling the pass; a budget found spent is a backlog of visitors already invited, and the pass
-releases three quarters so they drain first
-([ADR-0039](adr/0039-meter-admissions-not-the-cursor.md)). All arithmetic saturates. The
-cursor never passes `queue_counter + 1`, and an idle event holds no more than the burst. The
-cursor write is guarded on `serving_counter = :expected`; a pass that loses it writes no caps.
-The caps are then one `UpdateItem` per shard, absolute values, so writing them twice grants
-nothing twice.
+The budget is the free slots, so no more than `origin_concurrency` sessions are ever live. A slot
+is seen free up to one pass (10 s) after its session ends. The cursor moves once for every slot: the
+limit at the open, then each session a pass before it is due to end, so its replacement is already
+asking when the slot is granted. Unused budget is the no-show correction: half as many again are
+released for a slot left untaken ([ADR-0039](adr/0039-meter-admissions-not-the-cursor.md)).
+Lowering the limit below the live sessions admits nobody until enough have ended. Throughput is
+`origin_concurrency` per session length. All arithmetic saturates, and the cursor never passes
+`queue_counter + 1`. The cursor write is guarded on `serving_counter = :expected`; a pass that
+loses it writes neither the log nor the caps. The log is then one `UpdateItem`, and the caps one
+`UpdateItem` per shard, absolute values, so writing them twice grants nothing twice.
 
 The controller expires nothing. A position lives until DynamoDB TTL reclaims its row 24 hours
 after its last write, and the unused budget compensates for absentees
@@ -290,7 +304,10 @@ and a keyed tag of the viewer's IPv4 address or IPv6 /64 from `CloudFront-Viewer
 <session_cookie_name>=<jws>; Path=/; Max-Age=<session_ttl_seconds>; Secure; HttpOnly; SameSite=Lax
 ```
 
-`session_ttl_seconds` defaults to 3,600. The signing key is read from SSM once at cold start.
+`session_ttl_seconds` defaults to 900, and each session holds one of the origin's slots for that
+long. Terraform passes it as `SESSION_TTL_SECS` to `generate_token`, `nojs`, `controller` and
+`read`, which all require it, so the session the gate enforces is the one the controller counts.
+The signing key is read from SSM once at cold start.
 Terraform generates it (`random_bytes.signing_key`) and writes it to both SSM and the gate's
 KeyValueStore in the same apply.
 
@@ -361,7 +378,7 @@ The admin Lambda serves an Axum router behind an API Gateway greedy proxy:
 | `/_wr/admin/phase` | POST | Phase transition from an expected prior phase; refuses `active`, which only the open can set |
 | `/_wr/admin/start_time` | POST | Sets or clears the start time and arms the open schedule |
 | `/_wr/admin/open_now` | POST | Invokes `open_event` now |
-| `/_wr/admin/rate`, `/_wr/admin/message` | POST | Target rate (guarded on the prior rate), operator broadcast |
+| `/_wr/admin/concurrency`, `/_wr/admin/message` | POST | Origin concurrency (guarded on the prior value), operator broadcast |
 | `/_wr/admin/pause`, `/_wr/admin/resume` | POST | Admission control `open` ↔ `paused` |
 | `/_wr/admin/fail_open`, `/_wr/admin/recover` | POST | Sets and clears `fail_open_until`, mirrored to the KeyValueStore |
 | `/_wr/admin/force_maintenance` | POST | Emergency stop: maintenance from any phase, not debounced |
@@ -388,10 +405,9 @@ proven. The core ones:
 | In domain | `prop_in_domain` |
 | Uniform | `prop_uniform_by_decile` (χ² over 10 deciles at `n = 10,000`, below the p = 0.001 critical value) |
 | Keys distinct | `shard_keys_are_distinct_partition_keys`, `the_tokens_table_key_space_does_not_collide_across_kinds` |
-| Admission bounded | `no_window_admits_more_than_its_time_plus_the_burst`, `an_idle_event_banks_no_more_than_the_burst`, `a_pass_never_panics_rewinds_or_exceeds_its_bounds` |
-| No-show convergence | `admissions_converge_on_the_target_despite_no_shows` |
-| A backlog drains | `a_spent_budget_holds_the_cursor_back_so_a_backlog_drains`, `a_backlog_of_invited_visitors_drains_instead_of_persisting` |
-| Cadence-independent | `interleaved_executions_grant_what_one_cadence_would` |
+| Concurrency bounded | `no_more_sessions_are_ever_live_than_the_origin_takes`, `lowering_the_limit_below_the_live_sessions_admits_nobody`, `a_pass_never_panics_rewinds_or_grants_past_the_limit` |
+| No-show correction | `the_origin_stays_nearly_full_despite_no_shows` |
+| Sessions replaced | `sessions_ending_are_replaced_at_their_rate`, `replacements_are_released_a_pass_before_sessions_end`, `a_session_frees_its_slot_once_its_length_has_passed` |
 | Gate conformance | `infra/modules/edge/tests/gate.conformance.test.js` |
 
 ## 12. Known gaps
@@ -410,8 +426,8 @@ shape how the built system behaves:
   returns to the queue; set it longer than the worst realistic visit.
 - **The admin Lambda can read the signing key.** Its KeyValueStore grant covers `k` as well as the
   config, and IAM cannot narrow it.
-- **No concurrency term in the control law** (#65): nothing reports when a visitor leaves the
-  origin.
+- **No completion signal** (#65). A visitor who finishes early holds their slot until the session
+  ends, because nothing reports a departure.
 - **GovCloud has no gate.** CloudFront Functions are not offered there (N4).
 
 ## 13. FAQ

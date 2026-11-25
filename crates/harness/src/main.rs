@@ -45,7 +45,7 @@ struct Args {
     /// Visitors admitted per second. Drives the built-in stub's moving
     /// `serving_position` and, under `--polling backoff`, the client's own
     /// interval calculation — both read the same value, the way a real
-    /// event's controller and client both work from `target_rate`.
+    /// event's cursor and client's estimate both follow one admission rate.
     target_rate: u64,
 }
 
@@ -153,7 +153,7 @@ async fn main() -> Result<()> {
                             (
                                 200,
                                 format!(
-                                    r#"{{"event_id":"harness","phase":"active","serving_state":"running","serving_position":{serving},"target_rate":{target_rate}}}"#
+                                    r#"{{"event_id":"harness","phase":"active","serving_state":"running","serving_position":{serving},"origin_concurrency":{target_rate},"session_seconds":1}}"#
                                 ),
                             )
                         }

@@ -74,10 +74,11 @@ visible fairness failure at 1,000,000 people. Tests are the primary evidence.
   config), the refuse-on-throw path after one (an unreadable key, a throw inside the refusal: plain
   403, reason `error`, #242), and the optional previous key `kp` (#247). Suspicious paths (a dot
   segment, `;`, a backslash) matching any path rule are pinned by the cross-language vectors.
-- **No-show compensation, the admission bound and the backlog drain** — with an injected no-show
-  rate, admissions converge on the target rate; no window admits more than its time at that rate
-  plus the burst; and a spent budget holds the cursor back so visitors already invited drain
-  instead of persisting (ADR-0039).
+- **The concurrency bound, no-show compensation and replacement** — simulated over many passes,
+  no more sessions are ever live than `origin_concurrency`, whatever share of the people released
+  show up; with 30% no-shows the origin's slots stay nearly full; sessions ending are replaced at
+  their rate, released a pass before they end; and lowering the limit below the live sessions
+  admits nobody until enough have ended (ADR-0039, ADR-0041).
 
 ## Not currently provable, and why
 
@@ -96,8 +97,8 @@ the mechanism exists.
 - **Bounded registration volume** (#59) — no mechanism is chosen: the identity-based one was
   retired (ADR-0028), so there is no identifier to test "one position per identity" against.
   Write the test once #59 records which bound it adopts.
-- **Concurrency control** (#65) — with injected session durations an order of magnitude apart,
-  measured active sessions converge on the ceiling in both cases.
+- **Completion signal** (#65) — a visitor who reports leaving frees their slot before their session
+  would have ended, and the slot is granted to the next in line.
 - **Revocation** (#63) — no design exists yet (ADR-0021 §5.2); do not write a test against a
   mechanism that has not been chosen.
 

@@ -39,7 +39,8 @@ prek run             # pre-commit hooks (fmt, actionlint, zizmor, shellcheck)
 never run apply or destroy unless explicitly asked.
 
 Deployment configuration (region, `aws_profile`, `event_id`, `lambda_architecture`,
-artifact paths, and the event seed — `admission_rate`, `gate_rules`, `starts_at`) lives in
+artifact paths, `session_ttl_seconds`, and the event seed — `origin_concurrency`, `gate_rules`,
+`starts_at`) lives in
 `infra/environments/dev/terraform.tfvars` and is authoritative — the Makefile deliberately passes no `-var`, since a command-line `-var` would
 override the file. `make build` reads `lambda_architecture` out of that file to pick its cross-compile
 target, so the binaries cannot be built for a different architecture than the functions are
@@ -89,18 +90,23 @@ Position assignment has two paths:
   only, then writes each row with `attribute_not_exists(request_id)`. Gaps are acceptable;
   duplicates are not.
 
-Admission is metered where it happens (ADR-0039): `controller` runs six passes per
-`rate(1 minute)` execution (10 s cadence), and each grants an **admission budget** for the seconds
-elapsed (written as a cap `c` on each arrivals shard, at most two intervals outstanding) and
-advances `serving_counter` by the same amount, steered to leave a quarter of it unused: more unused
-than that releases extra (the no-show correction), and a spent budget releases three quarters so a
-backlog of visitors already invited drains. It is a **Lambda durable
+Admission is metered where it happens (ADR-0039) and bounded by **origin concurrency**
+(ADR-0041): the most sessions live at once. A session ends exactly `session_ttl_seconds` after
+its admission (900 s by default, the time to complete a purchase), so the live ones are the
+admissions of the last session length. `controller` runs six passes per `rate(1 minute)` execution
+(10 s cadence) and keeps an **admission log** (`EVT#{event_id}#LOG`: the total admitted at each
+pass) to count them. Each pass grants the free slots, `origin_concurrency` minus the live sessions,
+as an **admission budget** (a cap `c` on each arrivals shard), and advances `serving_counter` by the
+slots due free by the next pass, one pass early, plus half of any slot left untaken through the
+last pass (the no-show correction). Throughput is therefore `origin_concurrency` per session
+length. `SESSION_TTL_SECS` is required by every function that mints or counts a session and must
+be the same value: a session that outlives the controller's count is a visitor over the limit. It is a **Lambda durable
 function** (ADR-0022): each pass is a checkpointed durable step and each 10 s gap a durable
 wait that suspends the execution instead of holding the invocation open, so the waiting is not
 billed. The SDK (`aws-durable-execution-sdk`) is generally available and pinned exactly. It does
 not expire positions: a row lives until its DynamoDB TTL reclaims it (ADR-0031), and the unused
-budget is what compensates for absentees. A failed pass is skipped and the next is owed its
-seconds; an execution that finds the event `idle` or `post_event` ends after one pass.
+budget is what compensates for absentees. A failed pass is skipped and the next computes the
+same free slots from the same state; an execution that finds the event `idle` or `post_event` ends after one pass.
 
 **The gate is a CloudFront Function** (ADR-0021, issue #71), associated at viewer-request with the
 protected behaviour only — never distribution-wide, since Functions bill per invocation and a
@@ -168,8 +174,8 @@ actions must work with JavaScript disabled, and the UI adds no capability the ad
 Four DynamoDB tables, all on-demand with PITR: `Counters` (PK `event_id`), `PreQueue` (PK `r`),
 `Positions` (PK `request_id`), `Tokens` (PK `request_id`).
 
-The event's own `Counters` item holds the sequences, phase, seed, rate, message, and the
-operator's admission override: `admission_control` (the `StoredControl` wire string, `open` or
+The event's own `Counters` item holds the sequences, phase, seed, origin concurrency, message, and
+the operator's admission override: `admission_control` (the `StoredControl` wire string, `open` or
 `paused` only — never `fail_open`, issue #71) and `fail_open_until` (an epoch-seconds deadline,
 `0` = no window). `wr_common::resolve(stored, fail_open_until, now)` is the only thing that
 produces the third, resolved value, `AdmissionControl::FailOpen`; nothing parses it back out of
@@ -186,7 +192,8 @@ row, of which there is one per visitor.
 
 `prequeue_counter` and `arrivals` are order-free and striped ×10, **as separate items** keyed
 `EVT#{event_id}#PQ#{shard}` and `EVT#{event_id}#AR#{shard}`, each holding one attribute `n`.
-The event's own item is `EVT#{event_id}`. Every key is built by `wr_common::expr`, never at
+The event's own item is `EVT#{event_id}`; the controller's admission log is `EVT#{event_id}#LOG`,
+which only the controller reads. Every key is built by `wr_common::expr`, never at
 the call site, and `event_id` may not contain `#` — the separator would let one event's shard
 key collide with another event's item. The write
 ceiling is 1,000/s per partition key, so striping across attribute names on one item would

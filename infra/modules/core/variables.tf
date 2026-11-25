@@ -99,9 +99,9 @@ variable "nojs_reserved_concurrency" {
 }
 
 variable "session_ttl_seconds" {
-  description = "How long an admission session credential stays valid. Long enough to complete a purchase, short enough that a leaked cookie is not a standing bypass."
+  description = "How long an admitted visitor's session lasts, and so how long each one holds a slot of origin_concurrency. Long enough to complete a purchase, short enough that a leaked cookie is not a standing bypass."
   type        = number
-  default     = 3600
+  default     = 900
 
   validation {
     condition     = var.session_ttl_seconds > 0 && var.session_ttl_seconds <= 86400
@@ -298,14 +298,14 @@ variable "poll_divisor" {
   }
 }
 
-variable "admission_rate" {
-  description = "Target admission rate in visitors per second, seeded onto the event item so the controller drains from the first apply. An absent or zero target_rate releases nobody and expires nobody, forever, while the controller logs a successful pass every ten seconds -- which is why this has a real default rather than zero. The operator changes it live from the dashboard; Terraform only seeds it."
+variable "origin_concurrency" {
+  description = "How many visitors the origin takes at once, seeded onto the event item so the controller admits from the first apply. Zero would admit nobody, forever, while the controller logged a successful pass every ten seconds, so it has a real default. The operator changes it live from the dashboard; Terraform only seeds it."
   type        = number
-  default     = 5
+  default     = 100
 
   validation {
-    condition     = var.admission_rate >= 1 && var.admission_rate <= 100000 && floor(var.admission_rate) == var.admission_rate
-    error_message = "admission_rate must be a whole number of visitors per second between 1 and 100000 (MAX_ADMISSION_RATE)."
+    condition     = var.origin_concurrency >= 1 && var.origin_concurrency <= 100000 && floor(var.origin_concurrency) == var.origin_concurrency
+    error_message = "origin_concurrency must be a whole number between 1 and 100000 (MAX_ORIGIN_CONCURRENCY)."
   }
 }
 

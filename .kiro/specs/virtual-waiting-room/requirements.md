@@ -6,7 +6,7 @@ MUST = SHALL, SHOULD = SHOULD. IDs match that document exactly; build state is i
 
 ## Introduction
 
-The virtual waiting room meters visitors into an AWS origin at a rate the origin can survive,
+The virtual waiting room meters visitors into an AWS origin no faster than the origin can serve them,
 holding overflow on operator pages and admitting visitors under operator control. It runs
 scheduled events (known start time) and standby protection (dormant until inflow crosses a
 threshold). Every deployment is single-tenant, inside the client's own AWS account.
@@ -35,7 +35,7 @@ threshold). Every deployment is single-tenant, inside the client's own AWS accou
 
 **F0.5** — As an operator, I want scoped rooms and site-wide protection to coexist.
 - THE SYSTEM SHALL run scheduled and standby modes simultaneously on one origin.
-- Acceptance: A scheduled room on `/product/x` with a low admission rate coexists with standby protection across the whole site.
+- Acceptance: A scheduled room on `/product/x` with a low origin concurrency coexists with standby protection across the whole site.
 
 **F0.6** — As an operator, I want to declare what is protected.
 - THE SYSTEM SHALL allow the operator to declare protected requests by path, header, cookie, or user agent.
@@ -107,8 +107,8 @@ activation queues FIFO.
 - Acceptance: `GET /queue_num` and `GET /status` return correct values.
 
 **F3.2** — As an operator, I want to throttle admission during the event.
-- WHEN the operator changes the admission rate, THE SYSTEM SHALL apply the new target rate.
-- Acceptance: `POST /_wr/admin/rate` changes the target rate; effect visible within the cache TTL.
+- WHEN the operator changes the origin concurrency, THE SYSTEM SHALL keep no more admitted visitors' sessions live at once than the new limit.
+- Acceptance: `POST /_wr/admin/concurrency` changes the limit; no more sessions than it are ever live, and the change takes effect within one controller pass.
 
 **F3.3** — As an admitted visitor, I want a credential that needs no backend call.
 - WHEN a visitor is admitted, THE SYSTEM SHALL issue a cryptographically verifiable session credential.
@@ -122,10 +122,10 @@ activation queues FIFO.
 - WHEN a visitor's position is reached, THE SYSTEM SHALL establish a **session**.
 - Acceptance: A visitor navigates to a second page without re-presenting anything and is not re-queued.
 
-**F3.8** — As an operator, I want origin arrivals to hit the target despite no-shows.
-- THE SYSTEM SHALL compensate admission rate control for **no-shows**.
-- THE SYSTEM SHALL count each admitted visitor as one arrival however many times they call `/_wr/v1/generate_token`.
-- Acceptance: With a 30% no-show rate and a target of 500/min, origin arrivals converge on 500/min, not 350; three reloads add one arrival, not three.
+**F3.8** — As an operator, I want the origin kept full despite no-shows.
+- THE SYSTEM SHALL compensate admission control for **no-shows**.
+- THE SYSTEM SHALL count each admitted visitor once however many times they call `/_wr/v1/generate_token`.
+- Acceptance: With a 30% no-show rate the origin's slots stay nearly full, not 70% full; three reloads take one slot, not three.
 
 ### 1.5 Failure behaviour
 
@@ -169,7 +169,7 @@ activation queues FIFO.
 
 **F5.5** — As an operator, I want every action scriptable.
 - THE SYSTEM SHALL make every operator action available through an API, not only a console.
-- Acceptance: Rate change, reset, pause, message publish, and mode override all scriptable.
+- Acceptance: Concurrency change, reset, pause, message publish, and mode override all scriptable.
 
 ### 1.7 Abuse mitigation
 
@@ -274,10 +274,10 @@ Contractual deliverables. Without these the capacity requirements are not met.
 **O2** — THE SYSTEM SHALL have service quota increases filed with lead time.
 - Acceptance: API Gateway RPS and DynamoDB per-table WRU confirmed raised before T−0; the Readiness panel shows the limits in force.
 
-**O3** — THE SYSTEM SHALL have a load test at the event's target rate executed before the event.
+**O3** — THE SYSTEM SHALL have a load test at the event's origin concurrency executed before the event.
 - Acceptance: Report produced and reviewed with the client.
 
-**O4** — THE SYSTEM SHALL let the operator adjust the admission rate, hold admission, or stop the event mid-event, and SHALL document what each control does and what a waiting visitor sees.
+**O4** — THE SYSTEM SHALL let the operator adjust the origin concurrency, hold admission, or stop the event mid-event, and SHALL document what each control does and what a waiting visitor sees.
 - Acceptance: Every control is a dashboard form that works with JavaScript disabled; `docs/RUNBOOK.md` documents each.
 
 **O5** — WHEN a new WAF rule is introduced, THE SYSTEM SHALL observe it in Count mode before promoting it to Block.

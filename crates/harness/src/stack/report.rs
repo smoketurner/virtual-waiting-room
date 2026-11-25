@@ -26,6 +26,8 @@ pub struct Report {
     /// may be the harness's, not the design's, so the run is inconclusive.
     pub harness: Vec<Check>,
     pub facts: BTreeMap<String, String>,
+    /// Per-second series, for `report.json` only.
+    pub series: BTreeMap<String, Vec<u64>>,
 }
 
 impl Report {
@@ -87,7 +89,7 @@ impl Report {
             let _ = writeln!(
                 out,
                 "INCONCLUSIVE: the harness did not keep up, so a failure above may be its own. \
-                 Lower --rate and --visitors, or use --scale."
+                 Lower --concurrency and --visitors, or use --scale."
             );
         }
         out
@@ -181,6 +183,71 @@ pub fn spearman(xs: &[f64], ys: &[f64]) -> f64 {
     cov / (vx * vy).sqrt()
 }
 
+/// The most sessions live at any instant, each running the `session` seconds
+/// before the end `generate_token` gave it.
+#[must_use]
+pub fn peak_live(ends: &[u64], session: u64) -> u64 {
+    let mut edges: Vec<(u64, bool)> = Vec::with_capacity(ends.len() * 2);
+    for &end in ends {
+        edges.push((end.saturating_sub(session), true));
+        edges.push((end, false));
+    }
+    // An ending at the same second as a start frees its slot first: a session
+    // is live over [start, end).
+    edges.sort_unstable_by_key(|&(at, starts)| (at, starts));
+    let mut live = 0u64;
+    let mut peak = 0u64;
+    for (_, starts) in edges {
+        if starts {
+            live += 1;
+            peak = peak.max(live);
+        } else {
+            live = live.saturating_sub(1);
+        }
+    }
+    peak
+}
+
+/// Sessions live in each second from the first session's start to the last
+/// one's end, and the epoch second the series starts at.
+#[must_use]
+pub fn live_by_second(ends: &[u64], session: u64) -> (u64, Vec<u64>) {
+    let (Some(&first_end), Some(&last)) = (ends.iter().min(), ends.iter().max()) else {
+        return (0, Vec::new());
+    };
+    let first = first_end.saturating_sub(session);
+    let mut live = vec![0u64; usize::try_from(last - first).unwrap_or(0)];
+    for &end in ends {
+        let start = end.saturating_sub(session);
+        for second in start..end {
+            if let Some(n) = usize::try_from(second - first)
+                .ok()
+                .and_then(|i| live.get_mut(i))
+            {
+                *n += 1;
+            }
+        }
+    }
+    (first, live)
+}
+
+/// The share of `limit` slots held, second by second, from the first session's
+/// start to the last's: how full the origin was kept while anyone waited.
+#[must_use]
+pub fn occupancy(ends: &[u64], session: u64, limit: u64) -> Option<f64> {
+    let first = ends.iter().min()?.saturating_sub(session);
+    let last = ends.iter().max()?.saturating_sub(session);
+    if last <= first || limit == 0 {
+        return None;
+    }
+    let mut held = 0u64;
+    for &end in ends {
+        let start = end.saturating_sub(session);
+        held += end.min(last).saturating_sub(start.max(first));
+    }
+    Some(held as f64 / ((last - first) * limit) as f64)
+}
+
 /// The most admissions in any window of `width` seconds, and where it starts.
 #[must_use]
 pub fn busiest_window(series: &[u64], width: usize) -> (u64, usize) {
@@ -248,6 +315,23 @@ mod tests {
         assert!((spearman(&x, &x) - 1.0).abs() < 1e-12);
         let y = [5.0, 4.0, 3.0, 2.0, 1.0];
         assert!((spearman(&x, &y) + 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn sessions_ending_as_others_start_do_not_overlap() {
+        // Two back-to-back generations of two sessions each.
+        assert_eq!(peak_live(&[110, 110, 120, 120], 10), 2);
+        assert_eq!(peak_live(&[110, 110, 119, 120], 10), 3);
+        assert_eq!(peak_live(&[], 10), 0);
+    }
+
+    #[test]
+    fn a_full_origin_is_fully_occupied() {
+        // Two slots, refilled exactly as each session ends.
+        let ends = [110, 110, 120, 120, 130, 130];
+        assert_eq!(occupancy(&ends, 10, 2), Some(1.0));
+        let half = [110, 120, 130];
+        assert_eq!(occupancy(&half, 10, 2), Some(0.5));
     }
 
     #[test]

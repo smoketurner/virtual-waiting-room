@@ -1,7 +1,9 @@
 # ADR-0039: Meter admissions, not the cursor
 
 **Status:** Accepted. Amends [0033](0033-admission-claimed-once-per-visitor.md) and
-[0022](0022-durable-controller-cadence.md); the no-show estimator they describe is removed.
+[0022](0022-durable-controller-cadence.md); the no-show estimator they describe is removed. The
+budget and cursor law below are amended by [0041](0041-meter-origin-concurrency.md), which grants
+free slots of origin concurrency instead of a rate.
 
 ## 1. Context
 

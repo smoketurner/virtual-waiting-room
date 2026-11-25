@@ -6,9 +6,9 @@ deployment; it does not replace one (see [What it cannot show](#what-it-cannot-s
 
 ```bash
 make stack-emulator                                   # once: build and start the AWS Emulator
-make stack                                            # 2,000 visitors, 50/s, a 30 s countdown
-make stack STACK_ARGS="--visitors 20000 --rate 200 --countdown 60"
-make stack STACK_ARGS="--visitors 100000 --rate 83 --scale 0.1 --arrival herd"
+make stack                                            # 2,000 visitors, 500 at once for 60 s each
+make stack STACK_ARGS="--visitors 2000 --concurrency 400 --session 120 --countdown 30"
+make stack STACK_ARGS="--visitors 100000 --concurrency 5000 --session 60 --scale 0.1 --arrival herd"
 ```
 
 It needs Docker (the AWS Emulator has no macOS build) and Node.js (the gate and the page are
@@ -36,8 +36,9 @@ harness could not keep up and the result is inconclusive.
 - The open runs, and every cohort position recomputes from the seed, count and offsets `/status`
   publishes plus the `PreQueue` rows, distinct and inside `[0, N)`.
 - A cohort position is uncorrelated with when the visitor registered.
-- No window of admissions exceeds its time at the target rate plus the budget's burst.
-- Steady admissions run within 10% of the target rate, with or without no-shows.
+- No more sessions are ever live than `--concurrency`, counted from the session end each
+  `generate_token` answer gives.
+- The origin holds at least 85% of its slots from the first admission to the last.
 - `/status` reaches its origin at most about once a second, however many are waiting.
 - The gate never passes a request because it failed, and the shipped page's visitors pass it.
 - No accepted join is dead-lettered, no function fails or logs an error, and DynamoDB answers
@@ -56,8 +57,11 @@ fails the machine was saturated, and the run says it is inconclusive.
   own cache.
 - **IAM**, the WAF web ACL, and the Terraform itself.
 - **Scale beyond one machine.** A laptop handles tens of thousands of visitors at full rate. For
-  a larger event, scale the visitors, the admission rate and API Gateway's limits down together
+  a larger event, scale the visitors, the concurrency and API Gateway's limits down together
   (`--scale`), which keeps the shape of the crowd against the throttles.
+- **A real session length in a short run.** A run lasts about `visitors / concurrency` session
+  lengths, so runs use sessions of a minute or two. The turnover lag is a fixed few seconds, so a
+  short session overstates its share; at 900 s it is about a tenth of what a 120 s run shows.
 
 ## Findings
 
@@ -65,21 +69,22 @@ Each row is one run, reproducible with its seed. Every check passed in all of th
 
 | Run | Result |
 |---|---|
-| `--visitors 20000 --rate 200 --countdown 60 --seed 2` | Busiest second 5.8× the target, busiest 10 s 2.6×. 1,459 visitors who arrived before the open were throttled on their join and became live joiners, behind the cohort |
-| `--visitors 12000 --rate 40 --countdown 30 --no-show 0.3 --duplicate-rate 0.05 --seed 23` | With 30% no-shows, steady admissions 39.4/s against 40/s (F3.8). 664 duplicate deliveries, no duplicate position |
-| `--visitors 100000 --rate 83 --scale 0.1 --arrival herd --herd-window 10 --seed 11` | A one-tenth model of a million arriving at the open. Half had a position in 2.7 min, 99% in 6.3; 83.7/s admitted against 83/s; the open's drain wait ran 11 s and took 7,329 of them into the cohort |
-| `--visitors 500 --rate 25 --dynamodb http://127.0.0.1:18080 --seed 22` | The same checks with `ExtendDB` as the DynamoDB backend |
+| `--visitors 2000 --concurrency 400 --session 120 --countdown 30 --seed 31` | At most 400 sessions live against 400. The origin held 90% of its slots; at each turnover it dips for about a pass while the ended sessions are seen free and their replacements come in |
+| `--visitors 2000 --concurrency 400 --session 120 --countdown 30 --no-show 0.3 --duplicate-rate 0.05 --seed 32` | With 30% no-shows, at most 399 live and 87% of the slots held (F3.8). 95 duplicate deliveries, no duplicate position |
+| `--visitors 100000 --scale 0.1 --arrival herd --herd-window 10 --seed 11`, at commit `2d6cf3a` | A one-tenth model of a million arriving at the open, measured on the join path, which origin concurrency does not change. Half had a position in 2.7 min, 99% in 6.3; the open's drain wait ran 11 s and took 7,329 of them into the cohort |
+| `--visitors 500 --dynamodb http://127.0.0.1:18080 --seed 22`, at commit `2d6cf3a` | The same checks with `ExtendDB` as the DynamoDB backend |
 
 What the runs changed:
 
-- **Admission at the open is lumpier than the design said.** The budget bounds it, but inside an
-  interval nothing shapes it, so the origin should expect up to about 6× the target for a second
-  at the open. ADR-0039 now gives the measured figures.
+- **Sessions that start together end together.** The first concurrency run held 81% of the slots:
+  the controller saw a slot free a pass late, then a pass later again because of a safety margin,
+  and the people released for it were polling slowly or backing off on a 425. The log is now
+  stamped at the second the shards were read, which makes the margin unnecessary; a visitor within
+  `origin_concurrency` of the front polls at the floor; and a 425 is asked again at the floor.
 - **Throttled registrants lost their place in the cohort.** The page retried a join refused at the
   end of a countdown at its 30 s closed-event interval, so it landed after the open and was numbered
   behind everyone. The page now retries a throttled registration at the 5 s floor without backing
   off, which lands it inside the open's drain wait.
 - **The open's drain wait always runs its length under continuous traffic.** DESIGN §4.1 records
   it.
-- **The page retried a 429 or a 5xx from `/generate_token` at its 5 s floor.** It now backs off as
-  it does on a 425.
+- **The page retried a 429 or a 5xx from `/generate_token` at its 5 s floor.** It now backs off.

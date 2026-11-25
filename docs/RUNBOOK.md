@@ -12,9 +12,9 @@ One deployment serves one event and is torn down afterwards.
 
 | Control | What it does | What a waiting visitor sees |
 |---|---|---|
-| **Set rate** | Changes the target admission rate | The queue moves faster or slower |
+| **Set concurrency** | Changes how many visitors the origin takes at once | The queue moves faster or slower |
 | **Pause** | Holds admission; the queue keeps forming | Still queued, place kept, not moving |
-| **Resume** | Releases the hold at the configured rate | The queue moves again |
+| **Resume** | Releases the hold at the configured concurrency | The queue moves again |
 | **Fail open** | For a fixed number of minutes, every request reaches the origin, admitted or not | Nothing; they are through |
 | **Recover** | Ends the fail-open window early | Back to the queue, unless admitted meanwhile |
 | **Force maintenance** | Full stop; the event is down | An outage page, not a queue |
@@ -62,7 +62,7 @@ items (O1, O2) days ahead; the panel shows limits in force, not pending requests
 
 **Manual**: the panel cannot check these:
 
-- [ ] **Load test at the event's target rate, report reviewed with the client** (O3). Test the
+- [ ] **Load test at the event's origin concurrency, report reviewed with the client** (O3). Test the
       live-join path and `/status` under polling load; the pre-queue open is one write at any size.
 - [ ] **Cost modelled for this event** (O6), including the CloudFront plan tier.
 - [ ] **Edge protection matches the plan** (N7, [ADR-0038](adr/0038-edge-web-acl-on-flat-rate-plan.md)).
@@ -79,17 +79,21 @@ On the day (**manual**):
 - [ ] **The gate covers the right paths.** The panel counts rules; it cannot judge them. Load a
       protected URL in a private window and confirm you land on the waiting page. **An empty
       ruleset passes every request through**, which looks exactly like a working deployment.
-- [ ] **The admission rate is what the origin can serve**, not the seeded default.
+- [ ] **The origin concurrency is what the origin can serve at once**, not the seeded default.
 - [ ] **Alarms reach someone.** The alarms below notify only when `alarm_sns_topic_arn` is set to
       a topic with a subscriber. Without it they change state in CloudWatch and tell nobody.
 - [ ] **Someone who can act is watching.**
 
-### Deciding the admission rate
+### Deciding the origin concurrency and session length
 
-Enter the requests per second the origin sustains, as a whole number. Admissions are metered
-against a budget: over any stretch of time the origin receives at most the rate you enter, plus a
-burst of up to **two intervals** (20 seconds' worth of admissions) that can arrive at once, so the
-origin must survive that burst. Rate 0 is rejected; use Pause to stop admission.
+Enter how many visitors the origin can serve at once, as a whole number. No more admitted visitors
+than that hold a live session at any moment, and there is no burst beyond it, but the open admits
+that many at once, so the origin must survive the whole limit arriving together. Each session holds
+its slot for `session_ttl_seconds` (set at deploy, [`DEPLOY.md`](./DEPLOY.md#choosing-the-session-lifetime)),
+whether or not the visitor is still there, so throughput is the concurrency divided by the session
+length: at the 900 s default, a limit of 100 admits about 400 an hour. Lowering the limit below the
+sessions already live admits nobody until enough of them have ended. 0 is rejected; use Pause to
+stop admission.
 
 ---
 
@@ -110,15 +114,17 @@ In order:
 1. **Is the event open?** An unopened pre-queue event has no seed, and `/queue_num` answers "not
    yet open" to everyone. Press **Open now**.
 2. **Is admission paused?** The badge at the top shows paused, open or fail open. Press **Resume**.
-3. **Is the rate zero or unset?** Set it.
+3. **Is the origin concurrency unset?** Set it. With every slot holding a live session, the queue
+   moves only as sessions end.
 4. **Is the phase `maintenance`?** Move it back to `active` with the Phase control.
 5. **Is `admission_control_unreadable` firing?** The controller is holding admission because the
    stored control could not be parsed. Pause, then Resume, to rewrite it.
 
 ### If the origin is in trouble
 
-1. **Lower the rate.** It takes effect within one controller pass (about 10 s); nobody loses
-   their place.
+1. **Lower the origin concurrency.** It takes effect within one controller pass (about 10 s):
+   nobody more is admitted until the live sessions fall below it. Sessions already live run to
+   their end, and nobody loses their place.
 2. **Pause** if that is not enough.
 3. **Force maintenance** only if the origin is gone. Waiting visitors see an outage page.
 
@@ -187,7 +193,7 @@ operation.
 | `join-dlq-not-empty` | A join was received 10 times without being written and was dead-lettered | Check `assign_position`'s logs. The messages are in the dead-letter queue and can be redriven |
 | `arrival_record_failed` | A unit of the admission budget could not be taken, so the visitor was **not** admitted and will ask again | Harmless once. If continuous, admission has stopped: check `generate_token`'s logs and its grant on the `Counters` table |
 | `arrival_shard_draw_failed` | Same, one step earlier | As above |
-| `admission_claim_failed` | The write that marks a visitor admitted did not land; they were admitted anyway | Harmless once. If continuous, every reload takes a second unit of budget, so fewer people are admitted than the rate allows, never more |
+| `admission_claim_failed` | The write that marks a visitor admitted did not land; they were admitted anyway | Harmless once. If continuous, every reload takes a second unit of budget, so fewer people are admitted than the concurrency allows, never more |
 | `admission_control_unreadable` | The stored admission control could not be parsed; the controller is holding admission | The queue has stopped. Pause, then Resume |
 | `rules_audit_failed` | The ruleset changed but its audit stamp did not | Gate is correct; "last changed by" is stale. No visitor impact |
 | `fail_open_audit_lost` | Fail-open changed but its audit stamp lost a race | Change took effect; "last changed by" is stale. No visitor impact |
@@ -204,7 +210,7 @@ These are logged (`$.fields.event`) without an alarm of their own:
 
 | Event | What happened | What to do |
 |---|---|---|
-| `controller_pass_failed` | One controller pass failed and was skipped; the next is owed the seconds it missed | Harmless once. If continuous the queue has stopped: check the `controller` function's logs |
+| `controller_pass_failed` | One controller pass failed and was skipped; the next computes the same free slots from the same state | Harmless once. If continuous the queue has stopped: check the `controller` function's logs |
 | `open_drain_timed_out` | The join queue did not empty within 15 s, so the open went ahead; joins still queued are numbered behind the cohort | Check `assign_position`'s concurrency and the tables' pre-warming before the next event |
 | `open_drain_unreadable` | The open could not read the join queue and did not wait for it | Check `open_event`'s `sqs:GetQueueAttributes` grant |
 | `nojs_join_resent` | A no-JavaScript join had not registered after 60 s and was sent again | Expected occasionally. Many at once means the join consumer is behind |

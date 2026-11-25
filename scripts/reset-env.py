@@ -37,7 +37,7 @@ Prerequisites:
 
 Usage:
   AWS_PROFILE=dev-admin ./scripts/reset-env.py
-  AWS_PROFILE=dev-admin ./scripts/reset-env.py --target-rate 20
+  AWS_PROFILE=dev-admin ./scripts/reset-env.py --origin-concurrency 20
   AWS_PROFILE=dev-admin ./scripts/reset-env.py --phase idle --yes
   AWS_PROFILE=dev-admin ./scripts/reset-env.py --no-wait
 """
@@ -222,7 +222,7 @@ def invalidate(cf, distribution_id: str, wait: bool) -> str:
 
 
 def fresh_counters(
-    event_id: str, phase: str, target_rate: int, queue_ahead: int
+    event_id: str, phase: str, origin_concurrency: int, queue_ahead: int
 ) -> dict:
     """The `Counters` item for an event that has never run.
 
@@ -238,16 +238,16 @@ def fresh_counters(
     counter rather than stored, so a test needs the distance, not the bodies.
 
     It also pauses admission, which is the part that makes the queue hold.
-    Nobody occupies those positions, so none of the admission budget is taken,
-    the controller releases at its cap of twice the target every pass to make
-    up for it, and reaches `queue_counter + 1` in about a minute — the queue would
-    drain before a tester had finished opening the page. Paused, the controller
-    returns `Held` and the cursor does not move until an operator resumes.
+    Nobody occupies those positions, so no slot is ever taken, the controller
+    releases replacements for the untaken slots every pass, and reaches
+    `queue_counter + 1` within minutes — the queue would drain before a tester
+    had finished opening the page. Paused, the controller returns `Held` and the
+    cursor does not move until an operator resumes.
 
     Deliberately absent: shuffle_seed, participant_count, and prequeue_offsets
     (written only by the open), the prequeue_counter and arrivals shards, and
-    the controller's carried state (last_open_pass_at on this item; the taken
-    count `n` and cap `c` on each arrivals shard).
+    the controller's carried state (its admission log item; the taken count `n`
+    and cap `c` on each arrivals shard).
     """
     return {
         "event_id": {"S": event_key(event_id)},
@@ -255,7 +255,7 @@ def fresh_counters(
         "admission_control": {"S": "paused" if queue_ahead else "open"},
         "queue_counter": {"N": str(queue_ahead)},
         "serving_counter": {"N": "0"},
-        "target_rate": {"N": str(target_rate)},
+        "origin_concurrency": {"N": str(origin_concurrency)},
     }
 
 
@@ -295,10 +295,10 @@ def parse_args() -> argparse.Namespace:
         help="Phase to leave the event in. Default active, which is the only one that admits.",
     )
     p.add_argument(
-        "--target-rate",
+        "--origin-concurrency",
         type=int,
         default=5,
-        help="Visitors per second the controller meters at. Default 5, so a pass releases 50.",
+        help="Visitors the origin takes at once. Default 5.",
     )
     p.add_argument(
         "--queue-ahead",
@@ -326,9 +326,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    if args.target_rate < 1:
+    if args.origin_concurrency < 1:
         print(
-            "--target-rate must be at least 1; use --phase to stop admission",
+            "--origin-concurrency must be at least 1; use --phase to stop admission",
             file=sys.stderr,
         )
         return 2
@@ -383,7 +383,9 @@ def main() -> int:
     # The sweep above already deleted it, which is what makes this a rewrite
     # rather than a patch: PutItem replaces an item but only for the attributes
     # it names, so no attribute from the previous run can survive.
-    item = fresh_counters(event_id, args.phase, args.target_rate, args.queue_ahead)
+    item = fresh_counters(
+        event_id, args.phase, args.origin_concurrency, args.queue_ahead
+    )
     ddb.put_item(TableName=tables["counters"], Item=item)
     for key in sorted(item):
         print(f"  {key:18} {next(iter(item[key].values()))}")
@@ -417,12 +419,14 @@ def main() -> int:
     if args.phase != "active":
         print(f"Phase is {args.phase}: nobody will be admitted until it is active.")
     elif args.queue_ahead:
-        clears = args.queue_ahead / (args.target_rate * 10)
+        # Nobody holds those positions, so every slot stays free and each pass
+        # releases half the limit again in their place.
+        clears = args.queue_ahead / max(1, (args.origin_concurrency + 1) // 2)
         print(
             f"The queue is {args.queue_ahead:,} deep and admission is PAUSED, so the cursor is\n"
             f"held at 0. Join now to take position {args.queue_ahead + 1:,}, then press Resume on\n"
-            f"the dashboard to start it draining — roughly {clears:.0f} to {clears / 2:.0f} passes\n"
-            "at 10s each, since the controller doubles its release while nobody arrives."
+            f"the dashboard to start it draining — roughly {clears:.0f} passes at 10s each,\n"
+            "since the controller replaces the slots nobody takes."
         )
     else:
         print(

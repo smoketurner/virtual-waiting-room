@@ -89,12 +89,12 @@ resource "aws_dynamodb_table_item" "event" {
   hash_key   = aws_dynamodb_table.counters.hash_key
 
   item = jsonencode({
-    event_id          = { S = "EVT#${var.event_id}" }
-    phase             = { S = var.starts_at == "" ? "idle" : "pre_queue" }
-    admission_control = { S = "open" }
-    queue_counter     = { N = "0" }
-    serving_counter   = { N = "0" }
-    target_rate       = { N = tostring(var.admission_rate) }
+    event_id           = { S = "EVT#${var.event_id}" }
+    phase              = { S = var.starts_at == "" ? "idle" : "pre_queue" }
+    admission_control  = { S = "open" }
+    queue_counter      = { N = "0" }
+    serving_counter    = { N = "0" }
+    origin_concurrency = { N = tostring(var.origin_concurrency) }
   })
 
   lifecycle {

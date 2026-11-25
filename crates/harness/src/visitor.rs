@@ -709,7 +709,7 @@ mod tests {
                 } else {
                     (
                         200,
-                        r#"{"serving_state":"running","serving_position":0,"target_rate":5}"#
+                        r#"{"serving_state":"running","serving_position":0,"origin_concurrency":5,"session_seconds":1}"#
                             .to_owned(),
                     )
                 }
@@ -869,7 +869,7 @@ mod tests {
                 } else {
                     (
                         200,
-                        r#"{"serving_state":"running","serving_position":0,"target_rate":5}"#
+                        r#"{"serving_state":"running","serving_position":0,"origin_concurrency":5,"session_seconds":1}"#
                             .to_owned(),
                     )
                 }
@@ -1009,7 +1009,7 @@ mod tests {
             if path.starts_with("/_wr/v1/status") {
                 (
                     200,
-                    r#"{"serving_state":"running","serving_position":0,"target_rate":5}"#
+                    r#"{"serving_state":"running","serving_position":0,"origin_concurrency":5,"session_seconds":1}"#
                         .to_owned(),
                 )
             } else {

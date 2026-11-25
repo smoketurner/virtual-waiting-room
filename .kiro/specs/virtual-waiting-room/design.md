@@ -18,7 +18,7 @@ them, and the invariants a change must not break. It does not repeat the narrati
 | `read` | `/_wr/v1/status`, `/_wr/v1/queue_num` | DESIGN §4.2, §8 |
 | `generate_token` | Admission check, one admission claim, arrival count, session mint | DESIGN §2.3, §8 |
 | `nojs` | `/_wr/v1/enter`, `/_wr/v1/wait`. Admits only through `generate_token::admit` ([ADR-0037](../../../docs/adr/0037-no-javascript-queue.md)) | DESIGN §8 |
-| `controller` | Durable function: six 10 s passes per `rate(1 minute)` ([ADR-0022](../../../docs/adr/0022-durable-controller-cadence.md)) | DESIGN §7 |
+| `controller` | Durable function: six 10 s passes per `rate(1 minute)` ([ADR-0022](../../../docs/adr/0022-durable-controller-cadence.md)), metering origin concurrency ([ADR-0041](../../../docs/adr/0041-meter-origin-concurrency.md)) | DESIGN §7 |
 | `admin` | Axum + askama operator UI/API behind OIDC + PKCE. The only writer of the gate KeyValueStore after apply ([ADR-0016](../../../docs/adr/0016-admin-oidc-dynamodb-sessions.md), [ADR-0018](../../../docs/adr/0018-admin-vouch-design-language.md)) | DESIGN §8, §9 |
 | `wr-common` | `permutation`, `ids`, `items`, `expr`, `crypto`, `rules`, re-exported flat | DESIGN §4.3, §5.5 |
 | `harness` | Load harness for the polling and cost model | DESIGN §12 |
@@ -32,7 +32,7 @@ Every Lambda crate is split into `lib.rs` (pure logic, generic over a `Store` tr
 | Interface | Contract |
 |---|---|
 | `POST /_wr/v1/join` | `{request_id, event_id, h}` with `h = base64url(SHA-256(secret))`, schema-validated (400). 200 means enqueued, not assigned. A non-success SQS outcome returns 502 |
-| `GET /_wr/v1/status` | Phase, `serving_state`, `serving_position`, `target_rate`, message, `starts_at`, `poll_policy`. After the open it adds `shuffle_seed` (hex), `participant_count` and `prequeue_offsets`. Min TTL 1 s, path-only cache key, no cookies |
+| `GET /_wr/v1/status` | Phase, `serving_state`, `serving_position`, `origin_concurrency` (absent when unset), `session_seconds`, message, `starts_at`, `poll_policy`. After the open it adds `shuffle_seed` (hex), `participant_count` and `prequeue_offsets`. Min TTL 1 s, path-only cache key, no cookies |
 | `GET /_wr/v1/queue_num` | 200 position, 404 re-join with the **same** `request_id`, 409 not yet open |
 | `POST /_wr/v1/generate_token` | `request_id` + possession secret ([ADR-0035](../../../docs/adr/0035-request-id-proof-of-possession.md)) → `Set-Cookie` session |
 | Session cookie | HS256 JWS: `aud` event, `sub` request id, `iat`, `exp`, plus an optional IP tag ([ADR-0024](../../../docs/adr/0024-jws-credentials.md), [ADR-0036](../../../docs/adr/0036-optional-session-ip-binding.md)) |
@@ -46,7 +46,8 @@ Four on-demand tables with PITR. DESIGN §5.5 lists the attributes and
 [`docs/DYNAMODB.md`](../../../docs/DYNAMODB.md) lists every access pattern.
 
 - `Counters` (PK `event_id`): the event item `EVT#{id}`, plus shard items `EVT#{id}#PQ#{s}` and
-  `EVT#{id}#AR#{s}`, each holding `n`.
+  `EVT#{id}#AR#{s}`, each holding `n` (an arrivals shard also holds its cap `c`), and the
+  controller's admission log `EVT#{id}#LOG` (`h`, `p`).
 - `PreQueue` (PK `r`): `{s, l, t, h}`.
 - `Positions` (PK `request_id`): `{queue_position, entry_time, status, h, ttl}`.
 - `Tokens` (PK `request_id`): `SESS#` / `PKCE#` admin rows.
@@ -86,7 +87,8 @@ A change that breaks one of these is a fairness or safety failure, not a refacto
    gets a session but is not counted again.
 10. **`FailOpen` is never stored.** Storage holds `StoredControl` (`open`/`paused`) and the
     `fail_open_until` epoch. Only `wr_common::resolve` produces `FailOpen`.
-11. **Controller arithmetic is checked or saturating.** Release is capped at 2 × `target_rate`.
+11. **Controller arithmetic is checked or saturating.** The budget is never more than
+    `origin_concurrency` minus the live sessions, and the cursor never passes `queue_counter + 1`.
     The controller expires nothing ([ADR-0031](../../../docs/adr/0031-remove-controller-driven-expiry.md)).
 12. **A session is signed under a derived key**, never the raw secret. Rust and the gate agree
     byte for byte, as proven by the vectors in `crates/wr-common/tests/vectors/session.json`
@@ -110,7 +112,7 @@ These are tracked in [`tasks.md`](tasks.md):
 - automatic fail-open (#58)
 - a per-visitor position limit (#59)
 - session revocation (#63)
-- a concurrency term in the controller (#65)
+- a completion signal that frees a slot when a visitor leaves early (#65)
 - live metrics for F5.1
 - an OpenAPI spec (N8)
 - GovCloud

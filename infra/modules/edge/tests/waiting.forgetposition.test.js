@@ -34,7 +34,8 @@ function runningStatus() {
     serving_state: "running",
     serving_position: 90,
     participant_count: 0,
-    target_rate: 100,
+    origin_concurrency: 100,
+    session_seconds: 1,
     poll_policy: POLICY,
   };
 }

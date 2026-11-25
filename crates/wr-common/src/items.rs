@@ -110,12 +110,10 @@ pub struct Counters {
     /// Operator broadcast text shown to waiting visitors. Absent until an
     /// operator sets it; cleared by setting it empty.
     pub message: Option<String>,
-    /// The operator's target admission rate in visitors per second. Absent
-    /// until an operator sets one, which is also how the controller reads "do
-    /// not admit anyone yet". Waiting visitors are shown a wait estimate
-    /// derived from it before enough of the cursor's own movement has been
-    /// observed to measure the real rate.
-    pub target_rate: Option<u32>,
+    /// How many visitors the origin takes at once: the most sessions that are
+    /// live at any moment. Absent until set, which the controller reads as "do
+    /// not admit anyone yet".
+    pub origin_concurrency: Option<u32>,
     /// The operator's stored admission override (ADR-0019, issue #71):
     /// `Open` / `Paused`. Never `FailOpen` — that is resolved from
     /// `fail_open_until` by [`crate::ids::resolve`], not stored here.
@@ -255,7 +253,7 @@ impl Counters {
             shuffle_seed,
             participant_count: num("participant_count"),
             prequeue_offsets,
-            target_rate: num("target_rate").and_then(|n| u32::try_from(n).ok()),
+            origin_concurrency: num("origin_concurrency").and_then(|n| u32::try_from(n).ok()),
             message: item
                 .get("message")
                 .and_then(|v| v.as_s().ok())
@@ -531,7 +529,7 @@ mod tests {
             participant_count: None,
             prequeue_offsets: None,
             message: None,
-            target_rate: None,
+            origin_concurrency: None,
             stored_control: StoredControl::Open,
             fail_open_until: 0,
             starts_at: None,
@@ -695,7 +693,7 @@ mod tests {
         // Absent, not zero: no rate set is how the controller reads "admit
         // nobody yet", which a defaulted 0 would be indistinguishable from
         // only by accident.
-        assert!(counters.target_rate.is_none());
+        assert!(counters.origin_concurrency.is_none());
         assert_eq!(counters.stored_control, StoredControl::Open);
         assert_eq!(counters.fail_open_until, 0);
         // Absent, not zero: the waiting page tells "no start time set" from "a
@@ -746,26 +744,33 @@ mod tests {
     }
 
     #[test]
-    fn from_item_reads_the_operator_target_rate() {
+    fn from_item_reads_the_origin_concurrency() {
         let mut item = HashMap::new();
         item.insert(
-            "target_rate".to_owned(),
+            "origin_concurrency".to_owned(),
             AttributeValue::N("250".to_owned()),
         );
-        assert_eq!(Counters::from_item("evt-1", &item).target_rate, Some(250));
+        assert_eq!(
+            Counters::from_item("evt-1", &item).origin_concurrency,
+            Some(250)
+        );
     }
 
     #[test]
-    fn from_item_rejects_a_target_rate_too_large_for_u32() {
+    fn from_item_rejects_an_origin_concurrency_too_large_for_u32() {
         // Stored numbers are unbounded, the field is not. A value that does not
-        // fit reads as unset rather than wrapping into a small rate that would
+        // fit reads as unset rather than wrapping into a small limit that would
         // silently throttle the event.
         let mut item = HashMap::new();
         item.insert(
-            "target_rate".to_owned(),
+            "origin_concurrency".to_owned(),
             AttributeValue::N("4294967296".to_owned()),
         );
-        assert!(Counters::from_item("evt-1", &item).target_rate.is_none());
+        assert!(
+            Counters::from_item("evt-1", &item)
+                .origin_concurrency
+                .is_none()
+        );
     }
 
     #[test]

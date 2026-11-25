@@ -70,6 +70,14 @@ pub const SHARD_COUNT_ATTR: &str = "n";
 /// count, which it is written beside on every controller pass.
 pub const SHARD_CAP_ATTR: &str = "c";
 
+/// The admission log's entries: a flat list of numbers, each pair a pass's
+/// epoch seconds and the total admitted when it read the shards.
+pub const ADMISSION_LOG_ATTR: &str = "h";
+
+/// How many slots the cursor has been moved for, in all: the origin's limit
+/// plus every session due to have ended by the pass after the last.
+pub const ADMISSION_PROVIDED_ATTR: &str = "p";
+
 /// The attribute the event's scheduled start is stored in, epoch seconds.
 ///
 /// Named here because two crates must agree on it and neither can see the
@@ -158,6 +166,11 @@ pub enum Key<'a> {
     /// One arrivals shard, incremented when a visitor claims their admission
     /// and summed by the controller to measure the no-show rate.
     ArrivalsShard { event_id: &'a str, shard: Shard },
+    /// The controller's log of how many had been admitted when, which is how it
+    /// knows how many sessions are still live. Read and written by the
+    /// controller alone, so it is kept off the event's item, which every
+    /// admission check reads.
+    AdmissionLog { event_id: &'a str },
     /// An operator's OIDC session.
     OidcSession { session_id: &'a str },
     /// A pending OIDC login, keyed by its CSRF state.
@@ -173,7 +186,10 @@ impl Key<'_> {
     #[must_use]
     pub fn attr(self) -> &'static str {
         match self {
-            Key::Event { .. } | Key::PrequeueShard { .. } | Key::ArrivalsShard { .. } => KEY_ATTR,
+            Key::Event { .. }
+            | Key::PrequeueShard { .. }
+            | Key::ArrivalsShard { .. }
+            | Key::AdmissionLog { .. } => KEY_ATTR,
             Key::OidcSession { .. } | Key::PkceTransaction { .. } => TOKENS_KEY_ATTR,
             Key::Prequeue { .. } => PREQUEUE_KEY_ATTR,
             Key::Position { .. } => POSITIONS_KEY_ATTR,
@@ -191,6 +207,7 @@ impl Key<'_> {
             Key::ArrivalsShard { event_id, shard } => {
                 format!("EVT#{event_id}#AR#{}", shard.index())
             }
+            Key::AdmissionLog { event_id } => format!("EVT#{event_id}#LOG"),
             Key::OidcSession { session_id } => format!("SESS#{session_id}"),
             Key::PkceTransaction { state } => format!("PKCE#{state}"),
             // Untagged: one kind of item per table, so a tag would
@@ -450,6 +467,7 @@ mod tests {
             .value(),
             "EVT#evt#AR#3"
         );
+        assert_eq!(Key::AdmissionLog { event_id: "evt" }.value(), "EVT#evt#LOG");
         assert_eq!(Key::OidcSession { session_id: "abc" }.value(), "SESS#abc");
         assert_eq!(Key::PkceTransaction { state: "abc" }.value(), "PKCE#abc");
         // One kind per table, so no tag: the bytes would be paid per visitor.

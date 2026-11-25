@@ -36,7 +36,8 @@ function preQueueStatus() {
     serving_state: "closed",
     serving_position: 0,
     participant_count: 0,
-    target_rate: 10,
+    origin_concurrency: 10,
+    session_seconds: 1,
   };
 }
 

@@ -314,7 +314,7 @@ async fn wait_active(ddb: &aws_sdk_dynamodb::Client, name: &str) -> Result<()> {
 
 /// Writes the event item the way `aws_dynamodb_table_item.event` seeds it, with
 /// a scheduled start: phase `pre_queue`, admission open, both sequences at
-/// zero, the target rate, and `starts_at`.
+/// zero, the origin concurrency, and `starts_at`.
 ///
 /// # Errors
 ///
@@ -323,7 +323,7 @@ pub async fn seed_event(
     ddb: &aws_sdk_dynamodb::Client,
     tables: &Tables,
     event_id: &str,
-    target_rate: u32,
+    origin_concurrency: u32,
     starts_at: u64,
 ) -> Result<()> {
     let n = |v: u64| AttributeValue::N(v.to_string());
@@ -334,7 +334,7 @@ pub async fn seed_event(
         .item("admission_control", AttributeValue::S("open".to_owned()))
         .item("queue_counter", n(0))
         .item("serving_counter", n(0))
-        .item("target_rate", n(u64::from(target_rate)))
+        .item("origin_concurrency", n(u64::from(origin_concurrency)))
         .item(wr_common::STARTS_AT_ATTR, n(starts_at))
         .send()
         .await

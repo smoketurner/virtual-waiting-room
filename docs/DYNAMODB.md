@@ -17,7 +17,7 @@ secondary indexes and no streams. Terraform declares only the key attribute and 
 
 | Table | Partition key | Holds | TTL attribute |
 |---|---|---|---|
-| `Counters` | `event_id` | The event item, 10 pre-queue shards, 10 arrival shards | none |
+| `Counters` | `event_id` | The event item, 10 pre-queue shards, 10 arrival shards, the admission log | none |
 | `PreQueue` | `r` | One registration per pre-queue visitor | none |
 | `Positions` | `request_id` | One row per live joiner, plus one per admitted pre-queue member | `ttl` |
 | `Tokens` | `request_id` | Operator OIDC sessions and pending PKCE logins | `expires_at` |
@@ -28,6 +28,7 @@ secondary indexes and no streams. Terraform declares only the key attribute and 
 Counters   EVT#{event_id}             the event
            EVT#{event_id}#PQ#{0..9}   pre-queue registration shards
            EVT#{event_id}#AR#{0..9}   arrival shards
+           EVT#{event_id}#LOG         admission log
 Tokens     SESS#{session_id}          operator session
            PKCE#{state}               pending login
 PreQueue   {request_id}               bare
@@ -47,25 +48,30 @@ tests assert every placeholder is bound and used.
 ### 1.2 The event item
 
 Terraform seeds it at apply (`phase` = `idle`, or `pre_queue` when `starts_at` is set; `open`;
-both counters `0`; `target_rate` from `admission_rate`) and then ignores it.
+both counters `0`; `origin_concurrency` from the variable of the same name) and then ignores it.
 
 | Attribute | Writer | Meaning |
 |---|---|---|
 | `queue_counter` | `assign_position`, `open_event` | Live-join sequence; set to `N` at the open |
 | `serving_counter` | `controller` | Admission cursor, exclusive |
-| `last_open_pass_at` | `controller` | Epoch seconds of the last open pass; what the next pass's grant is measured from |
 | `phase` | `open_event`, `admin` | `idle` / `pre_queue` / `active` / `post_event` / `maintenance` |
 | `shuffle_seed`, `participant_count`, `prequeue_offsets` | `open_event` | The open outputs: 256-bit seed, `N`, ten prefix offsets. Written once |
 | `admission_control` | `admin` | `open` / `paused` only; absent reads as `open` |
 | `fail_open_until` | `admin` | Epoch seconds; `0` or absent means no window |
-| `target_rate` | `admin` | Visitors per second |
+| `origin_concurrency` | `admin` | How many visitors the origin takes at once |
 | `message` | `admin` | Operator broadcast |
 | `starts_at`, `starts_at_tz` | `admin` | Scheduled start (epoch) and the operator's IANA zone; absent means unscheduled |
 | `rules_digest`, `rules_count` | `admin` | Audit of the gate ruleset; the ruleset itself lives only in the KeyValueStore |
 | `last_action`, `last_action_by`, `last_action_at`, `last_action_epoch_ms` | `admin` | Audit trail and debounce anchor |
 
 A shard item holds two attributes: `s`, its own index (so a batch read can tell shards apart
-without parsing keys), and `n`, its count.
+without parsing keys), and `n`, its count. An arrival shard also holds `c`, the cap `n` may be
+taken up to.
+
+The admission log `EVT#{event_id}#LOG` is written only by `controller`. It holds `h`, a flat list
+of `[epoch seconds, total admitted]` pairs, one per recent pass, which is what live sessions are
+counted from, and `p`, how many slots the cursor has been moved for so far
+([DESIGN §7](DESIGN.md#7-outflow-control)).
 
 ### 1.3 Row shapes
 
@@ -105,7 +111,9 @@ same guarded mark; every session minted for the row expires from it (#237).
 | `generate_token`, `nojs` | `Positions` | `UpdateItem` admitted mark, guarded | — | 1 per first admission |
 | `controller` | `Counters` | `GetItem` event | Strong | 1 per pass |
 | `controller` | `Counters` | `BatchGetItem` of ten arrival shards | Strong | 1 per pass |
-| `controller` | `Counters` | `UpdateItem` cursor and `last_open_pass_at`, guarded | — | 1 per open pass |
+| `controller` | `Counters` | `GetItem` admission log | Strong | 1 per pass |
+| `controller` | `Counters` | `UpdateItem` cursor, guarded | — | 1 per open pass |
+| `controller` | `Counters` | `UpdateItem` admission log | — | 1 per open pass |
 | `controller` | `Counters` | `UpdateItem SET c` on each arrival shard | — | 10 per open pass |
 | `admin` | `Counters` | `GetItem`; guarded `UpdateItem` per action | Eventual | Operator actions |
 | `admin` | `Tokens` | `PutItem` session/login; `GetItem` session; `DeleteItem` logout; `DeleteItem ALL_OLD` to consume a login | Eventual | Operator logins |
@@ -167,7 +175,7 @@ saturated pre-queue index would be a duplicate global index and hand two visitor
 | Admission budget | `n < c` on the arrival shard | No admission past the cap the controller last wrote; a shard never granted one admits nobody ([ADR-0039](adr/0039-meter-admissions-not-the-cursor.md)) |
 | Admitted mark | `attribute_not_exists(request_id) OR status = :issued` | A visitor takes budget once; a repeat re-mints without it |
 | Phase change | `phase = :from` | A transition another operator applied is a 409 |
-| Rate change | `target_rate = :exp`, or `attribute_not_exists(target_rate)` | Same, for the rate |
+| Concurrency change | `origin_concurrency = :exp`, or `attribute_not_exists(origin_concurrency)` | Same, for the origin concurrency |
 | Admission control | `admission_control = :from`, also allowing absence when `:from` is `open` | Same; absence reads as `open` |
 | Debounced admin writes | `… AND (attribute_not_exists(last_action_epoch_ms) OR last_action_epoch_ms <= :cutoff)` | A double-submitted form is a no-op for 2,000 ms |
 | Audit stamps (rules, fail-open/recover, open now, IP binding) | `attribute_not_exists(last_action_epoch_ms) OR last_action_epoch_ms <= :ms` | An older action cannot overwrite a newer audit anchor |
@@ -218,6 +226,9 @@ Six strongly consistent reads, each because a stale answer is wrong:
 - `controller`'s arrival-shard read: each cap is written as `n` plus a share, so a stale `n`
   would re-grant budget already spent.
 
+The controller reads its admission log consistently too, though a log missing the latest pass
+would only count more sessions live.
+
 `generate_token`'s `Counters` read is consistent when made, but each execution environment holds
 the item for one second (`MEMO_SECS`), as `read` does: every admission attempt, refused or not,
 would otherwise be a read on one partition key. The cursor moves every ten seconds, and a pause
@@ -251,7 +262,7 @@ Write budget for a 1,000,000-participant event:
 | Pre-queue | Shard claims, batch 100 | ~10,000 |
 | Open | The guarded update | 1 |
 | Admission | Budget take + admitted mark | 2 per admitted visitor |
-| Admission | Cursor advance + ten shard caps | 66 per minute |
+| Admission | Cursor advance + log + ten shard caps | 72 per minute |
 
 The pre-queue dedupe adds about 1,000,000 strongly consistent reads (1 RRU each) over the
 registration window. Registration spread over 20 minutes runs at about 830 writes/s, under the cold

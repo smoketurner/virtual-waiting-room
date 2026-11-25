@@ -61,9 +61,10 @@ no call to the backend.
 
 ```
   controller (EventBridge Scheduler rate(1 minute); a durable execution of six 10 s passes)
-        grant admission budget for the time elapsed (plus what went unused, capped)
-        → UpdateItem serving_counter (elapsed, steered to leave a quarter-interval of
-          budget unused), then cap c on each arrivals shard
+        count live sessions from the admission log; grant the free slots,
+        origin_concurrency − live, as admission budget
+        → UpdateItem serving_counter (the slots due free by the next pass, plus a
+          no-show correction), the log, then cap c on each arrivals shard
         │
   Visitor polls /_wr/v1/status until serving_position ≥ own position
         │
@@ -306,10 +307,10 @@ Keys are built only in `wr_common::expr`.
 | `shuffle_seed`, `participant_count`, `prequeue_offsets` | Open outputs, written once at T−0 |
 | `admission_control` | The stored control, `open` or `paused` only, never `fail_open` (issue #71) |
 | `fail_open_until` | Fail-open deadline in epoch seconds. `0` means no window |
-| `target_rate` | Operator admission rate, in visitors per second |
+| `origin_concurrency` | How many visitors the origin takes at once |
 | `message` | Operator broadcast, delivered in `/_wr/v1/status` |
 | `starts_at` | Scheduled start, which the waiting page counts down to |
-| `last_open_pass_at`, `rules_digest`/`rules_count` | The controller's last open pass; ruleset audit |
+| `rules_digest`/`rules_count` | Ruleset audit |
 
 `wr_common::resolve(stored, fail_open_until, now)` is the only producer of
 `AdmissionControl::FailOpen`. A pre-queue shard item `EVT#{event_id}#PQ#{s}` holds its count
@@ -357,58 +358,77 @@ self-heal (§4.1) rides the same loop.
 
 ## 7. Outflow control
 
-Admission is metered where it happens, not where it is offered
-([ADR-0039](adr/0039-meter-admissions-not-the-cursor.md)). `generate_token` takes one unit of an
-**admission budget** for each visitor it admits and answers 425 when there is none. Each pass the
-controller grants budget and moves the cursor:
+The origin takes `origin_concurrency` visitors at once, and that is what the room meters: the most
+sessions live at any moment ([ADR-0041](adr/0041-meter-origin-concurrency.md),
+[#65](https://github.com/smoketurner/virtual-waiting-room/issues/65)). Admission is metered where it
+happens ([ADR-0039](adr/0039-meter-admissions-not-the-cursor.md)): `generate_token` takes one unit of
+an **admission budget** for each visitor it admits and answers 425 when there is none.
+
+A session ends exactly `session_ttl_seconds` after its admission, and minting it again keeps that
+end ([#237](https://github.com/smoketurner/virtual-waiting-room/issues/237)), so the sessions live
+now are the admissions of the last session length. The controller keeps an **admission log**, the
+total admitted at each pass, to count them. Each pass:
 
 ```
-owed     = target_rate × seconds since the last open pass     (one interval if ≥ 20 s, or none)
-unused   = Σ over shards of (c − n)                           (granted and not taken)
-budget   = min(unused + owed, 2 intervals of target_rate)     → written as c = n + share, per shard
-slack    = owed / 4
-release  = owed + clamp(unused − slack, −slack, owed)         → serving_counter, up to queue_counter + 1
+admitted = Σ over shards of n                                  (logged at the second the shards were read)
+horizon  = now − session_ttl_seconds
+live     = admitted − log[horizon]                             (the latest entry at or before it)
+budget   = origin_concurrency − live                           → written as c = n + share, per shard
+provided = origin_concurrency + log[horizon + 10 s]            (every slot, and each due free by the next pass)
+release  = provided − log.provided + ⌈min(unused, budget) / 2⌉ → serving_counter, up to queue_counter + 1
 ```
 
-The budget bounds what the origin receives: at most two intervals' worth is ever outstanding, so
-over any window of `t` seconds no more than `target_rate × t` plus that burst is admitted,
-whoever turns up and whenever. Unused budget beyond the slack is the no-show correction: it is
-exactly the admissions the origin was offered and did not get, so the cursor releases that many
-more people, at most doubling the pass, which covers a no-show rate up to 3/7 (about 43%). A
-budget found fully spent is read as a backlog of visitors already invited: the cursor gives up
-its slack and releases three quarters of `owed`, so they are admitted ahead of new releases and
-the backlog drains. Nothing is estimated or smoothed.
+The budget is the free slots, so no more than `origin_concurrency` sessions are ever live, whoever
+turns up and whenever. The log reads the latest entry at or before the horizon, so an admission
+counts as live until the first pass after its session has certainly ended: a slot is seen free up
+to one pass (10 s) late, and a log that misses a pass counts its admissions live for longer, never
+shorter. The entry is stamped with the whole second at which the shards were read, not the pass's
+start: a session starts at its request's whole second, and the request took its unit before the
+read, so no session the entry counts ends later than its stamp plus the session length.
+
+The cursor moves once for every slot: the limit at the open, then each session as it is due to end,
+counted a pass ahead so the people released for it are already asking when the slot is granted.
+Without that lead, sessions that started together end together and the origin sits empty while
+their replacements poll in. Unused budget is the no-show correction: a slot granted at the last
+pass and still untaken had someone released for it who did not come, so half as many again are
+released, which refills a slot nobody takes within a few passes without drawing a crowd for one
+whose visitor is merely slow. Lowering the limit below the live sessions grants nothing and releases
+nobody until enough sessions have ended. Throughput is `origin_concurrency` per session length:
+at the 900 s default, a limit of 100 admits about 400 an hour.
 
 A refusal has to cost almost nothing, because while the budget is spent everyone whose turn has
 come keeps asking. Each `generate_token` execution environment remembers for one second which
 shards it saw spent, and holds the event's `Counters` item for one second, so a refusal makes no
 conditional write and does not read the hot item; a pause therefore takes effect up to a second
-late. The page backs off on repeated 425s, doubling to its ceiling.
+late. The page asks again at its floor after a 425: the people asking are only those released for
+the next slots, about one turnover's worth, and a slot left waiting for a backed-off visitor is
+throughput lost. A visitor within `origin_concurrency` of the front polls at the floor too, because
+sessions ending release them without the cursor's measured speed saying so in advance.
 
 The controller is a Lambda durable function: Scheduler starts one execution a minute, which runs
 six checkpointed passes separated by 10 s durable waits. A wait suspends the execution, so it is
 not billed, and a replayed pass returns its checkpoint rather than advancing `serving_counter`
 twice ([ADR-0022](adr/0022-durable-controller-cadence.md)). A pass runs only while the phase is
-`active` and the resolved control is `Open`. Because `owed` follows the wall clock, an overlapping
-execution's extra pass grants and releases only the seconds since the one before it
-([#236](https://github.com/smoketurner/virtual-waiting-room/issues/236)); after a gap of two
-intervals or more a pass is owed one interval and does not make up the gap. All arithmetic is
-checked or saturating.
+`active` and the resolved control is `Open`. The budget and the release are both absolute, computed
+from the shards and the log rather than from the time since the last pass, so an overlapping
+execution's extra pass grants nothing twice and releases only what came due since
+([#236](https://github.com/smoketurner/virtual-waiting-room/issues/236)). A pass that loses the
+cursor race writes neither the log nor the caps. All arithmetic is checked or saturating.
 
-A pass that fails is skipped (`controller_pass_failed`) and the
-cadence carries on, the next pass being owed the seconds the failed one did not grant. An
-execution whose first pass finds the phase `idle` or `post_event` ends there, since such an event
-only becomes active through `pre_queue` and an open; that is most of the controller's cost
-between events (N1), and it means an operator who goes idle → pre_queue → open inside one minute
-waits for the next execution before admission starts.
+A pass that fails is skipped (`controller_pass_failed`) and the cadence carries on; the next pass
+computes the same free slots from the same state. An execution whose first pass finds the phase
+`idle` or `post_event` ends there, since such an event only becomes active through `pre_queue` and
+an open; that is most of the controller's cost between events (N1), and it means an operator who
+goes idle → pre_queue → open inside one minute waits for the next execution before admission
+starts.
 
 **Arrivals** are the budget taken: `generate_token` adds to one of ten shard items, once per
-visitor (60,000 admissions a minute would otherwise hit the 1,000 writes/s item ceiling). A pass
-reads the ten and writes each one's cap. **The controller expires nothing** and never scans; the
-unused budget compensates for absentees ([ADR-0031](adr/0031-remove-controller-driven-expiry.md)).
+visitor. A pass reads the ten, the log and the event item, and writes the cursor, the log and each
+shard's cap. **The controller expires nothing** and never scans; the unused budget compensates for
+absentees ([ADR-0031](adr/0031-remove-controller-driven-expiry.md)).
 
-**Not built:** a concurrency term. Nothing reports when a session completes, so origin
-concurrency drifts with session length
+**Not built:** a completion signal. A visitor who finishes early holds their slot until the session
+ends, because nothing reports a departure
 ([#65](https://github.com/smoketurner/virtual-waiting-room/issues/65)).
 
 ## 8. API surface, caching, and security
@@ -417,7 +437,7 @@ concurrency drifts with session length
 
 | Behaviour | Paths | Caching / cookies | Origin | Purpose |
 |---|---|---|---|---|
-| Polled | `/_wr/v1/status` | Min TTL 1 s, key is the path; no cookies | API Gateway → `read` | Phase, `serving_state`, `serving_position`, `target_rate`, message, `starts_at`, `poll_policy` ([ADR-0023](adr/0023-adaptive-poll-interval.md)); after T−0 the seed, count and offsets |
+| Polled | `/_wr/v1/status` | Min TTL 1 s, key is the path; no cookies | API Gateway → `read` | Phase, `serving_state`, `serving_position`, `origin_concurrency`, `session_seconds`, message, `starts_at`, `poll_policy` ([ADR-0023](adr/0023-adaptive-poll-interval.md)); after T−0 the seed, count and offsets |
 | Polled | `/_wr/v1/queue_num` | Min TTL 1 s, key adds `event_id` + `request_id`; no cookies | API Gateway → `read` | Own position. 404 means re-join; 409 means not yet open |
 | Join | `/_wr/v1/join` | uncached; no cookies | API Gateway → SQS | Join the queue or the pre-queue |
 | Write | `/_wr/v1/generate_token`, `/_wr/v1/enter`, `/_wr/v1/wait` | uncached; all cookies | API Gateway → `generate_token`, `nojs` | Mint the session; the no-JavaScript queue ([ADR-0037](adr/0037-no-javascript-queue.md)) |
@@ -449,7 +469,7 @@ allowlist is re-checked on every request.
 |---|---|
 | `/_wr/admin`, `/_wr/admin/state`, `/_wr/admin/login`, `/_wr/admin/callback`, `/_wr/admin/logout` | Dashboard with the readiness panel (issue #70), its state as JSON, the OIDC session |
 | `/_wr/admin/phase`, `/_wr/admin/open_now`, `/_wr/admin/start_time` | Any transition except to `active`; open now; set T−0 and arm the schedule |
-| `/_wr/admin/rate`, `/_wr/admin/message` | Target rate; broadcast message |
+| `/_wr/admin/concurrency`, `/_wr/admin/message` | Origin concurrency; broadcast message |
 | `/_wr/admin/pause`, `/_wr/admin/resume`, `/_wr/admin/force_maintenance` | Hold or resume admission (queue and rate kept); emergency full stop ([ADR-0017](adr/0017-andon-cord-emergency-controls.md)) |
 | `/_wr/admin/fail_open`, `/_wr/admin/recover` | Set (≤ 1,440 min) or clear the fail-open epoch; a pause still in force applies once it clears |
 | `/_wr/admin/rules`, `/_wr/admin/ip_binding` | Replace the gate ruleset (§2.3); session IP binding on/off ([ADR-0036](adr/0036-optional-session-ip-binding.md)) |
@@ -525,14 +545,14 @@ browser session; it does not bind a place to a person.
 | Pre-event readiness | The dashboard's diagnostics panel, which makes read-only checks against the deployment (issue #70, [`RUNBOOK.md`](./RUNBOOK.md)) |
 | Branding | Waiting-page HTML, CSS and JS in S3 behind CloudFront |
 | Messaging | `/_wr/admin/message` makes one `UpdateItem`, and every waiter sees it within one `/_wr/v1/status` TTL |
-| Position and wait | `/_wr/v1/queue_num` gives the position. The client estimates the wait from the measured movement of the cursor, falling back to `target_rate` |
+| Position and wait | `/_wr/v1/queue_num` gives the position. The client estimates the wait from the measured movement of the cursor, falling back to `origin_concurrency / session_seconds` |
 
 `waiting.js` polls adaptively (ADR-0023): the interval scales with the visitor's distance to the
 front, between a floor and a ceiling set in Terraform (`poll_floor_ms`, `poll_ceiling_ms`,
 `poll_divisor`). A visitor near the front sees a pause or a fail-open within the floor. A
 deep-queue visitor can see it up to about 39 s late (the ceiling plus jitter). The O4 runbook
-accepts that delay. Consecutive failed polls, and consecutive 425s from a redemption, double the
-interval up to the ceiling and the first success resets it
+accepts that delay. Consecutive failed polls, and consecutive 429s or 5xx from a redemption, double
+the interval up to the ceiling and the first success resets it
 ([#251](https://github.com/smoketurner/virtual-waiting-room/issues/251)). A 410 from
 `/_wr/v1/generate_token` drops the stored identity, so the next load takes a new place (#237).
 
@@ -648,18 +668,22 @@ policy is rolled back by publishing corrected values, not by removing them.
 ### Load at a million
 
 What a 1,000,000-visitor scheduled event asks of API Gateway and DynamoDB. **Modelled from the
-per-request costs in the code, not measured**: 833 admissions/s, and the arrival model above (a
-60-minute countdown with arrival fraction `u^0.2`, so joins peak at `5N / 3600` at T).
+per-request costs in the code, not measured**: the arrival model above (a 60-minute countdown with
+arrival fraction `u^0.2`, so joins peak at `5N / 3600` at T), and admission at `origin_concurrency`
+per session length (§7).
 
 | Phase | API Gateway | DynamoDB writes | DynamoDB reads |
 |---|---|---|---|
 | Countdown, 60 min | `/_wr/v1/join` ~280/s average, ~1,400/s peak at T. `/_wr/v1/status` origin fetches are bounded by CloudFront cache nodes, not audience: tens to low hundreds a second | ~1 unit per join on `PreQueue`, plus one shard-counter write per batch of up to 100: ~1,400/s peak | ~1 unit per join (the batch's consistent duplicate check): ~1,400/s peak |
 | The open | one invoke | one conditional write | ten shard counters, after up to 15 s of queue drain |
 | T to about T+160 s | 1,000,000 `/_wr/v1/queue_num`, ~8,500/s peak | none | one eventually consistent `PreQueue` read each: ~4,300 units/s peak |
-| Admission, ~20 min | `/_wr/v1/generate_token` at 833/s | 2 units per admission (the shard take, the `Positions` mark): ~1,700/s | ~1.5 units per admission (`Positions` consistent, `PreQueue` eventual; `Counters` is held per environment): ~1,300/s |
-| Controller, per pass | none | 11 (the cursor, ten caps) | ~11 units (the event item, ten shards) |
+| Admission | `/_wr/v1/generate_token` at `origin_concurrency / session_ttl_seconds` a second, plus the refusals of those whose turn has come | 2 units per admission (the shard take, the `Positions` mark) | ~1.5 units per admission (`Positions` consistent, `PreQueue` eventual; `Counters` is held per environment) |
+| Controller, per pass | none | 12 (the cursor, the log, ten caps) | ~12 units (the event item, the log, ten shards) |
 
-Over the whole event: roughly 3.5M API Gateway requests, 3M write units and 3–4M read units.
+- **Most of a million are not admitted.** At the 900 s session a limit of 100 admits 400 an hour,
+  and a limit of 10,000 admits 40,000. Everyone further back keeps a position and polls a cached
+  `/_wr/v1/status`, which costs the origin nothing and CloudFront a request per poll; the page's
+  wait estimate is what tells them.
 
 - **Joins scale with the shape of arrival, not with this model.** Everyone in the last five
   minutes is ~3,300/s; everyone in the last minute is ~16,700/s, above API Gateway's 10,000/s
@@ -680,15 +704,15 @@ Over the whole event: roughly 3.5M API Gateway requests, 3M write units and 3–
 The model above assumes people arrive during the countdown. If nobody does, the open writes a
 cohort of zero and the event is a live-join queue from its first second: all 1,000,000 visitors
 post `/_wr/v1/join` when they arrive. Run on the [local stack](LOCAL_STACK.md#findings) at
-one-tenth scale (100,000 visitors within 10 s of T, 83 admissions/s, every API Gateway limit at a
-tenth), which keeps the crowd's size relative to the throttles:
+one-tenth scale (100,000 visitors within 10 s of T, every API Gateway limit at a tenth), which keeps
+the crowd's size relative to the throttles:
 
 | | Measured, default quotas at one-tenth scale |
 |---|---|
 | Half the crowd has a position by | 2.7 min |
 | 90% / 99% have a position by | 4.4 / 6.3 min |
 | Join requests answered 429 | 3.4 per visitor |
-| Admission | 83.7/s against 83/s, nobody lost, no duplicate position |
+| Positions | Nobody lost, no duplicate position |
 
 Raising the account's API Gateway quota and the join throttle shortens the first two rows in
 proportion.
@@ -703,7 +727,7 @@ proportion.
 - **Order is arrival order only loosely.** Within such a burst a place is decided by which retry
   got through, not by who clicked first. The pre-queue exists to avoid exactly this: it randomizes
   deliberately instead of by accident.
-- **Admission is unaffected**: it runs at the target rate from the first pass, on whoever has a
+- **Admission is unaffected**: it fills the origin's slots from the first pass, from whoever has a
   position by then.
 - To take such a crowd faster, raise the account's API Gateway quota and
   `api_join_throttle_rate_limit` with it, and pre-warm the tables (`expected_join_rate`).
