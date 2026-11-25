@@ -31,7 +31,7 @@ const POLLED_TTL: Duration = Duration::from_secs(1);
 /// `waiting.js`: `FIRST_ASK_TARGET_RPS`.
 const FIRST_ASK_TARGET_RPS: u64 = 5000;
 /// `waiting.js`: `FIRST_ASK_MAX_SPREAD_MS`.
-const FIRST_ASK_MAX_SPREAD_MS: u64 = 60_000;
+const FIRST_ASK_MAX_SPREAD_MS: u64 = 120_000;
 
 /// `waiting.js` (#69): the deploy-time poll-policy defaults —
 /// `terraform.tfvars`' `poll_floor_ms`/`poll_ceiling_ms`/`poll_divisor`.

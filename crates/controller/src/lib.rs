@@ -8,15 +8,16 @@
 //! 1. grants budget for the time that has passed -- `target_rate` a second --
 //!    on top of whatever went unused, up to [`BURST_INTERVALS`] intervals'
 //!    worth, and
-//! 2. advances `serving_counter` by the same amount plus the unused budget, so
-//!    that people who never show up are replaced by the people behind them.
+//! 2. advances `serving_counter` by the same amount, plus the budget that went
+//!    unused beyond a small slack -- so people who never show up are replaced
+//!    by the people behind them -- or minus the shortfall when the budget was
+//!    spent, so that a backlog of people already invited drains.
 //!
 //! The first bounds what the origin receives: over any window of `t` seconds no
 //! more than `target_rate * t` plus the burst can be admitted, whoever turns up
 //! and whenever. The second is the whole no-show correction. Budget left
 //! unspent is, exactly, admissions the origin was promised and did not get, so
-//! it is what the cursor has to make up; there is no rate to estimate and
-//! nothing to smooth.
+//! it is what the cursor has to make up; there is no rate to estimate.
 //!
 //! The controller expires nothing. A position lives until `DynamoDB` TTL
 //! reclaims its row
@@ -61,6 +62,12 @@ pub const STALE_OPEN_PASS_SECS: u64 = 2 * INTERVAL_SECS;
 /// at no more than twice the target, which covers a no-show rate up to one
 /// half.
 pub const BURST_INTERVALS: u64 = 2;
+
+/// The share of a pass's budget the cursor is steered to leave unused, as a
+/// divisor: a quarter. It is the controller's margin for telling a backlog
+/// from a balance (see [`release_for`]), and also the most a pass holds back
+/// when the budget is spent.
+pub const SLACK_DIVISOR: u64 = 4;
 
 /// One arrivals shard as the controller reads it: how many admissions it has
 /// recorded, and the cap `generate_token` may take it up to.
@@ -159,11 +166,7 @@ pub fn compute_pass(inputs: PassInputs, now: u64) -> PassDecision {
     // hour has the same budget as one that sat idle for twenty seconds.
     let budget = unused.saturating_add(owed).min(burst);
 
-    // One position for each admission owed, plus one for each admission that
-    // was granted and not taken. The second term is the no-show correction, and
-    // it is bounded by the first: a pass that is owed nothing (it ran in the
-    // same second as another) releases nothing, however much budget is unused.
-    let positions = owed.saturating_add(unused.min(owed));
+    let positions = release_for(owed, unused);
 
     // The cursor is exclusive -- position p is admitted once p < serving_counter
     // -- and queue_counter is the highest position ever issued, so one past it
@@ -183,6 +186,34 @@ pub fn compute_pass(inputs: PassInputs, now: u64) -> PassDecision {
         budget,
         caps: caps_for(inputs.shards, budget),
         last_open_pass_at: now,
+    }
+}
+
+/// How far the cursor moves for a pass that is owed `owed` admissions and found
+/// `unused` budget.
+///
+/// The cursor is steered to keep a little budget unused: `owed /
+/// SLACK_DIVISOR`. Unused budget is the one thing the controller can see about
+/// demand, and it only says anything while it is above zero. A pass that finds
+/// the budget fully spent cannot tell "exactly enough people asked" from "forty
+/// thousand people are asking and being refused", and a law that released the
+/// full amount in that case kept such a backlog for the whole event, every one
+/// of them retrying. So:
+///
+/// - more unused than the slack: people are not showing up. Release that many
+///   extra, at most doubling the pass -- the no-show correction.
+/// - less: demand is at or over the budget. Release that many fewer, down to
+///   three quarters of the pass, so whoever is already waiting is admitted
+///   ahead of new releases and a backlog drains.
+///
+/// Both terms scale with `owed`, so a pass that is owed nothing (it ran in the
+/// same second as another) releases nothing.
+fn release_for(owed: u64, unused: u64) -> u64 {
+    let slack = owed.checked_div(SLACK_DIVISOR).unwrap_or(0);
+    if unused >= slack {
+        owed.saturating_add(unused.saturating_sub(slack).min(owed))
+    } else {
+        owed.saturating_sub(slack.saturating_sub(unused))
     }
 }
 
@@ -355,11 +386,16 @@ mod tests {
 
     const NOW: u64 = 1_000_000;
 
-    /// A mid-event state: the last pass ran one interval ago, and every unit of
-    /// the budget it granted was taken.
+    /// A mid-event state in balance: the last pass ran one interval ago, and
+    /// the slack -- a quarter of an interval's budget -- is what went unused.
     fn inputs(serving: u64, rate: u32) -> PassInputs {
+        let mut shards = [ShardBudget::default(); SHARDS];
+        shards[9] = ShardBudget {
+            taken: 0,
+            cap: u64::from(rate) * INTERVAL_SECS / SLACK_DIVISOR,
+        };
         PassInputs {
-            shards: [ShardBudget::default(); SHARDS],
+            shards,
             serving_counter: serving,
             queue_counter: u64::MAX - 1,
             target_rate: rate,
@@ -367,8 +403,9 @@ mod tests {
         }
     }
 
-    /// The same, with `unused` budget left over, all on shard 0.
+    /// The same, with exactly `unused` budget left over, all on shard 0.
     fn with_unused(mut i: PassInputs, unused: u64) -> PassInputs {
+        i.shards = [ShardBudget::default(); SHARDS];
         i.shards[0] = ShardBudget {
             taken: 100,
             cap: 100 + unused,
@@ -388,7 +425,7 @@ mod tests {
     #[test]
     fn a_regular_pass_grants_and_releases_one_interval() {
         let d = compute_pass(inputs(1000, 50), NOW);
-        assert_eq!(d.budget, 500); // 50/s * 10 s
+        assert_eq!(d.budget, 625); // 50/s * 10 s, on top of the 125 slack
         assert_eq!(d.release, 500);
         assert_eq!(d.next_serving_counter, 1500);
         assert_eq!(d.last_open_pass_at, NOW);
@@ -463,10 +500,49 @@ mod tests {
 
     #[test]
     fn unused_budget_releases_extra_positions() {
-        // 200 of last interval's admissions were not taken, so 200 more people
-        // are invited to take them.
+        // 200 of last interval's admissions were not taken. 125 of that is the
+        // slack the cursor aims to leave; the other 75 are people who did not
+        // show, so 75 more are invited.
         let d = compute_pass(with_unused(inputs(1000, 50), 200), NOW);
-        assert_eq!(d.release, 700);
+        assert_eq!(d.release, 575);
+    }
+
+    #[test]
+    fn a_spent_budget_holds_the_cursor_back_so_a_backlog_drains() {
+        // Nothing went unused: at least as many people asked as there was
+        // budget for. The cursor gives up its slack, and those already waiting
+        // are admitted ahead of new releases.
+        let d = compute_pass(with_unused(inputs(1000, 50), 0), NOW);
+        assert_eq!(d.release, 375);
+        assert_eq!(d.budget, 500);
+    }
+
+    #[test]
+    fn a_backlog_of_invited_visitors_drains_instead_of_persisting() {
+        // Forty thousand people are past the cursor and asking. Each pass
+        // admits a full budget and releases three quarters of one, so the
+        // backlog shrinks by an eighth of a thousand a pass until it is gone.
+        let mut i = with_unused(inputs(1, 50), 0);
+        let mut backlog = 4_000u64;
+        for step in 0..60u64 {
+            let now = NOW + step * INTERVAL_SECS;
+            let d = compute_pass(i, now);
+            backlog += d.release;
+            let take = backlog.min(d.budget);
+            backlog -= take;
+            let mut left = take;
+            for (shard, cap) in i.shards.iter_mut().zip(d.caps) {
+                let used = (cap - shard.taken).min(left);
+                left -= used;
+                *shard = ShardBudget {
+                    taken: shard.taken + used,
+                    cap,
+                };
+            }
+            i.serving_counter = d.next_serving_counter;
+            i.last_open_pass_at = now;
+        }
+        assert!(backlog < 500, "backlog still {backlog} after ten minutes");
     }
 
     #[test]
@@ -498,11 +574,13 @@ mod tests {
 
     #[test]
     fn a_fresh_event_is_owed_one_interval() {
-        let mut i = inputs(0, 50);
+        // No budget has ever been granted, so none is unused: the first pass
+        // grants an interval and holds the slack back from the cursor.
+        let mut i = with_unused(inputs(0, 50), 0);
         i.last_open_pass_at = 0;
         let d = compute_pass(i, 1_788_000_000);
         assert_eq!(d.budget, 500);
-        assert_eq!(d.release, 500);
+        assert_eq!(d.release, 375);
     }
 
     #[test]
@@ -511,14 +589,15 @@ mod tests {
             let mut i = inputs(1000, 50);
             i.last_open_pass_at = NOW - gap;
             let d = compute_pass(i, NOW);
-            assert_eq!(d.budget, 500, "gap {gap}");
+            assert_eq!(d.budget, 625, "gap {gap}");
             assert_eq!(d.release, 500, "gap {gap}");
         }
     }
 
     #[test]
     fn a_late_pass_is_owed_the_seconds_it_ran_late() {
-        let mut i = inputs(1000, 50);
+        // 750 owed; its slack is 187, and exactly that went unused.
+        let mut i = with_unused(inputs(1000, 50), 187);
         i.last_open_pass_at = NOW - 15;
         assert_eq!(compute_pass(i, NOW).release, 750);
     }
@@ -545,7 +624,7 @@ mod tests {
         // Two executions five seconds out of phase run twelve passes in the
         // minute one would run six in. Everyone shows up and takes their
         // admission at once, so nothing is carried.
-        let mut i = inputs(1, 50);
+        let mut i = with_unused(inputs(1, 50), 0);
         i.last_open_pass_at = NOW;
         let (mut released, mut granted) = (0u64, 0u64);
         for step in 1..=12u64 {
@@ -559,8 +638,13 @@ mod tests {
             i.serving_counter = d.next_serving_counter;
             i.last_open_pass_at = now;
         }
+        // The budget is the clock's, however many passes hand it out. The
+        // cursor holds its slack back each time, because the budget was spent.
         assert_eq!(granted, 50 * 60);
-        assert_eq!(released, 50 * 60);
+        assert!(
+            (50 * 60 * 3 / 4..=50 * 60).contains(&released),
+            "{released}"
+        );
     }
 
     // --- the loop ------------------------------------------------------------
@@ -699,7 +783,7 @@ mod tests {
         assert_eq!(outcome, PassOutcome::Ran { released: 500 });
         let writes = store.writes.lock().unwrap();
         assert_eq!(writes.release.unwrap().next_serving_counter, 20_500);
-        assert_eq!(writes.caps.unwrap().iter().sum::<u64>(), 500);
+        assert_eq!(writes.caps.unwrap().iter().sum::<u64>(), 625);
     }
 
     #[tokio::test]

@@ -506,6 +506,35 @@ test("a redemption answered 'at capacity' keeps polling and is admitted on a lat
   assert.equal(client.win.location.replacedTo, "/");
 });
 
+test("repeated 'at capacity' answers are asked for less and less often", async () => {
+  const client = loadClient({
+    route: (url) => {
+      if (url.startsWith("/_wr/v1/status")) {
+        return jsonResponse(200, activeStatus({ serving_position: 100, poll_policy: POLICY }));
+      }
+      if (url.startsWith("/_wr/v1/queue_num")) {
+        return jsonResponse(200, { position: 50, live_join: true });
+      }
+      if (url.startsWith("/_wr/v1/generate_token")) {
+        return jsonResponse(425, { admitted: false, error: "at capacity; position 50 is next" });
+      }
+      return jsonResponse(200, {});
+    },
+  });
+  const delays = [];
+  for (let i = 0; i < 4; i += 1) {
+    await client.flush();
+    const t = client.lastTimer();
+    delays.push(t.ms);
+    t.cancelled = true;
+    t.fn();
+  }
+  // Jitter is +/-20%, so each doubling still clears the one before it until
+  // the ceiling is reached.
+  assert.ok(delays[1] > delays[0] * 1.2, JSON.stringify(delays));
+  assert.ok(delays[3] <= POLICY.ceiling_ms * 1.3, JSON.stringify(delays));
+});
+
 // --- issue #61: re-minting a session refused for another network ----------
 
 test("a visitor sent back for another network is re-admitted straight through", async () => {

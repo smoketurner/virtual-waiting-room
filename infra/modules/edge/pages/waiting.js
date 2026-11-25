@@ -616,7 +616,7 @@
   // spread alone stops being enough and the account's API Gateway throttle
   // (10,000 requests a second by default, raisable on request) has to go up.
   var FIRST_ASK_TARGET_RPS = 5000;
-  var FIRST_ASK_MAX_SPREAD_MS = 60000;
+  var FIRST_ASK_MAX_SPREAD_MS = 120000;
   var firstAskAt = null;
 
   function scheduleFirstAsk(participants) {
@@ -900,6 +900,10 @@
       // (a 425 while the admission budget is spent, ADR-0039), or the operator
       // paused. Fall back to polling rather than hammering.
       admitting = false;
+      // Everyone whose turn has come is told 425 while the budget is spent,
+      // and asks again. Each asks less often the longer it lasts, so a spent
+      // budget is not also a storm of refusals.
+      capacityMisses = res.status === 425 ? capacityMisses + 1 : 0;
       if (res.status === 403) {
         // The secret this browser holds is not the one the place was taken
         // with (issue #62). Nothing on this page can recover that.
@@ -928,6 +932,9 @@
       throw err;
     });
   }
+
+  // Consecutive "at capacity" answers to a redemption. See redeem().
+  var capacityMisses = 0;
 
   var timer = null;
   var stopped = false;
@@ -1157,6 +1164,10 @@
                 // navigates away and a permanent refusal has called stop(),
                 // which schedule() honours.
                 if (!admitting) {
+                  nextIntervalMs = Math.min(
+                    policy.ceilingMs,
+                    policy.floorMs * Math.pow(2, Math.min(capacityMisses, 6))
+                  );
                   schedule();
                 }
               });
