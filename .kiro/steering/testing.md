@@ -71,8 +71,9 @@ visible fairness failure at 1,000,000 people. Tests are the primary evidence.
   `fail_open_until` active and lapsed, each refusal reason (`none`/`signature`/`event`/`expired`),
   XHR-versus-navigation refusal shaping, spoofed `x-wr-gate*` headers stripped at entry, and the
   throw-and-pass-through path (an unrecognised config version, a failed KeyValueStore read).
-- **No-show compensation** — with an injected no-show rate, measured origin arrivals converge
-  on the target rate.
+- **No-show compensation and the admission bound** — with an injected no-show rate, admissions
+  converge on the target rate, and no window admits more than its time at that rate plus the
+  burst (ADR-0039).
 
 ## Not currently provable, and why
 

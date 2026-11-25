@@ -60,16 +60,18 @@ no call to the backend.
 
 ```
   controller (EventBridge Scheduler rate(1 minute); a durable execution of six 10 s passes)
-        measure arrivals against releases → EWMA no-show rate → bounded release
-        → UpdateItem serving_counter
+        grant admission budget for the time elapsed (plus what went unused, capped)
+        → UpdateItem serving_counter (elapsed + unused), then cap c on each arrivals shard
         │
   Visitor polls /v1/status until serving_position ≥ own position
         │
   POST /v1/generate_token (request_id + possession secret, ADR-0035)
         1. event admitting? (phase active, resolve(stored control, fail_open_until, now))
         2. position reached?
-        3. claim the admission once (Positions.status issued → admitted, ADR-0033);
-           on the first claim, ADD n on a randomly drawn arrivals shard
+        3. take one unit of the admission budget (ADR-0039): conditional ADD n on a
+           randomly drawn arrivals shard while n < c (up to 3 draws), 425 when spent;
+           then mark Positions.status issued → admitted. An already-admitted visitor
+           re-mints without taking a unit
         4. sign the session (HS256 JWS, wr_common::crypto) → Set-Cookie
            (Path=/, Secure, HttpOnly, SameSite=Lax, Max-Age)
         │
@@ -275,11 +277,12 @@ Keys are built only in `wr_common::expr`.
 | `target_rate` | Operator admission rate, in visitors per second |
 | `message` | Operator broadcast, delivered in `/v1/status` |
 | `starts_at` | Scheduled start, which the waiting page counts down to |
-| controller state, `rules_digest`/`rules_count` | Smoothed no-show rate and last pass; ruleset audit |
+| `last_open_pass_at`, `rules_digest`/`rules_count` | The controller's last open pass; ruleset audit |
 
 `wr_common::resolve(stored, fail_open_until, now)` is the only producer of
-`AdmissionControl::FailOpen`. The shard items `EVT#{event_id}#PQ#{s}` and
-`EVT#{event_id}#AR#{s}` hold one attribute each, `n`. `event_id` may not contain `#`.
+`AdmissionControl::FailOpen`. A pre-queue shard item `EVT#{event_id}#PQ#{s}` holds its count
+`n`. An arrivals shard item `EVT#{event_id}#AR#{s}` holds `n`, the admissions taken, and `c`, the
+cap they may be taken up to. `event_id` may not contain `#`.
 
 **`PreQueue`** (PK `r`) has the attributes `s`, `l`, `t` and `h`. The names are short because
 DynamoDB bills attribute names on every write and the table holds one row per visitor. The table
@@ -321,30 +324,39 @@ self-heal (§4.1) rides the same loop.
 
 ## 7. Outflow control
 
-Some visitors whose turn arrives never click through, so the controller closes the loop on the
-operator's target rate:
+Admission is metered where it happens, not where it is offered
+([ADR-0039](adr/0039-meter-admissions-not-the-cursor.md)). `generate_token` takes one unit of an
+**admission budget** for each visitor it admits and answers 425 when there is none. Each pass the
+controller grants budget and moves the cursor:
 
 ```
-no_show_rate  = 1 − arrivals_last_interval / released_last_interval
-smoothed      = 0.3 · no_show_rate + 0.7 · smoothed          (EWMA_ALPHA)
-release_next  = min(target_rate / (1 − smoothed), 2 × target_rate)
+owed     = target_rate × seconds since the last open pass     (one interval if ≥ 20 s, or none)
+unused   = Σ over shards of (c − n)                           (granted and not taken)
+budget   = min(unused + owed, 2 intervals of target_rate)     → written as c = n + share, per shard
+release  = owed + min(unused, owed)                           → serving_counter, up to queue_counter + 1
 ```
+
+The budget bounds what the origin receives: at most two intervals' worth is ever outstanding, so
+over any window of `t` seconds no more than `target_rate × t` plus that burst is admitted,
+whoever turns up and whenever. Unused budget is the no-show correction: it is exactly the
+admissions the origin was offered and did not get, so the cursor releases that many more people.
+The cursor moves at most twice the target, which covers a no-show rate up to 50%. Nothing is
+estimated or smoothed.
 
 The controller is a Lambda durable function: Scheduler starts one execution a minute, which runs
 six checkpointed passes separated by 10 s durable waits. A wait suspends the execution, so it is
 not billed, and a replayed pass returns its checkpoint rather than advancing `serving_counter`
-twice ([ADR-0022](adr/0022-durable-controller-cadence.md)). A pass advances only while the phase
-is `active` and the resolved control is `Open`. Its target is `target_rate` times the seconds
-since the last open pass, so the total released follows the wall clock however many passes run:
-an overlapping execution's extra pass releases only the seconds since the one before it
-([#236](https://github.com/smoketurner/virtual-waiting-room/issues/236)). After a gap of two
-intervals or more it releases one interval's worth and does not make up the gap. All arithmetic
-is checked or saturating.
+twice ([ADR-0022](adr/0022-durable-controller-cadence.md)). A pass runs only while the phase is
+`active` and the resolved control is `Open`. Because `owed` follows the wall clock, an overlapping
+execution's extra pass grants and releases only the seconds since the one before it
+([#236](https://github.com/smoketurner/virtual-waiting-room/issues/236)); after a gap of two
+intervals or more a pass is owed one interval and does not make up the gap. All arithmetic is
+checked or saturating.
 
-**Arrivals** are counted by `generate_token`, once per visitor (ADR-0033), across ten shard items
-(60,000 admissions a minute would otherwise hit the 1,000 writes/s item ceiling). Reading them is
-ten reads per pass. **The controller expires nothing** and never scans; the no-show correction
-compensates for absentees ([ADR-0031](adr/0031-remove-controller-driven-expiry.md)).
+**Arrivals** are the budget taken: `generate_token` adds to one of ten shard items, once per
+visitor (60,000 admissions a minute would otherwise hit the 1,000 writes/s item ceiling). A pass
+reads the ten and writes each one's cap. **The controller expires nothing** and never scans; the
+unused budget compensates for absentees ([ADR-0031](adr/0031-remove-controller-driven-expiry.md)).
 
 **Not built:** a concurrency term. Nothing reports when a session completes, so origin
 concurrency drifts with session length

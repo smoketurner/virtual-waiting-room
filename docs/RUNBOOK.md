@@ -86,9 +86,10 @@ On the day (**manual**):
 
 ### Deciding the admission rate
 
-Enter the requests per second the origin sustains, as a whole number. The controller corrects
-upward for no-shows to at most **twice** the target, so the origin must survive twice what you
-enter. Rate 0 is rejected; use Pause to stop admission.
+Enter the requests per second the origin sustains, as a whole number. Admissions are metered
+against a budget: over any stretch of time the origin receives at most the rate you enter, plus a
+burst of up to **two intervals** (20 seconds' worth of admissions) that can arrive at once, so the
+origin must survive that burst. Rate 0 is rejected; use Pause to stop admission.
 
 ---
 
@@ -184,9 +185,9 @@ operation.
 |---|---|---|
 | `join_dropped` | A join reached SQS and was discarded (malformed body, or an `event_id` that does not match). The visitor got a 200 | Check `event_id` in `terraform.tfvars` against the event item. A mismatch drops **every** join |
 | `join-dlq-not-empty` | A join was retried to exhaustion and lost | Check `assign_position`'s logs. The messages are in the dead-letter queue and can be redriven |
-| `arrival_record_failed` | An admitted visitor's arrival went uncounted | Cumulative: each one inflates the measured no-show rate, so the controller over-releases. Consider lowering the rate |
+| `arrival_record_failed` | A unit of the admission budget could not be taken, so the visitor was **not** admitted and will ask again | Harmless once. If continuous, admission has stopped: check `generate_token`'s logs and its grant on the `Counters` table |
 | `arrival_shard_draw_failed` | Same, one step earlier | As above |
-| `admission_claim_failed` | The write that counts an admission once did not land | Harmless once. If continuous, the measured no-show rate collapses toward zero and the controller stops correcting |
+| `admission_claim_failed` | The write that marks a visitor admitted did not land; they were admitted anyway | Harmless once. If continuous, every reload takes a second unit of budget, so fewer people are admitted than the rate allows, never more |
 | `admission_control_unreadable` | The stored admission control could not be parsed; the controller is holding admission | The queue has stopped. Pause, then Resume |
 | `rules_audit_failed` | The ruleset changed but its audit stamp did not | Gate is correct; "last changed by" is stale. No visitor impact |
 | `fail_open_audit_lost` | Fail-open changed but its audit stamp lost a race | Change took effect; "last changed by" is stale. No visitor impact |

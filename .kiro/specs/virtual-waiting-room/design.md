@@ -75,7 +75,8 @@ A change that breaks one of these is a fairness or safety failure, not a refacto
    records, and every row write carries `attribute_not_exists`. Malformed records are dropped and
    never retried.
 7. **The pre-queue shard is a server-side random draw** per batch (`Shard::random`, issue #59),
-   never derived from `request_id`. The arrivals shard is random per admission.
+   never derived from `request_id`. The arrivals shard an admission takes its unit of budget from
+   (`n < c`, ADR-0039) is random per admission.
 8. **Sequences are never sharded.** `queue_counter` and `serving_counter` stay on the event item.
    Striped counters are separate items, not attributes
    ([ADR-0015](../../../docs/adr/0015-stripe-prequeue-counter.md)).

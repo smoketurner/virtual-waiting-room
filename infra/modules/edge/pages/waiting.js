@@ -607,9 +607,9 @@
 
   // How fast the cursor is actually moving, in positions per second, measured
   // from /status rather than taken on trust. The operator's target rate says
-  // what the origin was asked to absorb; the controller then corrects releases
-  // against the share of admitted visitors who never arrive, so the cursor's
-  // real speed is not the target. A visitor should be told what is happening,
+  // what the origin was asked to absorb; the controller then releases extra
+  // positions for admissions nobody took (ADR-0039), so the cursor's real
+  // speed is not the target. A visitor should be told what is happening,
   // not what was intended.
   //
   // Measured across a window rather than between consecutive polls. The cursor
@@ -661,7 +661,7 @@
 
   // Prefer what was observed over what was merely declared, and share that
   // choice between the on-screen ETA and the poll interval so the two never
-  // disagree: the controller corrects releases against a no-show rate, so
+  // disagree: the controller releases extra positions for no-shows, so
   // the cursor's real speed differs from the operator's target, and the
   // interval should track what is actually happening rather than what was
   // only intended.

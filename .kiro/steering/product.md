@@ -44,8 +44,9 @@ so only the scheduled mode is served end to end.
   permutation computed on read, not a million stored rows. The property that distinguishes us
   is not the write count — it is that a published seed, offsets and count let any third party
   recompute every position and prove the raffle was a raffle (F1.5).
-- **Closed-loop admission.** The controller measures the no-show rate and compensates so the
-  origin runs at the capacity the operator paid for.
+- **Closed-loop admission.** Admissions are metered against a budget granted at the target rate,
+  and budget nobody took releases more of the queue, so no-shows are compensated and the origin
+  runs at the capacity the operator paid for.
 - **Fails open.** If the waiting room is unavailable, visitors reach the site. A waiting room
   that fails closed turns its own outage into the operator's.
   **Only half-held today** (#58): the mechanism exists — an operator engages fail-open and the

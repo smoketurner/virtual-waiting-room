@@ -53,7 +53,7 @@ both counters `0`; `target_rate` from `admission_rate`) and then ignores it.
 |---|---|---|
 | `queue_counter` | `assign_position`, `open_event` | Live-join sequence; set to `N` at the open |
 | `serving_counter` | `controller` | Admission cursor, exclusive |
-| `last_serving_counter`, `last_arrivals_total`, `no_show_rate`, `last_open_pass_at` | `controller` | Measurement state between passes |
+| `last_open_pass_at` | `controller` | Epoch seconds of the last open pass; what the next pass's grant is measured from |
 | `phase` | `open_event`, `admin` | `idle` / `pre_queue` / `active` / `post_event` / `maintenance` |
 | `shuffle_seed`, `participant_count`, `prequeue_offsets` | `open_event` | The open outputs: 256-bit seed, `N`, ten prefix offsets. Written once |
 | `admission_control` | `admin` | `open` / `paused` only; absent reads as `open` |
@@ -99,12 +99,13 @@ one. A pre-queue member has no `Positions` row until the admission claim creates
 | `read` | `Positions` | `GetItem` | Eventual | 1 per `/v1/queue_num` with no `PreQueue` row, or a straggler |
 | `generate_token`, `nojs` | `Counters` | `GetItem` event | Strong | 1 per call |
 | `generate_token`, `nojs` | `Positions` | `GetItem` | Strong | 1 per call |
-| `generate_token`, `nojs` | `PreQueue` | `GetItem` | Eventual | 1 per call with no `Positions` row |
-| `generate_token`, `nojs` | `Positions` | `UpdateItem` admission claim, guarded | — | 1 per admission |
-| `generate_token`, `nojs` | `Counters` | `UpdateItem SET s ADD n` on a random arrival shard | — | 1 per first admission |
+| `generate_token`, `nojs` | `PreQueue` | `GetItem` | Eventual | 1 per call |
+| `generate_token`, `nojs` | `Counters` | `UpdateItem ADD n 1` on a random arrival shard, guarded on `n < c` | — | 1–3 per first admission |
+| `generate_token`, `nojs` | `Positions` | `UpdateItem` admitted mark, guarded | — | 1 per first admission |
 | `controller` | `Counters` | `GetItem` event | Strong | 1 per pass |
-| `controller` | `Counters` | `BatchGetItem` of ten arrival shards | Eventual | 1 per pass |
-| `controller` | `Counters` | `UpdateItem` cursor and measurement state, guarded | — | 1 per open pass |
+| `controller` | `Counters` | `BatchGetItem` of ten arrival shards | Strong | 1 per pass |
+| `controller` | `Counters` | `UpdateItem` cursor and `last_open_pass_at`, guarded | — | 1 per open pass |
+| `controller` | `Counters` | `UpdateItem SET c` on each arrival shard | — | 10 per open pass |
 | `admin` | `Counters` | `GetItem`; guarded `UpdateItem` per action | Eventual | Operator actions |
 | `admin` | `Tokens` | `PutItem` session/login; `GetItem` session; `DeleteItem` logout; `DeleteItem ALL_OLD` to consume a login | Eventual | Operator logins |
 
@@ -138,7 +139,7 @@ passes included, while distributing nothing. The reasoning is
 | `queue_counter` | Sequence | No | Summing shards cannot yield a unique ordered value |
 | `serving_counter` | Sequence | No | Same, and it is read as a running value |
 | Pre-queue index | Index | ×10 | The permutation needs indices unique and in `[0, N)`, not ordered; the open's prefix offsets reassemble them into exactly that range |
-| `arrivals` | Statistic | ×10 | Order carries no information |
+| `arrivals` | Budget meter | ×10 | Order carries no information; each shard holds `n` taken and `c`, its cap ([ADR-0039](adr/0039-meter-admissions-not-the-cursor.md)) |
 
 `SHARDS` is a constant, 10. The shard is drawn uniformly at random per invocation (pre-queue) or per
 admission (arrivals) rather than hashed from the client-supplied `request_id`, which would let a
@@ -162,7 +163,8 @@ saturated pre-queue index would be a duplicate global index and hand two visitor
 | `Positions` row (live join) | `attribute_not_exists(request_id)` | A duplicate join consumes no position |
 | Open | `attribute_not_exists(shuffle_seed) AND phase = :pre_queue` | Opens exactly once, and only from `pre_queue` |
 | Cursor advance | `attribute_not_exists(serving_counter) OR serving_counter = :expected` | Overlapping controller executions cannot double-advance |
-| Admission claim | `attribute_not_exists(request_id) OR status = :issued` | The arrival is counted once per visitor ([ADR-0033](adr/0033-admission-claimed-once-per-visitor.md)) |
+| Admission budget | `n < c` on the arrival shard | No admission past the cap the controller last wrote; a shard never granted one admits nobody ([ADR-0039](adr/0039-meter-admissions-not-the-cursor.md)) |
+| Admitted mark | `attribute_not_exists(request_id) OR status = :issued` | A visitor takes budget once; a repeat re-mints without it |
 | Phase change | `phase = :from` | A transition another operator applied is a 409 |
 | Rate change | `target_rate = :exp`, or `attribute_not_exists(target_rate)` | Same, for the rate |
 | Admission control | `admission_control = :from`, also allowing absence when `:from` is `open` | Same; absence reads as `open` |
@@ -176,7 +178,7 @@ own audit entry.
 
 Every guard's `ConditionalCheckFailedException` is handled by name as an outcome, not an error:
 `assign_position` reports a duplicate, `open_event` disambiguates already-open from wrong-phase,
-`generate_token` treats the claim as a repeat, the controller logs the lost race, and admin
+`generate_token` reads a spent shard as "try another, then 425", the controller logs the lost race, and admin
 returns a conflict. These guards are what let ingest run on an at-least-once SQS standard queue:
 a redelivery fails its condition, and ordering is irrelevant because positions come from a
 counter.
@@ -203,7 +205,7 @@ because it is the per-visitor table read across the cohort at audit; a row is ab
 
 ## 8. Consistency
 
-Six strongly consistent reads, each because a stale answer is wrong:
+Seven strongly consistent reads, each because a stale answer is wrong:
 
 - `assign_position`'s `Counters` read: the batch's live/pre-queue routing and the straggler
   fix-up turn on it.
@@ -214,15 +216,16 @@ Six strongly consistent reads, each because a stale answer is wrong:
   replica lags the controller.
 - `generate_token`'s `Positions` read: the admission status and digest must be current.
 - `controller`'s `Counters` read: it computes from the cursor its write is guarded on.
+- `controller`'s arrival-shard read: each cap is written as `n` plus a share, so a stale `n`
+  would re-grant budget already spent.
 
-Everything else is eventual. `read`'s answers are cached at the edge for a second anyway; the
-arrival sum feeds an EWMA (α 0.3) with release capped at twice the target; `PreQueue` rows are
-immutable; and admin's writes are guarded on the prior value, so a stale read is a conflict, not a
+Everything else is eventual. `read`'s answers are cached at the edge for a second anyway;
+`PreQueue` rows are immutable; and admin's writes are guarded on the prior value, so a stale read is a conflict, not a
 wrong write.
 
 **A partial batch is a failure, not a zero.** `open_event` and the controller check
 `unprocessed_keys` and error: a missed pre-queue shard strands every registrant in it, and a
-missed arrival shard reads as no-shows and over-releases. **A missing shard is zero; a corrupt one
+missed arrival shard would read as having admitted nobody and be capped below what it has taken. **A missing shard is zero; a corrupt one
 is an error**: a shard with no registrations has no item, but one whose `s` cannot be read fails
 the open rather than unadmitting its registrants.
 
@@ -242,8 +245,8 @@ Write budget for a 1,000,000-participant event:
 | Pre-queue | `PreQueue` rows | 1,000,000 |
 | Pre-queue | Shard claims, batch 100 | ~10,000 |
 | Open | The guarded update | 1 |
-| Admission | Admission claim + arrival increment | 2 per admitted visitor |
-| Admission | Cursor advance | 6 per minute |
+| Admission | Budget take + admitted mark | 2 per admitted visitor |
+| Admission | Cursor advance + ten shard caps | 66 per minute |
 
 The pre-queue dedupe adds about 1,000,000 strongly consistent reads (1 RRU each) over the
 registration window. Registration spread over 20 minutes runs at about 830 writes/s, under the cold
@@ -286,8 +289,8 @@ waiters and a 5.75 s mean interval: roughly 87,000 RRU/s, over twice the default
 There is no `Scan`. The controller's former `Positions` scan for expiry was removed
 ([ADR-0031](adr/0031-remove-controller-driven-expiry.md)); a position is live until its row is
 gone. `Positions.ttl` is `now + 86,400` (`POSITION_TTL_SECS`) at each write and is reclamation
-only: nothing reads it, and DynamoDB may take days to delete an expired row. The no-show correction
-is what compensates for visitors who never arrive.
+only: nothing reads it, and DynamoDB may take days to delete an expired row. Unused admission
+budget is what compensates for visitors who never arrive.
 
 `Tokens` rows expire on `expires_at`, and because expired rows stay readable until deleted, both
 `load_session` and the PKCE consume check `expires_at` themselves. `PreQueue` and `Counters` have

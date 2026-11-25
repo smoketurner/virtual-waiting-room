@@ -200,22 +200,23 @@ A pass runs only when `phase = active` and the resolved admission control is `Op
 writes nothing.
 
 ```
-observed  = Σ arrivals − last_arrivals_total
-released  = serving_counter − last_serving_counter
-no_show   = 1 − clamp(observed / released, 0, 1)
-smoothed  = 0.3 × no_show + 0.7 × previous                      // EWMA
-release   = min(target_rate × 10 / (1 − smoothed), 2 × target_rate × 10)
-next      = clamp(serving_counter + release, serving_counter, queue_counter + 1)
+owed     = target_rate × (now − last_open_pass_at)            // one interval if ≥ 20 s or never
+unused   = Σ shards (c − n)
+budget   = min(unused + owed, 2 × target_rate × 10)           // caps: c = n + an even share
+release  = owed + min(unused, owed)
+next     = clamp(serving_counter + release, serving_counter, queue_counter + 1)
 ```
 
-With nothing released last interval, or when the previous open pass is older than two intervals
-(an operator hold froze the baselines), the pass releases the raw target and carries the EWMA
-unchanged. All arithmetic saturates. The cursor never passes `queue_counter + 1`, so admission
-credit is not banked against an empty queue. The write is guarded on `serving_counter =
-:expected`, so overlapping executions cannot double-advance.
+The budget is what `generate_token` may admit before the next pass; unused budget is carried, up
+to the two-interval burst, and is also how many extra positions the cursor releases to replace
+no-shows ([ADR-0039](adr/0039-meter-admissions-not-the-cursor.md)). All arithmetic saturates. The
+cursor never passes `queue_counter + 1`, and an idle event holds no more than the burst. The
+cursor write is guarded on `serving_counter = :expected`; a pass that loses it writes no caps.
+The caps are then one `UpdateItem` per shard, absolute values, so writing them twice grants
+nothing twice.
 
 The controller expires nothing. A position lives until DynamoDB TTL reclaims its row 24 hours
-after its last write, and the no-show correction compensates for absentees
+after its last write, and the unused budget compensates for absentees
 ([ADR-0031](adr/0031-remove-controller-driven-expiry.md)).
 
 ### 7.2 Minting the session
@@ -236,17 +237,21 @@ shard's opened count is the visitor's place whatever `Positions` holds, the same
 | A straggler row with no live position | 404 |
 | Corrupt row | 500 |
 | `position ≥ serving_counter` | 425, keep polling |
+| Admission budget spent | 425, keep polling |
 
 Admission control is resolved by `wr_common::resolve(stored, fail_open_until, now)`; `FailOpen` is
 never stored.
 
-The admission is then **claimed once** ([ADR-0033](adr/0033-admission-claimed-once-per-visitor.md)):
-an `UpdateItem` on the `Positions` row setting `status = admitted`, guarded by
-`attribute_not_exists(request_id) OR status = issued`. It claims a live joiner's row or creates a
-pre-queue member's. Only the winner records an arrival on a random arrivals shard; a repeat (reload,
-second tab, lost response) is still admitted with a fresh session. A failed claim counts the
-arrival anyway, and a failed arrival write is logged as `arrival_record_failed` and the visitor
-admitted: over-counting under-releases, which is the safer error.
+A visitor not yet admitted then **takes one unit of the admission budget**
+([ADR-0039](adr/0039-meter-admissions-not-the-cursor.md)): an `UpdateItem ADD n 1` on a randomly
+drawn arrivals shard, conditional on `n < c`, trying up to three shards. With none to take the
+answer is 425 and the page asks again. A failed draw or write is also "no unit"
+(`arrival_shard_draw_failed`, `arrival_record_failed`): an admission that cannot be metered is not
+made. The `Positions` row is then marked `status = admitted`, guarded by
+`attribute_not_exists(request_id) OR status = issued`, which creates a pre-queue member's row. A
+visitor whose row is already admitted (reload, second tab, lost response) gets a fresh session
+without taking a unit. A failed mark (`admission_claim_failed`) still admits; a later call takes a
+second unit, which admits fewer people, never more.
 
 The session is a compact JWS (HS256) signed under a key derived from the deployment secret with a
 per-kind label ([ADR-0024](adr/0024-jws-credentials.md)), carrying the event as `aud`, the expiry,
@@ -344,7 +349,9 @@ proven. The core ones:
 | In domain | `prop_in_domain` |
 | Uniform | `prop_uniform_by_decile` (χ² over 10 deciles at `n = 10,000`, below the p = 0.001 critical value) |
 | Keys distinct | `shard_keys_are_distinct_partition_keys`, `the_tokens_table_key_space_does_not_collide_across_kinds` |
-| Release bounded | `near_total_no_show_is_bounded_at_cap`, `zero_arrivals_is_bounded_at_cap_not_infinite` |
+| Admission bounded | `no_window_admits_more_than_its_time_plus_the_burst`, `an_idle_event_banks_no_more_than_the_burst`, `a_pass_never_panics_rewinds_or_exceeds_its_bounds` |
+| No-show convergence | `admissions_converge_on_the_target_despite_no_shows` |
+| Cadence-independent | `interleaved_executions_grant_what_one_cadence_would` |
 | Gate conformance | `infra/modules/edge/tests/gate.conformance.test.js` |
 
 ## 12. Known gaps

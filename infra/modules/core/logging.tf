@@ -63,31 +63,30 @@ locals {
       value     = "$.fields.total"
     }
 
-    # The arrival went unrecorded, so the controller measures a no-show that
-    # did show. Cumulative and silent: every uncounted arrival inflates the
-    # no-show rate, and the controller answers by releasing more people than
-    # the origin agreed to serve.
+    # A unit of the admission budget could not be taken (ADR-0039), so the
+    # visitor was not admitted and will ask again. Harmless once; if it is
+    # failing for everyone -- a missing grant, a throttled table -- nobody is
+    # admitted at all, while the queue page keeps saying it is their turn.
     arrival_record_failed = {
       log_group = local.generate_token_name
       pattern   = "{ $.fields.event = \"arrival_record_failed\" }"
       value     = "1"
     }
 
-    # Same consequence, one step earlier: no shard drawn, so nothing to record
-    # the arrival against.
+    # Same consequence, one step earlier: no shard drawn, so no budget to take
+    # the unit from.
     arrival_shard_draw_failed = {
       log_group = local.generate_token_name
       pattern   = "{ $.fields.event = \"arrival_shard_draw_failed\" }"
       value     = "1"
     }
 
-    # The conditional write that makes an admission count once did not land, so
-    # the arrival is counted on the conservative assumption it was not counted
-    # before. Harmless for one visitor; if the claim is failing for everyone --
-    # a missing grant, a throttled table -- every poll of the waiting page
-    # counts another arrival, the measured no-show rate collapses toward zero,
-    # and the controller stops correcting for the people who never showed up.
-    # Visitors keep being admitted throughout, so nothing else reports it.
+    # The write that marks a visitor admitted did not land. They were admitted
+    # anyway, having taken their unit of budget. Harmless for one visitor; if
+    # it is failing for everyone -- a missing grant, a throttled table -- every
+    # reload takes another unit, so fewer people are admitted than the rate
+    # allows. Visitors keep being admitted throughout, so nothing else reports
+    # it.
     admission_claim_failed = {
       log_group = local.generate_token_name
       pattern   = "{ $.fields.event = \"admission_claim_failed\" }"
