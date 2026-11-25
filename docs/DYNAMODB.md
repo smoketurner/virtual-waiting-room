@@ -72,14 +72,15 @@ without parsing keys), and `n`, its count.
 | Item | Attributes |
 |---|---|
 | `PreQueue` | `r` request id, `s` shard, `l` local index, `t` registration time, `h` possession digest |
-| `Positions` | `request_id`, `queue_position`, `entry_time`, `status` (`issued`/`admitted`), `h`, `ttl` |
+| `Positions` | `request_id`, `queue_position`, `entry_time`, `status` (`issued`/`admitted`), `admitted_at`, `h`, `ttl` |
 | `Tokens` `SESS#` | `subject`, `email`, `expires_at` |
 | `Tokens` `PKCE#` | `pkce_verifier`, `nonce`, `expires_at` |
 
 `h` is the digest of the visitor's possession secret
 ([ADR-0035](adr/0035-request-id-proof-of-possession.md)); `generate_token` refuses a row without
 one. A pre-queue member has no `Positions` row until the admission claim creates one at
-`admitted`, copying `h` and stamping the derived position.
+`admitted`, copying `h` and stamping the derived position. `admitted_at` is written once, by that
+same guarded mark; every session minted for the row expires from it (#237).
 
 ## 2. Access patterns
 
@@ -91,7 +92,7 @@ one. A pre-queue member has no `Positions` row until the admission claim creates
 | `assign_position` | `PreQueue` | `PutItem` if `attribute_not_exists(r)` | — | 1 per registrant |
 | `assign_position` | `Counters` | `UpdateItem ADD queue_counter`, `ALL_NEW` | — | 1 per live batch, +1 per straggler fix-up |
 | `assign_position` | `Positions` | `PutItem` if `attribute_not_exists(request_id)` | — | 1 per live joiner |
-| `open_event` | `Counters` | `BatchGetItem` of ten pre-queue shards | Strong | Once per event |
+| `open_event` | `Counters` | `BatchGetItem` of ten pre-queue shards, after an SQS `GetQueueAttributes` wait of up to 15 s for the join queue to drain (#239) | Strong | Once per event |
 | `open_event` | `Counters` | `UpdateItem` open, guarded | — | Once per event |
 | `open_event` | `Counters` | `GetItem` projecting `shuffle_seed` | Eventual | Only when the open's guard fails, to tell "already open" from "wrong phase" |
 | `read` | `Counters` | `GetItem` event | Eventual, 1 s in-process cache | ≤ 1/s per execution environment |

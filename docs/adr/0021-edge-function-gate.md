@@ -145,10 +145,25 @@ viewer-request:
   4. invalid credential         -> refuse with a reason               (#73)
   5. no credential              -> refuse: navigation gets the waiting page,
                                    XHR gets JSON plus a header        (#72)
-  6. anything throws            -> pass through, mark the request
+  6. throws before a rule match -> pass through, mark the request
+  7. throws after a rule match  -> refuse, plain 403, reason `error`  (#242)
 ```
 
 Step 6 handles *the gate being broken*. It is not the same thing as #58 — see §5.1.
+
+**Amendment (#242, #247).** Step 6 originally read "anything throws → pass through". It now covers
+only a failure before a rule has matched (unreadable config, unknown version, malformed rule),
+where nothing says what is protected. Once a rule has matched the request is known to be protected,
+so any later failure — an unreadable key, a throw while verifying or while building the refusal —
+answers a literal 403 with `x-wr-reason: error`. Two further changes:
+
+- **Suspicious paths match any path rule.** A decoded path with a `.` or `..` segment, a `;` or a
+  backslash is something origins canonicalise differently, so it needs a session whenever a path
+  rule exists. `..` is no longer left unresolved-and-unmatched. `wr_common::rules` mirrors it, and
+  rejects at write time a prefix that could never match (`%`, `//`, a dot segment, `;`, backslash).
+- **An optional previous key.** If KeyValueStore key `kp` exists (same format as `k`), a session
+  that fails under `k` is tried under `kp`. It is read only after `k` refuses. Nothing writes `kp`
+  yet: this is the reader half of a rotation overlap.
 
 ## 4. Open decisions
 
@@ -438,6 +453,12 @@ job. `structure.md` and `testing.md` are updated to match; in particular `testin
 `infra/modules/edge/pages/waiting.js` exists solely to survive the 403-to-waiting-page loop that
 #64 and this ADR remove — replaced by the gate's own `next=` query parameter, which preserves the
 visitor's destination through the redirect without needing a client-side loop guard at all.
+
+**Amendment (#247).** A loop guard exists again, for a different loop: a gate that refuses a
+session `generate_token` has just minted (a key mismatch after a rotation) sent the visitor
+between the two at navigation speed. `waiting.js` records each successful redeem (`vwr_redeemed`)
+and stops, with a message, at the second gate refusal in a row inside 60 s of one. The `r=ip`
+guard is separate and stops one bounce earlier.
 
 **The trusted-key-group gate is retired in one change, with no dual-gate window.** A transition period would require
 knowing whether a viewer-request function runs before or after trusted-key-group validation, which

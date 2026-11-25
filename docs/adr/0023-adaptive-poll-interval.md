@@ -169,3 +169,10 @@ duplicating it here — it is a model, not a mechanism, and belongs with the oth
 - `crates/harness` gains `Polling::Backoff`, a `--target-rate` flag, and a moving `serving_position`
   in its built-in origin stub, so the client-request saving can be measured locally without a
   deployed stack.
+
+## Amendment: failed polls back off (#251)
+
+A poll chain that fails (a 5xx, a 429, a network error) used to be retried at the last interval
+indefinitely. Each consecutive failure now doubles the interval, up to `policy.ceilingMs`, with the
+existing jitter; the first success resets it. With no policy published the floor equals the
+ceiling, so there is nothing to back off to until one arrives.

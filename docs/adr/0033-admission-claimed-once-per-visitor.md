@@ -2,7 +2,9 @@
 
 **Status:** Accepted. Amended by [0039](0039-meter-admissions-not-the-cursor.md): the claim is now a
 mark made after a unit of the admission budget is taken, and the arrival count it protected is that
-budget. A repeat still admits.
+budget. A repeat still admits, but into the same visit: a session asked for again expires when the
+first one did (`admitted_at + session_ttl_seconds`, issue #237). After that `/v1/generate_token`
+answers 410 and the visitor takes a new place.
 
 ## 1. Context
 

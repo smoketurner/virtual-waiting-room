@@ -131,7 +131,10 @@ within the batch and any id that already has a `PreQueue` row, and claims a cont
 local indices on that shard with one `ADD n`. Each row `{r, s, l, t, h}` is written with
 `attribute_not_exists(r)`. Shard striping is [ADR-0015](adr/0015-stripe-prequeue-counter.md).
 
-**The open.** `open_event` reads the ten shard counts with one consistent `BatchGetItem`, computes
+**The open.** `open_event` first gives the join consumers a bounded moment to catch up: it polls
+the queue's waiting count once a second, up to 15 times, until it reads zero twice running, and
+opens regardless (#239; `open_drain_timed_out`, `open_drain_unreadable`). It then reads the ten
+shard counts with one consistent `BatchGetItem`, computes
 `offset[s] = Σ counts[0..s)` and `N`, and writes seed, `N`, offsets, `queue_counter = N` and
 `phase = active` in one `UpdateItem` guarded by `attribute_not_exists(shuffle_seed) AND phase =
 :pre_queue`. A double-fire or retry fails the guard and reports `AlreadyOpen`. Both the schedule
@@ -197,7 +200,12 @@ durable wait that suspends the execution instead of billing it
 ([ADR-0022](adr/0022-durable-controller-cadence.md)); `execution_timeout = 120`, retention 7 days.
 
 A pass runs only when `phase = active` and the resolved admission control is `Open`; otherwise it
-writes nothing.
+writes nothing. A pass that fails is skipped (`controller_pass_failed`) and the
+cadence carries on, the next pass being owed the seconds the failed one did not grant. An
+execution whose first pass finds the phase `idle` or `post_event` ends there, since such an event
+only becomes active through `pre_queue` and an open; that is most of the controller's cost
+between events (N1), and it means an operator who goes idle → pre_queue → open inside one minute
+waits for the next execution before admission starts.
 
 ```
 owed     = target_rate × (now − last_open_pass_at)            // one interval if ≥ 20 s or never
@@ -238,6 +246,7 @@ shard's opened count is the visitor's place whatever `Positions` holds, the same
 | Corrupt row | 500 |
 | `position ≥ serving_counter` | 425, keep polling |
 | Admission budget spent | 425, keep polling |
+| Already admitted, and `admitted_at + session_ttl_seconds` has passed | 410, take a new place |
 
 Admission control is resolved by `wr_common::resolve(stored, fail_open_until, now)`; `FailOpen` is
 never stored.
@@ -249,8 +258,12 @@ answer is 425 and the page asks again. A failed draw or write is also "no unit"
 (`arrival_shard_draw_failed`, `arrival_record_failed`): an admission that cannot be metered is not
 made. The `Positions` row is then marked `status = admitted`, guarded by
 `attribute_not_exists(request_id) OR status = issued`, which creates a pre-queue member's row. A
-visitor whose row is already admitted (reload, second tab, lost response) gets a fresh session
-without taking a unit. A failed mark (`admission_claim_failed`) still admits; a later call takes a
+visitor whose row is already admitted (reload, second tab, lost response) gets their session
+again without taking a unit. It is the same visit, not a new one: the mark stamps `admitted_at`
+once, every session for the row expires at `admitted_at + session_ttl_seconds`, and after that the
+answer is 410 ([#237](https://github.com/smoketurner/virtual-waiting-room/issues/237)). Otherwise a
+place that had reached the front could be handed around and mint full-length sessions for as long
+as its row lived. A failed mark (`admission_claim_failed`) still admits; a later call takes a
 second unit, which admits fewer people, never more.
 
 The session is a compact JWS (HS256) signed under a key derived from the deployment secret with a
@@ -272,7 +285,9 @@ and the signing secret (`k`) from one KeyValueStore. `event_id`, the cookie name
 path are templated into its source. It first strips any inbound `x-wr-gate`/`x-wr-gate-failed`
 header, then:
 
-1. No rule in the ruleset matches → pass through. An empty ruleset is dormancy.
+1. No rule in the ruleset matches → pass through. An empty ruleset is dormancy. A path rule also
+   matches any decoded path with a `.`/`..` segment, a `;` or a backslash, since origins
+   canonicalise those differently (#242).
 2. Now is before `enforce_from` → pass, `x-wr-gate: pending`. Before `fail_open_until` → pass,
    `x-wr-gate: failopen`.
 3. Missing cookie, bad signature, wrong event, expired, or — with IP binding on — a different
@@ -281,9 +296,14 @@ header, then:
    XHR.
 4. Otherwise pass through.
 
-If the function throws (unreadable store, unknown config version) it passes the request with
-`x-wr-gate-failed: true`. That is the gate failing, not a backend fail-open: it makes no network
-calls and cannot observe the backend. Cross-language conformance with `wr_common::crypto` and
+A session that fails under `k` is tried under the optional previous key `kp`, read only then
+(#247; nothing writes `kp` yet).
+
+If the function throws before a rule has matched (unreadable config, unknown config version) it
+passes the request with `x-wr-gate-failed: true`. If it throws after one has — an unreadable key,
+a failure while verifying or building the refusal — it answers a plain 403 with
+`x-wr-reason: error` (#242). Neither is a backend fail-open: the gate makes no network calls and
+cannot observe the backend. Cross-language conformance with `wr_common::crypto` and
 `wr_common::rules` is checked by `infra/modules/edge/tests/*.conformance.test.js` against vectors
 from `crates/wr-common/tests/vectors.rs`. The function must stay under CloudFront's 10,240-byte
 limit (a precondition), with a warning past 9,000.
@@ -309,7 +329,9 @@ to close them for an event.
 `<noscript>` form posts to `/v1/enter`, which mints the same UUIDv7 and possession secret the
 script would, keeps them in an `HttpOnly` cookie scoped to `/v1/`, and sends the same `{request_id,
 event_id, h}` message to the join queue. `/v1/wait` is a self-refreshing server-rendered page that
-calls `generate_token::admit`, so there is one way a session is minted.
+calls `generate_token::admit`, so there is one way a session is minted. The cookie also carries
+when the join was sent: one that has not registered after 60 s is resent, up to three times, and
+then the visitor is shown the form again (`nojs_join_resent`, `nojs_join_lost`, #251).
 
 ## 10. The operator surface
 
@@ -318,7 +340,8 @@ The admin Lambda serves an Axum router behind an API Gateway greedy proxy:
 | Route | Method | Does |
 |---|---|---|
 | `/admin`, `/admin/state` | GET | Dashboard (with the readiness panel) and JSON state |
-| `/admin/login`, `/admin/callback`, `/admin/logout` | GET | OIDC Authorization Code + PKCE ([ADR-0016](adr/0016-admin-oidc-dynamodb-sessions.md)) |
+| `/admin/login`, `/admin/callback` | GET | OIDC Authorization Code + PKCE ([ADR-0016](adr/0016-admin-oidc-dynamodb-sessions.md)). The callback answers a meta-refresh page, so the `SameSite=Strict` session cookie it sets is sent on the way to the dashboard |
+| `/admin/logout` | POST | Ends the session. Like every POST, needs the session's `csrf` form field |
 | `/admin/phase` | POST | Phase transition from an expected prior phase; refuses `active`, which only the open can set |
 | `/admin/start_time` | POST | Sets or clears the start time and arms the open schedule |
 | `/admin/open_now` | POST | Invokes `open_event` now |

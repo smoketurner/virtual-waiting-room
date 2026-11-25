@@ -61,6 +61,7 @@ the full shape. The values you will normally set:
 | `aliases`, `acm_certificate_arn` | `[]`, `""` | Hostnames viewers use, and a **us-east-1** ACM certificate covering them. Set both or neither. Empty uses the `*.cloudfront.net` name. |
 | `oidc_issuer` | `https://us.vouch.sh` | OIDC issuer for the admin login. |
 | `oidc_client_id`, `oidc_redirect_uri`, `oidc_allowed_emails` | `""` | **Required; the plan fails without them.** See [OIDC](#oidc-the-one-sequencing-step). The client secret goes in SSM, not here. |
+| `oidc_require_email_verified` | `true` | A login needs the provider's `email_verified` claim to be true. Set `false` only for a provider that omits the claim; an explicit `false` is still refused. |
 | `admission_rate` | `5` | Visitors per second, seeded onto the event. Changed live from the dashboard. |
 | `gate_rules` | `""` | Which requests the gate covers, one rule per line, same grammar as the dashboard's rules form (`p /checkout`, `c <cookie>`, `u <agent substring>`, `h <header> <value>`). Empty is dormant: everything passes through. |
 | `starts_at`, `starts_at_timezone` | `""`, `UTC` | When the event opens, local date-time with no zone, and its IANA zone. Set, the first apply seeds the event in the pre-queue phase and arms the open schedule. Empty leaves the event idle until an operator presses **Open now**. |
@@ -166,8 +167,11 @@ AWS_PROFILE=dev-admin uv run scripts/smoke_test.py
 
 ### Choosing the session lifetime
 
-A session lasts exactly `session_ttl_seconds` and nothing renews it. A visitor still on the origin
-when it lapses is sent back to the queue, checkout included
+A session lasts exactly `session_ttl_seconds` from the visitor's first admission and nothing
+renews it: asking the waiting page for it again returns one that expires at the same moment, and
+after that the place is used up (410) and they take a new one
+([#237](https://github.com/smoketurner/virtual-waiting-room/issues/237)). A visitor still on the
+origin when it lapses is sent back to the queue, checkout included
 ([ADR-0021](adr/0021-edge-function-gate.md), [ADR-0032](adr/0032-remove-the-origin-authorizer.md)).
 Set it longer than the worst realistic time on the origin (cart to confirmation, not the median).
 

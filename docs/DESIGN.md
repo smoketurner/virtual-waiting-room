@@ -29,6 +29,7 @@ no call to the backend.
                               DynamoDB PreQueue {r, s, l, t, h}
 
   T−0   EventBridge Scheduler → open_event
+          wait, up to 15 s, for the join queue to read empty twice running (#239)
           BatchGetItem the 10 shard counters, then ONE UpdateItem on Counters:
             SET shuffle_seed, participant_count = N, queue_counter = N,
                 prequeue_offsets, phase = active
@@ -70,9 +71,11 @@ no call to the backend.
         2. position reached?
         3. take one unit of the admission budget (ADR-0039): conditional ADD n on a
            randomly drawn arrivals shard while n < c (up to 3 draws), 425 when spent;
-           then mark Positions.status issued → admitted. An already-admitted visitor
-           re-mints without taking a unit
-        4. sign the session (HS256 JWS, wr_common::crypto) → Set-Cookie
+           then mark Positions.status issued → admitted, stamping admitted_at. An
+           already-admitted visitor re-mints without taking a unit
+        4. sign the session (HS256 JWS, wr_common::crypto), expiring at
+           admitted_at + ttl whenever it is asked for; 410 once that has passed (#237)
+           → Set-Cookie
            (Path=/, Secure, HttpOnly, SameSite=Lax, Max-Age)
         │
   CloudFront Function, viewer-request, protected behaviour only   ← the gate
@@ -84,13 +87,15 @@ no call to the backend.
                                                      302 to /_wr/waiting.html for
                                                      navigation, 403 JSON for XHR (#72)
         5. valid session                           → pass through
-        6. the function throws                     → pass through, marked failed
+        6. the function throws before a rule match → pass through, marked failed
+        7. it throws after one                     → refuse, plain 403, reason `error`
 ```
 
 The gate reads its configuration (`c`: version, `enforce_from`, `fail_open_until`, rules, IP
 binding) and the signing secret (`k`) from one CloudFront KeyValueStore
 ([ADR-0021](adr/0021-edge-function-gate.md)); `event_id` and the cookie name are templated into
-its source. Terraform seeds `c` from `gate_rules`, with `enforce_from = 0`. `/admin/rules` is the
+its source. A session that fails under `k` is tried under an optional previous key `kp`, which
+nothing writes yet (#247). Terraform seeds `c` from `gate_rules`, with `enforce_from = 0`. `/admin/rules` is the
 ruleset's only writer after that: it validates and re-encodes through `wr_common::rules`, writes
 the KeyValueStore (the ruleset's only store) by read-modify-write, and stamps `rules_digest` /
 `rules_count` on `Counters`. No admin route writes `enforce_from`.
@@ -112,7 +117,10 @@ the KeyValueStore (the ruleset's only store) by read-modify-write, and stamps `r
 | Visitor-facing state | `/v1/status` carries `phase` and a derived `serving_state` ([ADR-0019](adr/0019-visitor-facing-serving-state.md)) |
 
 **Protection rules** (path, header, cookie or user agent, evaluated at the gate) select what is
-queued; an unmatched request never is.
+queued; an unmatched request never is. A path rule also claims any decoded path with a `.` or
+`..` segment, a `;` or a backslash, which origins canonicalise differently, and a prefix that
+could never match (`%`, `//`, a dot segment, `;`, backslash) is rejected when the rule is written
+([#242](https://github.com/smoketurner/virtual-waiting-room/issues/242)).
 
 Scheduled events randomize because a published start makes arrival order measure latency, not
 intent; standby is FIFO because an unplanned spike's arrival order carries information.
@@ -135,6 +143,15 @@ counter item, `EVT#{event_id}#PQ#{s}`. It then writes one `PreQueue {r, s, l, t,
 record (§5.5) with `attribute_not_exists(r)`, after deduplicating the batch. Each shard is a separate item because the 1,000-write/s ceiling is per partition key, so
 ten items lift registration to about 10,000/s
 ([ADR-0015](adr/0015-stripe-prequeue-counter.md)).
+
+**Draining before the open.** A join answered 200 before T−0 is only in the cohort once
+`assign_position` has claimed its index, and arrivals bunch in the last minute, when the consumers
+are furthest behind. So the open first polls the join queue's waiting count
+(`sqs:GetQueueAttributes`) once a second, up to 15 times, until it reads zero twice running, then
+opens whatever it found. Joins still queued are numbered behind the cohort, and
+`open_drain_timed_out` or `open_drain_unreadable` is logged
+([#239](https://github.com/smoketurner/virtual-waiting-room/issues/239)). In-flight batches are
+not waited for: they are the straggler case.
 
 **Stragglers.** A registration landing after `open_event` read its shard is invisible to the
 open. The batch re-reads `Counters` after its writes and, if the event opened underneath it, gives
@@ -251,7 +268,8 @@ The live-join ceiling is the per-table on-demand quota: 40,000 WRU/s by default,
 1,000 WCU/s per-partition-key ceiling does not bind, because `request_id` keys are spread and the
 counter takes one write per batch. A new or long-idle table serves only ~4,000 writes/s, and a
 waiting room has no previous peak to grow from, so **tables are pre-warmed before every event**
-through the `warm_throughput_*` variables (O1). The open is one write and needs none.
+through the `warm_throughput_*` variables (O1). The open is one write and needs none; its wall
+time is that write plus up to 15 s of waiting for the join queue (§4.1).
 
 ### 5.4 Sequences and statistics
 
@@ -356,6 +374,13 @@ execution's extra pass grants and releases only the seconds since the one before
 intervals or more a pass is owed one interval and does not make up the gap. All arithmetic is
 checked or saturating.
 
+A pass that fails is skipped (`controller_pass_failed`) and the
+cadence carries on, the next pass being owed the seconds the failed one did not grant. An
+execution whose first pass finds the phase `idle` or `post_event` ends there, since such an event
+only becomes active through `pre_queue` and an open; that is most of the controller's cost
+between events (N1), and it means an operator who goes idle → pre_queue → open inside one minute
+waits for the next execution before admission starts.
+
 **Arrivals** are the budget taken: `generate_token` adds to one of ten shard items, once per
 visitor (60,000 admissions a minute would otherwise hit the 1,000 writes/s item ceiling). A pass
 reads the ten and writes each one's cap. **The controller expires nothing** and never scans; the
@@ -390,8 +415,11 @@ Served by `admin` (Axum, askama templates) behind an OIDC Authorization Code + P
 ([ADR-0016](adr/0016-admin-oidc-dynamodb-sessions.md), [ADR-0018](adr/0018-admin-vouch-design-language.md));
 every action works without JavaScript and no action needs the AWS console. A state-changing
 request is refused with a 403 unless it comes from the console's own origin (`Sec-Fetch-Site`,
-falling back to `Origin`), because the console shares a site with the customer's pages
-([#243](https://github.com/smoketurner/virtual-waiting-room/issues/243)).
+falling back to `Origin`) and carries the session's `csrf` form field, because the console shares
+a site with the customer's pages
+([#243](https://github.com/smoketurner/virtual-waiting-room/issues/243)). Logout is a POST. The
+session cookie is `__Host-` prefixed and `SameSite=Strict`, a login needs a verified email, and the
+allowlist is re-checked on every request.
 
 | Path | Purpose |
 |---|---|
@@ -409,7 +437,9 @@ One credential: the session cookie, an HS256 JWS (`aud` event id, `sub` request 
 validate as a session ([ADR-0011](adr/0011-session-cookie-after-token.md),
 [ADR-0024](adr/0024-jws-credentials.md)). `generate_token` mints it only for the holder of the
 `request_id`'s possession secret (ADR-0035); the gate refuses one for another event, and, with IP
-binding on, one whose network tag does not match. The admission token and origin authorizer are
+binding on, one whose network tag does not match. A session asked for again expires when the
+first one did, so one admission is one visit however often, or by whomever, it is redeemed
+([#237](https://github.com/smoketurner/virtual-waiting-room/issues/237)). The admission token and origin authorizer are
 gone ([ADR-0032](adr/0032-remove-the-origin-authorizer.md)). **Not built:** revocation
 ([#63](https://github.com/smoketurner/virtual-waiting-room/issues/63)).
 
@@ -466,7 +496,10 @@ browser session; it does not bind a place to a person.
 front, between a floor and a ceiling set in Terraform (`poll_floor_ms`, `poll_ceiling_ms`,
 `poll_divisor`). A visitor near the front sees a pause or a fail-open within the floor. A
 deep-queue visitor can see it up to about 39 s late (the ceiling plus jitter). The O4 runbook
-accepts that delay.
+accepts that delay. Consecutive failed polls double the interval up to the ceiling and the first
+success resets it
+([#251](https://github.com/smoketurner/virtual-waiting-room/issues/251)). A 410 from
+`/v1/generate_token` drops the stored identity, so the next load takes a new place (#237).
 
 **Not built:** live metrics for F5.1 (queue depth, admitted, no-show rate). See [`tasks.md`](../.kiro/specs/virtual-waiting-room/tasks.md),
 Phase 1h.
@@ -475,7 +508,8 @@ Phase 1h.
 
 **Fail-open** ([ADR-0009](adr/0009-fail-open.md)): `/admin/fail_open` sets `fail_open_until` on
 `Counters` and in the KeyValueStore, and the gate passes protected requests until its own clock
-passes it. The gate also passes through when it throws (unreadable config, unknown version).
+passes it. The gate also passes through when it throws before a rule has matched (unreadable
+config, unknown version); a throw after a match refuses (#242).
 **Not built:** automatic fail-open on a backend outage
 ([#58](https://github.com/smoketurner/virtual-waiting-room/issues/58)); there is no fail-closed
 setting. The failure domain is one region ([ADR-0034](adr/0034-single-region-failure-domain.md)).

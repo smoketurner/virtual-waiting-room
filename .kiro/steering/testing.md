@@ -69,8 +69,11 @@ visible fairness failure at 1,000,000 people. Tests are the primary evidence.
 - **Edge gate decision-tree branches (ADR-0021)** — `infra/modules/edge/tests/gate.decision-tree.test.js`
   covers every branch against the shipped function: dormancy (`r: []`), `enforce_from` pending,
   `fail_open_until` active and lapsed, each refusal reason (`none`/`signature`/`event`/`expired`),
-  XHR-versus-navigation refusal shaping, spoofed `x-wr-gate*` headers stripped at entry, and the
-  throw-and-pass-through path (an unrecognised config version, a failed KeyValueStore read).
+  XHR-versus-navigation refusal shaping, spoofed `x-wr-gate*` headers stripped at entry, the
+  throw-and-pass-through path before a rule match (an unrecognised config version, an unreadable
+  config), the refuse-on-throw path after one (an unreadable key, a throw inside the refusal: plain
+  403, reason `error`, #242), and the optional previous key `kp` (#247). Suspicious paths (a dot
+  segment, `;`, a backslash) matching any path rule are pinned by the cross-language vectors.
 - **No-show compensation and the admission bound** — with an injected no-show rate, admissions
   converge on the target rate, and no window admits more than its time at that rate plus the
   burst (ADR-0039).

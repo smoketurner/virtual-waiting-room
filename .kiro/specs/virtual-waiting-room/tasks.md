@@ -69,7 +69,7 @@ The build-state record for requirements.md. Requirement IDs in brackets; decisio
 - [x] Operator message in the `/status` payload [F5.3]
 - [x] Position and estimated wait from the measured admission rate, on the waiting page [F5.4]
 - [x] Admin actions: phase, rate, message, start_time, open_now, force_maintenance, pause, resume, fail_open, recover, rules, ip_binding
-- [ ] Every operator action scriptable, no console dependency [F5.5] — Partial: every action is an HTTP endpoint, but the only auth is the browser OIDC session; no machine-caller path (ADR-0016).
+- [ ] Every operator action scriptable, no console dependency [F5.5] — Partial: every action is an HTTP endpoint, but the only auth is the browser OIDC session, and every POST needs that session's `csrf` form field and a same-origin request (#243); no machine-caller path (ADR-0016).
 - [x] Admin UI: one Axum Lambda, askama templates, one self-contained stylesheet (ADR-0018), no React [F7.1, F7.2, F7.5]
 - [x] UI is a thin client over the same `/admin/*` actions [F7.3]
 - [x] OIDC Authorization Code + PKCE sessions in DynamoDB, enforced in the Lambda (ADR-0016) [F7.4]

@@ -195,6 +195,28 @@ operation.
 | `open_event_error` | The open failed, usually because the event was not in the pre-queue phase | Check the phase. The scheduler retries for up to 10 minutes; or fix the phase and **Open now** |
 | `open-dlq-not-empty` | A scheduled open failed every retry | The event is **not open** and the one-time schedule is spent. Fix the cause, then **Open now** |
 
+These are logged (`$.fields.event`) without an alarm of their own:
+
+| Event | What happened | What to do |
+|---|---|---|
+| `controller_pass_failed` | One controller pass failed and was skipped; the next is owed the seconds it missed | Harmless once. If continuous the queue has stopped: check the `controller` function's logs |
+| `open_drain_timed_out` | The join queue did not empty within 15 s, so the open went ahead; joins still queued are numbered behind the cohort | Check `assign_position`'s concurrency and the tables' pre-warming before the next event |
+| `open_drain_unreadable` | The open could not read the join queue and did not wait for it | Check `open_event`'s `sqs:GetQueueAttributes` grant |
+| `nojs_join_resent` | A no-JavaScript join had not registered after 60 s and was sent again | Expected occasionally. Many at once means the join consumer is behind |
+| `nojs_join_lost` | A no-JavaScript join never registered after three resends; the visitor was shown the form again | Check the join queue, its dead-letter queue and `assign_position` |
+| `admin_login_refused` | A login was refused: not on the allowlist, or the provider did not say the email is verified | If every login is refused for `email_verified`, the provider omits the claim: set `oidc_require_email_verified = false` |
+| `admin_session_refused` | A session's email is no longer on the allowlist | Expected after removing an operator |
+| `admin_csrf_refused` | A state-changing request lacked the session's `csrf` field | A stale dashboard tab (reload it), or a request another page made |
+
+**Visitors reporting "We let you in, but the site turned you back".** The gate refused a session
+`generate_token` had just minted, twice within a minute, and the page stopped rather than loop.
+The usual cause is a signing key regenerated while Lambdas were warm (the gate verifies with the
+new key, they sign with the old); with IP binding on, it is a visitor whose network keeps changing.
+
+**`/admin/rules` rejecting a path prefix.** A prefix containing `%`, `//`, a `.` or `..` segment,
+`;` or a backslash can never match a normalised request path, so it is refused when the rule is
+written rather than accepted and silently ignored.
+
 ---
 
 ## After the event

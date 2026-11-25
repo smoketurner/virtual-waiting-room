@@ -43,7 +43,7 @@ process memory.
 
 - **Routes.** Add `GET /admin/login` (redirect to the IdP), `GET /admin/callback` (exchange
   code, verify the ID token against the issuer's published JWKS, create a session), and
-  `GET /admin/logout`. `GET /admin` and every `/admin/*` action become **session-cookie-gated**:
+  `POST /admin/logout` (originally a GET; see the amendment below). `GET /admin` and every `/admin/*` action become **session-cookie-gated**:
   no valid session → 302 to `/admin/login`.
 - **This replaces SigV4 as the admin gate.** The `/admin*` API Gateway routes flip
   `AWS_IAM → NONE`; the Lambda enforces auth via the session cookie. A CloudFront behaviour
@@ -89,3 +89,25 @@ process memory.
 
 Additive to ADR-0014; reverses its SigV4 gate for the browser surface. Satisfies the
 operator-usable-dashboard requirement; keeps N1 and N6.
+
+## Amendment: the session is defended against the site it shares (#243)
+
+The console is served from the customer's own origin, so a script on their pages, or on a sibling
+subdomain, runs same-site with the operator's cookie. `SameSite=Lax` alone did not stop it posting
+`/admin/fail_open`.
+
+- **Cookies.** `__Host-vwr_admin_session` is `SameSite=Strict`; `__Host-vwr_admin_login_state` is
+  `Lax`, because the callback is a cross-site navigation from the provider and must carry it. The
+  `__Host-` prefix stops a sibling subdomain setting either.
+- **The callback answers 200 with a meta-refresh page**, not a redirect. A redirect continues the
+  navigation the provider started, and the browser withholds the Strict cookie the same response
+  set; the dashboard would see no session and return to login. The page needs no JavaScript.
+- **Every state-changing request carries the session's `csrf` form field**, checked in constant
+  time by one router-wide guard (`operator::guard_writes`) that decides by method, so a new route
+  cannot omit it. This is on top of the same-origin check (`Sec-Fetch-Site`, then `Origin`). A
+  session row without a token is not a session.
+- **Logout is a POST** with the token.
+- **`email_verified` must be true.** With `OIDC_REQUIRE_EMAIL_VERIFIED=false` an absent claim is
+  accepted, for a provider that omits it; an explicit `false` never is.
+- **The allowlist is re-checked on every request**, so removing an operator ends their session at
+  their next request rather than at its eight-hour expiry.

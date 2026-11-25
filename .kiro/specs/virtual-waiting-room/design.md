@@ -65,7 +65,8 @@ A change that breaks one of these is a fairness or safety failure, not a refacto
    it changes every position.
 2. **The open is one conditional write**, guarded by `attribute_not_exists(shuffle_seed) AND
    phase = pre_queue`. It sets the seed, `N`, the offsets, `queue_counter = N` and the phase
-   together. It reads the ten shard counters and never the rows.
+   together. It reads the ten shard counters and never the rows, after waiting up to 15 s for
+   the join queue to read empty (#239).
 3. **No seed before T−0.** Nothing can compute a position before the open.
 4. **Contiguous assembly.** The shard offsets are a prefix sum, so the indices are exactly
    `[0, N)`. A burned index is a gap nobody holds.
@@ -92,7 +93,8 @@ A change that breaks one of these is a fairness or safety failure, not a refacto
     against `infra/modules/edge/tests/gate.conformance.test.js`.
 13. **The gate is associated with the protected behaviour only**, never distribution-wide
     (`edge/tests/gate_association.tftest.hcl`). It passes through when no rule matches, before
-    `enforce_from`, inside a fail-open window, and when it throws.
+    `enforce_from`, inside a fail-open window, and when it throws before a rule has matched. A
+    throw after a match refuses with a plain 403 (#242).
 14. **The signing secret has one source.** `random_bytes.signing_key` is written to both the SSM
     parameter and KeyValueStore key `k`.
 15. **Every REST method requires the origin API key.** A Terraform test enforces this. The

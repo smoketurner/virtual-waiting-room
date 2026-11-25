@@ -26,7 +26,7 @@ It joins through the same queue and admits through the same code as the scripted
   in an `HttpOnly` cookie scoped to `/v1/`, and enqueues the identical
   `{request_id, event_id, h}` message on the join queue. `assign_position` cannot tell the two
   kinds of join apart, and needs no change. A visitor who already holds an identity is not
-  joined twice.
+  joined twice, except by the bounded resend below.
 - **Waiting.** `GET /v1/wait` is a server-rendered page that refreshes itself with
   `<meta http-equiv="refresh">`: every 5 s while the join is in flight or the visitor is near
   the front, 20 s otherwise, 30 s while the event is not admitting. Each load calls
@@ -55,3 +55,15 @@ It joins through the same queue and admits through the same code as the scripted
 - **Joining costs an attacker a Lambda invocation instead of an SQS write.** The reserved
   concurrency bounds what that can cost the operator. It adds no new way to take more places
   than `/v1/join` already allows (#59).
+
+## Amendment: a join that never landed is resent (#251, #237)
+
+The cookie value is now `<request_id>.<secret>.<joined_at>.<rejoins>`. A wait page that finds no
+registration more than 60 s after `joined_at` re-enqueues the same join (same id and digest, so
+the write guards make it idempotent) and restamps the cookie, up to three times. After that the
+visitor gets a "join lost" page with the form, and the cookie is cleared. Before this, a lost
+message left them refreshing "Joining" forever, with `/v1/enter` refusing to join them again.
+`nojs_join_resent` and `nojs_join_lost` are logged. A failed resend answers 503 and is not counted.
+
+A place whose session has run out (`SessionExpired`, ADR-0033's amendment) shows the same page as
+one that is not the visitor's: nothing can be redeemed, and they start again.
