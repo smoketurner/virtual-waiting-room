@@ -1,18 +1,8 @@
 # Tasks: Virtual Waiting Room
 
-Delivers requirements.md per design.md; requirement IDs in brackets; phases ordered by dependency and risk; decisions in ../../../docs/adr/.
-
----
-
-## Phase 0 — Spike
-
-Throwaway code. Measures what documentation cannot settle.
-
-- [ ] REST API `type: aws` → SQS with a request validator; confirm client UUIDv7 survives to the Lambda and malformed bodies are rejected with 400 [F2.4]
-- [ ] Concurrent `UpdateItem ADD :n` / `ALL_NEW` against one item: assert zero duplicate positions across allocated ranges; measure gap rate under induced 5xx [F2.2, F2.3]
-- [ ] Rust cold start on `provided.al2023` arm64 with an AWS SDK client — decides whether provisioned concurrency is needed. Measure the `aws-lc-rs` CPU-jitter-entropy init tax (aws-lc-rs ≥ 1.14.1 adds several ms–~1 s at process init) and compare mitigations: an **init-phase warm-up TLS handshake** (a cheap call like `list_tables` so the tax lands on boosted Init CPU, no entropy source dropped) versus building with `AWS_LC_SYS_NO_JITTER_ENTROPY=1` (removes it outright but drops one defense-in-depth entropy source — a security trade-off we lean against given the GovCloud/FIPS posture). Also A/B `opt-level` 3 vs `z` on cold-init P50 — scenario-dependent, decide by measurement, not a priori. Sources in the knowledge base (lambdabench.dev/rust, smithy-rs #4541)
-
-**Exit:** findings written down. Nothing else kept.
+The build-state record for requirements.md. Requirement IDs in brackets; decisions in
+[`docs/adr/`](../../../docs/adr/). An item only partly delivered stays unchecked with a
+`Partial:` note saying what is missing.
 
 ---
 
@@ -20,116 +10,96 @@ Throwaway code. Measures what documentation cannot settle.
 
 ### 1a. Data and counter
 
-- [x] Four tables — `Counters`, `PreQueue`, `Positions`, `Tokens` — on-demand, PITR, `warm_throughput_*` and optional `max_throughput_*` as variables (DESIGN §6.7) [O1] — Note: no `max_throughput_*` variables yet.
-- [x] `Counters` attributes: `queue_counter`, `serving_counter`, `arrivals#0..9`, `phase`, `phase_override`, `target_rate`, `shuffle_seed`, `operator_message` — Note: `phase_override` is instead the `Phase::Maintenance` variant, and `admission_control` (ADR-0019) replaces the `admission_paused`/`fail_open` pair.
-- [x] Batch range allocation via `UpdateItem ADD` / `ALL_NEW`; increment by **valid** count only [F2.2, F2.6]
-- [x] `PutItem` with `attribute_not_exists(request_id)` on every position write [F2.5]
+- [x] Four tables (`Counters`, `PreQueue`, `Positions`, `Tokens`), on-demand, PITR, `warm_throughput_*` as variables [O1]
+- [x] `Counters` event item: sequences, `phase` (incl. `maintenance`), `target_rate`, `shuffle_seed`, `operator_message`, `admission_control` + `fail_open_until`; `prequeue_counter` and `arrivals` striped ×10 as separate items (ADR-0015)
+- [x] Batch range claim via one `UpdateItem ADD` / `ALL_NEW`, incremented by the **valid** count only [F2.2, F2.6]
+- [x] Every position write guarded by `attribute_not_exists(request_id)` [F2.5]
+- [ ] `max_throughput_*` table variables (DESIGN §6.7) — Partial: not built.
 
 ### 1b. Event lifecycle and modes
 
 - [x] Phase state machine: idle → pre-queue → active → post-event, plus maintenance [F0.1, F0.8]
-- [ ] Operator-authored static page per phase, CDN-cached [F0.2]
-- [x] Protection rules (path, header, cookie, user agent), evaluated locally at the edge gate [F0.6] — all four kinds are evaluated by the CloudFront Function and frozen by the conformance vectors. The path-prefix-only origin authorizer was removed (ADR-0032).
-- [ ] Standby mode: CloudWatch alarm on `AWS/CloudFront` `Requests` (60 s period, `us-east-1`) → EventBridge → phase Lambda. Activation latency ~125 s worst case [F0.4, F0.7]
-- [ ] Scheduled and standby coexisting on one origin [F0.3, F0.5]
+- [x] Scheduled open at a configured start time; `/admin/open_now` opens early through `open_event` (ADR-0025) [F0.3]
+- [x] Protection rules (path, header, cookie, user agent) evaluated per request by the edge gate; an empty ruleset passes everything through (dormancy) — [#60](https://github.com/smoketurner/virtual-waiting-room/issues/60), [#66](https://github.com/smoketurner/virtual-waiting-room/issues/66) [F0.6]
+- [ ] Operator-authored page per phase, CDN-cached [F0.2] — Partial: one waiting page whose text follows the phase; no operator-authored page per phase.
+- [ ] Standby mode: CloudWatch alarm on `AWS/CloudFront` `Requests` → EventBridge → phase Lambda, ~125 s worst-case activation [F0.4, F0.7]
+- [ ] Scheduled and standby coexisting on one origin [F0.5]
 
 ### 1c. Pre-queue
 
-- [ ] Static countdown page, CDN-cached, zero origin calls per *view* — registration (one `POST /join` per visitor) is separate from viewing and is not zero-call; see the amended F1.1/F1.2 acceptance [F1.1, F1.2]
-  - *Partial: the countdown itself is built (issue #128). The operator sets the start time and its timezone on the dashboard, `/status` publishes `starts_at`, and `waiting.js` counts down to it during `pre_queue`. What is outstanding is the framing: the countdown renders on the existing waiting page, which is polled, not on a separate CDN-cached static page with zero origin calls per view.*
-- [x] Pre-queue registration (identity only, spread across the window); striped counter for ~10,000/s registration ceiling [C1]
-- [x] `/status` carries phase, so the countdown page polls one endpoint (Min TTL 1 s, no cookies forwarded — DESIGN §8); after T−0 also carries `shuffle_seed`, `participant_count`, `prequeue_offsets`
-- [x] Registration writes `PreQueue {r, s, l, t}` with `attribute_not_exists(r)`; shard `s = hash(request_id) % 10`, local index `l` claimed per-shard with one `SET s = :shard ADD n :count` per batch shard group (DESIGN §4.1, ADR-0015) [F2.5]
-- [x] Seeded permutation (DESIGN §4.2, ADR-0002): at T−0 one `UpdateItem` on `Counters` that reads the 10 shard counts, computes `prequeue_offsets` (prefix sums) and `participant_count = ΣΣcounts`, and sets `shuffle_seed`, `participant_count`, `prequeue_offsets`, `phase`, guarded by `attribute_not_exists(shuffle_seed)`. Global index `i = offset[s] + l`; position derived on read as `PRP(seed, i, N)` [F1.3, F1.4, F1.5, C2]
-- [x] Pseudorandom permutation (PRP): 4-round balanced Feistel, `HMAC-SHA256(seed, round || x)` round function, cycle-walking into `[0, N)`. Property tests for bijectivity over the full domain at N ≤ 10⁶, uniformity by chi-square, determinism across processes; assert the assembled global index space is exactly contiguous `[0, N)` across all 10 shards [F1.5] — Note: proptest bijectivity covers N < 2000 exhaustively; the 10⁶ cohort is Phase 3.
-- [x] Property test — **burned slot** (ADR-0015, F2.3): with an injected registration-write failure rate (counter incremented, `PreQueue` row absent), assert (a) the assembled index space is still a contiguous `[0, N)` where `N` = Σ shard counts, (b) `PRP` remains bijective over `[0, N)`, (c) a burned index resolves to a valid position that maps to no `PreQueue` row, and (d) the serving counter advancing past it admits nobody — no duplicate, no panic, no gap in the permutation [F1.5, F2.3]
-- [x] Property test — **straggler join racing the open** (ADR-0015): for a join whose local index was claimed after the open counted its shard, assert it is a straggler **by that shard's own issued count** (not by the reconstructed global index `i = offset[s] + l`, which can still land inside `[0, N)` on an interior shard) and that `/queue_num` never evaluates `PRP` out of domain for it, falling through to the `Positions` row instead — a live-join position if one has landed, 404 if not [F1.5]
+- [x] Registration writes `PreQueue {r, s, l, t}` with `attribute_not_exists(r)`; striped local-index counter for the ~10,000/s registration ceiling (ADR-0015) [C1, F2.5]
+- [x] Open at T−0 in one conditional `UpdateItem` (seed, prefix offsets, cohort size, phase) guarded by `attribute_not_exists(shuffle_seed)`; position is `PRP(seed, offset[s] + l, N)` on read (ADR-0002) [F1.3, F1.4, F1.5, C2]
+- [x] Feistel PRP with property tests: bijectivity (exhaustive for N < 2000), in-domain, determinism, uniformity; contiguous shard assembly; burned slot; straggler racing the open, judged by its shard's own issued count [F1.5, F2.3]
+- [x] `/status` carries the phase, and after T−0 the seed, `participant_count` and `prequeue_offsets` (Min TTL 1 s, no cookies forwarded)
+- [ ] Countdown page served from CDN cache with zero origin calls per view [F1.1, F1.2] — Partial: the countdown to `starts_at` renders on the polled waiting page ([#128](https://github.com/smoketurner/virtual-waiting-room/issues/128)), not on a separate cached page.
 
 ### 1d. Live join
 
-- [x] REST API `AWS` integration → SQS `SendMessage`, request validator with JSON Schema, DLQ with `maxReceiveCount` 5, `FunctionResponseTypes: [ReportBatchItemFailures]`, visibility timeout ≥ 6× function timeout + batching window [F2.1, F2.4, C5]
-- [ ] `BatchSize` / `MaximumBatchingWindowInSeconds` variables, default 100 / 1s — Partial: `BatchSize` 100 and a 1s window are hardcoded on the event-source mapping, not variables.
-- [ ] SQS ESM Provisioned Mode as an opt-in variable, default off — mutually exclusive with the maximum-concurrency setting
-- [ ] Per-event partition: one SQS queue and one Lambda function per event, each with reserved concurrency (ADR-0008) [N9]
+- [x] REST API `AWS` integration → SQS `SendMessage`, JSON Schema validator, DLQ (`maxReceiveCount` 5), `ReportBatchItemFailures`, visibility timeout ≥ 6× function timeout + window [F2.1, F2.4, C5]
+- [ ] `BatchSize` / `MaximumBatchingWindowInSeconds` as variables — Partial: hardcoded at 100 / 1 s.
+- [ ] SQS ESM Provisioned Mode as an opt-in variable, default off
+- [ ] Per-event partition: one queue and one function per event, each with reserved concurrency (ADR-0008) [N9] — Partial: `assign_position` has reserved concurrency; a deployment serves one `event_id`.
 
 ### 1e. Read path
 
-- [ ] `/status` (phase, serving position, rate, operator message — one payload), `/queue_num`, `/queue_pos_expiry` [F3.1] — Partial: `/status` and `/queue_num` are served by the read Lambda; `/queue_pos_expiry` is not routed at all, and neither is `/public_key`.
-- [x] Adaptive poll interval: `/status` publishes a Terraform-set `poll_policy` (floor/ceiling/divisor); `waiting.js` clamps its interval to it, scaling with distance to the front instead of polling at a fixed interval [N10, ADR-0023]
+- [x] `/v1/status` (phase, serving position, rate, message in one payload) and `/v1/queue_num`, served by the `read` Lambda [F3.1]. `/queue_pos_expiry` went with expiry (ADR-0031) and `/public_key` with signed URLs (ADR-0021).
+- [x] Adaptive poll interval from a Terraform-set `poll_policy` — [#69](https://github.com/smoketurner/virtual-waiting-room/issues/69) [N10, ADR-0023]
 
 ### 1f. Admission, session, and outflow control
 
-- [x] Deploy-time signing key into an SSM SecureString parameter, generated and rotated out of band so the key never lands in the repo or in Terraform state. Not Secrets Manager: a standard SecureString is free where a secret is $0.40/mo, which N1 (idle cost) does not allow
-- [x] `/v1/generate_token` — the `generate_token` Lambda checks the position against `serving_counter` (resolved from `StoredControl` + `fail_open_until`, issue #71), claims the admission with one conditional write so the arrival is counted once per visitor (ADR-0033), records it, and mints an HMAC-SHA256 session cookie (`wr_common::crypto::Session`) [F3.3, F3.8, ADR-0021]
-- [x] **The gate is a CloudFront Function** (issue #71, supersedes the trusted-key-group gate, ADR-0020): `infra/modules/edge/functions/gate.js.tftpl`, associated at viewer-request with the protected behaviour only, reads its ruleset and the signing secret from one CloudFront KeyValueStore (`modules/core`'s `gate_kvs_arn`, consumed by `modules/edge`). `event_id` and the session cookie name are templated into the function's own source [F3.4, ADR-0021]
-- [x] Gate scope and lifetime: the session credential is scoped by `event_id` — the gate refuses a credential minted for another event — closing the event-isolation half of [#61](https://github.com/smoketurner/virtual-waiting-room/issues/61); an operator-enabled IP binding closes transferability across networks (ADR-0036). [#63](https://github.com/smoketurner/virtual-waiting-room/issues/63) (revocation) remains open; no design chosen (ADR-0021 §5.2)
-- [x] Cross-language credential and rule conformance: `crates/wr-common/tests/vectors.rs` generates vectors (positives minted by the real `Session::sign`, negatives minted the same way then tampered byte-wise, `(rule, request) → bool` cases); `infra/modules/edge/tests/gate.conformance.test.js` checks the **shipped** function against them under `node:vm` [ADR-0021 §6]
-- Origin authorizer decision tree — removed (ADR-0032). The edge gate implements session cookie → protection match → 302, sharing `wr_common::rules::ProtectionRule` with the config writer [F3.4]
-- [x] Session cookie set after token validation (ADR-0011), signed over different inputs from the token, scoped per event, token stripped from the URL [F3.5, F3.6]
-- [x] Sliding and fixed session validity modes [F3.7]
-- [x] `StoredControl` (`Open`/`Paused`) + `Counters.fail_open_until` epoch (issue #71) replace the three-valued stored `AdmissionControl`: `wr_common::resolve(stored, fail_open_until, now)` is the only thing that produces the resolved `FailOpen`, so the string `"fail_open"` can no longer be written to storage. `/admin/fail_open` and `/admin/recover` engage/clear the epoch, mirrored to the edge gate's KeyValueStore (admin-writer-first entering, DynamoDB-first leaving) [ADR-0009, ADR-0019]
-- [ ] Fail open with a time-limited epoch (ADR-0009) [F4.1, F4.2, F4.3] — Partial: the *mechanism* is built (`fail_open_until`, evaluated by the CloudFront Function against its own clock) and an operator can engage it via `/admin/fail_open`, but nothing trips it **automatically** on a backend outage — engaging fail-open still depends on a human, or a watchdog that does not exist yet, noticing DynamoDB is down ([#58](https://github.com/smoketurner/virtual-waiting-room/issues/58))
-- [x] No-show compensating outflow controller: measure arrivals against releases, smooth, bound the correction, adjust `serving_counter` on a 10 s interval (`rate(1 minute)` × six passes, the scheduler's floor being one minute; the gaps are durable waits, so the controller is not billed for them — ADR-0022). Arrival counter sharded ×10 (`arrivals#0..9`) [F3.2, F3.8]
-- [ ] Concurrency term in the control law: nothing reports completion or abandonment, so origin concurrency drifts with session duration. `/update_session` was the route that would have; it returned 501 and was removed with the authorizer (ADR-0032), so closing this loop needs a new design ([#65](https://github.com/smoketurner/virtual-waiting-room/issues/65))
-- [x] Signing-key generation: `random_bytes.signing_key` generates the secret at apply and Terraform writes it to both the SSM SecureString the Lambdas read and the edge gate's KeyValueStore `k`. One value from one source, so the two copies cannot diverge and there is no bootstrap step whose absence has to be detected (issue #71)
+- [x] Signing key from `random_bytes.signing_key`, written by Terraform to both the SSM SecureString and the gate's KeyValueStore `k` (issue #71)
+- [x] `/v1/generate_token`: checks position against `serving_counter` (via `resolve`), claims the admission once per visitor (ADR-0033), records the arrival, mints the HMAC-SHA256 session [F3.3, F3.8]
+- [x] Gate as a CloudFront Function at viewer-request on the protected behaviour, configured from one KeyValueStore; shapes its own refusals (302 navigation, 403 XHR) — [#64](https://github.com/smoketurner/virtual-waiting-room/issues/64) [F3.4, ADR-0021]
+- [x] Session scoped per event, optional IP binding — [#61](https://github.com/smoketurner/virtual-waiting-room/issues/61) (ADR-0036); `request_id` redeemable only with its possession secret — [#62](https://github.com/smoketurner/virtual-waiting-room/issues/62) (ADR-0035) [F3.5]
+- [x] Cross-language credential and rule conformance vectors checked against the shipped gate function [ADR-0021 §6]
+- [x] `StoredControl` + `fail_open_until`; `/admin/fail_open` and `/admin/recover` mirrored to the gate (ADR-0009, ADR-0019)
+- [x] No-show compensating controller, 10 s cadence as a durable function (ADR-0022) [F3.2, F3.8]
+- [ ] Automatic fail-open on a backend outage — [#58](https://github.com/smoketurner/virtual-waiting-room/issues/58) [F4.1, F4.2, F4.3] — Partial: the time-limited mechanism is built and operator-engaged; nothing trips it automatically.
+- [ ] Revoke an admission — [#63](https://github.com/smoketurner/virtual-waiting-room/issues/63) — no design chosen (ADR-0021 §5.2).
+- [ ] Concurrency term in the control law — [#65](https://github.com/smoketurner/virtual-waiting-room/issues/65) — nothing reports completion or abandonment; needs a new design.
+- Retired: separately signed token (F3.6), sliding session (F3.7), session completion (F3.10) — ADR-0032; position expiry (F3.9) — ADR-0031.
 
-### 1g. Entry gating and abuse mitigation
+### 1g. Abuse mitigation
 
-- Deferred bot enforcement: admit to pre-queue, block at randomization — **F6.3 retired**
-      (ADR-0030). Built as open-time demotion, never enabled, removed. A client that posts
-      to the regional API Gateway URL rather than through CloudFront carried no viewer
-      telemetry, so the control was blind to the traffic it was aimed at.
-- [ ] Bound how many positions one visitor can hold
-      `Partial:` nothing does. `request_id` is client-supplied, so volume converts into share
-      of the front of the queue linearly and every deployment is a bare raffle. The entry
-      tickets that bounded identifier *minting* were removed (ADR-0028) — they needed the
-      customer to build a signing endpoint, and they never bounded volume. Open-time demotion
-      (ADR-0029) bounded the share a farm sharing an address, ASN, JA4 or user agent could take
-      of the *front*, and it was removed without ever being enabled (ADR-0030). Proof of work at
-      registration is what would bound this.
+- [ ] Bound how many positions one visitor can hold — [#59](https://github.com/smoketurner/virtual-waiting-room/issues/59) — Partial: server-drawn shards, reload dedupe and the edge web ACL's per-token join limit raise the price per place; nothing bounds volume per person.
+- Retired: entry tickets (F6.1, F6.2) — ADR-0028; open-time demotion (F6.3) — ADR-0030.
 
 ### 1h. Operator surface
 
-- [ ] Live metrics via EMF logs → CloudWatch: queue depth, admitted, no-show rate, expiry rate. Inflow from the `AWS/CloudFront` `Requests` metric, not counted in our code [F5.1]
-- [ ] Brandable waiting page — client supplies assets, no module fork [F5.2]
-- [x] Operator message as a `Counters` attribute, delivered in the existing `/status` payload — one `UpdateItem`, zero additional requests [F5.3]
-- [ ] Position and estimated wait derived from measured admission rate [F5.4]
-- [ ] Every operator action available via API; no console dependency [F5.5]
+- [x] Operator message in the `/status` payload [F5.3]
+- [x] Position and estimated wait from the measured admission rate, on the waiting page [F5.4]
+- [x] Admin actions: phase, rate, message, start_time, open_now, force_maintenance, pause, resume, fail_open, recover, rules, ip_binding
+- [ ] Every operator action scriptable, no console dependency [F5.5] — Partial: every action is an HTTP endpoint, but the only auth is the browser OIDC session; no machine-caller path (ADR-0016).
+- [x] Admin UI: one Axum Lambda, askama templates, one self-contained stylesheet (ADR-0018), no React [F7.1, F7.2, F7.5]
+- [x] UI is a thin client over the same `/admin/*` actions [F7.3]
+- [x] OIDC Authorization Code + PKCE sessions in DynamoDB, enforced in the Lambda (ADR-0016) [F7.4]
+- [x] HTML forms work with JavaScript disabled; a small poller refreshes current state [F7.5]
+- [x] askama template tests; no SPA bundle emitted
+- [x] Pre-event Readiness panel, generating the RUNBOOK checklist — [#70](https://github.com/smoketurner/virtual-waiting-room/issues/70) [O1, O2, N7] — Not built by choice: WAF and GovCloud rows.
+- [ ] Live metrics via EMF → CloudWatch: queue depth, admitted, no-show rate; inflow from `AWS/CloudFront` `Requests` [F5.1]
+- [ ] Admin dashboard metrics view (inflow, outflow, queue depth, admitted, no-show rate) [F7.6, F5.1]
+- [ ] Brandable waiting page from client-supplied assets [F5.2]
+- [ ] `enforce_from` settable from the admin API — Partial: Terraform-only.
 
-### 1i. Control plane
+### 1i. No-JavaScript queue
 
-- [ ] Admin API: `/admin/phase`, `/admin/rate`, `/admin/message`, `/admin/force_maintenance`, `/admin/rules` [F5.5] — Partial: phase, rate, message, reset, pause, resume, fail_open, recover, start_time, open_now, and rules are live. `/admin/open_now` opens the event without waiting for the scheduled start by invoking `open_event` (ADR-0025 Revision) rather than writing the open a second time; `/admin/phase` correspondingly refuses `active`, which only that conditional update -- seed, prefix offsets, cohort size and phase together -- can make true. `/metrics` and `/update_session` were removed (ADR-0032): the first was routed by API Gateway with no handler behind it, the second returned 501. `/admin/rules` (issue #71) replaces the edge gate's whole ruleset from a one-rule-per-line form, validated and encoded through `wr_common::rules::validate_rule_fields` + `encode_gate_config`, written to the KeyValueStore (the sole store for `rules`) and then audited on `Counters` (`rules_digest`, `rules_count`, `AdminAction::SetRules`) — a failed audit write is logged and swallowed, not surfaced to the operator, since the KeyValueStore write already landed by then. `enforce_from` is still Terraform-only; no admin route sets it. A rejected ruleset is reported as a
-plain-text 400 naming the offending line and reason (works with JavaScript disabled, the
-requirement that mattered); it is not re-rendered inline on the form beside the offending field.
-- Position expiry in the controller — **F3.9 retired** (ADR-0031). An unbounded `Scan` of
-  `Positions` six times a minute that could not see the pre-queue cohort and advanced an
-  attribute nothing read. DynamoDB TTL now reclaims the row and the no-show correction
-  compensates for absentees.
-- [x] Vendor one plain-CSS stylesheet into the admin Lambda — NO runtime npm dependency, NO React [F7.2, F7.5]. ADR-0018 replaced the Cloudscape design tokens with the Vouch design language, so the vendored `tokens.css` and its `extract_tokens.py` build step are deleted and the stylesheet is self-contained
-- [x] Single Axum Lambda (Rust, arm64, `provided.al2023`) serving the admin UI via askama compile-time templates; semantic HTML laid out to the ADR-0018 conventions (top bar, content header, stat tiles, status pills, card grid, forms, a dominant emergency card for the andon cord) [F7.1, F7.2]
-- [x] Reuse existing admin Lambda logic — UI is a thin server-rendered client over the SAME `/admin/*` actions; add no capability the API lacks [F7.3, F5.5]
-- [x] One auth path on every admin UI request, with no second weaker one [F7.4]. ADR-0016 replaced SigV4 with an OIDC Authorization Code + PKCE login session, enforced in the admin Lambda and stored in DynamoDB; API Gateway auth is NONE because the Lambda is the enforcement point
-- [x] HTML-form interactivity; core actions work with JS disabled; tiny vanilla-JS poller refreshes metrics within a 60s window [F7.5, F7.6]
-- [ ] Admin dashboard view: live metrics (inflow, outflow, queue depth, admitted, no-show rate, expiry rate) as an HTML view over `/metrics` JSON + CloudWatch EMF [F7.6, F5.1]
-- [x] askama template unit tests + rendered-HTML snapshot/accessibility check; verify no React/SPA bundle emitted
+- [x] `<noscript>` form posts to `/v1/enter`; `/v1/wait` is a server-rendered, self-refreshing page admitting through `generate_token` — [#67](https://github.com/smoketurner/virtual-waiting-room/issues/67) (ADR-0037)
 
-**Exit:** all endpoints correct; every lifecycle phase serves its page; pre-queue assigns fairly and reproducibly; a visitor browses multiple pages on one session; standby activates on threshold; entry gating rejects unsigned identifiers; operator can see and steer a live event via both API and the web interface; an operator can engage fail-open and the edge honours it.
+**Exit:** endpoints correct; pre-queue assigns fairly and reproducibly; a visitor browses many pages on one session; operator steers a live event from API and UI; fail-open engages and the edge honours it.
 
 ---
 
 ## Phase 2 — Terraform module
 
-- [x] `modules/core` — DynamoDB, SQS, Lambdas, IAM, regional REST API + validator [N5]
-- [ ] `modules/edge` — CloudFront with three cache behaviours per ADR-0013: polled endpoints (Min TTL 1 s, no cookie forwarding), write endpoints (uncached), protected origin (uncached, session cookie forwarded, gated by the CloudFront Function — issue #71, ADR-0021). Web Application Firewall (WAF) with Bot Control, Autonomous System Number (ASN) match and anti-DDoS in Count mode [N7, O5, C4] — Partial: the three cache behaviours and the gate are built, and the WAF web ACL is built behind `flat_rate_plan_tier` (ADR-0038) with Bot Control common, anti-DDoS, IP reputation and anonymous-IP rules in Count until promoted. ASN matching is not built.
-- `modules/authorizer` — removed (ADR-0032): nothing invoked it, and as wired it forwarded every request
-- [x] `var.enable_vpc` for ATO-constrained clients — design the seam now, do not retrofit
-- [x] Flat-rate plan subscription as a variable [O6] — `flat_rate_plan_tier` subscribes the distribution, the web ACL it requires and the gate's KeyValueStore through `aws_pricingplanmanager_subscription`; null stays on PAYG (ADR-0038).
-- [x] The REST API answers only CloudFront: every method requires an API key held by the distribution alone, sent as an origin custom header (ADR-0038) [N7]
-- [x] Add the admin-UI Lambda + its route/cache behaviour to the module; confirm it stays within the ~80-resource budget [N6] — Note: the resource-count confirmation is the separate item below.
-- [ ] CloudWatch alarms and a shipped dashboard — the metrics an operator acts on, not every metric available
-- [ ] Publish the OpenAPI specification for public and admin surfaces [N8]
+- [x] `modules/core` — DynamoDB, SQS, Lambdas, IAM, REST API + validator, the gate's KeyValueStore [N5]
+- [x] REST API answers only CloudFront: every method requires the origin API key (ADR-0038) [N7]
+- [x] Flat-rate plan subscription via `flat_rate_plan_tier` (ADR-0038) [O6]
+- [ ] `modules/edge` — three cache behaviours (ADR-0013), the gate, and WAF [N7, O5, C4] — Partial: all built, with the web ACL behind `flat_rate_plan_tier` and managed rules in Count; ASN matching is not built.
+- [ ] CloudWatch alarms and a shipped dashboard — Partial: alarms on log-metric filters and both DLQs are built; no dashboard.
+- [ ] `var.enable_vpc` for ATO-constrained clients — Partial: not built; no VPC variable exists.
+- [ ] OpenAPI specification for public and admin surfaces [N8]
 - [ ] `examples/` and generated variable reference
-- [ ] Verify resource count ≤ 80 [N6] and idle monthly cost under $5 [N1]
+- [ ] Verify idle monthly cost under $5 [N1]
 - [ ] Confirm no component runs outside the client's account [N3]
 
 **Exit:** `terraform apply` from a clean account to a working deployment [N2].
@@ -138,97 +108,56 @@ requirement that mattered); it is not re-rendered inline on the form beside the 
 
 ## Phase 3 — Load validation
 
-The one place where being wrong is unrecoverable in production.
+- [ ] Repeatable load harness [O3] — Partial: `crates/harness` counts origin requests per waiter locally (C4, N10); it generates no load against a deployment.
+- [ ] Pre-queue: 1M registrations; bijectivity over the full cohort, no correlation with registration time, seed absent before T−0 [F1.3, F1.4, C1, C2]
+- [ ] Live join: 10K/s at default quotas, 40K/s with increases; zero duplicates; gap rate measured [F2.2, C3]
+- [ ] Raise quotas and pre-warm before testing above defaults [O1, O2]
+- [ ] `/status` origin RPS flat from 10K to 1M waiters [C4]
+- [ ] Fail-open: waiting room returning 5xx, origin reachable [F4.1]
+- [ ] Session continuity across N pages [F3.5]
+- [ ] No-show: 30% no-shows at 500/min target converges on 500/min [F3.8]
+- [ ] Standby activation within ~125 s; unprotected paths unqueued [F0.4, F0.6]
+- [ ] Spike in < 5 s drops no joins [C5]
+- [ ] Event isolation under one event at its ceiling [N9]
+- [ ] Cold-start P50 with `opt-level` 3 vs `z` (the jitter-entropy flag is already set — `.kiro/steering/tech.md`)
 
-- [ ] Repeatable load harness as a deliverable, not a test script [O3]
-- [ ] Pre-queue path: 1M registrations, assignment as a single write. Assert bijectivity across the full cohort, no correlation between registration time and assigned position, and that the seed is absent before T−0 [F1.3, F1.4, C1, C2]
-- [ ] Live-join path: 10K/s at default quotas and 40K/s with increases filed; zero duplicates at both; gap rate measured [F2.2, C3]
-- [ ] Raise quotas and pre-warm *before* testing the live-join path above defaults, or the test measures throttling rather than the design. Pre-queue assignment needs neither, since it is one write [O1, O2]
-- [ ] `/status` origin requests per second (RPS) flat from 10K to 1M waiters: assert origin fetches ≈ elapsed/TTL, not a function of waiter count [C4]
-- [ ] Fail-open verified: waiting room returning 5xx, origin still reachable [F4.1]
-- [ ] Session continuity: a visitor browses N pages after admission without being re-queued [F3.5]
-- [ ] No-show compensation: with an injected 30% no-show rate and a 500/min target, measured origin arrivals converge on 500/min [F3.8]
-- [ ] Standby activation: inflow crossing the threshold queues new visitors within the ~125 s worst case; unprotected paths stay unqueued [F0.4, F0.6]
-- [ ] Spike arriving in <5s does not drop joins [C5]
-- [ ] Event isolation: drive one event to its throughput ceiling; a second event in the same deployment sees no change in join latency or error rate [N9]
-
-**Exit:** reproducible report. Demonstrating a million assigned positions is itself the primary sales asset.
+**Exit:** reproducible report.
 
 ---
 
 ## Phase 4 — Operational product
 
-What makes this a service rather than a repository.
-
-- [ ] Pre-event readiness checklist [O1, O2, O3] — API Gateway RPS increase filed, DynamoDB per-table write request unit (WRU) increase filed, tables pre-warmed, Provisioned Mode enabled, load test executed, rollback plan
-- [ ] Operator runbook [O4, O5] — Partial: `docs/RUNBOOK.md` covers what every control does and what a waiting visitor sees (the distinction that matters under pressure), a pre-event readiness checklist carrying O1-O3, what to do when the queue stops moving or the origin is in trouble, what each alarm means, and what the system will not do on its own. It also covers the edge web ACL: COUNT-then-enforce promotion of its managed rules and closing the no-JavaScript queue (ADR-0038), and that a flat-rate subscription pins the distribution until the billing cycle ends. Not covered: a rehearsal to exercise any of it.
-- [ ] Waiting-room reference client — countdown, position, estimated time of arrival (ETA), auto-advance; 429 retry with jitter [F4.5]; 404 means re-join with a fresh universally unique identifier version 7 (UUIDv7) [F4.4]; UUIDv7 via the `uuid` package
+- [ ] Pre-event readiness checklist [O1, O2, O3] — Partial: `docs/RUNBOOK.md` carries it, generated from the Readiness panel; no rollback plan.
+- [x] Reference client (`waiting.js`): countdown, position, ETA, auto-advance, backoff on a refused join, re-join on 404 [F4.4, F4.5]
+- [ ] Operator runbook [O4, O5] — Partial: `docs/RUNBOOK.md` is written; never rehearsed.
+- [ ] Single-region failure domain — [#68](https://github.com/smoketurner/virtual-waiting-room/issues/68) — Partial: documented (ADR-0034, `docs/DEPLOY.md`, break-glass in `docs/RUNBOOK.md`); not rehearsed against a deployment.
 - [ ] Client integration guide: CloudFront/ALB/CDN placement
-- [ ] Per-client cost model [O6] — poll interval is the dominant variable; compute the flat-rate versus pay-as-you-go (PAYG) crossover and include pre-warming
+- [ ] Per-client cost model, including the flat-rate vs PAYG crossover and pre-warming [O6]
 
 ---
 
 ## Phase 5 — GovCloud variant
 
-Ships second, priced separately. No CloudFront, no edge compute, no VPC origins.
+No CloudFront, no edge compute, no VPC origins; priced separately.
 
-- [ ] Internal Application Load Balancer (ALB) gating with a gate that does not exist yet; origin access via security groups and Identity and Access Management (IAM) [N4]
-- [ ] Replace CDN cache collapse for `/status` — the read-scaling story differs materially inside the boundary
-- [ ] Document the commercial-CloudFront-fronting-GovCloud-origin data-boundary question for the client's Authorizing Official (AO)
+- [ ] A gate for an internal ALB; origin access via security groups and IAM [N4]
+- [ ] Replacement for CDN cache collapse on `/status`
+- [ ] Document the commercial-CloudFront-fronting-GovCloud data-boundary question for the AO
 - [ ] Validate deploy in a real GovCloud account
-
----
-
-## Gaps from the architecture audit
-
-Filed as issues so they carry discussion; listed here because tasks.md is the build-state
-record and these are the things that stand between the current MVP and a waiting room an
-operator can run an event on.
-
-Reliability — the waiting room must not be the reason the site is down:
-
-- [ ] [#58](https://github.com/smoketurner/virtual-waiting-room/issues/58) Gate fails closed: no fail-open path [F4.1]
-      `Partial:` folded into #71, which built the `fail_open_until` mechanism and
-      `/admin/fail_open`; nothing trips it automatically (see F4.1 above).
-- [x] [#60](https://github.com/smoketurner/virtual-waiting-room/issues/60) Standby mode unreachable through the CloudFront gate [F0.4, F0.5, F0.7] — folded into #71: an empty ruleset passes every request through (dormancy)
-- [x] [#64](https://github.com/smoketurner/virtual-waiting-room/issues/64) Origin 403s replaced by the waiting page — folded into #71: no `custom_error_response`; the gate shapes its own refusals
-- [x] [#67](https://github.com/smoketurner/virtual-waiting-room/issues/67) Visitors without JavaScript can never join — the waiting page's `<noscript>` form (and, when the script fails to load, a revealed one) posts to `/v1/enter`; `/v1/wait` is a server-rendered, self-refreshing page that admits through `generate_token`'s own path (ADR-0037)
-- [ ] [#68](https://github.com/smoketurner/virtual-waiting-room/issues/68) Single-region failure domain undocumented and untested
-      `Partial:` documented: ADR-0034, the availability posture in `docs/DEPLOY.md`, and a
-      break-glass fail-open written straight to the KeyValueStore in `docs/RUNBOOK.md`. Not
-      rehearsed against a real deployment.
-- [x] [#70](https://github.com/smoketurner/virtual-waiting-room/issues/70) Pre-event readiness as a diagnostics panel in the admin UI, not a command [O1, O2, N7] — a read-only Readiness panel above Current state checks warm throughput on all four tables, DynamoDB and API Gateway account limits, `assign_position` reserved concurrency, the open and controller schedules, the gate ruleset (dormant or not, and any fail-open window), the `/v1/status` cache behaviour and the gate's association, each naming its requirement with a fix link. The checks are one catalogue in `crates/admin/src/readiness.rs`, and `docs/RUNBOOK.md`'s automated checklist is generated from it (a test fails on drift). Out of scope by decision: a CloudFront pricing-plan row. Not built: a WAF row (whether the opt-in web ACL is attached, ADR-0038). Not built: GovCloud "not applicable" rows, since nothing deploys to GovCloud (N4); reserved-concurrency rows for the other functions, which reserve none by design.
-
-Fairness and abuse — nothing bounds how many places one visitor takes:
-
-- [ ] [#59](https://github.com/smoketurner/virtual-waiting-room/issues/59) No one-position-per-visitor control [F6.3]
-      `Partial:` server-drawn shards and the reload dedupe are built. Entry tickets were
-      removed (ADR-0028) and the join telemetry with open-time demotion (ADR-0030). Nothing
-      bounds volume; see the unchecked items in §1g.
-- [x] [#61](https://github.com/smoketurner/virtual-waiting-room/issues/61) Admission cookies wildcard-scoped and transferable — event-scoped by #71; optional IP binding of the session (ADR-0036)
-- [x] [#62](https://github.com/smoketurner/virtual-waiting-room/issues/62) `request_id` is both a public cache key and the bearer credential — redeemed only with the possession secret it joined with (ADR-0035)
-- [ ] [#63](https://github.com/smoketurner/virtual-waiting-room/issues/63) No way to revoke an admission
-      `Partial:` folded into #71 and closed there; no revocation design exists (ADR-0021 §5.2).
-
-Control and cost:
-
-- [ ] [#65](https://github.com/smoketurner/virtual-waiting-room/issues/65) Outflow control has no concurrency term [F3.10]
-- [x] [#66](https://github.com/smoketurner/virtual-waiting-room/issues/66) Per-request protection rules unavailable at the gate [F0.6] — folded into #71: the CloudFront Function evaluates the ruleset per request
-- [x] [#69](https://github.com/smoketurner/virtual-waiting-room/issues/69) Adaptive poll interval — the dominant cost driver [O6] — #98, ADR-0023
 
 ---
 
 ## Deferred
 
-Out of scope for this release; see REQUIREMENTS §5.
+Out of scope for this release (REQUIREMENTS §5).
 
-- Invite-only waiting rooms with multi-factor authentication (MFA) gating
-- Proof-of-Work challenges and CAPTCHA softblock
-- Native application SDKs (iOS, Android, React Native)
-- Platform connector breadth beyond the CloudFront gate
+- Invite-only rooms with MFA gating
+- Proof-of-Work and CAPTCHA softblock before queue entry
+- Native SDKs (iOS, Android, React Native)
+- Connector breadth beyond the CloudFront gate
 - OpenID identity-provider adapter
 - Multi-region and global tables
-- CloudFront SaaS Manager variant for a client with many branded domains
+- CloudFront SaaS Manager variant for many branded domains
 
 ---
 
@@ -236,9 +165,8 @@ Out of scope for this release; see REQUIREMENTS §5.
 
 | Risk | Mitigation |
 |---|---|
-| Pre-queue randomization disputed as unfair | Recorded seed makes it auditable and reproducible [F1.5]; document the fairness model up front |
-| Client poll interval drives cost more than any infrastructure choice | Adaptive since [#69](https://github.com/smoketurner/virtual-waiting-room/issues/69) — scales with distance to the front, floor/ceiling/divisor Terraform-configurable, modelled per client [N10, O6, ADR-0023] |
-| Load harness cannot generate 1M participants from one source | Distributed harness; budget for it in Phase 3 |
-| GovCloud variant larger than estimated — no CloudFront, no virtual private cloud (VPC) origins | Phase 5, priced separately; no date until commercial ships |
-| On-call burden during a live event | Price as incident-critical infrastructure; cap concurrent engagements |
-| Connector breadth | Product scope decision; the CloudFront gate covers content delivery network (CDN) fronted origins |
+| Pre-queue randomization disputed as unfair | Recorded seed makes it auditable [F1.5] |
+| Poll interval drives cost | Adaptive (ADR-0023); modelled per client [N10, O6] |
+| Harness cannot generate 1M participants from one source | Distributed harness, budgeted in Phase 3 |
+| GovCloud variant larger than estimated | Phase 5, priced separately |
+| On-call burden during a live event | Price as incident-critical; cap concurrent engagements |

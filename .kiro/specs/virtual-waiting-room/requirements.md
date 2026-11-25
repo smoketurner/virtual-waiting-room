@@ -1,18 +1,15 @@
 # Requirements: Virtual Waiting Room
 
-EARS-formatted requirements for the virtual waiting room. Source of record: `docs/REQUIREMENTS.md`.
-Modal mapping: MUST = SHALL, SHOULD = SHOULD. Every original ID (F0.x, F1.x–F6.x, C1–C5,
-N1–N9, O1–O6) is preserved verbatim, with each original acceptance criterion carried through
-as a testable `Acceptance:` line. Section groupings, the "Fairness by mode" note, and the
-Out-of-scope + Non-goals sections are preserved.
+EARS form of [`docs/REQUIREMENTS.md`](../../../docs/REQUIREMENTS.md), the source of record.
+MUST = SHALL, SHOULD = SHOULD. IDs match that document exactly; build state is in
+[`tasks.md`](tasks.md), rationale in [`docs/adr/`](../../../docs/adr/).
 
 ## Introduction
 
 The virtual waiting room meters visitors into an AWS origin at a rate the origin can survive,
-holding overflow on operator-authored pages and admitting visitors under operator control. It
-runs in two modes at once — scheduled events with a known start time, and standby protection
-that stays dormant until inflow crosses a threshold. Every deployment is single-tenant, running
-entirely inside the client's own AWS account with no shared infrastructure.
+holding overflow on operator pages and admitting visitors under operator control. It runs
+scheduled events (known start time) and standby protection (dormant until inflow crosses a
+threshold). Every deployment is single-tenant, inside the client's own AWS account.
 
 ---
 
@@ -20,217 +17,192 @@ entirely inside the client's own AWS account with no shared infrastructure.
 
 ### 1.1 Event lifecycle
 
-**F0.1** — As an operator, I want events to move through a defined lifecycle so that behaviour is predictable at every stage.
+**F0.1** — As an operator, I want a defined lifecycle so that behaviour is predictable.
 - THE SYSTEM SHALL progress an event through **idle → pre-queue → active → post-event** phases.
 - Acceptance: Each phase is observable and the transitions are scheduled or manual.
 
-**F0.2** — As a visitor, I want a relevant page at each phase so that I always know the event's status.
+**F0.2** — As a visitor, I want a relevant page at each phase.
 - THE SYSTEM SHALL serve an operator-authored page for each phase.
 - Acceptance: Idle shows event information before the pre-queue opens; post-event shows outcome and next steps.
 
-**F0.3** — As an operator, I want scheduled events so that a room opens at a known start time.
-- WHERE an event is configured as **scheduled** with a known start time, THE SYSTEM SHALL open it at its scheduled time.
+**F0.3** — As an operator, I want a room to open at a known start time.
+- WHERE an event is **scheduled**, THE SYSTEM SHALL open it at its scheduled time.
 - Acceptance: A configured event opens at its scheduled time.
 
-**F0.4** — As an operator, I want standby protection so that surges are absorbed without my intervention.
-- WHERE an event is configured as **standby** (dormant year-round), THE SYSTEM SHALL activate automatically WHEN inflow crosses an operator-configured threshold.
+**F0.4** — As an operator, I want surges absorbed without my intervention.
+- WHERE **standby** is configured, THE SYSTEM SHALL activate automatically WHEN inflow crosses an operator-configured threshold.
 - Acceptance: Below threshold, visitors pass through untouched. Above it, new visitors are queued without operator action.
 
-**F0.5** — As an operator, I want both modes on one origin so that scoped rooms and site-wide protection coexist.
+**F0.5** — As an operator, I want scoped rooms and site-wide protection to coexist.
 - THE SYSTEM SHALL run scheduled and standby modes simultaneously on one origin.
 - Acceptance: A scheduled room on `/product/x` with a low admission rate coexists with standby protection across the whole site.
 
-**F0.6** — As an operator, I want to declare what is protected so that unprotected traffic is never queued.
-- THE SYSTEM SHALL allow the operator to declare which requests are protected, by path, header, cookie, or user agent.
+**F0.6** — As an operator, I want to declare what is protected.
+- THE SYSTEM SHALL allow the operator to declare protected requests by path, header, cookie, or user agent.
 - Acceptance: An unprotected path is never queued, in any mode.
 
-**F0.7** — As an operator, I want visible, overridable standby state so that I retain control.
+**F0.7** — As an operator, I want standby state visible and overridable.
 - THE SYSTEM SHALL make standby activation observable and manually overridable.
 - Acceptance: Operator can force-activate or force-dormant; state is visible in metrics.
 
-**F0.8** — As an operator, I want a maintenance mode so that I can hold every visitor regardless of mode or capacity.
+**F0.8** — As an operator, I want to hold every visitor on demand.
 - WHEN maintenance mode is enabled, THE SYSTEM SHALL park all visitors on an operator page.
 - Acceptance: Enabling it holds every visitor regardless of mode or capacity.
 
 **Fairness by mode.** Scheduled events randomize among pre-queue participants; standby
-activation queues first-in, first-out (FIFO).
+activation queues FIFO.
 
 ### 1.2 Pre-queue (scheduled events)
 
-**F1.1** — As a visitor arriving early, I want a countdown rather than a queued position so that registering costs nothing more than a bounded write.
-- WHILE an event is in the pre-queue phase, THE SYSTEM SHALL hold visitors on a countdown page rather than assign a queue position, and SHALL register each visitor's place with one row write, plus a share of one amortised shard-counter claim per batch.
-- Acceptance: A visitor arriving at T−10min sees a countdown and is registered; no `Positions` item — and no queue position — exists until the event opens.
+**F1.1** — As an early visitor, I want a countdown rather than a position, registered with one bounded write.
+- WHILE an event is in the pre-queue phase, THE SYSTEM SHALL hold visitors on a countdown page rather than assign a position, and SHALL register each with one row write plus a share of one amortised shard-counter claim per batch.
+- Acceptance: A visitor arriving at T−10min sees a countdown and is registered; no `Positions` item and no position exists until the event opens.
 
-**F1.2** — As an operator, I want page views served from cache so that origin load from browsing is independent of visitor count, with registration kept to one bounded write per visitor.
-- WHILE an event is in the pre-queue phase, THE SYSTEM SHALL serve the countdown page entirely from content delivery network (CDN) cache, so page views make zero calls to API Gateway, DynamoDB, or Simple Queue Service (SQS); registering a visitor's place SHALL be a separate, single direct write from the edge to the ingest queue, with no compute in the path.
-- Acceptance: Origin request count from page views is independent of visitor count; each visitor registers exactly once, deduplicated across reloads wherever the browser permits persistent client-side storage (a browser that denies it, e.g. private browsing, re-registers on every reload — a known gap, not a guarantee this requirement makes), with no Lambda in that write's path.
+**F1.2** — As an operator, I want countdown views served from cache.
+- WHILE an event is in the pre-queue phase, THE SYSTEM SHALL serve the countdown page entirely from CDN cache, with zero calls to API Gateway, DynamoDB or SQS per view; registration SHALL be a separate, one-time direct write from the edge to the ingest queue, with no compute in the path.
+- Acceptance: Origin requests from page views are independent of visitor count; each visitor registers once, deduplicated across reloads wherever the browser allows client-side storage; no Lambda in the write's path. Known residuals: a storage-denied visitor takes a new place on each reload, and two reloads in one batching window can each claim.
 
-**F1.3** — As an operator, I want fair, unpredictable ordering so that early registration confers no advantage.
-- WHEN the scheduled start (T−0) is reached, THE SYSTEM SHALL assign queue positions to pre-queue participants in **randomized** order, and THE SYSTEM SHALL NOT make the ordering predictable before that moment.
-- Acceptance: Assigned position shows no correlation with registration time; positions are uniformly distributed; the permutation key does not exist before T−0.
+**F1.3** — As an operator, I want ordering that early registration cannot game.
+- WHEN T−0 is reached, THE SYSTEM SHALL assign pre-queue positions in **randomized** order, and SHALL NOT make the ordering predictable before that moment.
+- Acceptance: No correlation between position and registration time; positions uniformly distributed; the permutation key does not exist before T−0.
 
-**F1.4** — As an operator, I want prompt assignment so that start-time scale does not delay opening.
-- WHEN the scheduled start is reached, THE SYSTEM SHALL complete position assignment for pre-queue participants promptly.
+**F1.4** — As an operator, I want assignment not to delay opening.
+- WHEN T−0 is reached, THE SYSTEM SHALL complete pre-queue position assignment promptly.
 - Acceptance: 1,000,000 participants assigned in one write; elapsed time independent of cohort size.
 
-**F1.5** — As an auditor, I want reproducible ordering so that fairness can be verified after the fact.
+**F1.5** — As an auditor, I want reproducible ordering.
 - THE SYSTEM SHALL make the randomization auditable after the fact.
-- Acceptance: A third party given the published seed, participant count, and registration indices recomputes every position and reproduces the ordering exactly.
+- Acceptance: A third party given the published seed, participant count and registration indices recomputes every position exactly.
 
 ### 1.3 Queue join (live arrivals)
 
-**F2.1** — As a live-arriving visitor, I want a position after the event opens so that late arrivals are ordered after the pre-queue.
+**F2.1** — As a live arrival, I want a position behind the pre-queue.
 - WHEN a visitor joins after the event opens, THE SYSTEM SHALL assign a position in arrival order.
 - Acceptance: A visitor joining at T+5min receives a position after all pre-queue participants.
 
-**F2.2** — As a visitor, I want a unique position so that no two visitors collide.
-- THE SYSTEM SHALL issue each visitor a unique queue position and SHALL NOT issue any position twice.
+**F2.2** — As a visitor, I want a unique position.
+- THE SYSTEM SHALL NOT issue any queue position twice.
 - Acceptance: Under concurrent load, the set of issued positions contains zero duplicates.
 
-**F2.3** — As an operator, I want gaps treated as acceptable so that they are measured, not fought.
+**F2.3** — As an operator, I want gaps measured, not fought.
 - THE SYSTEM SHALL allow queue positions to contain gaps.
-- Acceptance: Not a defect. Gap rate is measured and reported, not eliminated.
+- Acceptance: Not a defect. Gap rate is measured and reported.
 
-**F2.4** — As the system, I want a client-supplied identifier so that joins are idempotent and traceable.
-- WHEN a client joins, THE SYSTEM SHALL require the client to supply its own request identifier (UUIDv7).
+**F2.4** — As the system, I want a client-supplied identifier so joins are idempotent.
+- WHEN a client joins, THE SYSTEM SHALL require a client-supplied request identifier (UUIDv7).
 - Acceptance: A join without a valid UUIDv7 is rejected at the gateway with 400.
 
-**F2.5** — As a client retrying, I want idempotent joins so that a repeat does not consume a position.
+**F2.5** — As a retrying client, I want idempotent joins.
 - WHEN a join is repeated with the same request ID, THE SYSTEM SHALL NOT consume an additional position.
 - Acceptance: Duplicate submission returns the original position.
 
-**F2.6** — As the system, I want malformed joins rejected so that the counter is not polluted.
+**F2.6** — As the system, I want malformed joins to cost nothing.
 - WHEN a join is malformed, THE SYSTEM SHALL NOT consume a queue position.
 - Acceptance: Sending N malformed payloads leaves the counter unchanged.
 
 ### 1.4 Waiting and admission
 
-**F3.1** — As a waiting visitor, I want to read my position and the serving position so that I know my progress.
-- THE SYSTEM SHALL allow a visitor to read their own position and the current serving position.
+**F3.1** — As a waiting visitor, I want to see my progress.
+- THE SYSTEM SHALL let a visitor read their own position and the current serving position.
 - Acceptance: `GET /queue_num` and `GET /status` return correct values.
 
-**F3.2** — As an operator, I want to control admission rate so that I can throttle the origin during the event.
-- WHEN the operator changes the admission rate during an event, THE SYSTEM SHALL apply the new target rate.
-- Acceptance: `POST /admin/rate` changes the target rate; effect visible within the cache time to live (TTL).
+**F3.2** — As an operator, I want to throttle admission during the event.
+- WHEN the operator changes the admission rate, THE SYSTEM SHALL apply the new target rate.
+- Acceptance: `POST /admin/rate` changes the target rate; effect visible within the cache TTL.
 
-**F3.3** — As an admitted visitor, I want a verifiable credential so that admission needs no backend call.
+**F3.3** — As an admitted visitor, I want a credential that needs no backend call.
 - WHEN a visitor is admitted, THE SYSTEM SHALL issue a cryptographically verifiable session credential.
-- Acceptance: The session cookie is signed; the edge gate verifies the signature locally, with no backend call.
+- Acceptance: The session cookie is signed; the edge gate verifies it locally.
 
-**F3.4** — As the origin, I want unauthenticated requests refused so that only admitted visitors get through.
-- IF a request has no valid session, THEN THE SYSTEM SHALL refuse it at the edge, before the origin.
+**F3.4** — As the origin, I want only admitted visitors to reach me.
+- IF a request has no valid session, THEN THE SYSTEM SHALL refuse it at the edge.
 - Acceptance: A request with no credential, an expired one, or one for another event is refused at the edge.
 
-**F3.5** — As an admitted visitor, I want a session so that I am not re-checked on every request.
-- WHEN a visitor's position is reached, THE SYSTEM SHALL establish a **session** so they are not re-checked on every subsequent request.
+**F3.5** — As an admitted visitor, I want not to be re-checked on every request.
+- WHEN a visitor's position is reached, THE SYSTEM SHALL establish a **session**.
 - Acceptance: A visitor navigates to a second page without re-presenting anything and is not re-queued.
 
-**F3.8** — As an operator, I want no-show compensation so that actual origin arrivals hit the target.
-- THE SYSTEM SHALL compensate admission rate control for **no-shows** — admitted visitors who never arrive at the origin.
+**F3.8** — As an operator, I want origin arrivals to hit the target despite no-shows.
+- THE SYSTEM SHALL compensate admission rate control for **no-shows**.
 - THE SYSTEM SHALL count each admitted visitor as one arrival however many times they call `/v1/generate_token`.
-- Acceptance: With a 30% no-show rate and a target of 500/min, actual origin arrivals converge on 500/min, not 350. A visitor who reloads the waiting page three times adds one to the arrivals count, not three.
+- Acceptance: With a 30% no-show rate and a target of 500/min, origin arrivals converge on 500/min, not 350; three reloads add one arrival, not three.
 
 ### 1.5 Failure behaviour
 
-**F4.1** — As a visitor, I want to reach the origin if the waiting room is down so that an outage does not block me.
-- IF the waiting room is unavailable, THEN THE SYSTEM SHALL allow visitors to proceed to the origin rather than being blocked.
+**F4.1** — As a visitor, I want an outage of the waiting room not to block me.
+- IF the waiting room is unavailable, THEN THE SYSTEM SHALL let visitors proceed to the origin.
 - Acceptance: With the waiting room API returning 5xx, the origin remains reachable.
 
-**F4.2** — As the system, I want fail-open bounded so that normal queueing resumes automatically.
+**F4.2** — As the system, I want fail-open bounded.
 - WHERE fail-open is in effect, THE SYSTEM SHALL time-limit the bypass and the client SHALL retry in the background.
-- Acceptance: Bypass cookie expires; normal queueing resumes without user action.
+- Acceptance: Bypass expires; normal queueing resumes without user action.
 
-**F4.3** — As a client with strict needs, I want fail-open overridable so that I can choose fail-closed.
+**F4.3** — As a strict client, I want to choose fail-closed.
 - WHERE a client requires fail-closed, THE SYSTEM SHALL allow fail-open to be overridden per client.
 - Acceptance: A client requiring fail-closed can configure it, with the tradeoff documented.
 
-**F4.4** — As a client, I want to recover a lost join so that a downstream drop is not user-visible.
+**F4.4** — As a client, I want a lost join to be recoverable.
 - IF a join is lost downstream, THEN THE SYSTEM SHALL allow the client to recover it.
-- Acceptance: `GET /queue_num` returns 404; the client re-joins with the same request id, and the retry succeeds because no row exists for it yet.
+- Acceptance: `GET /queue_num` returns 404; the client re-joins with the same request id and succeeds because no row exists for it yet.
 
-**F4.5** — As a client, I want throttling handled gracefully so that joins succeed on retry.
-- WHEN the client receives HTTP 429, THE SYSTEM (client) SHALL treat it as expected and retry with jittered backoff.
+**F4.5** — As a client, I want throttling handled gracefully.
+- WHEN the client receives HTTP 429, THE client SHALL retry with jittered backoff.
 - Acceptance: Under gateway throttling, no user-visible error; joins succeed on retry.
 
 ### 1.6 Operator experience
 
-**F5.1** — As an operator, I want live metrics so that I can see event health in near real time.
-- THE SYSTEM SHALL show the operator live event metrics: inflow, outflow, queue depth, admitted, no-show rate, expiry rate.
+**F5.1** — As an operator, I want live metrics.
+- THE SYSTEM SHALL show live event metrics: inflow, outflow, queue depth, admitted, no-show rate.
 - Acceptance: Metrics visible in CloudWatch within one 60 s metric period.
 
-**F5.2** — As a client, I want to brand the waiting page so that I need not fork the module.
-- THE SYSTEM SHALL allow the waiting room page to be branded by the client without forking the module.
+**F5.2** — As a client, I want to brand the waiting page without forking.
+- THE SYSTEM SHALL allow the waiting page to be branded by the client without forking the module.
 - Acceptance: Client supplies template assets; no code change required.
 
-**F5.3** — As an operator, I want to publish a message so that I can inform waiting visitors mid-event.
-- WHEN the operator publishes a message during an event, THE SYSTEM SHALL display it to waiting visitors.
+**F5.3** — As an operator, I want to message waiting visitors.
+- WHEN the operator publishes a message, THE SYSTEM SHALL display it to waiting visitors.
 - Acceptance: Message appears on the waiting page within the cache TTL.
 
-**F5.4** — As a waiting visitor, I want my position and estimated wait so that I know how long I have.
+**F5.4** — As a waiting visitor, I want my position and estimated wait.
 - THE SYSTEM SHALL show waiting visitors their position and an estimated wait time.
 - Acceptance: Both displayed and updated as the queue advances.
 
-**F5.5** — As an operator, I want every action scriptable so that operations are API-first, not console-only.
+**F5.5** — As an operator, I want every action scriptable.
 - THE SYSTEM SHALL make every operator action available through an API, not only a console.
 - Acceptance: Rate change, reset, pause, message publish, and mode override all scriptable.
 
 ### 1.7 Abuse mitigation
 
-No requirement in this section is currently met by a shipped mechanism: nothing binds a place
-to a person.
-
-**Volume costs a challenge solve where the edge web ACL is on (ADR-0038).** `request_id` is
-client-supplied, so one visitor can still take N places, and randomization converts volume into
-expected share linearly. With the web ACL attached, each WAF token buys at most ten joins in ten
-minutes, a token needs a browser challenge solve, and past a per-IP limit each visitor on the
-address solves a CAPTCHA. The API answers only CloudFront, so posting to `execute-api` bypasses
-none of it. A farm running real browsers through residential proxies still takes places; bounding
-volume per person needs an identity a public onsale does not have (ADR-0028), and open-time
-demotion was removed without ever being enabled (ADR-0030).
-
-### Retired requirements
-
-IDs are never reused and never renumbered, so a requirement that no longer holds is recorded
-here rather than deleted.
-
-| ID | Required | Retired because | Record |
-|---|---|---|---|
-| F6.1 | Gate queue entry on a client-issued signed entry ticket carrying an opaque per-identity subject. | Nothing could use it without customer-side work the product does not supply. | ADR-0028 |
-| F6.2 | The entry ticket is signed by the client, not the waiting room, and its subject is opaque. | Retired with F6.1. | ADR-0028 |
-| F3.9 | Queue positions expire if unused within an operator-configured period. | Implemented as a controller `Scan` of `Positions` six times a minute: unbounded, blind to the pre-queue cohort (which has no `Positions` row), advancing an attribute nothing read, and applying a grace expressed in seconds as a distance in positions — so a hidden tab lost its place (#97). The no-show correction already compensates for absentees. | ADR-0031 |
-| F3.6 | The session is separately signed from the admission token. | There is no admission token. `Kind` keeps its enum shape so a future second kind must carry its own label. | ADR-0032 |
-| F3.7 | Session lifetime supports a sliding window and a hard cap. | `SessionMode::Sliding` lived only in the origin authorizer; the edge does not re-issue a cookie. Retired rather than left as a `MUST` with no mechanism. | ADR-0032 |
-| F3.10 | Sessions are markable as completed or abandoned. | `POST /update_session` returned 501 and nothing wrote `Completed` or `Abandoned`; both variants were deleted by ADR-0033. | ADR-0032 |
-| N6 | A full deployment is small enough to read and reason about in one sitting, targeting ≤ 80 Terraform-managed resources in `core`. | The intent was sound; the acceptance criterion never measured it. "Resources" was never defined as blocks or instances, and the two had drifted — 69 blocks, 8 of which expand through `for_each`. Worse, it was satisfiable by rewriting the same infrastructure: thirteen alarms as thirteen blocks breached the ceiling, the identical thirteen as three `for_each` blocks did not. A number that changes with formatting is not measuring comprehensibility. **N1 is the constraint that survives** — idle cost, which is what a resource count was standing in for. | — |
-| F6.3 | Bot-blocking decisions enforceable at event start rather than during the pre-queue. | Built as open-time demotion and never enabled; structurally blind to a client that bypassed CloudFront. | ADR-0030 |
+No requirement here is currently met: nothing binds a place to a person. See
+[`docs/REQUIREMENTS.md`](../../../docs/REQUIREMENTS.md) §1.7 and ADR-0038 for what the edge
+web ACL does and does not bound. F6.1–F6.3 are retired below.
 
 ### 1.8 Operator web interface
 
-New requirements. These build on the operator API surface (F5.1–F5.5); the web interface is a
-thin server-rendered client over that API and adds no capability the API lacks.
+A thin server-rendered client over the operator API (F5.1–F5.5); it adds no capability the API lacks.
 
-**F7.1** — As an operator, I want an admin web interface so that I can drive the system without scripting every action.
-- THE SYSTEM SHALL serve an operator admin web interface from a single Axum-based Lambda rendering server-side HTML via askama templates. (Relates to F5.5.)
-- Acceptance: Reachable at `/admin`, one Lambda, no browser SPA bundle.
+**F7.1** — As an operator, I want a web interface so that I need not script every action.
+- THE SYSTEM SHALL serve the operator interface from one Axum Lambda rendering server-side HTML with askama templates.
+- Acceptance: Reachable at `/admin`; one Lambda; no browser SPA bundle.
 
-**F7.2** — As an operator, I want AWS-native styling so that the interface feels like a native AWS service.
-- THE SYSTEM SHALL style the admin interface with the Cloudscape design language so it presents as an AWS-native service. (Relates to F5.1–F5.5.)
-- Acceptance: Uses Cloudscape design-token values (color/spacing/typography) extracted at build time; matches AWS console conventions (top nav, side nav, containers, tables).
+**F7.2** — As an operator, I want a consistent, dependency-free look.
+- THE SYSTEM SHALL style the interface in the Vouch design language as one self-contained stylesheet (ADR-0018).
+- Acceptance: No runtime npm dependency and no build-time token extraction.
 
-**F7.3** — As an operator, I want full parity with the admin API so that the UI exposes every operator capability.
-- THE admin interface SHALL expose every operator capability already in the admin API (phase incl. maintenance, rate, message, reset, rules, metrics view, session update); it is a thin server-rendered client adding no capability the API lacks. (Relates to F5.5 API-first; F5.2, F5.3.)
-- Acceptance: Each `/admin/*` action has a UI control; F5.5 API-first still holds.
+**F7.3** — As an operator, I want parity with the admin API.
+- THE interface SHALL expose every operator capability in the admin API and no other.
+- Acceptance: Each `/admin/*` action has a UI control; F5.5 still holds.
 
-**F7.4** — As a security owner, I want the UI to use the same auth as the API so that there is no weaker path.
-- WHEN an operator submits an admin action via the web interface, THE SYSTEM SHALL authenticate with AWS SigV4 (same as the admin API). (Relates to F5.5.)
-- Acceptance: Unauthenticated admin UI requests rejected; no second weaker auth path.
+**F7.4** — As a security owner, I want one auth path.
+- WHEN an operator makes any interface request, THE SYSTEM SHALL authenticate it through one path, with no weaker second one.
+- Acceptance: OIDC Authorization Code + PKCE session enforced in the Lambda (ADR-0016); unauthenticated requests are redirected to login.
 
-**F7.5** — As an operator, I want a server-rendered UI so that core actions do not depend on a client-side runtime.
-- THE admin interface SHALL be server-rendered with no client-side React runtime; interactivity uses HTML forms + minimal progressive-enhancement JS only. (Relates to F7.1, F7.3.)
-- Acceptance: Core actions work with JS disabled; no React/SPA bundle shipped.
+**F7.5** — As an operator, I want core actions without a client-side runtime.
+- THE interface SHALL be server-rendered with no React runtime; interactivity is HTML forms plus minimal progressive-enhancement JavaScript.
+- Acceptance: Core actions work with JavaScript disabled.
 
-**F7.6** — As an operator, I want live metrics in the UI so that I can watch event health from the admin interface.
-- THE admin interface SHALL display live metrics (inflow, outflow, queue depth, admitted, no-show rate, expiry rate) from `/metrics` + CloudWatch EMF. (Relates to F5.1.)
+**F7.6** — As an operator, I want live metrics in the interface.
+- THE interface SHALL display live metrics: inflow, outflow, queue depth, admitted, no-show rate.
 - Acceptance: Metrics render and refresh within one 60 s metric period.
 
 ---
@@ -238,70 +210,57 @@ thin server-rendered client over that API and adds no capability the API lacks.
 ## 2. Capacity
 
 Requirements on the deployed system, not on AWS defaults. Every figure requires the
-pre-event preparation in the Operational section.
+pre-event preparation in §4.
 
-**C1** — As an operator, I want the pre-queue to hold a large cohort so that mass-registration events are supported.
-- THE SYSTEM SHALL support at least 1,000,000 concurrent pre-queue participants.
+**C1** — THE SYSTEM SHALL support at least 1,000,000 concurrent pre-queue participants.
 - Acceptance: Load test sustains 1M countdown-page holders.
 
-**C2** — As an operator, I want atomic assignment so that no reader ever sees a partially assigned cohort.
-- WHEN the pre-queue cohort is assigned positions, THE SYSTEM SHALL make the assignment atomic — no interval in which some participants hold positions and others do not.
-- Acceptance: Assignment completes in a single conditional write; a reader either sees the pre-queue unassigned or sees every participant assigned.
+**C2** — WHEN the pre-queue cohort is assigned, THE SYSTEM SHALL make the assignment atomic.
+- Acceptance: A single conditional write; a reader sees either no participant assigned or all of them.
 
-**C3** — As an operator, I want a high live-join throughput so that surges are absorbed at scale.
-- THE SYSTEM SHALL sustain ≥ 10,000 joins/sec on the live-join path at default quotas, and ≥ 40,000/sec with quota increases filed.
+**C3** — THE SYSTEM SHALL sustain ≥ 10,000 joins/sec at default quotas, and ≥ 40,000/sec with quota increases filed.
 - Acceptance: Load test at both levels; zero duplicates at each.
 
-**C4** — As an operator, I want origin polling load flat so that scale does not overwhelm the origin.
-- THE SYSTEM SHALL keep polling load independent of visitor count at the origin.
-- Acceptance: Origin requests per second (RPS) for `/status` stays flat as waiters scale from 10K to 1M.
+**C4** — THE SYSTEM SHALL keep origin polling load independent of visitor count.
+- Acceptance: Origin RPS for `/status` stays flat as waiters scale from 10K to 1M.
 
-**C5** — As an operator, I want sudden spikes absorbed so that fast surges do not drop joins.
-- WHEN a spike arrives in under 5 seconds, THE SYSTEM SHALL handle it without dropping joins.
+**C5** — WHEN a spike arrives in under 5 seconds, THE SYSTEM SHALL NOT drop joins.
 - Acceptance: Joins are durably enqueued even when compute has not yet scaled.
 
 ---
 
 ## 3. Non-functional
 
-**N1** — As a client, I want near-zero idle cost so that dormant deployments are cheap.
-- THE SYSTEM SHALL approach zero idle cost, with no always-on compute or cache tier.
+**N1** — THE SYSTEM SHALL approach zero idle cost, with no always-on compute or cache tier.
 - Acceptance: Monthly bill for an idle deployment is under $5 excluding pre-warming.
 
-**N2** — As a client, I want deployment into my own account so that I retain full ownership.
-- THE SYSTEM SHALL deploy into the client's own AWS account.
+**N2** — THE SYSTEM SHALL deploy into the client's own AWS account.
 - Acceptance: `terraform apply` from a clean account produces a working deployment.
 
-**N3** — As a vendor, I want no shared infrastructure so that clients operate independently.
-- THE SYSTEM SHALL NOT require the vendor to operate shared infrastructure on clients' behalf.
+**N3** — THE SYSTEM SHALL NOT require the vendor to operate shared infrastructure on clients' behalf.
 - Acceptance: No component runs in a Smoke Turner account.
 
-**N4** — As a client, I want commercial-region support so that the product deploys where the gate exists.
-- THE SYSTEM SHALL support commercial AWS regions. GovCloud (US) is out of scope until a gate exists for it.
-- Acceptance: The commercial variant deploys and passes functional tests. GovCloud has no shipped gate: the edge gate is a CloudFront Function, which the partition does not offer, and the origin authorizer that filled that role was removed (ADR-0032).
+**N4** — THE SYSTEM SHALL support commercial AWS regions; GovCloud (US) is out of scope until a gate exists for it.
+- Acceptance: The commercial variant deploys and passes functional tests. GovCloud offers no CloudFront Function, so it has no gate (ADR-0032).
 
-**N5** — As an operator, I want everything in Terraform so that deployment has no manual steps.
-- THE SYSTEM SHALL express infrastructure as Terraform.
+**N5** — THE SYSTEM SHALL express infrastructure as Terraform.
 - Acceptance: No manual console steps in the deployment path.
 
-**N7** — As an operator, I want edge abuse mitigation so that bots are handled before the origin.
-- THE SYSTEM SHALL refuse every request without a valid session at the edge, before the origin is touched.
-- THE SYSTEM SHALL answer API requests from its own distribution only: every REST API method requires an API key held by CloudFront alone.
-- WHERE the deployment is on a CloudFront flat-rate plan, THE SYSTEM SHALL attach the edge web ACL: a WAF token from a browser challenge on every JavaScript API call, rate limits per token and per IP (escalating to CAPTCHA), and AWS managed rules in Count until promoted (O5).
-- THE SYSTEM SHALL NOT create a WAFv2 web ACL by default: on pay-as-you-go it bills between events, against N1.
-- Acceptance: The gate runs at viewer-request on the protected behaviour and the join burst reaches SQS with no compute in the path. A request straight to `execute-api` is refused with 403. With `flat_rate_plan_tier` set, a join without a WAF token is challenged rather than enqueued, and the no-JavaScript queue is never challenged (ADR-0037, ADR-0038).
+**N7** — Edge abuse mitigation.
+- THE SYSTEM SHALL refuse every request without a valid session at the edge, before the origin.
+- THE SYSTEM SHALL answer API requests from its own distribution only: every REST API method requires an API key only CloudFront holds.
+- WHERE `flat_rate_plan_tier` is set, THE SYSTEM SHALL attach the edge web ACL: a challenge on every JavaScript API call, rate limits per token and per IP, managed rules in Count until promoted (O5).
+- THE SYSTEM SHALL NOT create a web ACL by default, since on pay-as-you-go it bills against N1 (ADR-0038).
+- Acceptance: The gate runs at viewer-request on the protected behaviour; the join burst reaches SQS with no compute in the path; a request straight to `execute-api` is refused with 403; with the web ACL on, a join without a WAF token is challenged and the no-JavaScript queue never is (ADR-0037).
 
-**N8** — As an integrator, I want an OpenAPI spec so that client and admin surfaces are generated.
-- THE SYSTEM SHALL document the API as an OpenAPI specification.
+**N8** — THE SYSTEM SHALL document the API as an OpenAPI specification.
 - Acceptance: Spec published; client and admin surfaces generated from it.
 
-**N9** — As an operator, I want event isolation so that one busy event does not degrade another.
-- THE SYSTEM SHALL isolate concurrent events in one deployment from each other.
-- Acceptance: One event driven to its throughput ceiling does not increase queue-join latency or error rate for another event in the same deployment.
+**N9** — THE SYSTEM SHALL isolate concurrent events in one deployment from each other.
+- Acceptance: One event at its throughput ceiling does not increase join latency or error rate for another.
 
-**N10** — As an operator, I want client polling cost to scale with distance to the front so that a large waiting cohort does not multiply request volume by a fixed interval.
-- THE SYSTEM SHALL make client polling cost scale with distance to the front, not with waiting visitors × a fixed interval.
-- Acceptance: Poll count is O(log) in the starting wait, and the harness client-request total under `--polling backoff` is materially below `--polling hold-position` at identical settings.
+**N10** — THE SYSTEM SHALL make client polling cost scale with distance to the front, not with waiting visitors × a fixed interval.
+- Acceptance: Poll count is O(log) in the starting wait; the harness client-request total under `--polling backoff` is materially below `--polling hold-position` at identical settings.
 
 ---
 
@@ -309,56 +268,58 @@ pre-event preparation in the Operational section.
 
 Contractual deliverables. Without these the capacity requirements are not met.
 
-**O1** — As an operator, I want tables pre-warmed so that write throughput is ready at start.
-- THE SYSTEM SHALL have DynamoDB tables pre-warmed before each event.
-- Acceptance: Warm throughput ≥ the event's target write rate, verified before T−0. Measured against the running deployment by the admin dashboard's Readiness panel, whose checks generate the readiness checklist in `docs/RUNBOOK.md`; set through `warm_throughput_write_units`.
+**O1** — THE SYSTEM SHALL have DynamoDB tables pre-warmed before each event.
+- Acceptance: Warm throughput (`warm_throughput_write_units`) ≥ the event's target write rate, verified before T−0 by the dashboard's Readiness panel.
 
-**O2** — As an operator, I want quota increases filed early so that limits are not hit at start.
-- THE SYSTEM SHALL have service quota increases filed with lead time.
-- Acceptance: API Gateway RPS and DynamoDB per-table write request units (WRU) confirmed raised before T−0. The limits in force are shown by the admin dashboard's Readiness panel, whose checks generate the readiness checklist in `docs/RUNBOOK.md`.
+**O2** — THE SYSTEM SHALL have service quota increases filed with lead time.
+- Acceptance: API Gateway RPS and DynamoDB per-table WRU confirmed raised before T−0; the Readiness panel shows the limits in force.
 
-**O3** — As an operator, I want a load test before the event so that capacity is proven.
-- THE SYSTEM SHALL have a load test at the event's target rate executed before the event.
-- Acceptance: Report produced and reviewed with the client. On the readiness checklist in `docs/RUNBOOK.md`; the repeatable harness itself is not built.
+**O3** — THE SYSTEM SHALL have a load test at the event's target rate executed before the event.
+- Acceptance: Report produced and reviewed with the client.
 
-**O4** — As an operator, I want mid-event controls so that I can adjust, hold, or stop during the event.
-- THE SYSTEM SHALL allow the operator to adjust the admission rate, hold admission, open the gate, or stop the event mid-event.
-- THE SYSTEM SHALL document what each control does and what a waiting visitor sees as a result, since that is what distinguishes them under pressure.
-- Acceptance: Every control is a form on the dashboard and works with JavaScript disabled; `docs/RUNBOOK.md` documents each one. Not yet exercised in a rehearsal.
+**O4** — THE SYSTEM SHALL let the operator adjust the admission rate, hold admission, or stop the event mid-event, and SHALL document what each control does and what a waiting visitor sees.
+- Acceptance: Every control is a dashboard form that works with JavaScript disabled; `docs/RUNBOOK.md` documents each.
 
-**O5** — As an operator, I want WAF rules observed before blocking so that legitimate traffic is not dropped.
-- WHEN a new WAF rule is introduced, THE SYSTEM SHALL observe it in Count mode before promoting it to Block.
+**O5** — WHEN a new WAF rule is introduced, THE SYSTEM SHALL observe it in Count mode before promoting it to Block.
 - Acceptance: No rule enters Block without one event's worth of Count data.
 
-**O6** — As a client, I want a per-event cost model so that spend is understood beforehand.
-- THE SYSTEM SHALL have cost modelled per client before the event.
+**O6** — THE SYSTEM SHALL have cost modelled per client before the event.
 - Acceptance: Written estimate covering CloudFront, WAF, Bot Control, DynamoDB, and pre-warming.
 
 ---
 
 ## 5. Out of scope
 
-Not required for the current release. Rationale in `adr/README.md`.
+Not required for the current release; rationale in `docs/adr/README.md`.
 
-- Invite-only waiting rooms with multi-factor authentication (MFA) gating.
+- Invite-only waiting rooms with MFA gating.
 - Proof-of-Work challenges and CAPTCHA softblock before queue entry.
-- Native application software development kits (SDKs) for iOS, Android and React Native.
+- Native application SDKs for iOS, Android and React Native.
 - Platform connector breadth beyond the CloudFront gate.
 
 ## 6. Explicit non-goals
 
-- Physical-location queueing (restaurants, clinics, service counters).
-- Replacing the client's CDN or WAF. We integrate with them.
-- Multi-tenant software as a service (SaaS). We are not a Cloud Service Provider.
+- Physical-location queueing.
+- Replacing the client's CDN or WAF.
+- Multi-tenant SaaS.
 - Gapless position sequences.
-- Sub-second join latency. Queue join is latency-insensitive by nature.
-- Visitor engagement widgets and marketing data collection. Not infrastructure.
-- Email or Short Message Service (SMS) notification of queue position. Requires collecting personal data, which conflicts with the posture that no visitor data leaves the client's account.
+- Sub-second join latency.
+- Visitor engagement widgets and marketing data collection.
+- Email or SMS notification of queue position.
 
 ---
 
-## Traceability
+## Retired requirements
 
-- Design: `design.md` (same spec folder) elaborates how these requirements are realized.
-- Tasks: `tasks.md` (same spec folder) breaks the design into implementation work items.
-- Narrative source: the authoritative prose requirements remain in `docs/REQUIREMENTS.md`; this document re-expresses them in EARS form for the Kiro SDD workflow.
+Never reused or renumbered; kept in step with `docs/REQUIREMENTS.md`.
+
+| ID | Required | Record |
+|---|---|---|
+| F3.6 | Session signed separately from the admission token | ADR-0032 |
+| F3.7 | Sliding session window plus a hard cap | ADR-0032 |
+| F3.9 | Unused positions expire after an operator-configured period | ADR-0031 |
+| F3.10 | Sessions markable as completed or abandoned | ADR-0032 |
+| F6.1 | Queue entry gated on a client-signed entry ticket | ADR-0028 |
+| F6.2 | Entry ticket signed by the client, opaque subject | ADR-0028 |
+| F6.3 | Bot-blocking enforceable at event start | ADR-0030 |
+| N6 | ≤ 80 Terraform resources in `core` | — (superseded by N1) |
