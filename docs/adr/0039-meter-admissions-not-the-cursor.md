@@ -90,9 +90,11 @@ unused again.
   `a_backlog_of_invited_visitors_drains_instead_of_persisting`).
 - **Lag costs a bounded burst, not a sustained overshoot.** While visitors cannot yet know they
   were released, budget goes unused and the cursor runs ahead, as before. When they arrive they
-  find at most two intervals of budget. The same model that gave 2.65× for about 40 s (a million
-  visitors at 833/s, every one showing, learning their position up to about 160 s after the open)
-  gives a peak 10 s window of about 1.4× the target, then the target.
+  find at most two intervals of budget, and a backlog spends it in its first second: the budget is
+  granted in 10 s lumps and nothing shapes admissions inside an interval. Measured on the local
+  stack ([LOCAL_STACK.md](../LOCAL_STACK.md#findings)), the busiest second at the open admitted
+  4.5–5.8× the target and the busiest 10 s 1.9–2.6×, inside the bound in §3's first point; past
+  the open, admissions ran within 1% of the target.
 - **Passes can overlap.** Budget and release both follow elapsed seconds, and caps are absolute
   values, so a duplicated or interleaved pass grants nothing twice.
 - **An idle event banks nothing beyond the burst** (`an_idle_event_banks_no_more_than_the_burst`).

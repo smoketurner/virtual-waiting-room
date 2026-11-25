@@ -58,3 +58,27 @@ fails the machine was saturated, and the run says it is inconclusive.
 - **Scale beyond one machine.** A laptop handles tens of thousands of visitors at full rate. For
   a larger event, scale the visitors, the admission rate and API Gateway's limits down together
   (`--scale`), which keeps the shape of the crowd against the throttles.
+
+## Findings
+
+Each row is one run, reproducible with its seed. Every check passed in all of them.
+
+| Run | Result |
+|---|---|
+| `--visitors 20000 --rate 200 --countdown 60 --seed 2` | Busiest second 5.8× the target, busiest 10 s 2.6×. 1,459 visitors who arrived before the open were throttled on their join and became live joiners, behind the cohort |
+| `--visitors 12000 --rate 40 --countdown 30 --no-show 0.3 --duplicate-rate 0.05 --seed 23` | With 30% no-shows, steady admissions 39.4/s against 40/s (F3.8). 664 duplicate deliveries, no duplicate position |
+| `--visitors 100000 --rate 83 --scale 0.1 --arrival herd --herd-window 10 --seed 11` | A one-tenth model of a million arriving at the open. Half had a position in 2.7 min, 99% in 6.3; 83.7/s admitted against 83/s; the open's drain wait ran 11 s and took 7,329 of them into the cohort |
+| `--visitors 500 --rate 25 --dynamodb http://127.0.0.1:18080 --seed 22` | The same checks with `ExtendDB` as the DynamoDB backend |
+
+What the runs changed:
+
+- **Admission at the open is lumpier than the design said.** The budget bounds it, but inside an
+  interval nothing shapes it, so the origin should expect up to about 6× the target for a second
+  at the open. ADR-0039 now gives the measured figures.
+- **Throttled registrants lose their place in the cohort.** A join refused at the end of a
+  countdown is retried after the open and numbered behind everyone. DESIGN §4.1 records it; the
+  remedy is a join throttle and account quota sized to the countdown's last second.
+- **The open's drain wait always runs its length under continuous traffic.** DESIGN §4.1 records
+  it.
+- **The page retried a 429 or a 5xx from `/generate_token` at its 5 s floor.** It now backs off as
+  it does on a 425.
