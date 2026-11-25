@@ -220,8 +220,11 @@ favourable index. The open writes the seed, and `/v1/status` publishes it from t
 ### 4.4 Auditability
 
 Once the open has written them, `/v1/status` publishes `shuffle_seed` (lowercase hex),
-`participant_count` and `prequeue_offsets`. With the `(r, s, l)` tuples in `PreQueue`, anyone can
-recompute every position.
+`participant_count` and `prequeue_offsets`. With a registration's `(s, l)` its position can be
+recomputed; with the `PreQueue` table, every position can. This makes the order *recomputable*. It
+does not prove the seed was drawn fairly: the operator's own function draws it, after the indices
+are fixed, and nothing in the account can prove otherwise to someone who does not trust the
+operator ([ADR-0040](adr/0040-what-the-published-seed-proves.md)).
 
 ### 4.5 Live joins after opening
 

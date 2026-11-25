@@ -102,6 +102,12 @@ pub const POSSESSION_DIGEST_ATTR: &str = "h";
 /// The server-stamped time a `Positions` row was created, epoch seconds.
 pub const ENTRY_TIME_ATTR: &str = "entry_time";
 
+/// The attribute a `Positions` row records its admission in, epoch seconds.
+/// Written once, when the visitor is first admitted: every session minted for
+/// the row afterwards expires from this moment, not from the re-mint (issue
+/// #237).
+pub const ADMITTED_AT_ATTR: &str = "admitted_at";
+
 /// The expiry attribute of a `Positions` row.
 ///
 /// The `Positions` table's `ttl { attribute_name }` in

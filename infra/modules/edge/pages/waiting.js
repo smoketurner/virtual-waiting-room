@@ -24,6 +24,11 @@
   var AHEAD_AT_START_KEY = "vwr_ahead_at_start";
   var IP_REBIND_KEY = "vwr_ip_rebind";
   var IP_REBIND_WINDOW_MS = 60000;
+  // "<epoch ms>.<bounces>": when this page last redeemed, and how many times
+  // in a row the gate had by then sent the visitor straight back (issue #247).
+  var REDEEMED_KEY = "vwr_redeemed";
+  var BOUNCE_WINDOW_MS = 60000;
+  var MAX_BOUNCES = 2;
 
   // Adaptive poll interval (#69). No policy published ⇒ behave
   // exactly as this client always has: floor === ceiling === 5000ms, divisor
@@ -250,6 +255,24 @@
     }
     delete memoryStore[key];
   }
+
+  // The gate sends a refused visitor here with a reason (r=). Arriving that
+  // way moments after this page redeemed means the gate turned the fresh
+  // session down -- a rotated key, blocked cookies, an event id that does not
+  // match -- and redeeming again would only repeat it, at navigation speed
+  // (issue #247). Counted once, at load: by the time redeem() runs again the
+  // window may have passed, and the loop it guards is the immediate one.
+  // r=ip has its own, stricter guard in redeem().
+  var bounces = (function () {
+    if (!/[?&]r=/.test(window.location.search || "")) {
+      return 0;
+    }
+    var m = /^(\d+)\.(\d+)$/.exec(readStored(REDEEMED_KEY) || "");
+    if (!m || Date.now() - Number(m[1]) >= BOUNCE_WINDOW_MS) {
+      return 0;
+    }
+    return Number(m[2]) + 1;
+  })();
 
   var requestId = null;
   var secret = null;
@@ -832,6 +855,16 @@
     if (admitting) {
       return Promise.resolve();
     }
+    if (bounces >= MAX_BOUNCES) {
+      // Twice admitted, twice turned back. A reload after the window starts
+      // the count again, which is what the message asks for (issue #247).
+      say(
+        "We let you in, but the site turned you back",
+        "Please reload in a minute."
+      );
+      stop();
+      return Promise.resolve();
+    }
     admitting = true;
     return postJSON("/v1/generate_token", {
       request_id: requestId,
@@ -855,6 +888,7 @@
           }
           writeStored(IP_REBIND_KEY, String(Date.now()));
         }
+        writeStored(REDEEMED_KEY, Date.now() + "." + bounces);
         say("You're through", "Taking you to the site…");
         // Replace so the waiting page does not sit in the back history.
         window.location.replace(nextDestination());
@@ -870,6 +904,17 @@
         say(
           "We couldn't confirm this place is yours",
           "Open the waiting room again from the link you were given to take a new place."
+        );
+        stop();
+      } else if (res.status === 410) {
+        // This place was used and the visit it bought is over (issue #237).
+        // It cannot be redeemed again, so drop it: the next load of this page
+        // takes a new place instead of asking for the old one forever.
+        removeStored(IDENTITY_KEY);
+        removeStored(JOINED_KEY);
+        say(
+          "Your visit has ended",
+          "Reload this page to take a new place in line."
         );
         stop();
       }
@@ -900,6 +945,8 @@
   // being caught up promptly. schedule() consumes this once the running
   // chain settles.
   var catchUpWanted = false;
+  // The interval the last failed poll retried at; 0 once a poll succeeds.
+  var backoffMs = 0;
 
   function stop() {
     stopped = true;
@@ -1120,11 +1167,20 @@
             return schedule();
           });
       })
+      .then(function () {
+        backoffMs = 0;
+      })
       .catch(function () {
         // Transient. Say nothing alarming and try again — a blip must not
-        // look like a lost place. nextIntervalMs is left at its last value:
-        // an unknown state deserves no faster and no slower a retry than the
-        // visitor was already getting.
+        // look like a lost place. But an origin answering 5xx or 429 is not
+        // helped by every waiter retrying at the pace it was polled at when
+        // healthy (issue #251): each consecutive failure doubles the interval,
+        // up to the ceiling a healthy deep-queue poll already uses, and the
+        // first success above drops straight back. Kept apart from
+        // nextIntervalMs because a chain that fails after /status succeeded
+        // has already reset that to the floor.
+        backoffMs = Math.min(policy.ceilingMs, (backoffMs || nextIntervalMs) * 2);
+        nextIntervalMs = backoffMs;
         schedule();
       })
       .then(function () {

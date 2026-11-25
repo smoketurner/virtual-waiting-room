@@ -197,6 +197,9 @@ fn refusal(denied: &Denied) -> Result<Response<Body>, Error> {
         Denied::NotAdmitting | Denied::NotOpen => 409,
         Denied::NotRegistered => 404,
         Denied::NotHolder => 403,
+        // Gone: the place was used and its visit is over. The page takes a
+        // new one rather than asking again.
+        Denied::SessionExpired => 410,
         Denied::Corrupt => 500,
     };
     let mut payload = serde_json::json!({
@@ -320,7 +323,7 @@ mod tests {
             _request_id: &str,
             _position: u64,
             _digest: &wr_common::SecretDigest,
-            _now: u64,
+            now: u64,
         ) -> impl std::future::Future<Output = Result<(), StoreError>> + Send {
             let result = if self.mark_fails {
                 Err(StoreError("mark unavailable".to_owned()))
@@ -328,6 +331,7 @@ mod tests {
                 // Mirrors the conditional write: the row is admitted from here.
                 if let Some(row) = self.position.lock().unwrap().as_mut() {
                     row.status = PositionStatus::Admitted;
+                    row.admitted_at = Some(now);
                 }
                 Ok(())
             };
@@ -360,6 +364,7 @@ mod tests {
             position,
             status: PositionStatus::Issued,
             digest: Some(PossessionSecret::parse(SECRET).unwrap().digest()),
+            admitted_at: None,
         }
     }
 
@@ -442,6 +447,56 @@ mod tests {
         let again = handle(&state, request()).await.unwrap();
         assert_eq!(again.status(), 200);
         assert!(again.headers().contains_key("set-cookie"));
+    }
+
+    #[tokio::test]
+    async fn a_session_asked_for_again_expires_when_the_first_one_did() {
+        // Issue #237: a place that reached the front can be handed around. If
+        // every call minted a full-length session, one admission would admit
+        // anyone for as long as the row lived.
+        let state = state(FakeStore::admitting());
+        let first = handle(&state, request()).await.unwrap();
+        let admitted_at = state
+            .store
+            .position
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .admitted_at
+            .unwrap();
+        // Half the lifetime has gone by.
+        state
+            .store
+            .position
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .admitted_at = Some(admitted_at - 1800);
+        let second = handle(&state, request()).await.unwrap();
+
+        let expiry = |response: &Response<Body>| {
+            let body: serde_json::Value = serde_json::from_slice(response.body().as_ref()).unwrap();
+            body["expires_at"].as_u64().unwrap()
+        };
+        assert_eq!(expiry(&first), admitted_at + 3600);
+        assert_eq!(expiry(&second), admitted_at - 1800 + 3600);
+    }
+
+    #[tokio::test]
+    async fn a_place_whose_session_has_run_out_mints_nothing() {
+        let state = state(FakeStore::admitting());
+        {
+            let mut position = state.store.position.lock().unwrap();
+            let row = position.as_mut().unwrap();
+            row.status = PositionStatus::Admitted;
+            row.admitted_at = Some(1_000);
+        }
+        let response = handle(&state, request()).await.unwrap();
+        assert_eq!(response.status(), 410);
+        assert!(!response.headers().contains_key("set-cookie"));
+        assert_eq!(state.store.arrivals(), 0);
     }
 
     #[tokio::test]

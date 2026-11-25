@@ -7,9 +7,9 @@ use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
 use aws_sdk_dynamodb::types::AttributeValue;
 use wr_common::expr::{
-    Condition, ENTRY_TIME_ATTR, Key, POSITION_TTL_SECS, POSITIONS_KEY_ATTR, POSITIONS_TTL_ATTR,
-    POSSESSION_DIGEST_ATTR, QUEUE_POSITION_ATTR, SHARD_CAP_ATTR, SHARD_COUNT_ATTR, STATUS_ATTR,
-    Update,
+    ADMITTED_AT_ATTR, Condition, ENTRY_TIME_ATTR, Key, POSITION_TTL_SECS, POSITIONS_KEY_ATTR,
+    POSITIONS_TTL_ATTR, POSSESSION_DIGEST_ATTR, QUEUE_POSITION_ATTR, SHARD_CAP_ATTR,
+    SHARD_COUNT_ATTR, STATUS_ATTR, Update,
 };
 use wr_common::{Counters, PositionStatus, PreQueueItem, SecretDigest, Shard};
 
@@ -114,6 +114,9 @@ impl Store for DynamoStore {
                 AttributeValue::S(status_wire(PositionStatus::Admitted)),
             )
             .set(QUEUE_POSITION_ATTR, AttributeValue::N(position.to_string()))
+            // The guard lets this write land once per row, so this is the
+            // first admission and every later session expires from it (#237).
+            .set(ADMITTED_AT_ATTR, AttributeValue::N(now.to_string()))
             .set_if_not_exists(ENTRY_TIME_ATTR, AttributeValue::N(now.to_string()))
             // A live joiner's row has the digest already; a pre-queue member's
             // is created here, and its later calls read this row first.
@@ -249,10 +252,15 @@ fn position_from_item(item: &HashMap<String, AttributeValue>) -> Option<Position
         .get(POSSESSION_DIGEST_ATTR)
         .and_then(|v| v.as_s().ok())
         .and_then(|s| SecretDigest::parse(s).ok());
+    let admitted_at = item
+        .get(ADMITTED_AT_ATTR)
+        .and_then(|v| v.as_n().ok())
+        .and_then(|s| s.parse::<u64>().ok());
     Some(PositionRow {
         position,
         status,
         digest,
+        admitted_at,
     })
 }
 
@@ -289,7 +297,8 @@ mod tests {
                 Some(PositionRow {
                     position: 7,
                     status,
-                    digest: None
+                    digest: None,
+                    admitted_at: None,
                 })
             );
         }

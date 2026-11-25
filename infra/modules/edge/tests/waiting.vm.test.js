@@ -469,6 +469,22 @@ test("a redemption refused as not the holder stops, rather than polling forever"
   assert.match(client.elements.headline.textContent, /couldn't confirm/);
 });
 
+// Issue #237: a place whose session has run out cannot be redeemed again.
+test("a redemption answered 'gone' drops the place and stops", async () => {
+  const admitted = admittedRoute();
+  const client = loadClient({
+    route: (url) =>
+      url.startsWith("/v1/generate_token")
+        ? jsonResponse(410, { admitted: false, error: "the admission for this place in line has run out" })
+        : admitted(url),
+  });
+  await client.flush();
+  assert.equal(client.win.location.replacedTo, undefined);
+  assert.equal(client.lastTimer(), undefined, "nothing left scheduled");
+  assert.match(client.elements.headline.textContent, /visit has ended/);
+  assert.equal(client.win.localStorage.getItem("vwr_identity"), null);
+});
+
 // ADR-0039: the visitor's turn has come but the admission budget is spent.
 test("a redemption answered 'at capacity' keeps polling and is admitted on a later try", async () => {
   const admitted = admittedRoute();
@@ -517,6 +533,151 @@ test("a second ip refusal within a minute stops instead of looping", async () =>
   await second.flush();
   assert.equal(second.win.location.replacedTo, undefined, "no second bounce");
   assert.match(second.elements.headline.textContent, /keeps changing/);
+});
+
+// --- issue #247: the gate turning a fresh session back ----------------------
+
+/** Loads the page as the gate's redirect would, carrying storage over from `prev`. */
+function bounceBack(prev, reason, afterMs) {
+  // Seeded before load: the page counts a bounce once, as it starts.
+  const stored = {};
+  for (const key of ["vwr_identity", "vwr_redeemed", "vwr_joined"]) {
+    const value = prev.win.localStorage.getItem(key);
+    if (value !== null) {
+      stored[key] = value;
+    }
+  }
+  return loadClient({
+    route: admittedRoute(),
+    locationSearch: `?r=${reason}&next=%2Fcheckout`,
+    now: prev.clock.now + afterMs,
+    stored,
+  });
+}
+
+function redemptions(client) {
+  return client.calls.filter((c) => c.url.startsWith("/v1/generate_token")).length;
+}
+
+test("a session the gate keeps refusing stops after two bounces instead of looping", async () => {
+  const first = loadClient({ route: admittedRoute(), locationSearch: "?r=none&next=%2Fcheckout" });
+  await first.flush();
+  assert.equal(first.win.location.replacedTo, "/checkout");
+
+  // Turned back once: could be a race with a rotating key, so try once more.
+  const second = bounceBack(first, "signature", 800);
+  await second.flush();
+  assert.equal(second.win.location.replacedTo, "/checkout", "one bounce is retried");
+
+  // Turned back again: stop, without redeeming a third time.
+  const third = bounceBack(second, "signature", 800);
+  await third.flush();
+  assert.equal(third.win.location.replacedTo, undefined, "no third navigation");
+  assert.equal(redemptions(third), 0, "and no third redemption");
+  assert.match(third.elements.headline.textContent, /turned you back/);
+  assert.match(third.elements.subhead.textContent, /reload in a minute/);
+  assert.equal(third.liveTimers().length, 0, "polling has stopped");
+
+  // Reloading inside the window changes nothing; after it, the visitor is let through again.
+  const early = bounceBack(second, "signature", 30_000);
+  await early.flush();
+  assert.equal(early.win.location.replacedTo, undefined);
+  const later = bounceBack(second, "signature", 61_000);
+  await later.flush();
+  assert.equal(later.win.location.replacedTo, "/checkout");
+});
+
+test("the bounce guard covers every refusal reason, blocked cookies included", async () => {
+  for (const reason of ["none", "event", "expired", "error"]) {
+    const first = loadClient({ route: admittedRoute() });
+    await first.flush();
+    const second = bounceBack(first, reason, 500);
+    await second.flush();
+    const third = bounceBack(second, reason, 500);
+    await third.flush();
+    assert.equal(third.win.location.replacedTo, undefined, `r=${reason} must stop`);
+  }
+});
+
+test("a refusal long after the last redemption is not a bounce", async () => {
+  // An expired session an hour on is the ordinary way back into the queue.
+  const first = loadClient({ route: admittedRoute() });
+  await first.flush();
+  let prev = first;
+  for (let i = 0; i < 4; i++) {
+    const next = bounceBack(prev, "expired", 3_600_000);
+    await next.flush();
+    assert.equal(next.win.location.replacedTo, "/checkout", `visit ${i}`);
+    prev = next;
+  }
+});
+
+test("a recent redemption without a gate refusal is not a bounce", async () => {
+  // Reopening the waiting page by hand carries no r=.
+  let prev = loadClient({ route: admittedRoute() });
+  await prev.flush();
+  for (let i = 0; i < 4; i++) {
+    const next = loadClient({
+      route: admittedRoute(),
+      now: prev.clock.now + 500,
+      stored: { vwr_redeemed: prev.win.localStorage.getItem("vwr_redeemed") },
+    });
+    await next.flush();
+    assert.equal(next.win.location.replacedTo, "/", `visit ${i}`);
+    prev = next;
+  }
+});
+
+// --- issue #251: back off while the API is failing --------------------------
+
+test("consecutive /status failures back off to the ceiling and reset on success", async () => {
+  let failing = false;
+  const healthy = route(() => activeStatus({ poll_policy: POLICY, serving_position: 90 }), 95);
+  const client = loadClient({
+    route: (url) => (failing ? jsonResponse(503, {}) : healthy(url)),
+  });
+  await client.flush();
+  assert.ok(client.lastTimer().ms <= FLOOR * 1.3, "healthy and near the front: the floor");
+
+  failing = true;
+  const seen = [];
+  for (let i = 0; i < 5; i++) {
+    client.fireLastTimer();
+    await client.flush();
+    seen.push(client.lastTimer().ms);
+  }
+  [10000, 20000, 30000, 30000, 30000].forEach((base, i) => {
+    assert.ok(
+      seen[i] >= base && seen[i] <= base * 1.3,
+      `failure ${i + 1}: expected ${base}ms plus jitter, got ${seen[i]}`
+    );
+  });
+
+  failing = false;
+  client.fireLastTimer();
+  await client.flush();
+  assert.ok(client.lastTimer().ms <= FLOOR * 1.3, "the first success returns to the floor");
+
+  // And the next outage starts doubling from the floor again, not the ceiling.
+  failing = true;
+  client.fireLastTimer();
+  await client.flush();
+  assert.ok(client.lastTimer().ms <= 10000 * 1.3, `got ${client.lastTimer().ms}`);
+});
+
+test("a network failure and a 429 back off the same way", async () => {
+  for (const fail of [() => Promise.reject(new TypeError("Failed to fetch")), () => jsonResponse(429, {})]) {
+    let failing = false;
+    const healthy = route(() => activeStatus({ poll_policy: POLICY }), 95);
+    const client = loadClient({ route: (url) => (failing ? fail() : healthy(url)) });
+    await client.flush();
+    failing = true;
+    client.fireLastTimer();
+    await client.flush();
+    client.fireLastTimer();
+    await client.flush();
+    assert.ok(client.lastTimer().ms >= 20000, `second failure: got ${client.lastTimer().ms}`);
+  }
 });
 
 test("a redemption that fails in flight is retried, not abandoned", async () => {

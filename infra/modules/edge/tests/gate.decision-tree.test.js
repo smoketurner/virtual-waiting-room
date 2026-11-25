@@ -194,6 +194,156 @@ test("a failed KeyValueStore read throws and passes through marked (fail-open on
   assert.equal(result.headers["x-wr-gate-failed"].value, "true");
 });
 
+// --- issue #242: a throw past a rule match refuses --------------------------
+
+function assertPlainRefusal(result, req) {
+  assert.notEqual(result, req.request, "must not pass the request through");
+  assert.equal(result.statusCode, 403);
+  assert.equal(result.headers["x-wr-reason"].value, "error");
+  assert.equal(result.headers["cache-control"].value, "no-store");
+  assert.ok(!("location" in result.headers));
+}
+
+test("unreadable signing key, with a cookie: refused, not passed", async () => {
+  for (const kvs of [{ c: protectedConfig() }, { c: protectedConfig(), k: new Error("kvs down") }]) {
+    const gate = loadGate({ kvs });
+    const req = event("/checkout", {
+      headers: { accept: "text/html" },
+      cookies: { [COOKIE]: validSessionCredential() },
+    });
+    const result = await gate.handler(req);
+    assertPlainRefusal(result, req);
+    assert.ok(!("x-wr-gate-failed" in req.request.headers));
+    assert.ok(gate.logs.some((l) => l.includes("gate threw")));
+  }
+});
+
+test("unreadable signing key, without a cookie: refused to the waiting page", async () => {
+  const gate = loadGate({ kvs: { c: protectedConfig(), k: new Error("kvs down") } });
+  const req = event("/checkout", { headers: { accept: "text/html" }, cookies: {} });
+  const result = await gate.handler(req);
+  assert.equal(result.statusCode, 302);
+  assert.equal(result.headers["x-wr-reason"].value, "none");
+});
+
+test("a throw while building the refusal still refuses, plainly", async () => {
+  // A querystring entry whose getter throws: refuse() reads it for next=.
+  const gate = loadGate({ kvs: { c: protectedConfig(), k: SECRET } });
+  for (const cookies of [{}, { [COOKIE]: "not.a.session" }]) {
+    const req = event("/checkout", { headers: { accept: "text/html" }, cookies });
+    Object.defineProperty(req.request.querystring, "q", {
+      enumerable: true,
+      get() {
+        throw new Error("hostile querystring");
+      },
+    });
+    assertPlainRefusal(await gate.handler(req), req);
+  }
+});
+
+test("a throw while verifying the cookie refuses", async () => {
+  const gate = loadGate({ kvs: { c: protectedConfig(), k: SECRET } });
+  const req = event("/checkout", { headers: { accept: "text/html" } });
+  // A cookie entry with no string value: verify() throws on .split.
+  req.request.cookies[COOKIE] = { value: 42 };
+  assertPlainRefusal(await gate.handler(req), req);
+});
+
+test("a throw on an unprotected request still passes, marked", async () => {
+  // A malformed rule throws while matching: nothing yet says the request is
+  // protected, so this is the unreadable-config case.
+  const gate = loadGate({ kvs: { c: { v: 1, s: 0, f: 0, r: [["p", 7]] } } });
+  const req = event("/about", { headers: { accept: "text/html" } });
+  const result = await gate.handler(req);
+  assert.equal(result, req.request);
+  assert.equal(result.headers["x-wr-gate-failed"].value, "true");
+});
+
+// --- issue #242: suspicious paths, through the whole handler ----------------
+
+test("a path an origin might canonicalise to a protected one needs a session", async () => {
+  const gate = loadGate({ kvs: { c: protectedConfig(), k: SECRET } });
+  for (const uri of ["/x/../checkout", "/%2e%2e/checkout", "/shop;a/checkout", "/shop\\checkout", "/a/./b"]) {
+    const req = event(uri, { headers: { accept: "text/html" }, cookies: {} });
+    const result = await gate.handler(req);
+    assert.equal(result.statusCode, 302, `${uri} passed with no cookie`);
+  }
+  const cred = validSessionCredential({ expiresAt: 1_700_003_600 });
+  const req = event("/x/../checkout", { headers: { accept: "text/html" }, cookies: { [COOKIE]: cred } });
+  assert.equal(await gate.handler(req), req.request, "a valid session still passes");
+});
+
+test("a suspicious path passes untouched when no path rule exists", async () => {
+  for (const r of [[], [["c", "loyalty_member"]]]) {
+    const gate = loadGate({ kvs: { c: protectedConfig({ r }) } });
+    const req = event("/x/../checkout", { headers: { accept: "text/html" } });
+    assert.equal(await gate.handler(req), req.request);
+    assert.ok(!("x-wr-gate-failed" in req.request.headers));
+  }
+});
+
+// --- issue #247: a session signed under the previous key --------------------
+
+const NEW_SECRET = "the-key-the-deployment-rotated-to";
+
+test("a session signed under the previous key (kp) is accepted", async () => {
+  const gate = loadGate({ kvs: { c: protectedConfig(), k: NEW_SECRET, kp: SECRET } });
+  const req = event("/checkout", {
+    headers: { accept: "text/html" },
+    cookies: { [COOKIE]: validSessionCredential() },
+  });
+  assert.equal(await gate.handler(req), req.request);
+  assert.deepEqual(gate.kvsCalls, ["c", "k", "kp"]);
+});
+
+test("a session under the current key never reads kp", async () => {
+  const gate = loadGate({ kvs: { c: protectedConfig(), k: SECRET, kp: "an-older-key" } });
+  const req = event("/checkout", {
+    headers: { accept: "text/html" },
+    cookies: { [COOKIE]: validSessionCredential() },
+  });
+  assert.equal(await gate.handler(req), req.request);
+  assert.deepEqual(gate.kvsCalls, ["c", "k"]);
+});
+
+test("a session under neither key is refused with reason=signature", async () => {
+  for (const kp of ["some-other-key", new Error("kvs down"), undefined]) {
+    const kvs = { c: protectedConfig(), k: NEW_SECRET };
+    if (kp !== undefined) {
+      kvs.kp = kp;
+    }
+    const gate = loadGate({ kvs });
+    const req = event("/checkout", {
+      headers: { accept: "text/html" },
+      cookies: { [COOKIE]: validSessionCredential() },
+    });
+    const result = await gate.handler(req);
+    assert.equal(result.statusCode, 302);
+    assert.equal(result.headers["x-wr-reason"].value, "signature");
+  }
+});
+
+test("a previous-key session still has its expiry, event and IP binding checked", async () => {
+  const kvs = { c: protectedConfig({ b: true }), k: NEW_SECRET, kp: SECRET };
+  const reasonFor = async (overrides, viewerIp, now) => {
+    const gate = loadGate({ kvs, now });
+    const req = event("/checkout", {
+      headers: { accept: "text/html" },
+      cookies: { [COOKIE]: validSessionCredential(overrides(gate)) },
+      viewerIp,
+    });
+    const result = await gate.handler(req);
+    return result === req.request ? "pass" : result.headers["x-wr-reason"].value;
+  };
+  // The tag was minted under the key that signed the session, so it is
+  // checked under that key, not the current one.
+  const tagged = (gate) => ({ cip: gate.ipTag(SECRET, "198.51.100.7") });
+  assert.equal(await reasonFor(tagged, "198.51.100.7"), "pass");
+  assert.equal(await reasonFor(tagged, "203.0.113.50"), "ip");
+  assert.equal(await reasonFor(() => ({ eventId: "other" }), "198.51.100.7"), "event");
+  assert.equal(await reasonFor(tagged, "198.51.100.7", 1_700_003_600), "expired");
+});
+
 test("spoofed x-wr-gate / x-wr-gate-failed headers are stripped before any decision", async () => {
   const gate = loadGate({ kvs: { c: dormantConfig() } });
   const req = event("/anything", {

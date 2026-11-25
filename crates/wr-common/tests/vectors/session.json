@@ -444,6 +444,280 @@
       "matches": false
     },
     {
+      "name": "suspicious_parent_segment",
+      "rule": [
+        "p",
+        "/checkout"
+      ],
+      "request": {
+        "path": "/x/../checkout",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": true
+    },
+    {
+      "name": "suspicious_parent_segment_elsewhere",
+      "rule": [
+        "p",
+        "/checkout"
+      ],
+      "request": {
+        "path": "/about/../team",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": true
+    },
+    {
+      "name": "suspicious_encoded_parent_segment",
+      "rule": [
+        "p",
+        "/checkout"
+      ],
+      "request": {
+        "path": "/%2e%2e/checkout",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": true
+    },
+    {
+      "name": "suspicious_mixed_case_encoded_parent",
+      "rule": [
+        "p",
+        "/checkout"
+      ],
+      "request": {
+        "path": "/x/%2E%2e/y",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": true
+    },
+    {
+      "name": "suspicious_half_encoded_parent",
+      "rule": [
+        "p",
+        "/checkout"
+      ],
+      "request": {
+        "path": "/x/.%2e/checkout",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": true
+    },
+    {
+      "name": "suspicious_trailing_parent_segment",
+      "rule": [
+        "p",
+        "/checkout"
+      ],
+      "request": {
+        "path": "/about/..",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": true
+    },
+    {
+      "name": "suspicious_relative_parent",
+      "rule": [
+        "p",
+        "/checkout"
+      ],
+      "request": {
+        "path": "../checkout",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": true
+    },
+    {
+      "name": "suspicious_dot_segment_elsewhere",
+      "rule": [
+        "p",
+        "/checkout"
+      ],
+      "request": {
+        "path": "/about/./team",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": true
+    },
+    {
+      "name": "suspicious_trailing_dot_segment",
+      "rule": [
+        "p",
+        "/checkout"
+      ],
+      "request": {
+        "path": "/about/.",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": true
+    },
+    {
+      "name": "suspicious_path_params",
+      "rule": [
+        "p",
+        "/checkout"
+      ],
+      "request": {
+        "path": "/shop;a/checkout",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": true
+    },
+    {
+      "name": "suspicious_encoded_semicolon",
+      "rule": [
+        "p",
+        "/checkout"
+      ],
+      "request": {
+        "path": "/shop%3Ba/checkout",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": true
+    },
+    {
+      "name": "suspicious_backslash",
+      "rule": [
+        "p",
+        "/checkout"
+      ],
+      "request": {
+        "path": "/shop\\checkout",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": true
+    },
+    {
+      "name": "suspicious_encoded_backslash",
+      "rule": [
+        "p",
+        "/checkout"
+      ],
+      "request": {
+        "path": "/shop%5Ccheckout",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": true
+    },
+    {
+      "name": "suspicious_encoded_slash_parent",
+      "rule": [
+        "p",
+        "/checkout"
+      ],
+      "request": {
+        "path": "/x%2f..%2fcheckout",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": true
+    },
+    {
+      "name": "no_match_dots_inside_a_name",
+      "rule": [
+        "p",
+        "/checkout"
+      ],
+      "request": {
+        "path": "/about/a..b",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": false
+    },
+    {
+      "name": "no_match_three_dots",
+      "rule": [
+        "p",
+        "/checkout"
+      ],
+      "request": {
+        "path": "/about/.../team",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": false
+    },
+    {
+      "name": "no_match_dotfile",
+      "rule": [
+        "p",
+        "/checkout"
+      ],
+      "request": {
+        "path": "/.well-known/security.txt",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": false
+    },
+    {
+      "name": "no_match_trailing_dot_in_name",
+      "rule": [
+        "p",
+        "/checkout"
+      ],
+      "request": {
+        "path": "/about./team",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": false
+    },
+    {
+      "name": "no_match_double_encoded_parent",
+      "rule": [
+        "p",
+        "/checkout"
+      ],
+      "request": {
+        "path": "/%252e%252e/checkout",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": false
+    },
+    {
+      "name": "suspicious_path_is_not_a_cookie_rule_match",
+      "rule": [
+        "c",
+        "loyalty_member"
+      ],
+      "request": {
+        "path": "/x/../checkout",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": false
+    },
+    {
+      "name": "suspicious_path_is_not_a_header_rule_match",
+      "rule": [
+        "h",
+        "x-internal-monitor",
+        "true"
+      ],
+      "request": {
+        "path": "/shop;a/checkout",
+        "headers": [],
+        "cookies": []
+      },
+      "matches": false
+    },
+    {
       "name": "user_agent_substring",
       "rule": [
         "u",

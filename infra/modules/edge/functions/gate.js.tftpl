@@ -101,8 +101,8 @@ function ownProperty(obj, key) {
 }
 
 // CloudFront sends the raw path to the origin, so a rule must not be evaded
-// by an encoding the origin treats as equivalent. Not a full RFC 3986
-// resolver: ".." segments are deliberately not resolved.
+// by an encoding the origin treats as equivalent. Not an RFC 3986 resolver:
+// what an origin might canonicalise is suspicious instead (#242).
 function hexVal(c) {
   return c >= 48 && c <= 57 ? c - 48
      : c >= 65 && c <= 70 ? c - 55
@@ -128,12 +128,9 @@ function percentDecode(uri) {
   }
   return out;
 }
-// Collapse '//', drop '.' segments, until stable. Mirrors normalized_path.
-function normalizedPath(uri) {
-  var p = percentDecode(uri), q;
-  while ((q = p.replace(/\/\/+/g, '/').replace(/\/\.\//g, '/')) !== p) p = q;
-  return p.replace(/\/\.$/, '/').toLowerCase();
-}
+// #242: a "." or ".." segment, ";params" or a backslash. No origin agrees
+// on what these mean, so any path rule covers them. Mirrors suspicious_path.
+var SUSPICIOUS_RE = /[;\\]|(^|\/)\.\.?(\/|$)/;
 
 function queryString(qs) {
   var parts = [];
@@ -151,7 +148,9 @@ function matches(rule, request) {
   var headers = request.headers || {};
   var cookies = request.cookies || {};
   if (rule[0] === 'p') {
-    return normalizedPath(request.uri).indexOf(rule[1].toLowerCase()) === 0;
+    var p = percentDecode(request.uri);
+    return SUSPICIOUS_RE.test(p) ||
+      p.replace(/\/\/+/g, '/').toLowerCase().indexOf(rule[1].toLowerCase()) === 0;
   }
   if (rule[0] === 'h') {
     var h = ownProperty(headers, rule[1].toLowerCase());
@@ -207,23 +206,19 @@ function refuse(request, reason) {
 }
 
 async function handler(event) {
-  var request = event.request;
-  stripSpoofableHeaders(request);
+  var request = event.request, hit = false;
   try {
+    stripSpoofableHeaders(request);
     // cfg.r === [] is dormancy (#60): every request matches no rule.
     var cfg = await kvs.get('c', { format: 'json' });
     if (cfg.v !== 1) {
       throw new Error('unrecognized gate config version');
     }
 
-    var protectedByRule = false;
-    for (var i = 0; i < cfg.r.length; i++) {
-      if (matches(cfg.r[i], request)) {
-        protectedByRule = true;
-        break;
-      }
+    for (var i = 0; i < cfg.r.length && !hit; i++) {
+      hit = matches(cfg.r[i], request);
     }
-    if (!protectedByRule) {
+    if (!hit) {
       return request;
     }
 
@@ -248,6 +243,15 @@ async function handler(event) {
     var secret = await kvs.get('k', { format: 'string' });
     var session = verify(cookie.value, secret);
     if (!session) {
+      // #247: a session signed before a key rotation. "kp" is optional, and
+      // read only once "k" has refused, so the hot path is one read.
+      try {
+        secret = await kvs.get('kp', { format: 'string' });
+        session = verify(cookie.value, secret);
+      } catch (e) {
+      }
+    }
+    if (!session) {
       return refuse(request, 'signature');
     }
     if (session.eventId !== EVENT_ID) {
@@ -256,7 +260,8 @@ async function handler(event) {
     if (now >= session.expiresAt) {
       return refuse(request, 'expired');
     }
-    // #61, operator-enabled: a session redeemed from another network.
+    // #61, operator-enabled: a session redeemed from another network. Tagged
+    // under the key that signed it.
     if (cfg.b && session.ip !== ipTag(secret, event.viewer.ip)) {
       return refuse(request, 'ip');
     }
@@ -264,6 +269,16 @@ async function handler(event) {
   } catch (e) {
     // The gate being broken, not #58: no network calls happen here.
     console.log('gate threw: ' + e);
+    // #242: past a rule match the request is known protected, so a throw
+    // refuses. A literal, since building a refusal may be what threw.
+    if (hit) {
+      return {
+        statusCode: 403,
+        statusDescription: 'Forbidden',
+        headers: { 'cache-control': { value: 'no-store' }, 'x-wr-reason': { value: 'error' } }
+      };
+    }
+    // Unreadable config: nothing says what is protected. Pass, marked.
     request.headers['x-wr-gate-failed'] = { value: 'true' };
     return request;
   }

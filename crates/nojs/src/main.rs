@@ -13,10 +13,11 @@ use lambda_http::{Body, Error, Request, Response, run, service_fn};
 use nojs::page::{WaitHtml, encode_component};
 use nojs::sqs::SqsJoinQueue;
 use nojs::{
-    ENTER_PATH, Identity, JoinQueue, WAIT_PATH, WaitOutcome, WaitPage, clear_identity_cookie,
-    enter, identity_from_cookies, next_from_referer, next_param, outcome, safe_next,
+    ENTER_PATH, Identity, JoinQueue, Unanswered, WAIT_PATH, WaitOutcome, WaitPage,
+    clear_identity_cookie, enter, identity_from_cookies, next_from_referer, next_param, outcome,
+    safe_next,
 };
-use tracing::error;
+use tracing::{error, warn};
 use wr_common::SigningKey;
 
 struct AppState<S: Store, Q: JoinQueue> {
@@ -209,7 +210,63 @@ async fn handle_wait<S: Store, Q: JoinQueue>(
             &next,
             Some(&clear_identity_cookie()),
         ),
+        WaitOutcome::Show(WaitPage::Joining) => {
+            handle_unanswered(state, &identity, &next, now).await
+        }
         WaitOutcome::Show(shown) => page(StatusCode::OK, &shown, &next, None),
+    }
+}
+
+/// The wait page for a visitor no registration exists for (issue #251).
+///
+/// Usually the join is still in flight. One the queue or the ingest lost
+/// would otherwise leave this page refreshing forever, since `/v1/enter` will
+/// not join a visitor who already holds an identity: so an overdue join is
+/// sent again from here, a bounded number of times, and after that the
+/// visitor is told and gets the form back.
+async fn handle_unanswered<S: Store, Q: JoinQueue>(
+    state: &AppState<S, Q>,
+    identity: &Identity,
+    next: &str,
+    now: u64,
+) -> Result<Response<Body>, Error> {
+    match identity.unanswered(now) {
+        Unanswered::InFlight => page(StatusCode::OK, &WaitPage::Joining, next, None),
+        Unanswered::Resend(restamped) => {
+            if let Err(e) = enter(&state.queue, &state.event_id, &restamped).await {
+                // The cookie keeps its old stamp, so the next load tries again.
+                error!(error = %e, event = "nojs_join_failed", "could not resend a no-JavaScript join");
+                return page(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &WaitPage::Unavailable,
+                    next,
+                    None,
+                );
+            }
+            warn!(
+                event = "nojs_join_resent",
+                rejoins = restamped.rejoins,
+                "resent a no-JavaScript join that never registered"
+            );
+            page(
+                StatusCode::OK,
+                &WaitPage::Joining,
+                next,
+                Some(&restamped.set_cookie()),
+            )
+        }
+        Unanswered::GaveUp => {
+            error!(
+                event = "nojs_join_lost",
+                "a no-JavaScript join never registered after every resend"
+            );
+            page(
+                StatusCode::OK,
+                &WaitPage::JoinLost,
+                next,
+                Some(&clear_identity_cookie()),
+            )
+        }
     }
 }
 
@@ -344,6 +401,7 @@ mod tests {
                     position: p,
                     status: PositionStatus::Issued,
                     digest: Some(PossessionSecret::parse(SECRET).unwrap().digest()),
+                    admitted_at: None,
                 }),
             },
             queue: FakeQueue {
@@ -375,8 +433,94 @@ mod tests {
         }
     }
 
+    /// The second every wait in these tests is served at.
+    const NOW: u64 = 1_700_000_000;
+
+    /// A cookie whose join was sent `ago` seconds before [`NOW`].
+    fn stamped_cookie(secret: &str, ago: u64, rejoins: u8) -> String {
+        format!("{IDENTITY_COOKIE}={ID}.{secret}.{}.{rejoins}", NOW - ago)
+    }
+
     fn identity_cookie(secret: &str) -> String {
-        format!("{IDENTITY_COOKIE}={ID}.{secret}")
+        stamped_cookie(secret, 0, 0)
+    }
+
+    async fn wait_with(state: &AppState<FakeStore, FakeQueue>, cookie: &str) -> Response<Body> {
+        handle_wait(
+            state,
+            &request("GET", "/v1/wait?next=%2Fcheckout", &[("cookie", cookie)]),
+            NOW,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_join_still_in_flight_is_waited_on_not_resent() {
+        let state = state(None, false);
+        let response = wait_with(&state, &stamped_cookie(SECRET, 30, 0)).await;
+        assert_eq!(response.status(), 200);
+        assert!(text(&response).contains("http-equiv=\"refresh\" content=\"5\""));
+        assert!(response.headers().get("set-cookie").is_none());
+        assert!(state.queue.sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_lost_join_is_resent_as_the_same_join_and_the_cookie_restamped() {
+        let state = state(None, false);
+        let response = wait_with(&state, &stamped_cookie(SECRET, 61, 0)).await;
+        assert_eq!(response.status(), 200);
+        assert!(text(&response).contains("http-equiv=\"refresh\""));
+
+        let sent = state.queue.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        let msg: serde_json::Value = serde_json::from_str(&sent[0]).unwrap();
+        assert_eq!(msg["request_id"], ID);
+        assert_eq!(
+            msg["h"],
+            PossessionSecret::parse(SECRET).unwrap().digest().as_str()
+        );
+        let cookie = response.headers()["set-cookie"].to_str().unwrap();
+        assert!(
+            cookie.starts_with(&format!("{IDENTITY_COOKIE}={ID}.{SECRET}.{NOW}.1;")),
+            "{cookie}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_join_lost_after_every_resend_gets_the_form_back() {
+        let state = state(None, false);
+        let response = wait_with(&state, &stamped_cookie(SECRET, 61, nojs::MAX_REJOINS)).await;
+        assert_eq!(response.status(), 200);
+        let html = text(&response);
+        assert!(html.contains(r#"action="/v1/enter?next=%2Fcheckout""#));
+        assert!(!html.contains("http-equiv"));
+        assert!(
+            response.headers()["set-cookie"]
+                .to_str()
+                .unwrap()
+                .contains("Max-Age=0"),
+            "the identity is forgotten so /v1/enter joins afresh"
+        );
+        assert!(state.queue.sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_resend_the_queue_refused_is_tried_again_on_the_next_load() {
+        let state = state(None, true);
+        let response = wait_with(&state, &stamped_cookie(SECRET, 61, 0)).await;
+        assert_eq!(response.status(), 503);
+        assert!(text(&response).contains("http-equiv=\"refresh\""));
+        // No restamp: the attempt did not happen, so it is not counted.
+        assert!(response.headers().get("set-cookie").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_registered_visitor_is_never_resent_however_old_the_stamp() {
+        let state = state(Some(700), false);
+        let response = wait_with(&state, &stamped_cookie(SECRET, 80_000, nojs::MAX_REJOINS)).await;
+        assert!(text(&response).contains("700"));
+        assert!(state.queue.sent.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

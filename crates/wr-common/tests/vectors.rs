@@ -445,6 +445,71 @@ fn rules_by_path_form() -> Vec<RuleVector> {
             matches: false,
         },
     ]
+    .into_iter()
+    .chain(rules_by_suspicious_path())
+    .collect()
+}
+
+/// Issue #242: a path an origin might canonicalise into a protected one is
+/// covered by every path rule, whatever its prefix — and by no other kind of
+/// rule. The `no_match` rows pin the edges of "segment": a dot inside a name
+/// is an ordinary character.
+fn rules_by_suspicious_path() -> Vec<RuleVector> {
+    let path = |name: &str, path: &str, matches: bool| RuleVector {
+        name: name.to_owned(),
+        rule: serde_json::json!(["p", "/checkout"]),
+        request: req(path, &[], &[]),
+        matches,
+    };
+    vec![
+        path("suspicious_parent_segment", "/x/../checkout", true),
+        path(
+            "suspicious_parent_segment_elsewhere",
+            "/about/../team",
+            true,
+        ),
+        path(
+            "suspicious_encoded_parent_segment",
+            "/%2e%2e/checkout",
+            true,
+        ),
+        path("suspicious_mixed_case_encoded_parent", "/x/%2E%2e/y", true),
+        path("suspicious_half_encoded_parent", "/x/.%2e/checkout", true),
+        path("suspicious_trailing_parent_segment", "/about/..", true),
+        path("suspicious_relative_parent", "../checkout", true),
+        path("suspicious_dot_segment_elsewhere", "/about/./team", true),
+        path("suspicious_trailing_dot_segment", "/about/.", true),
+        path("suspicious_path_params", "/shop;a/checkout", true),
+        path("suspicious_encoded_semicolon", "/shop%3Ba/checkout", true),
+        path("suspicious_backslash", "/shop\\checkout", true),
+        path("suspicious_encoded_backslash", "/shop%5Ccheckout", true),
+        path(
+            "suspicious_encoded_slash_parent",
+            "/x%2f..%2fcheckout",
+            true,
+        ),
+        path("no_match_dots_inside_a_name", "/about/a..b", false),
+        path("no_match_three_dots", "/about/.../team", false),
+        path("no_match_dotfile", "/.well-known/security.txt", false),
+        path("no_match_trailing_dot_in_name", "/about./team", false),
+        path(
+            "no_match_double_encoded_parent",
+            "/%252e%252e/checkout",
+            false,
+        ),
+        RuleVector {
+            name: "suspicious_path_is_not_a_cookie_rule_match".into(),
+            rule: serde_json::json!(["c", "loyalty_member"]),
+            request: req("/x/../checkout", &[], &[]),
+            matches: false,
+        },
+        RuleVector {
+            name: "suspicious_path_is_not_a_header_rule_match".into(),
+            rule: serde_json::json!(["h", "x-internal-monitor", "true"]),
+            request: req("/shop;a/checkout", &[], &[]),
+            matches: false,
+        },
+    ]
 }
 
 /// The user-agent, cookie and header matchers. Split from [`rules`] only to

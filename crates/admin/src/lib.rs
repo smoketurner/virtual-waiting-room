@@ -16,6 +16,7 @@ pub mod dynamo;
 pub mod edge;
 pub mod oidc;
 pub mod opener;
+pub mod operator;
 pub mod probe;
 pub mod readiness;
 pub mod scheduler;

@@ -106,6 +106,11 @@ pub struct Dashboard {
     /// state view (the poller endpoint reuses this struct).
     #[serde(skip)]
     pub csp_nonce: String,
+    /// The session's CSRF token (issue #243), echoed by a hidden `csrf` field
+    /// in every form. Set by the handler like `operator_email`. Not part of
+    /// the JSON state view: the poller has no use for it.
+    #[serde(skip)]
+    pub csrf_token: String,
     /// The current edge-gate ruleset (issue #71), one line per rule, for
     /// pre-filling the rules form. Read from the `KeyValueStore` separately
     /// from `ControlState` (rules live only there), so it defaults empty
@@ -278,6 +283,7 @@ impl Dashboard {
                 _ => "none yet".to_owned(),
             },
             csp_nonce: String::new(),
+            csrf_token: String::new(),
             operator_email: String::new(),
             rules_text: String::new(),
             ip_binding: IpBinding::Off,
@@ -350,6 +356,48 @@ mod tests {
             starts_at: None,
             starts_at_timezone: None,
         }
+    }
+
+    #[test]
+    fn every_form_carries_the_sessions_csrf_token() {
+        // Checked on the template source, so a form inside a branch this
+        // state does not render is counted too (issue #243). The field must
+        // sit directly inside the form's opening tag to count.
+        let source = include_str!("../templates/dashboard.html");
+        let forms = source.matches("<form").count();
+        assert!(forms >= 15, "{forms} forms");
+        let field = r#"<input type="hidden" name="csrf" value="{{ csrf_token }}">"#;
+        for (index, form) in source.split("<form").skip(1).enumerate() {
+            let after_tag = form.split_once('>').unwrap().1;
+            assert!(
+                form.starts_with(r#" method="post""#)
+                    || form.starts_with(r#" class="session" method="post""#),
+                "form {index} is not a post"
+            );
+            assert!(
+                after_tag.trim_start().starts_with(field),
+                "form {index} has no csrf field: {}",
+                &form[..form.len().min(120)]
+            );
+        }
+
+        let mut view = Dashboard::from_state(&state(), 0);
+        view.csrf_token = "tok-123".to_owned();
+        let html = view.render().unwrap();
+        assert_eq!(
+            html.matches("<form").count(),
+            html.matches(r#"<input type="hidden" name="csrf" value="tok-123">"#)
+                .count()
+        );
+        // Render-only, like the nonce: the poller's JSON never carries it.
+        assert!(!serde_json::to_string(&view).unwrap().contains("tok-123"));
+    }
+
+    #[test]
+    fn signing_out_is_a_form_post_not_a_link() {
+        let html = Dashboard::from_state(&state(), 0).render().unwrap();
+        assert!(html.contains(r#"method="post" action="/admin/logout""#));
+        assert!(!html.contains(r#"href="/admin/logout""#));
     }
 
     #[test]

@@ -82,12 +82,13 @@ pub fn origin_of(url: &str) -> Option<&str> {
 /// Whether a request is a state-changing one that another site sent (issue
 /// #243).
 ///
-/// The session cookie is `SameSite=Lax`, which stops a cross-*site* POST but
-/// not a same-site one: the console shares an origin with the customer's own
-/// pages, and their sibling subdomains are same-site. A script on any of them
-/// could otherwise post `/admin/fail_open` with the operator's cookie. Every
+/// The session cookie's `SameSite` stops a cross-*site* POST but not a
+/// same-site one: the console shares an origin with the customer's own pages,
+/// and their sibling subdomains are same-site. A script on any of them could
+/// otherwise post `/admin/fail_open` with the operator's cookie. Every
 /// operator action is a same-origin form post from the dashboard, so anything
-/// else is refused.
+/// else is refused. The per-session token (`crate::operator::guard_writes`) is
+/// the second layer, for a request this one cannot tell apart.
 ///
 /// `Sec-Fetch-Site` decides when the browser sends it, since a page cannot
 /// set or remove it. Without it, `Origin` is compared with the console's own
@@ -99,7 +100,7 @@ pub fn origin_of(url: &str) -> Option<&str> {
 /// a bookmark to the dashboard keeps working.
 #[must_use]
 pub fn is_cross_site_write(method: &Method, headers: &HeaderMap, own_origin: Option<&str>) -> bool {
-    if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
+    if crate::operator::is_safe(method) {
         return false;
     }
     if let Some(site) = headers.get("sec-fetch-site") {

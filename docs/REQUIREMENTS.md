@@ -34,7 +34,7 @@ activation queues first-in, first-out (FIFO).
 | F1.2 | The countdown page MUST be servable entirely from CDN cache, so repeated views make zero calls to API Gateway, DynamoDB or SQS. Registration MUST be a separate, one-time direct write from the edge to the ingest queue, with no compute in the path. | Origin requests from page views are independent of visitor count; each visitor registers once, deduplicated across reloads wherever the browser allows client-side storage; no Lambda in the write's path. Known residuals: a storage-denied visitor takes a new place on each reload, and two reloads in one batching window can each claim. |
 | F1.3 | At T−0 the system MUST assign queue positions to pre-queue participants in **randomized** order, and the ordering MUST NOT be predictable before that moment. | Assigned position shows no correlation with registration time; positions are uniformly distributed; the permutation key does not exist before T−0. |
 | F1.4 | Position assignment for pre-queue participants MUST complete promptly at the scheduled start. | 1,000,000 participants assigned in one write; elapsed time independent of cohort size. |
-| F1.5 | The randomization MUST be auditable after the fact. | A third party given the published seed, participant count and registration indices recomputes every position exactly. |
+| F1.5 | The randomization MUST be recomputable after the fact. | A third party given the published seed, participant count and registration indices recomputes every position exactly. This checks the arithmetic, not that the seed was drawn fairly ([ADR-0040](adr/0040-what-the-published-seed-proves.md)). |
 
 ### 1.3 Queue join (live arrivals)
 

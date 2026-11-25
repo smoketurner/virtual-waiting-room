@@ -104,6 +104,17 @@ body {
   color: var(--gray-400);
 }
 
+.top-nav .session {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.top-nav .session button {
+  padding: 6px 12px;
+  font-size: 13px;
+}
+
 /* --- Content + header ----------------------------------------------------- */
 
 .content {

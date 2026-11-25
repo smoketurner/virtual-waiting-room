@@ -10,6 +10,8 @@
 //!   request id and a 32-byte possession secret, ADR-0035), keeps it in an
 //!   `HttpOnly` cookie, and puts the same `{request_id, event_id, h}` message
 //!   on the same join queue, so `assign_position` cannot tell the two apart.
+//!   The cookie also records when the join was sent, so a join the queue lost
+//!   is sent again rather than waited on forever (issue #251).
 //! - `GET /v1/wait` is a server-rendered page that refreshes itself. Each load
 //!   runs [`generate_token::admit`], the one path a session is minted by, and
 //!   either shows the visitor their place or sets the session cookie and sends
@@ -38,16 +40,48 @@ pub const IDENTITY_COOKIE_PATH: &str = "/v1/";
 /// How long the identity is kept, matching the script's storage.
 pub const IDENTITY_MAX_AGE_SECS: u64 = 86_400;
 
+/// How long a join may go unanswered before it is taken for lost and sent
+/// again (issue #251). The ingest's worst-case delivery latency is about 20
+/// seconds (the event source mapping's batch window on a quiet queue), so a
+/// join still in flight is not resent; `waiting.js` clears the same window
+/// with its `MAX_MISSES`.
+pub const REJOIN_AFTER_SECS: u64 = 60;
+/// How many times a lost join is sent again before the visitor is told and
+/// given the form back. Bounded so a join nothing will ever accept does not
+/// cost a queue write a minute for the cookie's whole day.
+pub const MAX_REJOINS: u8 = 3;
+
 pub const ENTER_PATH: &str = "/v1/enter";
 pub const WAIT_PATH: &str = "/v1/wait";
 
-/// A request id and the secret that proves it, as one value. The same shape
-/// `waiting.js` stores (`<request_id>.<secret>`), so a visitor who later turns
-/// JavaScript on is not asked to hold two different things.
+/// A request id, the secret that proves it, and when its join was last sent,
+/// as one cookie value: `<request_id>.<secret>.<joined_at>.<rejoins>`.
+///
+/// The last two are what `waiting.js` keeps in memory as its miss counter: a
+/// page that reloads has nowhere else to remember that a join has gone
+/// unanswered (issue #251). They are not secret and not signed. A visitor who
+/// rewrites them can only resend their own join, which a bare post to
+/// [`ENTER_PATH`] already costs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Identity {
     pub request_id: String,
     pub secret: PossessionSecret,
+    /// Epoch seconds at which the join was last put on the queue.
+    pub joined_at: u64,
+    /// How many times it has been sent again since the first.
+    pub rejoins: u8,
+}
+
+/// What to do about a join no registration has appeared for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unanswered {
+    /// Recent enough to still be in flight: keep waiting.
+    InFlight,
+    /// Overdue: send the same join again, and keep this restamped identity
+    /// once the queue has taken it.
+    Resend(Identity),
+    /// Sent [`MAX_REJOINS`] more times and still nothing: tell the visitor.
+    GaveUp,
 }
 
 /// The operating system RNG failed. There is nothing to fall back to: an
@@ -77,27 +111,67 @@ impl Identity {
             .to_string();
         let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(secret);
         let secret = PossessionSecret::parse(&encoded).map_err(|_| RngUnavailable)?;
-        Ok(Self { request_id, secret })
+        Ok(Self {
+            request_id,
+            secret,
+            joined_at: now_ms / 1000,
+            rejoins: 0,
+        })
     }
 
-    /// Parses the cookie value. Anything else -- a truncated value, a legacy
-    /// bare id -- is no identity, so the visitor is offered the form again.
+    /// Parses the cookie value. Anything else -- a truncated value, a bare id,
+    /// one without its join stamp -- is no identity, so the visitor is offered
+    /// the form again.
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
-        let (request_id, secret) = value.split_once('.')?;
-        if !wr_common::is_uuid_shape(request_id) {
+        let mut parts = value.split('.');
+        let (request_id, secret, joined_at, rejoins) =
+            (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+        if parts.next().is_some() || !wr_common::is_uuid_shape(request_id) {
             return None;
         }
         Some(Self {
             request_id: request_id.to_owned(),
             secret: PossessionSecret::parse(secret).ok()?,
+            joined_at: parse_decimal(joined_at)?,
+            rejoins: u8::try_from(parse_decimal(rejoins)?).ok()?,
         })
     }
 
-    /// The cookie value, `<request_id>.<secret>`.
+    /// The cookie value, `<request_id>.<secret>.<joined_at>.<rejoins>`.
     #[must_use]
     pub fn cookie_value(&self) -> String {
-        format!("{}.{}", self.request_id, self.secret.expose())
+        format!(
+            "{}.{}.{}.{}",
+            self.request_id,
+            self.secret.expose(),
+            self.joined_at,
+            self.rejoins
+        )
+    }
+
+    /// What to do at `now` (epoch seconds) when no registration exists for
+    /// this identity (issue #251).
+    ///
+    /// A join the queue or the ingest lost leaves nothing behind, so the only
+    /// evidence is time. The resend carries the same request id and digest:
+    /// `assign_position` writes a place only where none exists for the id, so
+    /// a first join that was merely slow is not given a second one. A stamp
+    /// from the future counts as just sent.
+    #[must_use]
+    pub fn unanswered(&self, now: u64) -> Unanswered {
+        if now.saturating_sub(self.joined_at) <= REJOIN_AFTER_SECS {
+            return Unanswered::InFlight;
+        }
+        match self.rejoins.checked_add(1) {
+            Some(rejoins) if rejoins <= MAX_REJOINS => Unanswered::Resend(Self {
+                request_id: self.request_id.clone(),
+                secret: self.secret.clone(),
+                joined_at: now,
+                rejoins,
+            }),
+            Some(_) | None => Unanswered::GaveUp,
+        }
     }
 
     /// The `Set-Cookie` header that stores this identity.
@@ -121,6 +195,15 @@ impl Identity {
         })
         .to_string()
     }
+}
+
+/// A plain decimal number: digits only, so `+5` and a 40-digit string a
+/// visitor typed into their cookie are both refused rather than interpreted.
+fn parse_decimal(text: &str) -> Option<u64> {
+    if text.is_empty() || text.len() > 20 || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
 }
 
 /// The `Set-Cookie` that forgets an identity which no longer proves anything.
@@ -249,6 +332,9 @@ pub enum WaitPage {
     /// The identity is not the one this place was taken with. Forgotten, so
     /// the form comes back.
     Lost,
+    /// The join was sent [`MAX_REJOINS`] more times and never registered
+    /// (issue #251). Forgotten, so the form comes back.
+    JoinLost,
     /// Something is wrong on this side; retrying may help.
     Unavailable,
 }
@@ -259,7 +345,7 @@ impl WaitPage {
     #[must_use]
     pub const fn refresh_secs(&self) -> Option<u64> {
         match self {
-            Self::NotInLine | Self::Lost => None,
+            Self::NotInLine | Self::Lost | Self::JoinLost => None,
             Self::Joining => Some(5),
             Self::Queued { ahead, .. } => Some(if *ahead < 100 { 5 } else { 20 }),
             Self::Holding => Some(30),
@@ -283,7 +369,9 @@ pub fn outcome(admission: Admission) -> WaitOutcome {
             Denied::AtCapacity { position } => WaitPage::Queued { position, ahead: 0 },
             Denied::NotRegistered => WaitPage::Joining,
             Denied::NotAdmitting | Denied::NotOpen => WaitPage::Holding,
-            Denied::NotHolder => WaitPage::Lost,
+            // A used-up place is, for this visitor, the same as one that is
+            // not theirs: nothing here can be redeemed, and they start again.
+            Denied::NotHolder | Denied::SessionExpired => WaitPage::Lost,
             Denied::Corrupt => WaitPage::Unavailable,
         }),
         Admission::EventNotFound | Admission::SignFailed => {
@@ -303,8 +391,11 @@ mod tests {
     const ID: &str = "018f3a2b-7c9d-7e1f-abcd-0123456789ab";
     const SECRET: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
+    /// The second the test identity's join was sent at.
+    const JOINED: u64 = 1_700_000_000;
+
     fn identity() -> Identity {
-        Identity::parse(&format!("{ID}.{SECRET}")).unwrap()
+        Identity::parse(&format!("{ID}.{SECRET}.{JOINED}.0")).unwrap()
     }
 
     #[test]
@@ -328,13 +419,22 @@ mod tests {
 
     #[test]
     fn only_a_well_formed_identity_cookie_is_an_identity() {
-        let header = format!("other=1; {IDENTITY_COOKIE}={ID}.{SECRET}; x=y");
+        let header = format!("other=1; {IDENTITY_COOKIE}={ID}.{SECRET}.{JOINED}.0; x=y");
         assert_eq!(identity_from_cookies(&header), Some(identity()));
         for bad in [
             format!("{IDENTITY_COOKIE}={ID}"),
-            format!("{IDENTITY_COOKIE}={ID}.short"),
-            format!("{IDENTITY_COOKIE}=not-a-uuid.{SECRET}"),
-            format!("x{IDENTITY_COOKIE}={ID}.{SECRET}"),
+            format!("{IDENTITY_COOKIE}={ID}.short.{JOINED}.0"),
+            format!("{IDENTITY_COOKIE}=not-a-uuid.{SECRET}.{JOINED}.0"),
+            format!("x{IDENTITY_COOKIE}={ID}.{SECRET}.{JOINED}.0"),
+            // Without the join stamp there is no telling a lost join from a
+            // slow one (issue #251), so it is no identity.
+            format!("{IDENTITY_COOKIE}={ID}.{SECRET}"),
+            format!("{IDENTITY_COOKIE}={ID}.{SECRET}.{JOINED}"),
+            format!("{IDENTITY_COOKIE}={ID}.{SECRET}.{JOINED}.0.0"),
+            format!("{IDENTITY_COOKIE}={ID}.{SECRET}.+5.0"),
+            format!("{IDENTITY_COOKIE}={ID}.{SECRET}.{JOINED}.256"),
+            format!("{IDENTITY_COOKIE}={ID}.{SECRET}.{JOINED}.-1"),
+            format!("{IDENTITY_COOKIE}={ID}.{SECRET}.{}.0", "9".repeat(21)),
             String::new(),
         ] {
             assert_eq!(identity_from_cookies(&bad), None, "{bad}");
@@ -356,6 +456,70 @@ mod tests {
             3,
             "the API schema allows no more"
         );
+    }
+
+    /// The restamped identity of a resend, if that is what was decided.
+    fn resent(decided: Unanswered) -> Option<Identity> {
+        match decided {
+            Unanswered::Resend(identity) => Some(identity),
+            Unanswered::InFlight | Unanswered::GaveUp => None,
+        }
+    }
+
+    #[test]
+    fn a_minted_identity_is_stamped_with_when_it_joined() {
+        let minted = Identity::mint(1_700_000_000_999).unwrap();
+        assert_eq!((minted.joined_at, minted.rejoins), (JOINED, 0));
+    }
+
+    #[test]
+    fn an_unanswered_join_is_left_alone_while_it_can_still_be_in_flight() {
+        // The ingest may take 20 s on a quiet queue; a resend inside that is
+        // a duplicate message for a place that is simply late.
+        for elapsed in [0, 20, REJOIN_AFTER_SECS] {
+            assert_eq!(
+                identity().unanswered(JOINED + elapsed),
+                Unanswered::InFlight,
+                "{elapsed}s"
+            );
+        }
+        // A stamp ahead of this clock is treated as just sent.
+        assert_eq!(identity().unanswered(JOINED - 500), Unanswered::InFlight);
+    }
+
+    #[test]
+    fn an_overdue_join_is_resent_as_the_same_join_and_restamped() {
+        let now = JOINED + REJOIN_AFTER_SECS + 1;
+        let resent = resent(identity().unanswered(now)).unwrap();
+        assert_eq!(resent.joined_at, now);
+        assert_eq!(resent.rejoins, 1);
+        // Same id, same digest: assign_position cannot give it a second place.
+        assert_eq!(resent.join_message("evt"), identity().join_message("evt"));
+        // Restamped, so the next reload waits a full window before the next.
+        assert_eq!(resent.unanswered(now + 5), Unanswered::InFlight);
+        assert_eq!(Identity::parse(&resent.cookie_value()), Some(resent));
+    }
+
+    #[test]
+    fn a_join_is_resent_a_bounded_number_of_times_then_given_up() {
+        let mut held = identity();
+        let mut now = JOINED;
+        for expected in 1..=MAX_REJOINS {
+            now += REJOIN_AFTER_SECS + 1;
+            let resent = resent(held.unanswered(now)).unwrap();
+            assert_eq!(resent.rejoins, expected);
+            held = resent;
+        }
+        assert_eq!(held.unanswered(now + 5), Unanswered::InFlight);
+        now += REJOIN_AFTER_SECS + 1;
+        assert_eq!(held.unanswered(now), Unanswered::GaveUp);
+
+        // A count a visitor wrote into the cookie cannot overflow into more.
+        let maxed = Identity {
+            rejoins: u8::MAX,
+            ..identity()
+        };
+        assert_eq!(maxed.unanswered(now), Unanswered::GaveUp);
     }
 
     struct Recorder(Mutex<Vec<String>>);
@@ -450,6 +614,7 @@ mod tests {
     fn a_page_that_can_change_refreshes_and_one_that_cannot_does_not() {
         assert_eq!(WaitPage::NotInLine.refresh_secs(), None);
         assert_eq!(WaitPage::Lost.refresh_secs(), None);
+        assert_eq!(WaitPage::JoinLost.refresh_secs(), None);
         assert_eq!(
             WaitPage::Queued {
                 position: 5,

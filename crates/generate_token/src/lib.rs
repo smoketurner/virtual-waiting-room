@@ -87,9 +87,10 @@ pub trait Store {
 pub struct PositionRow {
     pub position: u64,
     pub status: PositionStatus,
-    /// Absent only on a row written before issue #62, which cannot be
-    /// redeemed.
+    /// Absent only on a malformed row, which cannot be redeemed.
     pub digest: Option<SecretDigest>,
+    /// When the visitor was first admitted, if they have been.
+    pub admitted_at: Option<u64>,
 }
 
 /// Why a visitor is not being admitted right now.
@@ -115,6 +116,11 @@ pub enum Denied {
     /// pass (ADR-0039). Not a refusal of the visitor -- they ask again.
     #[error("at capacity; position {position} is next")]
     AtCapacity { position: u64 },
+    /// The visitor was admitted, and the visit that admission bought is over:
+    /// a session lasts its lifetime from the first admission, however often it
+    /// is asked for again (issue #237). They take a new place.
+    #[error("the admission for this place in line has run out")]
+    SessionExpired,
     /// The caller does not hold the secret this `request_id` joined with
     /// (issue #62): knowing the id is not enough to be admitted as it.
     #[error("not the holder of this place in line")]
@@ -127,9 +133,10 @@ pub struct Grant {
     pub position: u64,
     /// The digest the secret was verified against, for the admitted mark.
     pub digest: SecretDigest,
-    /// Whether this visitor has been admitted before. They are entitled to
-    /// their session again, and have already taken their unit of budget.
-    pub already_admitted: bool,
+    /// When this visitor was first admitted, if they have been. They are
+    /// entitled to their session again until it runs out, and have already
+    /// taken their unit of budget.
+    pub admitted_at: Option<u64>,
 }
 
 /// How many shards one admission tries before answering "at capacity". The
@@ -207,7 +214,17 @@ pub async fn admit<S: Store>(
     // a retried request arrives here again with the row already marked, and
     // gets its session without taking a second unit -- the origin was already
     // charged for this person.
-    if !grant.already_admitted {
+    //
+    // What they get again is the same visit, not a new one (issue #237). A
+    // place that has reached the front can be handed around -- the id and its
+    // secret are two strings -- and if every call minted a full-length session
+    // one admission would admit an unlimited number of people for as long as
+    // the row lived, each with a session bound to their own network. The
+    // session runs from the first admission; once that has passed there is
+    // nothing left to hand out.
+    let admitted_at = if let Some(at) = grant.admitted_at {
+        at
+    } else {
         if !take_any_slot(store, minting.event_id).await {
             return Ok(Admission::Refused(Denied::AtCapacity {
                 position: grant.position,
@@ -222,9 +239,13 @@ pub async fn admit<S: Store>(
         {
             tracing::error!(error = %e, event = "admission_claim_failed", "could not mark the visitor admitted; admitting anyway");
         }
-    }
+        now
+    };
 
-    let expires_at = now.saturating_add(minting.session_ttl_secs);
+    let expires_at = admitted_at.saturating_add(minting.session_ttl_secs);
+    if expires_at <= now {
+        return Ok(Admission::Refused(Denied::SessionExpired));
+    }
     let session = Session {
         event_id: minting.event_id.to_owned(),
         request_id: request_id.to_owned(),
@@ -353,13 +374,23 @@ pub fn decide(
     Ok(Grant {
         position,
         digest,
-        already_admitted: matches!(
-            position_row,
-            Some(PositionRow {
+        admitted_at: match position_row {
+            Some(&PositionRow {
                 status: PositionStatus::Admitted,
+                admitted_at,
+                ..
+            }) => {
+                // A row marked admitted with no time is not one this code
+                // writes. Treating it as admitted at the epoch refuses it as
+                // expired, which is the direction that mints nothing.
+                Some(admitted_at.unwrap_or(0))
+            }
+            Some(&PositionRow {
+                status: PositionStatus::Issued,
                 ..
             })
-        ),
+            | None => None,
+        },
     })
 }
 
@@ -475,6 +506,10 @@ mod tests {
             position,
             status,
             digest: Some(digest()),
+            admitted_at: match status {
+                PositionStatus::Issued => None,
+                PositionStatus::Admitted => Some(1_700_000_000),
+            },
         }
     }
 
@@ -617,16 +652,16 @@ mod tests {
         // theirs, for a failure that was not theirs. What being admitted
         // already governs is whether a second unit of budget is taken, which
         // the grant reports and `admit` acts on.
-        for (status, already_admitted) in [
-            (PositionStatus::Issued, false),
-            (PositionStatus::Admitted, true),
+        for (status, admitted_at) in [
+            (PositionStatus::Issued, None),
+            (PositionStatus::Admitted, Some(1_700_000_000)),
         ] {
             assert_eq!(
                 decide(&counters(10), None, Some(&row(3, status)), &secret(), 0).unwrap(),
                 Grant {
                     position: 3,
                     digest: digest(),
-                    already_admitted,
+                    admitted_at,
                 }
             );
         }
@@ -784,6 +819,7 @@ mod tests {
             position: 3,
             status: PositionStatus::Issued,
             digest: None,
+            admitted_at: None,
         };
         assert_eq!(
             decide(&counters(10), None, Some(&legacy), &secret(), 0).unwrap_err(),

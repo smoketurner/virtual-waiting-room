@@ -71,7 +71,7 @@ activation queues FIFO.
 - Acceptance: 1,000,000 participants assigned in one write; elapsed time independent of cohort size.
 
 **F1.5** — As an auditor, I want reproducible ordering.
-- THE SYSTEM SHALL make the randomization auditable after the fact.
+- THE SYSTEM SHALL make the randomization recomputable after the fact. This checks the arithmetic, not that the seed was drawn fairly (ADR-0040).
 - Acceptance: A third party given the published seed, participant count and registration indices recomputes every position exactly.
 
 ### 1.3 Queue join (live arrivals)
