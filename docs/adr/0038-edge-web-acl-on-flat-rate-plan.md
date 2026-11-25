@@ -58,8 +58,17 @@ so one path cannot drain the account's shared bucket on pay-as-you-go. In the we
 URI-path match now applies `URL_DECODE` then `NORMALIZE_PATH`; `/v1/wait` has its own per-IP limit
 (`waf_nojs_wait_ip_limit`); and a rule requires the `aws-waf-token` cookie on the JavaScript API
 paths, so a token sent only in the `x-aws-waf-token` header cannot escape the cookie-keyed rate
-limits. That rule runs in Count until `waf_managed_rules_mode = "enforce"`: its effect on a
-first, token-less request has not been observed against a deployment.
+limits. That rule blocks by default and sits after the challenge, so a request with no token at
+all is challenged before it is reached; `waf_require_token_cookie = false` drops it to Count. A
+token is honoured for one hour by default (`waf_token_immunity_seconds`, was four): a token may
+join `waf_join_token_limit` times every ten minutes for as long as it lives, and WAF has no
+lifetime quota, so the token's life is what one solve is worth. Neither has been observed
+against a deployment.
+
+**Amendment ([#251](https://github.com/smoketurner/virtual-waiting-room/issues/251)).** The origin
+key now has generations (`origin_key_generation`): the current and the previous key are both
+attached to the usage plan, so a rotation no longer opens the 403 window described under
+"Introducing the key" below while CloudFront deploys the new header.
 
 ### The web ACL (with a flat-rate plan, `flat_rate_plan_tier`)
 

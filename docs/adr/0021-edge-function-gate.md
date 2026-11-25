@@ -162,8 +162,9 @@ answers a literal 403 with `x-wr-reason: error`. Two further changes:
   rule exists. `..` is no longer left unresolved-and-unmatched. `wr_common::rules` mirrors it, and
   rejects at write time a prefix that could never match (`%`, `//`, a dot segment, `;`, backslash).
 - **An optional previous key.** If KeyValueStore key `kp` exists (same format as `k`), a session
-  that fails under `k` is tried under `kp`. It is read only after `k` refuses. Nothing writes `kp`
-  yet: this is the reader half of a rotation overlap.
+  that fails under `k` is tried under `kp`. It is read only after `k` refuses. Terraform
+  writes it: `kp` is the signing key's previous generation (`signing_key_generation`), so a
+  rotation leaves issued sessions valid until they expire.
 
 ## 4. Open decisions
 

@@ -176,3 +176,10 @@ A poll chain that fails (a 5xx, a 429, a network error) used to be retried at th
 indefinitely. Each consecutive failure now doubles the interval, up to `policy.ceilingMs`, with the
 existing jitter; the first success resets it. With no policy published the floor equals the
 ceiling, so there is nothing to back off to until one arrives.
+
+## Amendment: capacity answers back off, and the first ask spreads over 120 s (ADR-0039)
+
+A redemption answered 425 because the admission budget is spent is retried the same way: each
+consecutive one doubles the interval, up to the ceiling. `scheduleFirstAsk`'s window is capped at
+120 s rather than 60 s, which puts a million-visitor cohort's `/_wr/v1/queue_num` peak at about
+8,500/s, under API Gateway's default 10,000/s account limit.

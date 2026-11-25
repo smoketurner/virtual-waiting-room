@@ -215,8 +215,9 @@ These are logged (`$.fields.event`) without an alarm of their own:
 
 **Visitors reporting "We let you in, but the site turned you back".** The gate refused a session
 `generate_token` had just minted, twice within a minute, and the page stopped rather than loop.
-The usual cause is a signing key regenerated while Lambdas were warm (the gate verifies with the
-new key, they sign with the old); with IP binding on, it is a visitor whose network keeps changing.
+The usual cause is a signing key two generations old (rotated twice within one session
+lifetime, so the gate no longer holds it as `kp`); with IP binding on, it is a visitor whose
+network keeps changing.
 
 **`/_wr/admin/rules` rejecting a path prefix.** A prefix containing `%`, `//`, a `.` or `..` segment,
 `;` or a backslash can never match a normalised request path, so it is refused when the rule is
@@ -249,5 +250,7 @@ written rather than accepted and silently ignored.
   across many addresses still takes them. A request id alone admits no one (it also needs the
   secret the browser joined with, [ADR-0035](adr/0035-request-id-proof-of-possession.md)), but a
   visitor who hands over both hands over their place.
-- **Survive a signing-key rotation.** Regenerating the key invalidates every issued session. Do it
-  before an event opens, never during one.
+- **Survive two signing-key rotations.** Raising `signing_key_generation` once keeps issued
+  sessions valid until they expire (the gate still accepts the previous generation); raising it
+  again inside one session lifetime ends the oldest. See
+  [`DEPLOY.md`](./DEPLOY.md#rotating-keys).

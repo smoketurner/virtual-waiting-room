@@ -61,7 +61,7 @@ The build-state record for requirements.md. Requirement IDs in brackets; decisio
 
 ### 1g. Abuse mitigation
 
-- [ ] Bound how many positions one visitor can hold — [#59](https://github.com/smoketurner/virtual-waiting-room/issues/59) — Partial: server-drawn shards, reload dedupe and the edge web ACL's per-token join limit raise the price per place; nothing bounds volume per person.
+- [ ] Bound how many positions one visitor can hold — [#59](https://github.com/smoketurner/virtual-waiting-room/issues/59) — Partial: server-drawn shards, reload dedupe and the edge web ACL's per-token join limit, a one-hour token life and a required token cookie raise the price per place; WAF has no lifetime quota per token, so nothing bounds volume per person.
 - Retired: entry tickets (F6.1, F6.2) — ADR-0028; open-time demotion (F6.3) — ADR-0030.
 
 ### 1h. Operator surface

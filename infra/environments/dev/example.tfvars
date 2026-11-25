@@ -43,8 +43,8 @@ oidc_allowed_emails = "" # comma-separated; "" = deny all (fail closed)
 # alarm_sns_topic_arn            = ""    # SNS topic every alarm notifies; "" = alarms change state silently
 # table_deletion_protection      = false # true for a real event; must be false to change event_id
 # controller_reserved_concurrency = 2
-# api_join_throttle_rate_limit   = 10000 # with the burst limits below, per-method stage throttles
-# api_join_throttle_burst_limit  = 5000
+# api_join_throttle_rate_limit   = 7000  # below the account limit, so a join storm cannot starve admission and the console
+# api_join_throttle_burst_limit  = 3500
 # api_throttle_rate_limit        = 10000
 # api_throttle_burst_limit       = 5000
 # waf_nojs_wait_ip_limit         = 300   # only with flat_rate_plan_tier

@@ -260,13 +260,13 @@ variable "oidc_require_email_verified" {
 variable "api_join_throttle_rate_limit" {
   description = "Requests per second POST /_wr/v1/join accepts before answering 429."
   type        = number
-  default     = 10000
+  default     = 7000
 }
 
 variable "api_join_throttle_burst_limit" {
   description = "Token-bucket size for POST /_wr/v1/join."
   type        = number
-  default     = 5000
+  default     = 3500
 }
 
 variable "api_throttle_rate_limit" {

@@ -74,9 +74,10 @@ visible fairness failure at 1,000,000 people. Tests are the primary evidence.
   config), the refuse-on-throw path after one (an unreadable key, a throw inside the refusal: plain
   403, reason `error`, #242), and the optional previous key `kp` (#247). Suspicious paths (a dot
   segment, `;`, a backslash) matching any path rule are pinned by the cross-language vectors.
-- **No-show compensation and the admission bound** — with an injected no-show rate, admissions
-  converge on the target rate, and no window admits more than its time at that rate plus the
-  burst (ADR-0039).
+- **No-show compensation, the admission bound and the backlog drain** — with an injected no-show
+  rate, admissions converge on the target rate; no window admits more than its time at that rate
+  plus the burst; and a spent budget holds the cursor back so visitors already invited drain
+  instead of persisting (ADR-0039).
 
 ## Not currently provable, and why
 

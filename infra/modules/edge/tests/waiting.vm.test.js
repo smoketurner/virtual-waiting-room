@@ -535,6 +535,38 @@ test("repeated 'at capacity' answers are asked for less and less often", async (
   assert.ok(delays[3] <= POLICY.ceiling_ms * 1.3, JSON.stringify(delays));
 });
 
+// The whole crowd arriving at once: the gateway answers most joins 429.
+test("a throttled join is retried for as long as it takes, and no number is asked for meanwhile", async () => {
+  const client = loadClient({
+    route: (url) => {
+      if (url.startsWith("/_wr/v1/status")) {
+        return jsonResponse(200, activeStatus({ poll_policy: POLICY }));
+      }
+      if (url.startsWith("/_wr/v1/join")) {
+        return jsonResponse(429, {});
+      }
+      return jsonResponse(200, { position: 50, live_join: true });
+    },
+  });
+  // Far more rounds than MAX_JOIN_ATTEMPTS, each past any backoff.
+  for (let i = 0; i < 30; i += 1) {
+    await client.flush();
+    client.clock.now += 10 * 60 * 1000;
+    const t = client.lastTimer();
+    assert.ok(t, "still polling after " + i + " throttled joins");
+    t.cancelled = true;
+    t.fn();
+  }
+  await client.flush();
+  const joins = client.calls.filter((c) => c.url.startsWith("/_wr/v1/join")).length;
+  assert.ok(joins > 20, "kept trying: " + joins);
+  assert.equal(
+    client.calls.filter((c) => c.url.startsWith("/_wr/v1/queue_num")).length,
+    0,
+    "no position is asked for before a join has been accepted"
+  );
+});
+
 // --- issue #61: re-minting a session refused for another network ----------
 
 test("a visitor sent back for another network is re-admitted straight through", async () => {

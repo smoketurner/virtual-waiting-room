@@ -180,7 +180,7 @@ run "one_path_cannot_spend_the_account_throttle" {
   }
 
   assert {
-    condition     = aws_api_gateway_method_settings.join.settings[0].throttling_rate_limit == 10000 && aws_api_gateway_method_settings.join.settings[0].throttling_burst_limit == 5000
+    condition     = aws_api_gateway_method_settings.join.settings[0].throttling_rate_limit == 7000 && aws_api_gateway_method_settings.join.settings[0].throttling_burst_limit == 3500
     error_message = "the join path keeps the rate the ingest is designed for"
   }
 }

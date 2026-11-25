@@ -48,7 +48,8 @@ protected: CloudFront Function gate ── valid session cookie → your origin
   anyone recompute every position.
 - **Closed-loop admission.** Every admission takes a unit of a budget the controller grants at the
   target rate, so the origin's intake is bounded; budget nobody took releases more of the queue,
-  compensating for no-shows up to half the line.
+  compensating for no-shows up to about 43% of the line, and a spent budget holds the queue back
+  so visitors already invited drain first.
 - **The gate makes no network calls.** It reads its rules and signing key from a CloudFront
   KeyValueStore. Requests that match no rule pass through untouched.
 - **Fail-open is manual.** An operator can open the gate for a bounded window, but nothing trips

@@ -78,14 +78,21 @@ unused again.
   outstanding, so over any window of `t` seconds no more than `target_rate × t` plus two intervals'
   worth can be admitted. Banked positions cannot be redeemed faster than that. The bound is tested
   (`no_window_admits_more_than_its_time_plus_the_burst`).
-- **No-shows are still compensated**, up to a rate of one half: with a share `z` of released
-  visitors never arriving, unused budget settles at `z/(1−z)` of an interval and admissions settle
-  on the target (`admissions_converge_on_the_target_despite_no_shows`, F3.8). Past one half the
-  cursor is at its cap of twice the target, as it was before.
+- **No-shows are still compensated**, up to a rate of 3/7, about 43%: with a share `z` of
+  released visitors never arriving, unused budget settles at the slack plus `z/(1−z)` of an
+  interval and admissions settle on the target
+  (`admissions_converge_on_the_target_despite_no_shows`, F3.8). At most one interval is carried
+  between passes, so that sum cannot pass one interval: `1/4 + z/(1−z) ≤ 1`. Past it the cursor
+  is at 1.75 times the target and admissions fall short.
+- **A backlog drains.** A budget found spent releases three quarters of a pass, so visitors the
+  cursor has already passed are admitted ahead of new releases
+  (`a_spent_budget_holds_the_cursor_back_so_a_backlog_drains`,
+  `a_backlog_of_invited_visitors_drains_instead_of_persisting`).
 - **Lag costs a bounded burst, not a sustained overshoot.** While visitors cannot yet know they
   were released, budget goes unused and the cursor runs ahead, as before. When they arrive they
-  find at most two intervals of budget. The same model that gave 2.65× for about 40 s gives one or
-  two 10 s windows at up to 2×, then the target.
+  find at most two intervals of budget. The same model that gave 2.65× for about 40 s (a million
+  visitors at 833/s, every one showing, learning their position up to about 160 s after the open)
+  gives a peak 10 s window of about 1.4× the target, then the target.
 - **Passes can overlap.** Budget and release both follow elapsed seconds, and caps are absolute
   values, so a duplicated or interleaved pass grants nothing twice.
 - **An idle event banks nothing beyond the burst** (`an_idle_event_banks_no_more_than_the_burst`).

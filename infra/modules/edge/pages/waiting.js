@@ -489,6 +489,8 @@
   var MAX_REJOIN_CYCLES = 3;
   var JOIN_BACKOFF_CEILING_MS = 120000;
   var joinAttempts = 0;
+  // Joins answered 429. Paces the retry; never ends it.
+  var joinThrottles = 0;
   var rejoinCycles = 0;
   var joinBlockedUntil = 0;
 
@@ -531,15 +533,30 @@
       if (res.status >= 200 && res.status < 300) {
         joinedId = requestId;
         joinAttempts = 0;
+        joinThrottles = 0;
         writeStored(JOINED_KEY, requestId);
         return;
       }
+      // A 429 is the API smoothing a burst, not refusing this visitor: when a
+      // whole crowd arrives at once the gateway takes them at its own rate and
+      // everyone else is told to come back. That can take minutes at a million
+      // people, so it never counts towards giving up -- a visitor who is
+      // turned away for being one of many must not be told the queue is
+      // broken. Structural failures still count.
+      if (res.status === 429) {
+        joinAttempts -= 1;
+        joinThrottles += 1;
+      }
       // Exponential, capped. The cap bounds the rate; MAX_JOIN_ATTEMPTS is what
-      // bounds the total.
-      var backoff = Math.min(
-        JOIN_BACKOFF_CEILING_MS,
-        policy.floorMs * Math.pow(2, joinAttempts - 1)
-      );
+      // bounds the total. Spread by half either way, because every visitor
+      // turned away in the same second would otherwise come back in the same
+      // second, and the gateway would sit idle in between.
+      var backoff =
+        Math.min(
+          JOIN_BACKOFF_CEILING_MS,
+          policy.floorMs * Math.pow(2, Math.min(joinAttempts + joinThrottles, 7) - 1)
+        ) *
+        (0.5 + Math.random());
       joinBlockedUntil = Date.now() + backoff;
     });
   }
@@ -554,6 +571,8 @@
   // misses lands inside that window, so the recovery fired on every normal join
   // and sent a duplicate message for a place that was simply still in flight.
   var MAX_MISSES = 8;
+  // What a poll resolves to while no join has been accepted.
+  var UNJOINED = {};
   var misses = 0;
 
   // A place in line, once known, never changes: it is derived from an opened
@@ -1105,6 +1124,13 @@
                 body: { position: knownPosition, live_join: knownLiveJoin },
               };
             }
+            if (joinedId !== requestId) {
+              // No join has been accepted yet, so there is no number to ask
+              // for. Asking anyway costs a request per visitor per poll on an
+              // endpoint the edge cannot collapse, and when a crowd arrives at
+              // once those requests crowd out the joins they are waiting on.
+              return UNJOINED;
+            }
             if (Date.now() < firstAskAt) {
               return null;
             }
@@ -1113,6 +1139,13 @@
             );
           })
           .then(function (q) {
+            if (q === UNJOINED) {
+              nextIntervalMs = policy.floorMs;
+              if (!stopped) {
+                say("Getting your place in line…", "Just a moment.");
+              }
+              return schedule();
+            }
             if (q === null) {
               // Inside the spread window. The queue is open and moving, and
               // saying so is more honest than a spinner — this visitor has a

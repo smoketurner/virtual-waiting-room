@@ -62,15 +62,18 @@ no call to the backend.
 ```
   controller (EventBridge Scheduler rate(1 minute); a durable execution of six 10 s passes)
         grant admission budget for the time elapsed (plus what went unused, capped)
-        → UpdateItem serving_counter (elapsed + unused), then cap c on each arrivals shard
+        → UpdateItem serving_counter (elapsed, steered to leave a quarter-interval of
+          budget unused), then cap c on each arrivals shard
         │
   Visitor polls /_wr/v1/status until serving_position ≥ own position
         │
   POST /_wr/v1/generate_token (request_id + possession secret, ADR-0035)
-        1. event admitting? (phase active, resolve(stored control, fail_open_until, now))
+        1. event admitting? (phase active, resolve(stored control, fail_open_until, now));
+           the Counters item is held 1 s per execution environment
         2. position reached?
         3. take one unit of the admission budget (ADR-0039): conditional ADD n on a
            randomly drawn arrivals shard while n < c (up to 3 draws), 425 when spent;
+           a shard seen spent is not asked again for 1 s;
            then mark Positions.status issued → admitted, stamping admitted_at. An
            already-admitted visitor re-mints without taking a unit
         4. sign the session (HS256 JWS, wr_common::crypto), expiring at
@@ -94,8 +97,8 @@ no call to the backend.
 The gate reads its configuration (`c`: version, `enforce_from`, `fail_open_until`, rules, IP
 binding) and the signing secret (`k`) from one CloudFront KeyValueStore
 ([ADR-0021](adr/0021-edge-function-gate.md)); `event_id` and the cookie name are templated into
-its source. A session that fails under `k` is tried under an optional previous key `kp`, which
-nothing writes yet (#247). Terraform seeds `c` from `gate_rules`, with `enforce_from = 0`. `/_wr/admin/rules` is the
+its source. A session that fails under `k` is tried under the previous key `kp`, the signing
+key's previous generation (#247). Terraform seeds `c` from `gate_rules`, with `enforce_from = 0`. `/_wr/admin/rules` is the
 ruleset's only writer after that: it validates and re-encodes through `wr_common::rules`, writes
 the KeyValueStore (the ruleset's only store) by read-modify-write, and stamps `rules_digest` /
 `rules_count` on `Counters`. No admin route writes `enforce_from`.
@@ -355,15 +358,24 @@ controller grants budget and moves the cursor:
 owed     = target_rate × seconds since the last open pass     (one interval if ≥ 20 s, or none)
 unused   = Σ over shards of (c − n)                           (granted and not taken)
 budget   = min(unused + owed, 2 intervals of target_rate)     → written as c = n + share, per shard
-release  = owed + min(unused, owed)                           → serving_counter, up to queue_counter + 1
+slack    = owed / 4
+release  = owed + clamp(unused − slack, −slack, owed)         → serving_counter, up to queue_counter + 1
 ```
 
 The budget bounds what the origin receives: at most two intervals' worth is ever outstanding, so
 over any window of `t` seconds no more than `target_rate × t` plus that burst is admitted,
-whoever turns up and whenever. Unused budget is the no-show correction: it is exactly the
-admissions the origin was offered and did not get, so the cursor releases that many more people.
-The cursor moves at most twice the target, which covers a no-show rate up to 50%. Nothing is
-estimated or smoothed.
+whoever turns up and whenever. Unused budget beyond the slack is the no-show correction: it is
+exactly the admissions the origin was offered and did not get, so the cursor releases that many
+more people, at most doubling the pass, which covers a no-show rate up to 3/7 (about 43%). A
+budget found fully spent is read as a backlog of visitors already invited: the cursor gives up
+its slack and releases three quarters of `owed`, so they are admitted ahead of new releases and
+the backlog drains. Nothing is estimated or smoothed.
+
+A refusal has to cost almost nothing, because while the budget is spent everyone whose turn has
+come keeps asking. Each `generate_token` execution environment remembers for one second which
+shards it saw spent, and holds the event's `Counters` item for one second, so a refusal makes no
+conditional write and does not read the hot item; a pause therefore takes effect up to a second
+late. The page backs off on repeated 425s, doubling to its ceiling.
 
 The controller is a Lambda durable function: Scheduler starts one execution a minute, which runs
 six checkpointed passes separated by 10 s durable waits. A wait suspends the execution, so it is
@@ -447,9 +459,12 @@ first one did, so one admission is one visit however often, or by whomever, it i
 gone ([ADR-0032](adr/0032-remove-the-origin-authorizer.md)). **Not built:** revocation
 ([#63](https://github.com/smoketurner/virtual-waiting-room/issues/63)).
 
-`random_bytes.signing_key` is generated at apply and written to both readers: an SSM SecureString
-for the Lambdas (free idle, unlike Secrets Manager) and KeyValueStore key `k` for the gate.
-Regenerating it invalidates every issued cookie. The functions that read the key (`generate_token`,
+`random_bytes.signing_key` is generated at apply, one key per generation, and the current one is
+written to both readers: an SSM SecureString for the Lambdas (free idle, unlike Secrets Manager)
+and KeyValueStore key `k` for the gate. Raising `signing_key_generation` rotates it: the previous
+generation becomes `kp`, which the gate still accepts, so sessions already issued last until they
+expire rather than ending at once; a second rotation drops them
+([`DEPLOY.md`](./DEPLOY.md#rotating-keys)). The functions that read the key (`generate_token`,
 `nojs`) read it once at init, so a non-secret `SIGNING_KEY_FINGERPRINT` in their environment changes
 with the key: a rotation publishes new configuration and retires the warm environments still
 holding the old one ([#247](https://github.com/smoketurner/virtual-waiting-room/issues/247)).
@@ -482,7 +497,7 @@ per request and per rule between events, breaking N1.
 | Requests per token | the four JS API paths | Block (429) past `waf_api_token_limit` per 5 min |
 | Token requests + joins per IP | verify page, `/_wr/v1/join` | CAPTCHA past `waf_join_ip_limit` per 5 min. It escalates rather than blocks, because carrier NAT puts many real buyers behind one IP |
 | Anonymous / hosting IP | verify page, join | CAPTCHA (Count until promoted) |
-| Token cookie required | the four JS API paths | Block a request with no `aws-waf-token` cookie, so a token sent only by header cannot escape the per-token limits. Count until `waf_managed_rules_mode = "enforce"` |
+| Token cookie required | the four JS API paths | Block a request with no `aws-waf-token` cookie, so a token sent only by header cannot escape the per-token limits. Count when `waf_require_token_cookie = false` |
 | No-JS joins per IP | `/_wr/v1/enter` | Block past `waf_nojs_ip_limit` per 5 min |
 | No-JS waits per IP | `/_wr/v1/wait` | Block (429) past `waf_nojs_wait_ip_limit` per 5 min |
 | Anonymous IP, no JS | `/_wr/v1/enter` | Block (Count until promoted) |
@@ -508,8 +523,8 @@ browser session; it does not bind a place to a person.
 front, between a floor and a ceiling set in Terraform (`poll_floor_ms`, `poll_ceiling_ms`,
 `poll_divisor`). A visitor near the front sees a pause or a fail-open within the floor. A
 deep-queue visitor can see it up to about 39 s late (the ceiling plus jitter). The O4 runbook
-accepts that delay. Consecutive failed polls double the interval up to the ceiling and the first
-success resets it
+accepts that delay. Consecutive failed polls, and consecutive 425s from a redemption, double the
+interval up to the ceiling and the first success resets it
 ([#251](https://github.com/smoketurner/virtual-waiting-room/issues/251)). A 410 from
 `/_wr/v1/generate_token` drops the stored identity, so the next load takes a new place (#237).
 
@@ -557,7 +572,9 @@ See [`DEPLOY.md`](./DEPLOY.md).
   never starved by it.
 - **Least privilege.** Each function's `UpdateItem` on `Counters` is scoped by leading key to the
   items it writes: the event item, the pre-queue shards or the arrivals shards
-  ([#250](https://github.com/smoketurner/virtual-waiting-room/issues/250)).
+  ([#250](https://github.com/smoketurner/virtual-waiting-room/issues/250)). The admin's
+  read of the distribution's configuration, for the readiness panel, is granted by the `edge`
+  module on its own distribution, since `core` cannot name a distribution built from its outputs.
 - **Error caching.** The distribution caches a 404, 429 or 5xx for one second, not CloudFront's
   default ten, so one failed poll does not pin an error on a whole edge location.
 - **GovCloud** is out of scope (N4). It has no CloudFront, so it has no edge gate and no request
@@ -593,9 +610,10 @@ and ~5 requests per iOS discard-and-reload.
   --target-rate 1 --arrival late`), but 2.66x (late) and 2.88x (uniform) end to end at 833/s with
   a 180 s countdown. That puts adaptive at ~75–81M, inside Business with 35–40% headroom. Short
   runs understate the saving: `make load VISITORS=1000000 SECONDS=90` reads 1.83x because the
-  ~60 s first-ask spread dominates it. The harness cannot measure time-to-admission.
+  first-ask spread (60 s when measured, now up to 120 s) dominates it. The harness cannot measure time-to-admission.
 - **No T−0 herd.** Open discovery spreads over the ~39 s ceiling jitter plus `scheduleFirstAsk`'s
-  60 s, so peak `/_wr/v1/queue_num` load is no higher than the 60 s spread alone
+  window of up to 120 s, so peak `/_wr/v1/queue_num` load is no higher than that spread alone:
+  about 8,500/s at a million, under API Gateway's 10,000/s default
   ([#84](https://github.com/smoketurner/virtual-waiting-room/issues/84)).
 
 **Pricing** (baseline, foreground-only bound, pay-as-you-go, US/Europe):
@@ -618,6 +636,64 @@ per-client choices are open in [`adr/README.md`](adr/README.md).
 **Caveats.** The model assumes clients honour `policy.floorMs`; nothing server-side enforces it,
 so abuse is the edge's job (§8). Clients keep the last good policy when one is withdrawn, so a bad
 policy is rolled back by publishing corrected values, not by removing them.
+
+### Load at a million
+
+What a 1,000,000-visitor scheduled event asks of API Gateway and DynamoDB. **Modelled from the
+per-request costs in the code, not measured**: 833 admissions/s, and the arrival model above (a
+60-minute countdown with arrival fraction `u^0.2`, so joins peak at `5N / 3600` at T).
+
+| Phase | API Gateway | DynamoDB writes | DynamoDB reads |
+|---|---|---|---|
+| Countdown, 60 min | `/_wr/v1/join` ~280/s average, ~1,400/s peak at T. `/_wr/v1/status` origin fetches are bounded by CloudFront cache nodes, not audience: tens to low hundreds a second | ~1 unit per join on `PreQueue`, plus one shard-counter write per batch of up to 100: ~1,400/s peak | ~1 unit per join (the batch's consistent duplicate check): ~1,400/s peak |
+| The open | one invoke | one conditional write | ten shard counters, after up to 15 s of queue drain |
+| T to about T+160 s | 1,000,000 `/_wr/v1/queue_num`, ~8,500/s peak | none | one eventually consistent `PreQueue` read each: ~4,300 units/s peak |
+| Admission, ~20 min | `/_wr/v1/generate_token` at 833/s | 2 units per admission (the shard take, the `Positions` mark): ~1,700/s | ~1.5 units per admission (`Positions` consistent, `PreQueue` eventual; `Counters` is held per environment): ~1,300/s |
+| Controller, per pass | none | 11 (the cursor, ten caps) | ~11 units (the event item, ten shards) |
+
+Over the whole event: roughly 3.5M API Gateway requests, 3M write units and 3–4M read units.
+
+- **Joins scale with the shape of arrival, not with this model.** Everyone in the last five
+  minutes is ~3,300/s; everyone in the last minute is ~16,700/s, above API Gateway's 10,000/s
+  default account limit and above the ~4,000 writes/s an un-warmed table serves. Declaring
+  `expected_join_rate` makes the plan fail unless `warm_throughput_write_units` covers it (O1).
+- **The position lookup is the largest request peak**, and the client's spread sets it: the
+  first ask is spread over up to 120 s. At 60 s the same cohort peaked at ~16,600/s.
+- **A spent budget costs no writes.** A refused `generate_token` reads two per-visitor rows and
+  nothing shared (§7), so the admission rows above do not grow with the number of visitors asking.
+- **The per-key ceilings that matter** are the ten arrivals shards, 1,000 writes/s each, so
+  10,000 admissions/s, and the event's own item, which takes one `queue_counter` claim per ingest
+  batch and one cursor write per pass.
+- Nothing here has been run against a deployment; the load tests in
+  [`tasks.md`](../.kiro/specs/virtual-waiting-room/tasks.md) are still open.
+
+### Worst case: nobody comes early
+
+The model above assumes people arrive during the countdown. If nobody does, the open writes a
+cohort of zero and the event is a live-join queue from its first second: all 1,000,000 visitors
+post `/_wr/v1/join` when they arrive. Modelled for arrival within 10 s of T:
+
+| | Default quotas, tables not pre-warmed | API Gateway quota 50,000/s, tables pre-warmed |
+|---|---|---|
+| Joins offered at peak | ~100,000/s against 7,000/s accepted | the same against the join throttle |
+| Half the crowd has a position by | ~2.3 min | ~1.3 min |
+| 99% have a position by | ~6 min | ~3.6 min |
+| Requests answered 429 | ~1.1M | none at the account limit |
+
+- **The ceiling is API Gateway, and it is a rate, not a capacity.** The join path has no compute
+  to exhaust, so the crowd is taken at the join throttle (7,000/s by default, kept under the
+  account's 10,000/s so admission, lookups and the console are not starved alongside it) and
+  everyone else is told 429. A million people need at least 143 s at that rate.
+- **Nobody is turned away.** A 429 never counts towards the page giving up; the retry backs off
+  with jitter so the gateway is not idle between waves. No position is asked for until a join has
+  been accepted, or the lookups, which the edge cannot collapse, outnumber the joins they wait on.
+- **Order is arrival order only loosely.** Within such a burst a place is decided by which retry
+  got through, not by who clicked first. The pre-queue exists to avoid exactly this: it randomizes
+  deliberately instead of by accident.
+- **Admission is unaffected**: it runs at the target rate from the first pass, on whoever has a
+  position by then.
+- To take such a crowd faster, raise the account's API Gateway quota and
+  `api_join_throttle_rate_limit` with it, and pre-warm the tables (`expected_join_rate`).
 
 ## 13. Requirement coverage
 

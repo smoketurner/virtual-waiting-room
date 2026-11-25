@@ -42,11 +42,13 @@ so only the scheduled mode is served end to end.
   door means no cold start and no concurrency ceiling during a burst.
 - **Randomization is one write, and it is auditable.** Queue order is a seeded pseudorandom
   permutation computed on read, not a million stored rows. The property that distinguishes us
-  is not the write count — it is that a published seed, offsets and count let any third party
-  recompute every position and prove the raffle was a raffle (F1.5).
+  is not the write count — it is that a published seed, offsets and count let a third party
+  recompute every position (F1.5). That checks the arithmetic, not that the seed was drawn
+  fairly (ADR-0040).
 - **Closed-loop admission.** Admissions are metered against a budget granted at the target rate,
-  and budget nobody took releases more of the queue, so no-shows are compensated and the origin
-  runs at the capacity the operator paid for.
+  and budget nobody took releases more of the queue, so no-shows are compensated (up to about 43%
+  of the line) and the origin runs at the capacity the operator paid for. A spent budget holds the
+  queue back so visitors already invited are admitted first.
 - **Fails open.** If the waiting room is unavailable, visitors reach the site. A waiting room
   that fails closed turns its own outage into the operator's.
   **Only half-held today** (#58): the mechanism exists — an operator engages fail-open and the

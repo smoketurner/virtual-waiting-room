@@ -65,7 +65,7 @@ the full shape. The values you will normally set:
 | `alarm_sns_topic_arn` | `""` | SNS topic every alarm notifies on alarm and on recovery. Empty leaves the alarms changing state with nobody told. |
 | `table_deletion_protection` | `false` | Deletion protection on the four tables. Turn on for a real event; it must be off to change `event_id` or to destroy. |
 | `controller_reserved_concurrency` | `2` | Concurrency reserved for the controller so ingest cannot starve it. |
-| `api_join_throttle_rate_limit`, `api_join_throttle_burst_limit` | `10000`, `5000` | Stage throttle on `POST /_wr/v1/join`. Raise the account quota before raising these. |
+| `api_join_throttle_rate_limit`, `api_join_throttle_burst_limit` | `7000`, `3500` | Stage throttle on `POST /_wr/v1/join`. Below the account's 10,000/s on purpose, so a crowd of joins cannot starve admission and the console. Raise it with the account quota, keeping it under that quota. |
 | `api_throttle_rate_limit`, `api_throttle_burst_limit` | `10000`, `5000` | Stage throttle on every other method. Lower to cap what the read and admission functions can be asked for. |
 | `admission_rate` | `5` | Visitors per second, seeded onto the event. Changed live from the dashboard. |
 | `gate_rules` | `""` | Which requests the gate covers, one rule per line, same grammar as the dashboard's rules form (`p /checkout`, `c <cookie>`, `u <agent substring>`, `h <header> <value>`). Empty is dormant: everything passes through. |
@@ -77,6 +77,9 @@ the full shape. The values you will normally set:
 | `waf_managed_rules_mode` | `count` | `count` or `enforce` for the managed rules (plan only). |
 | `waf_join_ip_limit` | `100` | Token requests plus joins per IP per 5 minutes before a CAPTCHA (plan only). |
 | `waf_nojs_wait_ip_limit` | `300` | No-JavaScript waiting-page requests per IP per 5 minutes before a 429 (plan only). |
+| `waf_require_token_cookie` | `true` | A JavaScript API request holding a WAF token must carry it as the cookie, or it is blocked; `false` counts instead (plan only). |
+| `signing_key_generation`, `origin_key_generation` | `1`, `1` | Raise by one to rotate the session signing key or the CloudFront-to-API key. See [Rotating keys](#rotating-keys). |
+| `expected_join_rate` | `0` | Peak joins per second expected, 0 if unknown. Above 4,000 the plan fails unless `warm_throughput_write_units` covers it. |
 | `nojs_enabled` | `true` | `false` closes the no-JavaScript queue at the edge (plan only). |
 
 Terraform seeds `admission_rate`, `gate_rules` and the open schedule once; after that the
@@ -178,11 +181,29 @@ AWS_PROFILE=dev-admin uv run scripts/smoke_test.py
 - **Gate signing key.** `random_bytes` generates it during apply, and Terraform writes the same
   value to the SSM SecureString `/<name_prefix>/signing-key` (read by `generate_token`) and the
   KeyValueStore key `k` (read by the gate). It lives in Terraform state, which the S3 backend
-  encrypts. **Regenerating it invalidates every session already issued** (the gate refuses them
-  with `x-wr-reason=signature`); there is no overlap period. Regenerate only before an event
-  opens.
+  encrypts. There is one key per generation; see [Rotating keys](#rotating-keys).
+- **CloudFront-to-API key.** Generated the same way, sent by the distribution as `x-api-key`
+  ([ADR-0038](adr/0038-edge-web-acl-on-flat-rate-plan.md)).
 - **OIDC client secret.** Terraform creates `/<name_prefix>/oidc-client-secret` as a placeholder
   under `ignore_changes`; you write the real value with `aws ssm put-parameter` as above.
+
+### Rotating keys
+
+Both keys rotate by raising a number in `terraform.tfvars` and applying. Each keeps its previous
+generation valid, so a rotation is not an outage.
+
+- **`signing_key_generation`.** The new key signs from the apply on. The previous generation
+  becomes the gate's `kp`, which it tries when `k` refuses, so sessions already issued stay good
+  until they expire. A `SIGNING_KEY_FINGERPRINT` in the minting functions' environment changes
+  with the key, which retires warm environments still holding the old one. Rotating twice within
+  one `session_ttl_seconds` drops the oldest sessions: the generation before the previous one is
+  destroyed.
+- **`origin_key_generation`.** API Gateway honours the new key at once and CloudFront takes
+  minutes to start sending it. The previous key stays attached to the usage plan until the next
+  rotation, so the API keeps answering while the distribution deploys.
+
+After a suspected compromise, rotate twice (waiting out one session lifetime between them if
+visitors are inside) so the exposed generation is gone.
 
 ### Choosing the session lifetime
 

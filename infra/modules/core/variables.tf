@@ -378,9 +378,9 @@ variable "alarm_sns_topic_arn" {
 # it is accepted and has no effect.
 
 variable "api_join_throttle_rate_limit" {
-  description = "Steady-state requests per second POST /_wr/v1/join accepts before answering 429. Sized for the join burst the ingest path is designed to take (10,000/s), which is also the account default limit: raise the account quota before raising this."
+  description = "Steady-state requests per second POST /_wr/v1/join accepts before answering 429. Deliberately below the account's default limit of 10,000/s, which every method shares: when a crowd arrives at once joins would otherwise take the whole account bucket, and admission, position lookups and the operator console would be answered 429 alongside them. Raise it together with the account quota, keeping it under that quota."
   type        = number
-  default     = 10000
+  default     = 7000
 
   validation {
     condition     = var.api_join_throttle_rate_limit >= 1
@@ -391,7 +391,7 @@ variable "api_join_throttle_rate_limit" {
 variable "api_join_throttle_burst_limit" {
   description = "Token-bucket size for POST /_wr/v1/join: how many joins may arrive at once before the rate limit applies."
   type        = number
-  default     = 5000
+  default     = 3500
 
   validation {
     condition     = var.api_join_throttle_burst_limit >= 1 && floor(var.api_join_throttle_burst_limit) == var.api_join_throttle_burst_limit

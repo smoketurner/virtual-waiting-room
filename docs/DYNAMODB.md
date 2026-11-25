@@ -206,19 +206,23 @@ because it is the per-visitor table read across the cohort at audit; a row is ab
 
 ## 8. Consistency
 
-Seven strongly consistent reads, each because a stale answer is wrong:
+Six strongly consistent reads, each because a stale answer is wrong:
 
 - `assign_position`'s `Counters` read: the batch's live/pre-queue routing and the straggler
   fix-up turn on it.
 - `assign_position`'s `PreQueue` dedupe read: a replica that has not seen a row would burn an
   index.
 - `open_event`'s shard read: a missed registration is a visitor with no position.
-- `generate_token`'s `Counters` read: a visitor at their turn must not be told to wait because a
-  replica lags the controller.
 - `generate_token`'s `Positions` read: the admission status and digest must be current.
 - `controller`'s `Counters` read: it computes from the cursor its write is guarded on.
 - `controller`'s arrival-shard read: each cap is written as `n` plus a share, so a stale `n`
   would re-grant budget already spent.
+
+`generate_token`'s `Counters` read is consistent when made, but each execution environment holds
+the item for one second (`MEMO_SECS`), as `read` does: every admission attempt, refused or not,
+would otherwise be a read on one partition key. The cursor moves every ten seconds, and a pause
+takes effect at most a second late. The same environment does not retry a shard it saw refuse a
+take for one second, so a spent budget is not also a stream of failed conditional writes.
 
 Everything else is eventual. `read`'s answers are cached at the edge for a second anyway;
 `PreQueue` rows are immutable; and admin's writes are guarded on the prior value, so a stale read is a conflict, not a
@@ -260,15 +264,15 @@ second whatever the crowd. `/_wr/v1/queue_num` is keyed per visitor and cannot c
 asks it once.
 
 **The first-ask spike** is the real read event. At 1,000,000 participants the client's spread
-saturates at 60 s:
+saturates at 120 s:
 
 ```
-requests          = 1,000,000 / 60 s    ≈ 16,700 /s
-PreQueue GetItem  = 16,700 × 0.5 RRU    ≈  8,350 RRU/s   (21 % of the 40,000 quota)
+requests          = 1,000,000 / 120 s   ≈  8,350 /s
+PreQueue GetItem  =  8,350 × 0.5 RRU    ≈  4,200 RRU/s   (10 % of the 40,000 quota)
 ```
 
-Those reads hit a million distinct keys, so there is no hot partition. API Gateway's default
-10,000/s account throttle binds before DynamoDB does.
+Those reads hit a million distinct keys, so there is no hot partition, and the request rate
+stays under API Gateway's default 10,000/s account throttle.
 
 **The in-process cache protects the one hot item.** Both endpoints read the `Counters` item, and
 one partition serves at most 3,000 RCU/s. `read` holds the item for one second per execution
@@ -277,8 +281,8 @@ is cached too, and a poisoned lock is a miss. Reads then scale with environments
 
 ```
 environments ≈ request_rate × mean_duration
-16,700 /s × 20 ms   →    ~334 environments  →  ~167 RCU/s   (6 % of the partition ceiling)
-16,700 /s × 100 ms  →  ~1,670 environments  →  ~835 RCU/s   (28 %)
+ 8,350 /s × 20 ms   →    ~167 environments  →   ~84 RCU/s   (3 % of the partition ceiling)
+ 8,350 /s × 100 ms  →    ~835 environments  →  ~418 RCU/s   (14 %)
 ```
 
 Without it the same spike is about 8,350 RCU/s against a 3,000 ceiling. Re-fetching

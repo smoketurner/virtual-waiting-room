@@ -181,9 +181,10 @@ shard and index come from `GET /_wr/v1/queue_num`.
 
 - asks `/_wr/v1/queue_num` only until it knows its position, since a position never changes; every
   later tick fetches `/_wr/v1/status` alone, which CloudFront collapses;
-- delays that first ask by a random slice of `min(60 s, participants / 5000 s⁻¹)` so the cohort
-  does not ask at once (at 1,000,000 participants that is about 16,700 requests/s, above the
+- delays that first ask by a random slice of `min(120 s, participants / 5000 s⁻¹)` so the cohort
+  does not ask at once (at 1,000,000 participants that is about 8,500 requests/s, under the
   default 10,000/s API Gateway account throttle);
+- asks again less and less often, doubling to the ceiling, while a redemption is answered 425;
 - polls at `clamp(floor, ceiling, secondsAhead × 1000 / divisor)` plus up to 30 % jitter, from the
   Terraform-set `poll_policy` ([ADR-0023](adr/0023-adaptive-poll-interval.md)), defaulting to a
   fixed 5 s;
@@ -219,13 +220,17 @@ waits for the next execution before admission starts.
 owed     = target_rate × (now − last_open_pass_at)            // one interval if ≥ 20 s or never
 unused   = Σ shards (c − n)
 budget   = min(unused + owed, 2 × target_rate × 10)           // caps: c = n + an even share
-release  = owed + min(unused, owed)
+slack    = owed / 4
+release  = owed + clamp(unused − slack, −slack, owed)
 next     = clamp(serving_counter + release, serving_counter, queue_counter + 1)
 ```
 
 The budget is what `generate_token` may admit before the next pass; unused budget is carried, up
-to the two-interval burst, and is also how many extra positions the cursor releases to replace
-no-shows ([ADR-0039](adr/0039-meter-admissions-not-the-cursor.md)). All arithmetic saturates. The
+to the two-interval burst. The cursor is steered to leave a quarter of a pass's budget unused:
+more than that is people not showing, and that many extra positions are released, at most
+doubling the pass; a budget found spent is a backlog of visitors already invited, and the pass
+releases three quarters so they drain first
+([ADR-0039](adr/0039-meter-admissions-not-the-cursor.md)). All arithmetic saturates. The
 cursor never passes `queue_counter + 1`, and an idle event holds no more than the burst. The
 cursor write is guarded on `serving_counter = :expected`; a pass that loses it writes no caps.
 The caps are then one `UpdateItem` per shard, absolute values, so writing them twice grants
@@ -257,12 +262,15 @@ shard's opened count is the visitor's place whatever `Positions` holds, the same
 | Already admitted, and `admitted_at + session_ttl_seconds` has passed | 410, take a new place |
 
 Admission control is resolved by `wr_common::resolve(stored, fail_open_until, now)`; `FailOpen` is
-never stored.
+never stored. The `Counters` item is held for one second per execution environment, as `read`
+holds it, so the admission path does not put a read per attempt on one partition key; a pause
+takes effect up to a second late.
 
 A visitor not yet admitted then **takes one unit of the admission budget**
 ([ADR-0039](adr/0039-meter-admissions-not-the-cursor.md)): an `UpdateItem ADD n 1` on a randomly
 drawn arrivals shard, conditional on `n < c`, trying up to three shards. With none to take the
-answer is 425 and the page asks again. A failed draw or write is also "no unit"
+answer is 425 and the page asks again, and the environment does not ask a shard it saw spent
+for another second, so a refusal costs no write. A failed draw or write is also "no unit"
 (`arrival_shard_draw_failed`, `arrival_record_failed`): an admission that cannot be metered is not
 made. The `Positions` row is then marked `status = admitted`, guarded by
 `attribute_not_exists(request_id) OR status = issued`, which creates a pre-queue member's row. A
@@ -304,8 +312,8 @@ header, then:
    XHR.
 4. Otherwise pass through.
 
-A session that fails under `k` is tried under the optional previous key `kp`, read only then
-(#247; nothing writes `kp` yet).
+A session that fails under `k` is tried under the previous key `kp`, read only then. Terraform
+writes it: `kp` is the signing key's previous generation (#247).
 
 If the function throws before a rule has matched (unreadable config, unknown config version) it
 passes the request with `x-wr-gate-failed: true`. If it throws after one has — an unreadable key,
@@ -347,7 +355,7 @@ The admin Lambda serves an Axum router behind an API Gateway greedy proxy:
 
 | Route | Method | Does |
 |---|---|---|
-| `/_wr/admin`, `/_wr/admin/state` | GET | Dashboard (with the readiness panel) and JSON state |
+| `/_wr/admin`, `/_wr/admin/state` | GET | Dashboard (with the readiness panel, whose read of the distribution the `edge` module grants on its own distribution, #250) and JSON state |
 | `/_wr/admin/login`, `/_wr/admin/callback` | GET | OIDC Authorization Code + PKCE ([ADR-0016](adr/0016-admin-oidc-dynamodb-sessions.md)). The callback answers a meta-refresh page, so the `SameSite=Strict` session cookie it sets is sent on the way to the dashboard |
 | `/_wr/admin/logout` | POST | Ends the session. Like every POST, needs the session's `csrf` form field |
 | `/_wr/admin/phase` | POST | Phase transition from an expected prior phase; refuses `active`, which only the open can set |
@@ -382,6 +390,7 @@ proven. The core ones:
 | Keys distinct | `shard_keys_are_distinct_partition_keys`, `the_tokens_table_key_space_does_not_collide_across_kinds` |
 | Admission bounded | `no_window_admits_more_than_its_time_plus_the_burst`, `an_idle_event_banks_no_more_than_the_burst`, `a_pass_never_panics_rewinds_or_exceeds_its_bounds` |
 | No-show convergence | `admissions_converge_on_the_target_despite_no_shows` |
+| A backlog drains | `a_spent_budget_holds_the_cursor_back_so_a_backlog_drains`, `a_backlog_of_invited_visitors_drains_instead_of_persisting` |
 | Cadence-independent | `interleaved_executions_grant_what_one_cadence_would` |
 | Gate conformance | `infra/modules/edge/tests/gate.conformance.test.js` |
 
