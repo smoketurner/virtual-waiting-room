@@ -198,6 +198,12 @@ variable "waf_nojs_wait_ip_limit" {
   default     = 300
 }
 
+variable "waf_require_token_cookie" {
+  description = "Whether a JavaScript API request holding a WAF token must carry it as the cookie. False counts such requests instead of blocking them."
+  type        = bool
+  default     = true
+}
+
 variable "nojs_enabled" {
   description = "Whether the no-JavaScript queue stays open on a flat-rate plan. false closes it at the edge for an event where it is being abused."
   type        = bool

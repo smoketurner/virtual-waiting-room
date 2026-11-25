@@ -118,9 +118,10 @@ module "edge" {
 
   # Pay-as-you-go unless a flat-rate plan is set; the plan brings the web ACL
   # (ADR-0038), whose cost it bundles.
-  flat_rate_plan_tier    = var.flat_rate_plan_tier
-  waf_managed_rules_mode = var.waf_managed_rules_mode
-  waf_join_ip_limit      = var.waf_join_ip_limit
-  waf_nojs_wait_ip_limit = var.waf_nojs_wait_ip_limit
-  nojs_enabled           = var.nojs_enabled
+  flat_rate_plan_tier      = var.flat_rate_plan_tier
+  waf_managed_rules_mode   = var.waf_managed_rules_mode
+  waf_join_ip_limit        = var.waf_join_ip_limit
+  waf_nojs_wait_ip_limit   = var.waf_nojs_wait_ip_limit
+  waf_require_token_cookie = var.waf_require_token_cookie
+  nojs_enabled             = var.nojs_enabled
 }
