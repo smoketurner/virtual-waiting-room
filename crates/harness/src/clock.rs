@@ -13,12 +13,24 @@ fn start() -> (Timestamp, std::time::Instant, Instant) {
     *START.get_or_init(|| (Timestamp::now(), std::time::Instant::now(), Instant::now()))
 }
 
+/// How far tokio's clock is past the start, signed. A test runtime's paused
+/// clock can be behind the one that fixed the start, and a clamped
+/// `elapsed()` would then stand still while its own clock moves.
+fn since_start(start: Instant) -> SignedDuration {
+    let now = Instant::now();
+    if now >= start {
+        SignedDuration::try_from(now - start).unwrap_or(SignedDuration::MAX)
+    } else {
+        -SignedDuration::try_from(start - now).unwrap_or(SignedDuration::MAX)
+    }
+}
+
 /// Now, on the run's clock. The first call fixes the start.
 #[must_use]
 pub fn now() -> Timestamp {
     let (wall, _, start) = start();
-    let elapsed = SignedDuration::try_from(start.elapsed()).unwrap_or(SignedDuration::MAX);
-    wall.checked_add(elapsed).unwrap_or(Timestamp::MAX)
+    wall.checked_add(since_start(start))
+        .unwrap_or(Timestamp::MAX)
 }
 
 /// The run's clock as a `std::time::Instant`, for code that ages a cache on
@@ -26,7 +38,13 @@ pub fn now() -> Timestamp {
 #[must_use]
 pub fn monotonic() -> std::time::Instant {
     let (_, base, start) = start();
-    base + start.elapsed()
+    let offset = since_start(start);
+    let magnitude = offset.unsigned_abs();
+    if offset.is_negative() {
+        base.checked_sub(magnitude).unwrap_or(base)
+    } else {
+        base + magnitude
+    }
 }
 
 #[cfg(test)]
