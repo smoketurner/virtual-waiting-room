@@ -649,8 +649,7 @@ async fn open_now(
             &session.email,
             now,
         )
-        .await
-        .map(|_outcome| ()),
+        .await,
     )
 }
 

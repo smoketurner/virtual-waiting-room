@@ -29,10 +29,6 @@ use axum::routing::{get, post};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
-/// How long an invocation may wait for an environment and run: API Gateway's
-/// 29 s integration timeout is the longest any caller here waits.
-const INVOKE_TIMEOUT: Duration = Duration::from_secs(29);
-
 type Reply = Result<Bytes, String>;
 
 /// Why an invocation did not produce a response.
@@ -40,8 +36,9 @@ type Reply = Result<Bytes, String>;
 pub enum Failure {
     /// The function reported an error.
     FunctionError,
-    /// No environment answered within API Gateway's 29 s. With the functions
-    /// healthy this means the machine running the harness is saturated.
+    /// No environment answered within the function's timeout. With the
+    /// functions healthy this means the machine running the harness is
+    /// saturated.
     Timeout,
     /// The pool shut down underneath the call.
     Dropped,
@@ -59,6 +56,8 @@ struct HostState {
     queue: Mutex<mpsc::Receiver<Pending>>,
     waiting: Mutex<HashMap<String, oneshot::Sender<Reply>>>,
     arn: String,
+    /// How long an invocation may wait for an environment and run.
+    timeout: Duration,
     /// Environments parked in `next`, waiting for work.
     idle: AtomicUsize,
 }
@@ -122,7 +121,7 @@ impl Function {
             .send(Pending { id, payload, reply })
             .await
             .map_err(|_| Failure::Dropped)?;
-        let bytes = tokio::time::timeout(INVOKE_TIMEOUT, rx)
+        let bytes = tokio::time::timeout(self.host.timeout, rx)
             .await
             .map_err(|_| Failure::Timeout)?
             .map_err(|_| Failure::Dropped)?
@@ -169,6 +168,9 @@ pub struct Spec<'a> {
     pub max_environments: usize,
     pub env: Vec<(String, String)>,
     pub log_dir: &'a Path,
+    /// The function's configured timeout: API Gateway's 29 s for the functions
+    /// behind it.
+    pub timeout: Duration,
 }
 
 /// Starts a function's runtime API listener and its environments.
@@ -187,6 +189,7 @@ pub async fn start(spec: Spec<'_>) -> Result<Arc<Function>> {
             super::aws::ACCOUNT_ID,
             spec.name
         ),
+        timeout: spec.timeout,
         idle: AtomicUsize::new(0),
     });
     let app = axum::Router::new()
@@ -269,7 +272,7 @@ async fn next(State(state): State<Arc<HostState>>) -> Response<Body> {
     let deadline = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis())
-        + INVOKE_TIMEOUT.as_millis();
+        + state.timeout.as_millis();
     let mut response = Response::new(Body::from(pending.payload));
     let headers = response.headers_mut();
     let pairs = [

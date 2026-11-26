@@ -182,7 +182,7 @@ run "the_open_can_read_the_join_queue_depth_and_only_that" {
   }
 
   assert {
-    condition     = aws_lambda_function.open_event.timeout == 30
-    error_message = "the open's timeout must leave room for the drain wait"
+    condition     = aws_lambda_function.open_event.timeout == 900
+    error_message = "the open's timeout is how long it may wait for the join queue to drain: Lambda's maximum"
   }
 }

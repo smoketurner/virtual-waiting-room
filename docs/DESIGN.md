@@ -29,7 +29,7 @@ no call to the backend.
                               DynamoDB PreQueue {r, s, l, t, h}
 
   T−0   EventBridge Scheduler → open_event
-          wait, up to 15 s, for the join queue to read empty twice running (#239)
+          wait, up to 900 s, for the join queue to catch up twice running (#239)
           BatchGetItem the 10 shard counters, then ONE UpdateItem on Counters:
             SET shuffle_seed, participant_count = N, queue_counter = N,
                 prequeue_offsets, phase = active
@@ -150,15 +150,16 @@ ten items lift registration to about 10,000/s
 
 **Draining before the open.** A join answered 200 before T−0 is only in the cohort once
 `assign_position` has claimed its index, and arrivals bunch in the last minute, when the consumers
-are furthest behind. So the open first polls the join queue's waiting count
-(`sqs:GetQueueAttributes`) once a second, up to 15 times, until it reads zero twice running, then
-opens whatever it found. Joins still queued are numbered behind the cohort, and
-`open_drain_timed_out` or `open_drain_unreadable` is logged
-([#239](https://github.com/smoketurner/virtual-waiting-room/issues/239)). In-flight batches are
-not waited for: they are the straggler case. While joins keep arriving the queue rarely reads empty
-twice, so under continuous traffic at T−0 the wait runs its full length: the open lands 10–15 s
-after the published start, and everyone who joins in that time is in the cohort
-([local stack](LOCAL_STACK.md#findings)).
+are furthest behind. So the open first reads the join queue's waiting count
+(`sqs:GetQueueAttributes`) and the ten shard counts once a second, until twice running no more is
+waiting than the consumers counted since the last read. It waits as long as its 900 s timeout
+allows, so how fast joins arrive decides when the event opens, not who is in the cohort
+([ADR-0042](adr/0042-the-open-waits-out-the-join-backlog.md)). An empty queue is not the test:
+joins keep arriving after T−0, and under steady traffic the queue rarely reads empty twice
+([local stack](LOCAL_STACK.md#findings)). Everyone who joins during the wait is in the cohort.
+In-flight batches are not waited for: they are the straggler case. A wait that reaches the
+deadline, or a queue that cannot be read, opens anyway and logs `open_drain_timed_out` or
+`open_drain_unreadable` ([#239](https://github.com/smoketurner/virtual-waiting-room/issues/239)).
 
 A join refused with a 429 is not queued at all. During the countdown the page retries it at the poll
 floor, about every 5 s, without backing off, so a registration throttled in the last seconds lands
@@ -279,9 +280,10 @@ A batch claims `[end − n + 1, end]` with one increment by the count of **valid
 The live-join ceiling is the per-table on-demand quota: 40,000 WRU/s by default, adjustable. The
 1,000 WCU/s per-partition-key ceiling does not bind, because `request_id` keys are spread and the
 counter takes one write per batch. A new or long-idle table serves only ~4,000 writes/s, and a
-waiting room has no previous peak to grow from, so **tables are pre-warmed before every event**
-through the `warm_throughput_*` variables (O1). The open is one write and needs none; its wall
-time is that write plus up to 15 s of waiting for the join queue (§4.1).
+waiting room has no previous peak to grow from. A cold table still takes every join, because the
+open waits for the queue to drain (§4.1); pre-warming through the `warm_throughput_*` variables
+(O1) only shortens that wait. The open is one write and needs none; its wall time is that write
+plus the wait.
 
 ### 5.4 Sequences and statistics
 
@@ -675,7 +677,7 @@ per session length (§7).
 | Phase | API Gateway | DynamoDB writes | DynamoDB reads |
 |---|---|---|---|
 | Countdown, 60 min | `/_wr/v1/join` ~280/s average, ~1,400/s peak at T. `/_wr/v1/status` origin fetches are bounded by CloudFront cache nodes, not audience: tens to low hundreds a second | ~1 unit per join on `PreQueue`, plus one shard-counter write per batch of up to 100: ~1,400/s peak | ~1 unit per join (the batch's consistent duplicate check): ~1,400/s peak |
-| The open | one invoke | one conditional write | ten shard counters, after up to 15 s of queue drain |
+| The open | one invoke | one conditional write | ten shard counters a second while the queue drains, then once |
 | T to about T+160 s | 1,000,000 `/_wr/v1/queue_num`, ~8,500/s peak | none | one eventually consistent `PreQueue` read each: ~4,300 units/s peak |
 | Admission | `/_wr/v1/generate_token` at `origin_concurrency / session_ttl_seconds` a second, plus the refusals of those whose turn has come | 2 units per admission (the shard take, the `Positions` mark) | ~1.5 units per admission (`Positions` consistent, `PreQueue` eventual; `Counters` is held per environment) |
 | Controller, per pass | none | 12 (the cursor, the log, ten caps) | ~12 units (the event item, the log, ten shards) |
@@ -687,8 +689,9 @@ per session length (§7).
 
 - **Joins scale with the shape of arrival, not with this model.** Everyone in the last five
   minutes is ~3,300/s; everyone in the last minute is ~16,700/s, above API Gateway's 10,000/s
-  default account limit and above the ~4,000 writes/s an un-warmed table serves. Declaring
-  `expected_join_rate` makes the plan fail unless `warm_throughput_write_units` covers it (O1).
+  default account limit and above the ~4,000 writes/s an un-warmed table serves. The table's
+  ceiling delays the open, which waits for the backlog (§4.1); the account limit refuses joins,
+  and one accepted only after the open is behind the cohort.
 - **The position lookup is the largest request peak**, and the client's spread sets it: the
   first ask is spread over up to 120 s. At 60 s the same cohort peaked at ~16,600/s.
 - **A spent budget costs no writes.** A refused `generate_token` reads two per-visitor rows and
@@ -730,7 +733,7 @@ proportion.
 - **Admission is unaffected**: it fills the origin's slots from the first pass, from whoever has a
   position by then.
 - To take such a crowd faster, raise the account's API Gateway quota and
-  `api_join_throttle_rate_limit` with it, and pre-warm the tables (`expected_join_rate`).
+  `api_join_throttle_rate_limit` with it.
 
 ## 13. Requirement coverage
 

@@ -66,8 +66,8 @@ A change that breaks one of these is a fairness or safety failure, not a refacto
    it changes every position.
 2. **The open is one conditional write**, guarded by `attribute_not_exists(shuffle_seed) AND
    phase = pre_queue`. It sets the seed, `N`, the offsets, `queue_counter = N` and the phase
-   together. It reads the ten shard counters and never the rows, after waiting up to 15 s for
-   the join queue to read empty (#239).
+   together. It reads the ten shard counters and never the rows, after waiting, up to its 900 s
+   timeout, for the join queue to catch up (#239).
 3. **No seed before T−0.** Nothing can compute a position before the open.
 4. **Contiguous assembly.** The shard offsets are a prefix sum, so the indices are exactly
    `[0, N)`. A burned index is a gap nobody holds.

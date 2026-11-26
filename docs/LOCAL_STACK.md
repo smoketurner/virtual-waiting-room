@@ -36,6 +36,7 @@ harness could not keep up and the result is inconclusive.
 - The open runs, and every cohort position recomputes from the seed, count and offsets `/status`
   publishes plus the `PreQueue` rows, distinct and inside `[0, N)`.
 - A cohort position is uncorrelated with when the visitor registered.
+- Every join accepted before the open is in the cohort, not numbered behind it.
 - No more sessions are ever live than `--concurrency`, counted from the session end each
   `generate_token` answer gives.
 - The origin holds at least 85% of its slots from the first admission to the last.
@@ -85,6 +86,7 @@ What the runs changed:
   end of a countdown at its 30 s closed-event interval, so it landed after the open and was numbered
   behind everyone. The page now retries a throttled registration at the 5 s floor without backing
   off, which lands it inside the open's drain wait.
-- **The open's drain wait always runs its length under continuous traffic.** DESIGN §4.1 records
-  it.
+- **The open's drain wait always ran its length under continuous traffic**, because it waited for
+  the queue to read empty twice. It now waits for the queue to catch up, for as long as its
+  timeout allows (ADR-0042).
 - **The page retried a 429 or a 5xx from `/generate_token` at its 5 s floor.** It now backs off.

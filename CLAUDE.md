@@ -83,8 +83,9 @@ Position assignment has two paths:
   position is `PRP(seed, offset[s] + l, N)`, computed on read — never stored (ADR-0002), and
   `queue_counter` starts at `N` so live joiners are numbered behind the whole cohort. The open
   reads the ten shard counters and never the rows, so the write costs the same at a million
-  registrations as at ten. Before it reads them it waits, up to 15 s, for the join queue to read
-  empty, so joins accepted before T−0 are in the cohort rather than behind it (issue #239).
+  registrations as at ten. Before it reads them it waits for the join queue to catch up, as long as its
+  900 s timeout allows, so joins accepted before T−0 are in the cohort rather than behind it
+  (issue #239, ADR-0042).
 - **Live join.** `assign_position` claims a contiguous block with one
   `UpdateItem ADD queue_counter :n / ALL_NEW`, incrementing by the count of **valid** records
   only, then writes each row with `attribute_not_exists(request_id)`. Gaps are acceptable;

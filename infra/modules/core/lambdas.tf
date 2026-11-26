@@ -28,11 +28,9 @@ resource "aws_lambda_function" "open_event" {
   runtime       = "provided.al2023"
   architectures = [local.lambda_runtime_arch]
   handler       = "bootstrap"
-  # The open itself is one BatchGetItem and one conditional UpdateItem, well
-  # under a second whatever the cohort size, because it reads counters, not
-  # rows. The rest of the budget is the wait for the join queue to drain first
-  # (issue #239), so a registrant still in the queue at T-0 is in the cohort.
-  timeout     = 30
+  # Lambda's maximum: the open waits for the join queue to drain first, however
+  # long the backlog at T-0 takes (issue #239).
+  timeout     = 900
   memory_size = 256
 
   # A reservation is a guarantee as much as a cap. The open fires at T-0, into
