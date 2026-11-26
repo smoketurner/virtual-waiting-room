@@ -834,7 +834,7 @@ mod tests {
             message: None,
             origin_concurrency: None,
             stored_control: StoredControl::Open,
-            fail_open_until: 0,
+            fail_open_until: None,
             starts_at: None,
         }
     }
@@ -859,7 +859,7 @@ mod tests {
             message: None,
             origin_concurrency: None,
             stored_control: StoredControl::Open,
-            fail_open_until: 0,
+            fail_open_until: None,
             starts_at: None,
         }
     }

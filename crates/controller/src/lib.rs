@@ -34,6 +34,7 @@
 //! overflow checks, so a bare subtraction that underflows would wrap to a huge
 //! value and release a damaging burst.
 
+use jiff::{SignedDuration, Timestamp};
 use std::future::Future;
 
 use serde::{Deserialize, Serialize};
@@ -44,7 +45,7 @@ pub mod dynamo;
 /// The controller interval in seconds. The `EventBridge` Scheduler `rate()`
 /// minimum is one minute, so the schedule fires `rate(1 minute)` and the
 /// handler runs [`PASSES_PER_INVOKE`] passes this many seconds apart.
-pub const INTERVAL_SECS: u64 = 10;
+pub const INTERVAL: SignedDuration = SignedDuration::from_secs(10);
 
 /// Passes per durable execution. `INTERVAL_SECS * PASSES_PER_INVOKE == 60`, so
 /// one execution started by the `rate(1 minute)` schedule covers a full minute.
@@ -72,7 +73,7 @@ impl ShardBudget {
 /// One pass's reading: at `at`, `admitted` visitors had been admitted in all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LogEntry {
-    pub at: u64,
+    pub at: Timestamp,
     pub admitted: u64,
 }
 
@@ -92,7 +93,7 @@ impl AdmissionLog {
     /// it, or nobody when there is none. Anyone admitted after that entry is
     /// counted as still live, so a gap in the log admits fewer, never more.
     #[must_use]
-    pub fn admitted_by(&self, horizon: u64) -> u64 {
+    pub fn admitted_by(&self, horizon: Timestamp) -> u64 {
         let mut admitted = 0;
         for entry in &self.entries {
             if entry.at > horizon {
@@ -107,7 +108,7 @@ impl AdmissionLog {
     /// entries a pass at or after `horizon` can need: those after it, and the
     /// latest one at or before it.
     #[must_use]
-    pub fn recorded(&self, entry: LogEntry, horizon: u64, provided: u64) -> Self {
+    pub fn recorded(&self, entry: LogEntry, horizon: Timestamp, provided: u64) -> Self {
         let mut entries = self.entries.clone();
         entries.push(entry);
         entries.sort_by_key(|e| e.at);
@@ -131,15 +132,15 @@ pub struct PassInputs {
     /// How many sessions the origin takes at once.
     pub origin_concurrency: u32,
     /// How long a session lasts, the same value `generate_token` mints with.
-    pub session_secs: u64,
+    pub session: SignedDuration,
     /// The total admitted at each recent pass.
     pub log: AdmissionLog,
-    /// The whole epoch second, rounded down, at which the shards were read.
-    /// Every admission they count began at or before it: a session starts at
-    /// its request's whole second, and the request took its unit before the
-    /// read. So this is the latest any of their sessions can end, less
-    /// `session_secs`, and what the pass is logged at.
-    pub shards_read_at: u64,
+    /// When the shards were read, rounded down to the whole second. Every
+    /// admission they count began at or before it: a session starts at its
+    /// request's time, and the request took its unit before the read. So this
+    /// is the latest any of their sessions can end, less `session`, and what
+    /// the pass is logged at.
+    pub shards_read_at: Timestamp,
 }
 
 /// What one pass decided.
@@ -183,9 +184,10 @@ pub fn admitted(shards: [ShardBudget; SHARDS]) -> u64 {
 /// A pure function of its inputs and `now`, so the cadence is testable with
 /// time injected.
 #[must_use]
-pub fn compute_pass(inputs: &PassInputs, now: u64) -> PassDecision {
+pub fn compute_pass(inputs: &PassInputs, now: Timestamp) -> PassDecision {
     let admitted = admitted(inputs.shards);
-    let horizon = now.saturating_sub(inputs.session_secs);
+    // Saturating at jiff's range, as the counts saturate at u64's.
+    let horizon = now.checked_sub(inputs.session).unwrap_or(Timestamp::MIN);
     let live = admitted.saturating_sub(inputs.log.admitted_by(horizon));
     let limit = u64::from(inputs.origin_concurrency);
     let free = limit.saturating_sub(live);
@@ -201,7 +203,7 @@ pub fn compute_pass(inputs: &PassInputs, now: u64) -> PassDecision {
     let provided = limit.saturating_add(
         inputs
             .log
-            .admitted_by(horizon.saturating_add(INTERVAL_SECS)),
+            .admitted_by(horizon.checked_add(INTERVAL).unwrap_or(Timestamp::MAX)),
     );
     let positions = provided
         .saturating_sub(inputs.log.provided)
@@ -277,8 +279,8 @@ pub struct ControllerState {
     /// The operator's stored admission override (issue #71: never `FailOpen`,
     /// which is resolved from `fail_open_until` instead).
     pub stored_control: StoredControl,
-    /// Epoch-seconds fail-open deadline; `0` means no window is in force.
-    pub fail_open_until: u64,
+    /// The fail-open deadline; `None` means no window is in force.
+    pub fail_open_until: Option<Timestamp>,
     pub inputs: PassInputs,
 }
 
@@ -349,7 +351,7 @@ pub enum PassOutcome {
 pub async fn run_pass<S: Store>(
     store: &S,
     event_id: &str,
-    now: u64,
+    now: Timestamp,
 ) -> Result<PassOutcome, StoreError> {
     let state = store.read_state(event_id).await?;
     if state.phase != Phase::Active {
@@ -412,9 +414,10 @@ mod tests {
 
     use super::*;
 
-    const NOW: u64 = 1_000_000;
+    const NOW: i64 = 1_000_000;
     // Not a multiple of the interval, so sessions end between passes.
-    const SESSION: u64 = 605;
+    const SESSION: i64 = 605;
+    const INTERVAL_SECS: i64 = INTERVAL.as_secs();
 
     fn inputs(concurrency: u32) -> PassInputs {
         PassInputs {
@@ -422,9 +425,9 @@ mod tests {
             serving_counter: 0,
             queue_counter: u64::MAX - 1,
             origin_concurrency: concurrency,
-            session_secs: SESSION,
+            session: SignedDuration::from_secs(SESSION),
             log: AdmissionLog::default(),
-            shards_read_at: NOW,
+            shards_read_at: Timestamp::constant(NOW, 0),
         }
     }
 
@@ -439,8 +442,11 @@ mod tests {
         i
     }
 
-    fn entry(at: u64, admitted: u64) -> LogEntry {
-        LogEntry { at, admitted }
+    fn entry(secs: i64, admitted: u64) -> LogEntry {
+        LogEntry {
+            at: Timestamp::constant(secs, 0),
+            admitted,
+        }
     }
 
     fn log_of(entries: Vec<LogEntry>) -> AdmissionLog {
@@ -455,16 +461,16 @@ mod tests {
     #[test]
     fn the_log_reads_the_latest_entry_at_or_before_the_horizon() {
         let log = log_of(vec![entry(100, 5), entry(110, 9), entry(120, 14)]);
-        assert_eq!(log.admitted_by(99), 0);
-        assert_eq!(log.admitted_by(100), 5);
-        assert_eq!(log.admitted_by(119), 9);
-        assert_eq!(log.admitted_by(10_000), 14);
+        assert_eq!(log.admitted_by(Timestamp::constant(99, 0)), 0);
+        assert_eq!(log.admitted_by(Timestamp::constant(100, 0)), 5);
+        assert_eq!(log.admitted_by(Timestamp::constant(119, 0)), 9);
+        assert_eq!(log.admitted_by(Timestamp::constant(10_000, 0)), 14);
     }
 
     #[test]
     fn recording_keeps_only_what_a_later_pass_can_need() {
         let log = log_of(vec![entry(100, 5), entry(110, 9), entry(120, 14)]);
-        let next = log.recorded(entry(130, 20), 115, 0);
+        let next = log.recorded(entry(130, 20), Timestamp::constant(115, 0), 0);
         assert_eq!(
             next.entries,
             vec![entry(110, 9), entry(120, 14), entry(130, 20)]
@@ -475,8 +481,8 @@ mod tests {
             let mut whole = log.entries.clone();
             whole.push(entry(130, 20));
             assert_eq!(
-                next.admitted_by(horizon),
-                log_of(whole).admitted_by(horizon)
+                next.admitted_by(Timestamp::constant(horizon, 0)),
+                log_of(whole).admitted_by(Timestamp::constant(horizon, 0))
             );
         }
     }
@@ -484,7 +490,7 @@ mod tests {
     #[test]
     fn an_entry_from_a_clock_behind_the_log_is_put_in_order() {
         let log = log_of(vec![entry(100, 5), entry(120, 14)]);
-        let next = log.recorded(entry(110, 9), 0, 0);
+        let next = log.recorded(entry(110, 9), Timestamp::constant(0, 0), 0);
         assert_eq!(
             next.entries,
             vec![entry(100, 5), entry(110, 9), entry(120, 14)]
@@ -495,7 +501,7 @@ mod tests {
 
     #[test]
     fn the_first_pass_fills_every_slot() {
-        let d = compute_pass(&inputs(100), NOW);
+        let d = compute_pass(&inputs(100), Timestamp::constant(NOW, 0));
         assert_eq!(d.live, 0);
         assert_eq!(d.budget, 100);
         assert_eq!(d.release, 100);
@@ -517,8 +523,8 @@ mod tests {
         // A request that took its unit just before the read started its
         // session in that second, after the pass itself began.
         let mut i = with_taken(inputs(100), 7, 0);
-        i.shards_read_at = NOW + 1;
-        let d = compute_pass(&i, NOW);
+        i.shards_read_at = Timestamp::constant(NOW + 1, 0);
+        let d = compute_pass(&i, Timestamp::constant(NOW, 0));
         assert_eq!(d.log.entries, vec![entry(NOW + 1, 7)]);
     }
 
@@ -526,7 +532,7 @@ mod tests {
     fn a_full_origin_grants_nothing_and_releases_nobody() {
         let mut i = with_taken(inputs(100), 100, 0);
         i.log = after_the_open();
-        let d = compute_pass(&i, NOW);
+        let d = compute_pass(&i, Timestamp::constant(NOW, 0));
         assert_eq!(d.live, 100);
         assert_eq!(d.budget, 0);
         assert_eq!(d.release, 0);
@@ -538,12 +544,12 @@ mod tests {
         let mut i = with_taken(inputs(100), 130, 0);
         let opened = NOW - SESSION;
         i.log = log_of(vec![entry(opened - 10, 0), entry(opened, 100)]);
-        let d = compute_pass(&i, NOW);
+        let d = compute_pass(&i, Timestamp::constant(NOW, 0));
         // The first 100 have ended; the 30 are live.
         assert_eq!(d.live, 30);
         assert_eq!(d.budget, 70);
         // A second earlier, they had not.
-        let d = compute_pass(&i, NOW - 1);
+        let d = compute_pass(&i, Timestamp::constant(NOW - 1, 0));
         assert_eq!(d.live, 130);
         assert_eq!(d.budget, 0);
     }
@@ -559,11 +565,11 @@ mod tests {
         };
         // A pass before they end: nothing is granted yet, but the 100 behind
         // them are released.
-        let before = compute_pass(&i, NOW - INTERVAL_SECS);
+        let before = compute_pass(&i, Timestamp::constant(NOW - INTERVAL_SECS, 0));
         assert_eq!((before.live, before.budget, before.release), (100, 0, 100));
         // When they end, the slots are granted and nobody more is released.
         i.log = before.log;
-        let at = compute_pass(&i, NOW);
+        let at = compute_pass(&i, Timestamp::constant(NOW, 0));
         assert_eq!((at.live, at.budget, at.release), (0, 100, 0));
     }
 
@@ -572,13 +578,13 @@ mod tests {
         // 60 admitted and live, 40 slots granted last pass and still free.
         let mut i = with_taken(inputs(100), 60, 40);
         i.log = after_the_open();
-        let d = compute_pass(&i, NOW);
+        let d = compute_pass(&i, Timestamp::constant(NOW, 0));
         assert_eq!(d.budget, 40);
         assert_eq!(d.release, 20);
         // One slot nobody takes still draws someone.
         let mut i = with_taken(inputs(100), 99, 1);
         i.log = after_the_open();
-        assert_eq!(compute_pass(&i, NOW).release, 1);
+        assert_eq!(compute_pass(&i, Timestamp::constant(NOW, 0)).release, 1);
     }
 
     #[test]
@@ -586,7 +592,7 @@ mod tests {
         let mut i = with_taken(inputs(100), 80, 20);
         i.log = after_the_open();
         i.origin_concurrency = 50;
-        let d = compute_pass(&i, NOW);
+        let d = compute_pass(&i, Timestamp::constant(NOW, 0));
         assert_eq!(d.budget, 0);
         assert_eq!(d.release, 0);
         for (cap, shard) in d.caps.iter().zip(i.shards) {
@@ -596,7 +602,7 @@ mod tests {
 
     #[test]
     fn a_zero_limit_grants_and_releases_nothing() {
-        let d = compute_pass(&inputs(0), NOW);
+        let d = compute_pass(&inputs(0), Timestamp::constant(NOW, 0));
         assert_eq!((d.budget, d.release), (0, 0));
     }
 
@@ -610,7 +616,7 @@ mod tests {
             };
         }
         i.origin_concurrency = 57 + 450;
-        let d = compute_pass(&i, NOW);
+        let d = compute_pass(&i, Timestamp::constant(NOW, 0));
         assert_eq!(d.budget, 57);
         for (index, (cap, shard)) in d.caps.iter().zip(i.shards).enumerate() {
             let expected = 5 + u64::from(index < 7);
@@ -622,7 +628,7 @@ mod tests {
     fn the_cursor_stops_at_the_end_of_the_line() {
         let mut i = inputs(100);
         i.queue_counter = 40;
-        let d = compute_pass(&i, NOW);
+        let d = compute_pass(&i, Timestamp::constant(NOW, 0));
         assert_eq!(d.next_serving_counter, 41);
         assert_eq!(d.release, 41);
     }
@@ -632,7 +638,7 @@ mod tests {
         let mut i = inputs(100);
         i.serving_counter = 500;
         i.queue_counter = 10;
-        let d = compute_pass(&i, NOW);
+        let d = compute_pass(&i, Timestamp::constant(NOW, 0));
         assert_eq!(d.next_serving_counter, 500);
         assert_eq!(d.release, 0);
     }
@@ -642,15 +648,15 @@ mod tests {
     /// Runs `passes` regular passes in which a fixed share of the people
     /// released show up, at the next pass, and take a slot while there is one.
     /// Returns the live sessions as each pass's admissions land.
-    fn simulate(concurrency: u32, show_per_thousand: u64, passes: u64) -> (Vec<u64>, u64) {
+    fn simulate(concurrency: u32, show_per_thousand: u64, passes: i64) -> (Vec<u64>, u64) {
         let mut i = inputs(concurrency);
         let mut waiting = 0u64;
-        let mut admissions: Vec<(u64, u64)> = Vec::new();
+        let mut admissions: Vec<(i64, u64)> = Vec::new();
         let mut live_after = Vec::new();
         for step in 0..passes {
             let now = NOW + step * INTERVAL_SECS;
-            i.shards_read_at = now;
-            let d = compute_pass(&i, now);
+            i.shards_read_at = Timestamp::constant(now, 0);
+            let d = compute_pass(&i, Timestamp::constant(now, 0));
             let take = waiting.min(d.budget);
             waiting -= take;
             waiting += d.release * show_per_thousand / 1000;
@@ -717,7 +723,7 @@ mod tests {
         // cursor moves concurrency per session length, plus the open's fill.
         let passes = 600;
         let (_, served) = simulate(100, 1000, passes);
-        let sessions = passes * INTERVAL_SECS / (SESSION + INTERVAL_SECS);
+        let sessions = u64::try_from(passes * INTERVAL_SECS / (SESSION + INTERVAL_SECS)).unwrap();
         assert!(served >= 100 * sessions, "{served}");
         assert!(served <= 100 * (sessions + 2), "{served}");
     }
@@ -791,7 +797,7 @@ mod tests {
         ControllerState {
             phase: Phase::Active,
             stored_control: StoredControl::Open,
-            fail_open_until: 0,
+            fail_open_until: None,
             inputs: inputs(100),
         }
     }
@@ -799,7 +805,9 @@ mod tests {
     #[tokio::test]
     async fn an_open_pass_moves_the_cursor_records_the_pass_and_grants_the_free_slots() {
         let store = FakeStore::new(active_state());
-        let outcome = run_pass(&store, "evt", NOW).await.unwrap();
+        let outcome = run_pass(&store, "evt", Timestamp::constant(NOW, 0))
+            .await
+            .unwrap();
         assert_eq!(outcome, PassOutcome::Ran { released: 100 });
         let writes = store.writes.lock().unwrap();
         assert_eq!(writes.release.as_ref().unwrap().next_serving_counter, 100);
@@ -811,7 +819,9 @@ mod tests {
     async fn a_lost_release_race_releases_nobody_and_writes_nothing_else() {
         let mut store = FakeStore::new(active_state());
         store.lose_release = true;
-        let outcome = run_pass(&store, "evt", NOW).await.unwrap();
+        let outcome = run_pass(&store, "evt", Timestamp::constant(NOW, 0))
+            .await
+            .unwrap();
         assert_eq!(outcome, PassOutcome::Ran { released: 0 });
         let writes = store.writes.lock().unwrap();
         assert!(writes.log.is_none() && writes.caps.is_none());
@@ -822,7 +832,9 @@ mod tests {
         let mut state = active_state();
         state.phase = Phase::PreQueue;
         let store = FakeStore::new(state);
-        let outcome = run_pass(&store, "evt", NOW).await.unwrap();
+        let outcome = run_pass(&store, "evt", Timestamp::constant(NOW, 0))
+            .await
+            .unwrap();
         assert_eq!(outcome, PassOutcome::NotActive(Phase::PreQueue));
         let writes = store.writes.lock().unwrap();
         assert!(writes.release.is_none() && writes.caps.is_none());
@@ -833,7 +845,9 @@ mod tests {
         let mut state = active_state();
         state.stored_control = StoredControl::Paused;
         let store = FakeStore::new(state);
-        let outcome = run_pass(&store, "evt", NOW).await.unwrap();
+        let outcome = run_pass(&store, "evt", Timestamp::constant(NOW, 0))
+            .await
+            .unwrap();
         assert_eq!(outcome, PassOutcome::Held(AdmissionControl::Paused));
         let writes = store.writes.lock().unwrap();
         assert!(writes.release.is_none() && writes.caps.is_none());
@@ -842,15 +856,19 @@ mod tests {
     #[tokio::test]
     async fn fail_open_holds_the_controller_until_the_window_lapses() {
         let mut state = active_state();
-        state.fail_open_until = NOW + 5;
+        state.fail_open_until = Some(Timestamp::constant(NOW + 5, 0));
         let store = FakeStore::new(state);
         assert_eq!(
-            run_pass(&store, "evt", NOW).await.unwrap(),
+            run_pass(&store, "evt", Timestamp::constant(NOW, 0))
+                .await
+                .unwrap(),
             PassOutcome::Held(AdmissionControl::FailOpen)
         );
         // The very next pass, past the deadline, runs.
         assert!(matches!(
-            run_pass(&store, "evt", NOW + 10).await.unwrap(),
+            run_pass(&store, "evt", Timestamp::constant(NOW + 10, 0))
+                .await
+                .unwrap(),
             PassOutcome::Ran { .. }
         ));
     }
@@ -881,8 +899,14 @@ mod tests {
         )
     }
 
+    /// Any instant jiff can hold, edges included.
+    fn instant() -> impl Strategy<Value = Timestamp> {
+        let (min, max) = (Timestamp::MIN.as_second(), Timestamp::MAX.as_second());
+        prop_oneof![Just(min), Just(max), min..=max].prop_map(|secs| Timestamp::constant(secs, 0))
+    }
+
     fn log() -> impl Strategy<Value = AdmissionLog> {
-        proptest::collection::vec((count(), count()), 0..8).prop_map(|mut pairs| {
+        proptest::collection::vec((instant(), count()), 0..8).prop_map(|mut pairs| {
             pairs.sort_unstable();
             log_of(
                 pairs
@@ -900,17 +924,17 @@ mod tests {
             serving in count(),
             queue in count(),
             concurrency in any::<u32>(),
-            session in count(),
+            session in prop_oneof![0i64..1_000_000, Just(i64::MAX), 0..=i64::MAX],
             log in log(),
-            now in count(),
-            read_at in count(),
+            now in instant(),
+            read_at in instant(),
         ) {
             let inputs = PassInputs {
                 shards,
                 serving_counter: serving,
                 queue_counter: queue,
                 origin_concurrency: concurrency,
-                session_secs: session,
+                session: SignedDuration::from_secs(session),
                 log,
                 shards_read_at: read_at,
             };

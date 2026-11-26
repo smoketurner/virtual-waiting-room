@@ -44,9 +44,9 @@ pub const SESSION_COOKIE: &str = "__Host-vwr_admin_session";
 pub const STATE_COOKIE: &str = "__Host-vwr_admin_login_state";
 
 /// The session cookie's lifetime, matching the session row's (8 h).
-const SESSION_MAX_AGE_SECS: u32 = 8 * 60 * 60;
+const SESSION_MAX_AGE: jiff::SignedDuration = jiff::SignedDuration::from_hours(8);
 /// The login-state cookie's lifetime, matching the pending login's (10 min).
-const STATE_MAX_AGE_SECS: u32 = 600;
+const STATE_MAX_AGE: jiff::SignedDuration = jiff::SignedDuration::from_mins(10);
 
 /// The largest form the guard will buffer to read the token from. The rules
 /// form is the biggest the console posts and is bounded far below this by the
@@ -57,9 +57,10 @@ const MAX_FORM_BYTES: usize = 64 * 1024;
 /// starts carries it, a top-level navigation included.
 #[must_use]
 pub fn session_cookie(session_id: &str) -> String {
+    let max_age = SESSION_MAX_AGE.as_secs();
     format!(
         "{SESSION_COOKIE}={session_id}; Path=/; HttpOnly; Secure; SameSite=Strict; \
-         Max-Age={SESSION_MAX_AGE_SECS}"
+         Max-Age={max_age}"
     )
 }
 
@@ -74,9 +75,10 @@ pub fn cleared_session_cookie() -> String {
 /// `Strict` cookie would not be sent on it, so no login could complete.
 #[must_use]
 pub fn state_cookie(state: &str) -> String {
+    let max_age = STATE_MAX_AGE.as_secs();
     format!(
         "{STATE_COOKIE}={state}; Path=/; HttpOnly; Secure; SameSite=Lax; \
-         Max-Age={STATE_MAX_AGE_SECS}"
+         Max-Age={max_age}"
     )
 }
 

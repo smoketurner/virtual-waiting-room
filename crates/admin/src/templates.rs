@@ -233,12 +233,12 @@ fn lifecycle_for(phase: &str) -> Vec<Step> {
 }
 
 impl Dashboard {
-    /// Builds the view from control state at `now` (epoch seconds), which
-    /// resolves the stored control against the fail-open epoch (issue #71) —
+    /// Builds the view from control state at `now`, which resolves the stored
+    /// control against the fail-open deadline (issue #71) —
     /// nothing here ever reads a stored "`fail_open`" string, because
     /// `StoredControl` cannot hold one.
     #[must_use]
-    pub fn from_state(state: &ControlState, now: u64) -> Self {
+    pub fn from_state(state: &ControlState, now: jiff::Timestamp) -> Self {
         let dash = |s: Option<String>| s.unwrap_or_else(|| "not set".to_owned());
         let resolved = wr_common::resolve(state.stored_control, state.fail_open_until, now);
         Self {
@@ -255,7 +255,10 @@ impl Dashboard {
             message: dash(state.message.clone()),
             message_raw: state.message.clone().unwrap_or_default(),
             admission_control: resolved.as_wire_str().to_owned(),
-            fail_open_remaining_secs: state.fail_open_until.saturating_sub(now),
+            // A deadline already past leaves nothing, not a negative count.
+            fail_open_remaining_secs: state.fail_open_until.map_or(0, |until| {
+                u64::try_from(until.duration_since(now).as_secs()).unwrap_or(0)
+            }),
             queued_control: state.stored_control.as_wire_str().to_owned(),
             serving_state: {
                 use wr_common::ServingState::{Closed, FailOpen, Paused, Running};
@@ -293,15 +296,15 @@ impl Dashboard {
                 dash(
                     state
                         .starts_at
-                        .and_then(|secs| crate::format_start_time(secs, tz))
+                        .and_then(|at| crate::format_start_time(at, tz))
                         .map(|at| format!("{at} {tz}")),
                 )
             },
             starts_at_raw: state
                 .starts_at
-                .and_then(|secs| {
+                .and_then(|at| {
                     crate::format_start_time(
-                        secs,
+                        at,
                         state.starts_at_timezone.as_deref().unwrap_or("UTC"),
                     )
                 })
@@ -337,6 +340,7 @@ mod tests {
     use wr_common::Phase;
 
     use super::*;
+    use jiff::Timestamp;
 
     fn state() -> ControlState {
         ControlState {
@@ -348,7 +352,7 @@ mod tests {
             origin_concurrency: Some(500),
             message: Some("Doors open at noon".to_owned()),
             stored_control: wr_common::StoredControl::Open,
-            fail_open_until: 0,
+            fail_open_until: None,
             last_action: Some("set_concurrency".to_owned()),
             last_action_by: Some("op@example.com".to_owned()),
             last_action_at: Some("2026-09-09T22:00:00Z".to_owned()),
@@ -381,7 +385,7 @@ mod tests {
             );
         }
 
-        let mut view = Dashboard::from_state(&state(), 0);
+        let mut view = Dashboard::from_state(&state(), Timestamp::constant(0, 0));
         view.csrf_token = "tok-123".to_owned();
         let html = view.render().unwrap();
         assert_eq!(
@@ -395,14 +399,18 @@ mod tests {
 
     #[test]
     fn signing_out_is_a_form_post_not_a_link() {
-        let html = Dashboard::from_state(&state(), 0).render().unwrap();
+        let html = Dashboard::from_state(&state(), Timestamp::constant(0, 0))
+            .render()
+            .unwrap();
         assert!(html.contains(r#"method="post" action="/_wr/admin/logout""#));
         assert!(!html.contains(r#"href="/_wr/admin/logout""#));
     }
 
     #[test]
     fn renders_current_state() {
-        let html = Dashboard::from_state(&state(), 0).render().unwrap();
+        let html = Dashboard::from_state(&state(), Timestamp::constant(0, 0))
+            .render()
+            .unwrap();
         assert!(html.contains("launch"));
         assert!(html.contains(">active<"));
         assert!(html.contains("Doors open at noon"));
@@ -424,7 +432,7 @@ mod tests {
     #[test]
     fn the_readiness_panel_sits_above_current_state_and_shows_measured_values() {
         use crate::readiness::{CheckId, Status};
-        let mut view = Dashboard::from_state(&state(), 0);
+        let mut view = Dashboard::from_state(&state(), Timestamp::constant(0, 0));
         view.readiness = vec![readiness_row(
             CheckId::DynamoDbLimits,
             Status::Pass,
@@ -449,7 +457,7 @@ mod tests {
     #[test]
     fn a_failing_readiness_row_names_its_requirement_and_links_its_fix() {
         use crate::readiness::{CheckId, Status};
-        let mut view = Dashboard::from_state(&state(), 0);
+        let mut view = Dashboard::from_state(&state(), Timestamp::constant(0, 0));
         view.readiness = vec![readiness_row(
             CheckId::AssignPositionConcurrency,
             Status::Fail,
@@ -469,7 +477,7 @@ mod tests {
     #[test]
     fn an_in_page_fix_link_stays_in_the_page() {
         use crate::readiness::{CheckId, Status};
-        let mut view = Dashboard::from_state(&state(), 0);
+        let mut view = Dashboard::from_state(&state(), Timestamp::constant(0, 0));
         view.readiness = vec![readiness_row(CheckId::GateRuleset, Status::Warn, "dormant")];
         let html = view.render().unwrap();
         assert!(html.contains(r##"<a href="#protection-rules">"##), "{html}");
@@ -479,7 +487,7 @@ mod tests {
     #[test]
     fn a_readiness_row_that_could_not_be_read_says_so_without_a_fix() {
         use crate::readiness::{CheckId, Status};
-        let mut view = Dashboard::from_state(&state(), 0);
+        let mut view = Dashboard::from_state(&state(), Timestamp::constant(0, 0));
         view.readiness = vec![readiness_row(
             CheckId::ApiGatewayThrottle,
             Status::NotEvaluable,
@@ -494,7 +502,7 @@ mod tests {
     #[test]
     fn the_readiness_panel_stays_out_of_the_polled_json() {
         use crate::readiness::{CheckId, Status};
-        let mut view = Dashboard::from_state(&state(), 0);
+        let mut view = Dashboard::from_state(&state(), Timestamp::constant(0, 0));
         view.readiness = vec![readiness_row(CheckId::GateRuleset, Status::Pass, "2 rules")];
         let json = serde_json::to_string(&view).unwrap();
         assert!(!json.contains("readiness"), "{json}");
@@ -502,7 +510,9 @@ mod tests {
 
     #[test]
     fn an_unscheduled_event_offers_no_clear_and_defaults_to_utc() {
-        let html = Dashboard::from_state(&state(), 0).render().unwrap();
+        let html = Dashboard::from_state(&state(), Timestamp::constant(0, 0))
+            .render()
+            .unwrap();
         assert!(html.contains("not set"));
         // Nothing to clear, so no clear button to mis-click.
         assert!(!html.contains("Clear start time"));
@@ -518,7 +528,9 @@ mod tests {
         let mut s = state();
         s.phase = Phase::PreQueue;
         s.participant_count = None;
-        let html = Dashboard::from_state(&s, 0).render().unwrap();
+        let html = Dashboard::from_state(&s, Timestamp::constant(0, 0))
+            .render()
+            .unwrap();
 
         assert!(html.contains("Open now"));
         assert!(html.contains("/_wr/admin/open_now"));
@@ -537,7 +549,9 @@ mod tests {
         // A cohort size on the item means the open already ran, whether the
         // schedule fired it or an operator did. Pressing it again is a no-op
         // the button should not invite.
-        let html = Dashboard::from_state(&state(), 0).render().unwrap();
+        let html = Dashboard::from_state(&state(), Timestamp::constant(0, 0))
+            .render()
+            .unwrap();
 
         assert!(!html.contains("/_wr/admin/open_now"));
         assert!(html.contains("Already open"));
@@ -554,7 +568,9 @@ mod tests {
         let mut s = state();
         s.phase = Phase::Idle;
         s.participant_count = None;
-        let html = Dashboard::from_state(&s, 0).render().unwrap();
+        let html = Dashboard::from_state(&s, Timestamp::constant(0, 0))
+            .render()
+            .unwrap();
 
         assert!(
             !html.contains(r#"action="/_wr/admin/open_now""#),
@@ -586,7 +602,9 @@ mod tests {
         let mut s = state();
         s.phase = Phase::Maintenance;
         s.participant_count = None;
-        let html = Dashboard::from_state(&s, 0).render().unwrap();
+        let html = Dashboard::from_state(&s, Timestamp::constant(0, 0))
+            .render()
+            .unwrap();
 
         assert!(
             !html.contains(r#"action="/_wr/admin/open_now""#),
@@ -617,7 +635,9 @@ mod tests {
             let mut s = state();
             s.phase = phase;
             s.participant_count = None;
-            let html = Dashboard::from_state(&s, 0).render().unwrap();
+            let html = Dashboard::from_state(&s, Timestamp::constant(0, 0))
+                .render()
+                .unwrap();
             assert_eq!(
                 html.contains(r#"action="/_wr/admin/open_now""#),
                 opens,
@@ -632,9 +652,11 @@ mod tests {
         // York, so that is what the form must show them -- re-rendering in UTC
         // would invite them to "correct" a time that is already right.
         let mut s = state();
-        s.starts_at = Some(1_907_762_400);
+        s.starts_at = Some(Timestamp::constant(1_907_762_400, 0));
         s.starts_at_timezone = Some("America/New_York".to_owned());
-        let html = Dashboard::from_state(&s, 0).render().unwrap();
+        let html = Dashboard::from_state(&s, Timestamp::constant(0, 0))
+            .render()
+            .unwrap();
 
         assert!(html.contains(r#"value="2030-06-15T10:00""#));
         assert!(html.contains(r#"<option value="America/New_York" selected>"#));
@@ -647,7 +669,7 @@ mod tests {
         // indistinguishable from a genuinely empty (dormant) ruleset, and
         // submitting it would overwrite the real one. The form must not
         // render at all in that case.
-        let mut view = Dashboard::from_state(&state(), 0);
+        let mut view = Dashboard::from_state(&state(), Timestamp::constant(0, 0));
         view.rules_load_failed = true;
         let html = view.render().unwrap();
         assert!(!html.contains("action=\"/_wr/admin/rules\""));
@@ -656,7 +678,7 @@ mod tests {
 
     #[test]
     fn a_successful_ruleset_read_shows_the_form_not_the_error() {
-        let mut view = Dashboard::from_state(&state(), 0);
+        let mut view = Dashboard::from_state(&state(), Timestamp::constant(0, 0));
         view.rules_text = "p /checkout".to_owned();
         let html = view.render().unwrap();
         assert!(html.contains("action=\"/_wr/admin/rules\""));
@@ -666,7 +688,7 @@ mod tests {
 
     #[test]
     fn the_ip_binding_state_and_its_toggle_are_rendered() {
-        let mut view = Dashboard::from_state(&state(), 0);
+        let mut view = Dashboard::from_state(&state(), Timestamp::constant(0, 0));
         let off = view.render().unwrap();
         assert!(off.contains("action=\"/_wr/admin/ip_binding\""));
         assert!(off.contains("IP binding: <strong>off</strong>"));
@@ -697,7 +719,10 @@ mod tests {
             (Phase::Maintenance, "maintenance"),
         ] {
             s.phase = phase;
-            assert_eq!(Dashboard::from_state(&s, 0).phase, wire);
+            assert_eq!(
+                Dashboard::from_state(&s, Timestamp::constant(0, 0)).phase,
+                wire
+            );
         }
     }
 
@@ -707,14 +732,18 @@ mod tests {
         // admin.css defines; `status-prequeue` would render unstyled.
         let mut s = state();
         s.phase = Phase::PreQueue;
-        let html = Dashboard::from_state(&s, 0).render().unwrap();
+        let html = Dashboard::from_state(&s, Timestamp::constant(0, 0))
+            .render()
+            .unwrap();
         assert!(html.contains("status-pre_queue"), "{html}");
         assert!(html.contains(">pre_queue<"), "{html}");
     }
 
     #[test]
     fn core_actions_are_plain_form_posts_no_js() {
-        let html = Dashboard::from_state(&state(), 0).render().unwrap();
+        let html = Dashboard::from_state(&state(), Timestamp::constant(0, 0))
+            .render()
+            .unwrap();
         // Every operator action is a POST form to its /_wr/admin route — works with
         // JavaScript disabled.
         for action in [
@@ -743,7 +772,9 @@ mod tests {
         s.participant_count = None;
         s.origin_concurrency = None;
         s.message = None;
-        let html = Dashboard::from_state(&s, 0).render().unwrap();
+        let html = Dashboard::from_state(&s, Timestamp::constant(0, 0))
+            .render()
+            .unwrap();
         assert!(html.contains("not set"));
     }
 
@@ -754,7 +785,9 @@ mod tests {
         // Open: no banner, and the action offered is Pause.
         let mut s = state();
         s.stored_control = Open;
-        let open = Dashboard::from_state(&s, 0).render().unwrap();
+        let open = Dashboard::from_state(&s, Timestamp::constant(0, 0))
+            .render()
+            .unwrap();
         assert!(!open.contains("pause-banner"));
         assert!(open.contains("action=\"/_wr/admin/pause\""));
         assert!(open.contains(">open<"));
@@ -762,7 +795,9 @@ mod tests {
         // Paused: banner, and the action offered is Resume, not Pause again.
         let mut s = state();
         s.stored_control = Paused;
-        let paused = Dashboard::from_state(&s, 0).render().unwrap();
+        let paused = Dashboard::from_state(&s, Timestamp::constant(0, 0))
+            .render()
+            .unwrap();
         assert!(paused.contains("Admission is PAUSED"));
         assert!(paused.contains("action=\"/_wr/admin/resume\""));
         assert!(!paused.contains("action=\"/_wr/admin/pause\""));
@@ -771,8 +806,10 @@ mod tests {
         // Fail open: its own banner and badge, never rendered as the normal
         // admitting state — the operator must see the room is being bypassed.
         let mut s = state();
-        s.fail_open_until = 1000;
-        let failed_open = Dashboard::from_state(&s, 500).render().unwrap();
+        s.fail_open_until = Some(Timestamp::constant(1000, 0));
+        let failed_open = Dashboard::from_state(&s, Timestamp::constant(500, 0))
+            .render()
+            .unwrap();
         assert!(failed_open.contains("FAIL OPEN"));
         assert!(failed_open.contains(">fail open<"));
         assert!(!failed_open.contains("Admission is PAUSED"));
@@ -781,8 +818,11 @@ mod tests {
     #[test]
     fn serving_state_reports_fail_open_to_the_operator() {
         let mut s = state();
-        s.fail_open_until = 1000;
-        assert_eq!(Dashboard::from_state(&s, 500).serving_state, "Fail open");
+        s.fail_open_until = Some(Timestamp::constant(1000, 0));
+        assert_eq!(
+            Dashboard::from_state(&s, Timestamp::constant(500, 0)).serving_state,
+            "Fail open"
+        );
     }
 
     #[test]
@@ -792,8 +832,8 @@ mod tests {
         // "Open" — the resolved control (fail_open) says nothing about it.
         let mut s = state();
         s.stored_control = wr_common::StoredControl::Paused;
-        s.fail_open_until = 1000;
-        let view = Dashboard::from_state(&s, 500);
+        s.fail_open_until = Some(Timestamp::constant(1000, 0));
+        let view = Dashboard::from_state(&s, Timestamp::constant(500, 0));
         assert_eq!(view.admission_control, "fail_open");
         assert_eq!(view.queued_control, "paused");
         assert_eq!(view.fail_open_remaining_secs, 500);
@@ -805,7 +845,9 @@ mod tests {
         // than shown disabled or labelled "not yet available". /update_session
         // was the last one; it is gone, and nothing may reintroduce a form
         // posting to a route the router does not serve.
-        let html = Dashboard::from_state(&state(), 0).render().unwrap();
+        let html = Dashboard::from_state(&state(), Timestamp::constant(0, 0))
+            .render()
+            .unwrap();
         assert!(
             !html.contains("/update_session"),
             "the dashboard must not offer a control backed by a 501 endpoint"
@@ -824,7 +866,9 @@ mod tests {
         // change (pause/resume, phase transition) flips it alongside its
         // sibling badges, instead of leaving "Visitors see: Running" stale next
         // to a "paused" / "post_event" badge until a full page reload.
-        let html = Dashboard::from_state(&state(), 0).render().unwrap();
+        let html = Dashboard::from_state(&state(), Timestamp::constant(0, 0))
+            .render()
+            .unwrap();
         assert!(
             html.contains(r#"id="s-serving_state""#),
             "#s-serving_state must be present in the current-state card"
@@ -844,7 +888,9 @@ mod tests {
         // getElementById handler (badges that swap className/innerHTML). This
         // guards the whole class of "serialised field gets an s- id but is left
         // out of the poller" regressions; #s-serving_state was one instance.
-        let html = Dashboard::from_state(&state(), 0).render().unwrap();
+        let html = Dashboard::from_state(&state(), Timestamp::constant(0, 0))
+            .render()
+            .unwrap();
         let nums = nums_array(&html);
         // Badge elements change className/innerHTML, so they use dedicated
         // handlers rather than the nums textContent loop — by design.
@@ -875,7 +921,7 @@ mod tests {
         // serializes it. Guard the other half of the contract: serving_state is
         // NOT #[serde(skip)], unlike the render-only inputs it must stay apart
         // from.
-        let view = Dashboard::from_state(&state(), 0);
+        let view = Dashboard::from_state(&state(), Timestamp::constant(0, 0));
         let json = serde_json::to_string(&view).unwrap();
         assert!(
             json.contains(r#""serving_state":"Running""#),

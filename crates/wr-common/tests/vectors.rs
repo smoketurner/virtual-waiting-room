@@ -33,6 +33,7 @@
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use wr_common::{Session, SigningKey};
 
@@ -42,10 +43,10 @@ struct PositiveVector {
     key_hex: String,
     event_id: String,
     request_id: String,
-    issued_at: u64,
-    expires_at: u64,
+    issued_at: i64,
+    expires_at: i64,
     /// The instant both verifiers check the credential at.
-    now: u64,
+    now: i64,
     credential: String,
 }
 
@@ -54,7 +55,7 @@ struct NegativeVector {
     name: String,
     key_hex: String,
     credential: String,
-    now: u64,
+    now: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -125,15 +126,15 @@ fn positives() -> Vec<PositiveVector> {
     let mk = |name: &str,
               event_id: &str,
               request_id: &str,
-              issued_at: u64,
-              expires_at: u64,
-              now: u64| {
+              issued_at: i64,
+              expires_at: i64,
+              now: i64| {
         let key = SigningKey::new(&key_bytes(&key_hex));
         let session = Session {
             event_id: event_id.to_owned(),
             request_id: request_id.to_owned(),
-            issued_at,
-            expires_at,
+            issued_at: Timestamp::constant(issued_at, 0),
+            expires_at: Timestamp::constant(expires_at, 0),
             ip_tag: None,
         };
         PositiveVector {
@@ -197,8 +198,8 @@ fn negatives() -> Vec<NegativeVector> {
     let session = Session {
         event_id: "smoke".to_owned(),
         request_id: "r1".to_owned(),
-        issued_at: 1000,
-        expires_at: 2000,
+        issued_at: Timestamp::constant(1000, 0),
+        expires_at: Timestamp::constant(2000, 0),
         ip_tag: None,
     };
     let real = session.sign(&key).expect("real session signs");
@@ -628,16 +629,21 @@ fn committed_vectors_match_the_generator() {
 fn rust_accepts_every_positive_and_rejects_every_negative() {
     for v in positives() {
         let key = SigningKey::new(&key_bytes(&v.key_hex));
-        let session = Session::verify(&v.credential, &key, v.now)
+        let session = Session::verify(&v.credential, &key, Timestamp::constant(v.now, 0))
             .unwrap_or_else(|e| panic!("positive vector {:?} failed to verify: {e:?}", v.name));
         assert_eq!(session.event_id, v.event_id, "vector {:?}", v.name);
         assert_eq!(session.request_id, v.request_id, "vector {:?}", v.name);
-        assert_eq!(session.expires_at, v.expires_at, "vector {:?}", v.name);
+        assert_eq!(
+            session.expires_at,
+            Timestamp::constant(v.expires_at, 0),
+            "vector {:?}",
+            v.name
+        );
     }
     for v in negatives() {
         let key = SigningKey::new(&key_bytes(&v.key_hex));
         assert!(
-            Session::verify(&v.credential, &key, v.now).is_err(),
+            Session::verify(&v.credential, &key, Timestamp::constant(v.now, 0)).is_err(),
             "negative vector {:?} unexpectedly verified",
             v.name
         );

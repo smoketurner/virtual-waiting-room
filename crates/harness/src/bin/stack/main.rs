@@ -387,7 +387,7 @@ async fn run() -> Result<Verdict> {
         ddb.clone(),
         tables.counters.clone(),
         event_id.clone(),
-        args.session,
+        jiff::SignedDuration::from_secs(i64::try_from(args.session)?),
     );
     let controller_task = {
         let event_id = event_id.clone();
@@ -395,13 +395,11 @@ async fn run() -> Result<Verdict> {
         tokio::spawn(async move {
             let mut passes = Vec::new();
             loop {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_or(0, |d| d.as_secs());
-                let outcome = controller::run_pass(&controller_store, &event_id, now).await;
+                let outcome =
+                    controller::run_pass(&controller_store, &event_id, harness::clock::now()).await;
                 passes.push(outcome.map_err(|e| e.to_string()));
                 tokio::select! {
-                    () = tokio::time::sleep(Duration::from_secs(controller::INTERVAL_SECS)) => {}
+                    () = tokio::time::sleep(controller::INTERVAL.unsigned_abs()) => {}
                     _ = stop.changed() => return passes,
                 }
             }
@@ -411,7 +409,7 @@ async fn run() -> Result<Verdict> {
     // The visitors.
     // A full origin turns over once a session length, and a slot is seen free
     // up to a pass after its session ends.
-    let turnover = args.session + controller::INTERVAL_SECS;
+    let turnover = args.session + controller::INTERVAL.unsigned_abs().as_secs();
     let expected_drain =
         (args.visitors as u64).div_ceil(u64::from(args.concurrency.max(1))) * turnover;
     let last_arrival = match args.arrival {

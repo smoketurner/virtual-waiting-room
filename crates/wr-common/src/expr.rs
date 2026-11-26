@@ -130,7 +130,7 @@ pub const POSITIONS_TTL_ATTR: &str = "ttl";
 ///
 /// Storage reclamation only, never an admission deadline: it is far longer than
 /// any event, and nothing reads it to decide whether a visitor may be admitted.
-pub const POSITION_TTL_SECS: u64 = 86_400;
+pub const POSITION_TTL: jiff::SignedDuration = jiff::SignedDuration::from_hours(24);
 
 /// Which item a key addresses.
 ///

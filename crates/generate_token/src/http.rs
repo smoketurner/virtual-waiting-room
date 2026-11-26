@@ -4,7 +4,7 @@
 
 use lambda_http::{Body, Error, Request, RequestExt, Response};
 use tracing::info;
-use wr_common::http::{epoch_seconds, received_at};
+use wr_common::http::received_at;
 use wr_common::{PossessionSecret, SigningKey};
 
 use crate::{Admission, Denied, Minting, Store, admit, session_set_cookie, viewer_ip};
@@ -17,7 +17,7 @@ pub struct AppState<S: Store> {
     pub key: SigningKey,
     pub event_id: String,
     pub session_cookie_name: String,
-    pub session_ttl_secs: u64,
+    pub session: jiff::SignedDuration,
 }
 
 /// Answers one `POST /_wr/v1/generate_token`, at the time API Gateway
@@ -27,9 +27,7 @@ pub struct AppState<S: Store> {
 ///
 /// The store failed, or a response could not be built.
 pub async fn handle<S: Store>(state: &AppState<S>, req: Request) -> Result<Response<Body>, Error> {
-    let now = received_at(&req)
-        .and_then(epoch_seconds)
-        .ok_or("request carried no API Gateway request time")?;
+    let now = received_at(&req).ok_or("request carried no API Gateway request time")?;
     let Some(request_id) = request_id(&req) else {
         return json(400, &serde_json::json!({ "error": "request_id required" }));
     };
@@ -47,7 +45,7 @@ pub async fn handle<S: Store>(state: &AppState<S>, req: Request) -> Result<Respo
         &Minting {
             key: &state.key,
             event_id: &state.event_id,
-            session_ttl_secs: state.session_ttl_secs,
+            session: state.session,
         },
         &request_id,
         &secret,
@@ -72,18 +70,14 @@ pub async fn handle<S: Store>(state: &AppState<S>, req: Request) -> Result<Respo
             );
         }
     };
-    let set_cookie = session_set_cookie(
-        &state.session_cookie_name,
-        &credential,
-        state.session_ttl_secs,
-    );
+    let set_cookie = session_set_cookie(&state.session_cookie_name, &credential, state.session);
 
     info!(position, "admitted");
 
     let body = serde_json::to_string(&serde_json::json!({
         "admitted": true,
         "position": position,
-        "expires_at": expires_at,
+        "expires_at": expires_at.as_second(),
     }))?;
     Ok(Response::builder()
         .status(200)
@@ -203,7 +197,7 @@ mod tests {
                     origin_concurrency: Some(10),
                     message: None,
                     stored_control: wr_common::StoredControl::Open,
-                    fail_open_until: 0,
+                    fail_open_until: None,
                     starts_at: None,
                 },
                 position: Mutex::new(Some(row(3))),
@@ -264,7 +258,7 @@ mod tests {
             _request_id: &str,
             _position: u64,
             _digest: &wr_common::SecretDigest,
-            now: u64,
+            now: jiff::Timestamp,
         ) -> impl std::future::Future<Output = Result<(), StoreError>> + Send {
             let result = if self.mark_fails {
                 Err(StoreError("mark unavailable".to_owned()))
@@ -286,7 +280,7 @@ mod tests {
             key: SigningKey::new(b"a-test-signing-key"),
             event_id: "evt".to_owned(),
             session_cookie_name: "vwr_session".to_owned(),
-            session_ttl_secs: 3600,
+            session: jiff::SignedDuration::from_hours(1),
         }
     }
 
@@ -423,15 +417,15 @@ mod tests {
             .unwrap()
             .as_mut()
             .unwrap()
-            .admitted_at = Some(admitted_at - 1800);
+            .admitted_at = Some(admitted_at - jiff::SignedDuration::from_mins(30));
         let second = handle(&state, received(request())).await.unwrap();
 
         let expiry = |response: &Response<Body>| {
             let body: serde_json::Value = serde_json::from_slice(response.body().as_ref()).unwrap();
-            body["expires_at"].as_u64().unwrap()
+            body["expires_at"].as_i64().unwrap()
         };
-        assert_eq!(expiry(&first), admitted_at + 3600);
-        assert_eq!(expiry(&second), admitted_at - 1800 + 3600);
+        assert_eq!(expiry(&first), admitted_at.as_second() + 3600);
+        assert_eq!(expiry(&second), admitted_at.as_second() - 1800 + 3600);
     }
 
     #[tokio::test]
@@ -441,7 +435,7 @@ mod tests {
             let mut position = state.store.position.lock().unwrap();
             let row = position.as_mut().unwrap();
             row.status = PositionStatus::Admitted;
-            row.admitted_at = Some(1_000);
+            row.admitted_at = Some(jiff::Timestamp::from_second(1_000).unwrap());
         }
         let response = handle(&state, received(request())).await.unwrap();
         assert_eq!(response.status(), 410);
@@ -539,7 +533,12 @@ mod tests {
         let response = handle(&state, received(req)).await.unwrap();
         let cookie = response.headers()["set-cookie"].to_str().unwrap();
         let credential = cookie.split(';').next().unwrap().split_once('=').unwrap().1;
-        let session = Session::verify(credential, &state.key, 1).unwrap();
+        let session = Session::verify(
+            credential,
+            &state.key,
+            jiff::Timestamp::from_second(1).unwrap(),
+        )
+        .unwrap();
         assert_eq!(session.ip_tag, state.key.ip_tag("198.51.100.7"));
 
         // No header (a request that bypassed CloudFront): minted untagged.
@@ -547,7 +546,13 @@ mod tests {
         let cookie = response.headers()["set-cookie"].to_str().unwrap();
         let credential = cookie.split(';').next().unwrap().split_once('=').unwrap().1;
         assert_eq!(
-            Session::verify(credential, &state.key, 1).unwrap().ip_tag,
+            Session::verify(
+                credential,
+                &state.key,
+                jiff::Timestamp::from_second(1).unwrap()
+            )
+            .unwrap()
+            .ip_tag,
             None
         );
     }

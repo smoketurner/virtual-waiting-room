@@ -4,7 +4,7 @@
 
 use lambda_http::{Body, Error, Request, RequestExt, Response};
 use wr_common::Counters;
-use wr_common::http::{epoch_seconds, received_at};
+use wr_common::http::received_at;
 
 use crate::{CountersCache, PollPolicy, QueueNumError, ResolvedQueueNum, Store, queue_num, status};
 
@@ -16,7 +16,7 @@ pub struct Ctx<S: Store> {
     /// The adaptive poll policy (#69), parsed once at cold start
     /// from Terraform-set env vars. `None` when any is absent or invalid.
     pub poll_policy: Option<PollPolicy>,
-    pub session_seconds: u64,
+    pub session: jiff::SignedDuration,
     /// The monotonic clock the `Counters` copy ages on: `Instant::now` under
     /// the runtime.
     pub monotonic: fn() -> std::time::Instant,
@@ -39,16 +39,11 @@ pub async fn route<S: Store>(ctx: &Ctx<S>, req: Request) -> Result<Response<Body
 }
 
 async fn handle_status<S: Store>(ctx: &Ctx<S>, req: &Request) -> Result<Response<Body>, Error> {
-    let now = received_at(req)
-        .and_then(epoch_seconds)
-        .ok_or("request carried no API Gateway request time")?;
+    let now = received_at(req).ok_or("request carried no API Gateway request time")?;
     let Some(counters) = load_counters(ctx).await? else {
         return json(404, &serde_json::json!({ "error": "event not found" }));
     };
-    json(
-        200,
-        &status(&counters, ctx.poll_policy, ctx.session_seconds, now),
-    )
+    json(200, &status(&counters, ctx.poll_policy, ctx.session, now))
 }
 
 async fn handle_queue_num<S: Store>(ctx: &Ctx<S>, req: &Request) -> Result<Response<Body>, Error> {
@@ -177,7 +172,7 @@ mod tests {
             event_id: "evt".to_owned(),
             counters_cache: CountersCache::new(std::time::Duration::from_secs(1)),
             poll_policy: None,
-            session_seconds: 900,
+            session: jiff::SignedDuration::from_mins(15),
             monotonic: std::time::Instant::now,
         }
     }

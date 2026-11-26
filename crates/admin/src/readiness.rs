@@ -13,6 +13,7 @@
 //! [`ReadinessProbe`], whose SDK-backed implementation lives in `probe`, and
 //! through the existing [`EdgeConfigStore`] for the gate's ruleset.
 
+use jiff::Timestamp;
 use std::fmt::Write as _;
 use std::future::Future;
 use std::time::Duration;
@@ -569,20 +570,23 @@ pub fn evaluate_reserved_concurrency(reserved: Option<i32>) -> (Status, String) 
     }
 }
 
-/// The epoch second a one-time `at(YYYY-MM-DDTHH:MM:SS)` expression fires at,
-/// read in `timezone`. `None` for any other expression.
+/// When a one-time `at(YYYY-MM-DDTHH:MM:SS)` expression fires, read in
+/// `timezone`. `None` for any other expression.
 #[must_use]
-pub fn at_epoch(expression: &str, timezone: &str) -> Option<i64> {
+pub fn fires_at(expression: &str, timezone: &str) -> Option<Timestamp> {
     let inner = expression.strip_prefix("at(")?.strip_suffix(')')?;
     let civil: jiff::civil::DateTime = inner.parse().ok()?;
     let tz = jiff::tz::TimeZone::get(timezone).ok()?;
     let zoned = tz.to_ambiguous_zoned_datetime(civil).compatible().ok()?;
-    Some(zoned.timestamp().as_second())
+    Some(zoned.timestamp())
 }
 
-/// Judges the one-time open schedule at `now` (epoch seconds).
+/// Judges the one-time open schedule at `now`.
 #[must_use]
-pub fn evaluate_open_schedule(schedule: Option<&ScheduleFacts>, now: u64) -> (Status, String) {
+pub fn evaluate_open_schedule(
+    schedule: Option<&ScheduleFacts>,
+    now: Timestamp,
+) -> (Status, String) {
     let Some(s) = schedule else {
         return (
             Status::Fail,
@@ -596,8 +600,7 @@ pub fn evaluate_open_schedule(schedule: Option<&ScheduleFacts>, now: u64) -> (St
             format!("disabled ({when}): the event will not open on its own"),
         );
     }
-    let now = i64::try_from(now).unwrap_or(i64::MAX);
-    match at_epoch(&s.expression, &s.timezone) {
+    match fires_at(&s.expression, &s.timezone) {
         Some(at) if at > now => (Status::Pass, format!("enabled, {when}")),
         Some(_) => (
             Status::Warn,
@@ -626,9 +629,9 @@ pub fn evaluate_controller_schedule(schedule: Option<&ScheduleFacts>) -> (Status
     }
 }
 
-/// Judges the gate's ruleset and fail-open window at `now` (epoch seconds).
+/// Judges the gate's ruleset and fail-open window at `now`.
 #[must_use]
-pub fn evaluate_gate_ruleset(cfg: &GateConfig, now: u64) -> (Status, String) {
+pub fn evaluate_gate_ruleset(cfg: &GateConfig, now: Timestamp) -> (Status, String) {
     let (mut status, mut detail) = match cfg.rules.len() {
         0 => (
             Status::Warn,
@@ -637,16 +640,12 @@ pub fn evaluate_gate_ruleset(cfg: &GateConfig, now: u64) -> (Status, String) {
         1 => (Status::Pass, "1 rule configured".to_owned()),
         n => (Status::Pass, format!("{n} rules configured")),
     };
-    if cfg.fail_open_until > now {
+    if let Some(until) = cfg.fail_open_until.filter(|&until| until > now) {
         status = status.worst(Status::Warn);
-        let until = i64::try_from(cfg.fail_open_until)
-            .ok()
-            .and_then(|s| jiff::Timestamp::from_second(s).ok())
-            .map_or_else(|| cfg.fail_open_until.to_string(), |t| t.to_string());
         let _ = write!(
             detail,
             ". Fail-open is active until {until} ({}s left): the gate is bypassed",
-            cfg.fail_open_until.saturating_sub(now)
+            until.duration_since(now).as_secs()
         );
     }
     (status, detail)
@@ -725,7 +724,7 @@ pub async fn run_checks<P, E>(
     probe: &P,
     edge: &E,
     targets: WarmTargets,
-    now: u64,
+    now: Timestamp,
     limit: Duration,
 ) -> Vec<Row>
 where
@@ -867,6 +866,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+
     use crate::{ETag, EdgeStoreError};
 
     fn warm(write: i64, read: i64) -> WarmThroughput {
@@ -1115,19 +1115,19 @@ mod tests {
     const OPENS_AT: i64 = 1_907_762_400;
 
     #[test]
-    fn at_epoch_reads_the_expression_in_its_zone() {
+    fn fires_at_reads_the_expression_in_its_zone() {
         assert_eq!(
-            at_epoch("at(2030-06-15T10:00:00)", "America/New_York"),
-            Some(OPENS_AT)
+            fires_at("at(2030-06-15T10:00:00)", "America/New_York"),
+            Some(Timestamp::constant(OPENS_AT, 0))
         );
-        assert_eq!(at_epoch("rate(1 minute)", "UTC"), None);
-        assert_eq!(at_epoch("at(2030-06-15T10:00:00)", "Not/AZone"), None);
+        assert_eq!(fires_at("rate(1 minute)", "UTC"), None);
+        assert_eq!(fires_at("at(2030-06-15T10:00:00)", "Not/AZone"), None);
     }
 
     #[test]
     fn an_armed_open_in_the_future_passes_and_shows_when() {
         let s = schedule(true, "at(2030-06-15T10:00:00)");
-        let now = u64::try_from(OPENS_AT - 1).unwrap();
+        let now = Timestamp::constant(OPENS_AT - 1, 0);
         let (status, detail) = evaluate_open_schedule(Some(&s), now);
         assert_eq!(status, Status::Pass);
         assert_eq!(detail, "enabled, at(2030-06-15T10:00:00) America/New_York");
@@ -1136,23 +1136,29 @@ mod tests {
     #[test]
     fn an_armed_open_in_the_past_warns() {
         let s = schedule(true, "at(2030-06-15T10:00:00)");
-        let now = u64::try_from(OPENS_AT).unwrap();
+        let now = Timestamp::constant(OPENS_AT, 0);
         assert_eq!(evaluate_open_schedule(Some(&s), now).0, Status::Warn);
     }
 
     #[test]
     fn a_disabled_open_warns_and_a_missing_one_fails() {
         let s = schedule(false, "at(2099-12-31T23:59:59)");
-        let (status, detail) = evaluate_open_schedule(Some(&s), 0);
+        let (status, detail) = evaluate_open_schedule(Some(&s), Timestamp::constant(0, 0));
         assert_eq!(status, Status::Warn);
         assert!(detail.contains("will not open on its own"), "{detail}");
-        assert_eq!(evaluate_open_schedule(None, 0).0, Status::Fail);
+        assert_eq!(
+            evaluate_open_schedule(None, Timestamp::constant(0, 0)).0,
+            Status::Fail
+        );
     }
 
     #[test]
     fn an_open_that_is_not_a_one_time_expression_warns() {
         let s = schedule(true, "rate(1 day)");
-        assert_eq!(evaluate_open_schedule(Some(&s), 0).0, Status::Warn);
+        assert_eq!(
+            evaluate_open_schedule(Some(&s), Timestamp::constant(0, 0)).0,
+            Status::Warn
+        );
     }
 
     #[test]
@@ -1169,11 +1175,13 @@ mod tests {
 
     // --- Gate ruleset (F0.6) ---
 
-    fn gate(rules: usize, fail_open_until: u64) -> GateConfig {
+    /// A gate document with `rules` rules, failing open until the epoch
+    /// second `until`, or not at all when it is 0.
+    fn gate(rules: usize, until: i64) -> GateConfig {
         GateConfig {
             v: 1,
-            enforce_from: 0,
-            fail_open_until,
+            enforce_from: None,
+            fail_open_until: (until != 0).then(|| Timestamp::constant(until, 0)),
             rules: (0..rules)
                 .map(|i| wr_common::ProtectionRule::PathPrefix(format!("/p{i}")))
                 .collect(),
@@ -1183,7 +1191,7 @@ mod tests {
 
     #[test]
     fn a_dormant_ruleset_warns_and_says_so() {
-        let (status, detail) = evaluate_gate_ruleset(&gate(0, 0), 100);
+        let (status, detail) = evaluate_gate_ruleset(&gate(0, 0), Timestamp::constant(100, 0));
         assert_eq!(status, Status::Warn);
         assert!(detail.starts_with("dormant"), "{detail}");
     }
@@ -1191,25 +1199,25 @@ mod tests {
     #[test]
     fn a_configured_ruleset_passes_with_its_count() {
         assert_eq!(
-            evaluate_gate_ruleset(&gate(1, 0), 100),
+            evaluate_gate_ruleset(&gate(1, 0), Timestamp::constant(100, 0)),
             (Status::Pass, "1 rule configured".to_owned())
         );
         assert_eq!(
-            evaluate_gate_ruleset(&gate(3, 0), 100),
+            evaluate_gate_ruleset(&gate(3, 0), Timestamp::constant(100, 0)),
             (Status::Pass, "3 rules configured".to_owned())
         );
     }
 
     #[test]
     fn an_active_fail_open_window_warns_and_a_lapsed_one_does_not() {
-        let (status, detail) = evaluate_gate_ruleset(&gate(2, 1_000), 400);
+        let (status, detail) = evaluate_gate_ruleset(&gate(2, 1_000), Timestamp::constant(400, 0));
         assert_eq!(status, Status::Warn);
         assert!(
             detail.contains("Fail-open is active until 1970-01-01T00:16:40Z (600s left)"),
             "{detail}"
         );
         assert_eq!(
-            evaluate_gate_ruleset(&gate(2, 1_000), 1_000).0,
+            evaluate_gate_ruleset(&gate(2, 1_000), Timestamp::constant(1_000, 0)).0,
             Status::Pass
         );
     }
@@ -1409,7 +1417,14 @@ mod tests {
     }
 
     async fn run(probe: &FakeProbe, edge: &FakeGate) -> Vec<Row> {
-        run_checks(probe, edge, CONFIGURED, 0, Duration::from_millis(50)).await
+        run_checks(
+            probe,
+            edge,
+            CONFIGURED,
+            Timestamp::constant(0, 0),
+            Duration::from_millis(50),
+        )
+        .await
     }
 
     #[tokio::test]

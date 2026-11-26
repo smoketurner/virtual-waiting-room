@@ -2,15 +2,17 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::Instant;
+
+use jiff::{SignedDuration, Timestamp};
 
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
 use aws_sdk_dynamodb::types::AttributeValue;
 use wr_common::expr::{
-    ADMITTED_AT_ATTR, Condition, ENTRY_TIME_ATTR, Key, POSITION_TTL_SECS, POSITIONS_KEY_ATTR,
+    ADMITTED_AT_ATTR, Condition, ENTRY_TIME_ATTR, Key, POSITION_TTL, POSITIONS_KEY_ATTR,
     POSITIONS_TTL_ATTR, POSSESSION_DIGEST_ATTR, QUEUE_POSITION_ATTR, SHARD_CAP_ATTR,
     SHARD_COUNT_ATTR, STATUS_ATTR, Update,
 };
@@ -19,8 +21,8 @@ use wr_common::{Counters, PositionStatus, PreQueueItem, SHARDS, SecretDigest, Sh
 use crate::{PositionRow, Store, StoreError};
 
 /// How long one execution environment answers from what it last read or
-/// learned, in seconds. See [`SpentShards`] and `load_counters`.
-const MEMO_SECS: u64 = 1;
+/// learned. See [`SpentShards`] and `load_counters`.
+const MEMO: SignedDuration = SignedDuration::from_secs(1);
 
 /// Which arrivals shards this execution environment last saw with no budget
 /// left, and until when it will take that as still true.
@@ -32,26 +34,30 @@ const MEMO_SECS: u64 = 1;
 /// such writes: at a million visitors that is several times what the ten
 /// shard items can take, and the throttling it causes falls on real
 /// admissions. A shard's cap only rises on a controller pass, every ten
-/// seconds, so a shard seen spent is not asked again for [`MEMO_SECS`]; the
+/// seconds, so a shard seen spent is not asked again for [`MEMO`]; the
 /// cost is that new budget is noticed up to that much late.
 #[derive(Debug, Default)]
 pub struct SpentShards {
-    until: [AtomicU64; SHARDS],
+    /// Epoch seconds, per shard: atomics hold no `Timestamp`.
+    until: [AtomicI64; SHARDS],
 }
 
 impl SpentShards {
     /// Whether `shard` was seen spent recently enough to skip asking it.
     #[must_use]
-    pub fn is_spent(&self, shard: Shard, now: u64) -> bool {
+    pub fn is_spent(&self, shard: Shard, now: Timestamp) -> bool {
         self.until
             .get(shard.index())
-            .is_some_and(|until| now <= until.load(Ordering::Relaxed))
+            .is_some_and(|until| now.as_second() <= until.load(Ordering::Relaxed))
     }
 
     /// Records that `shard` refused a take at `now`.
-    pub fn mark(&self, shard: Shard, now: u64) {
+    pub fn mark(&self, shard: Shard, now: Timestamp) {
         if let Some(until) = self.until.get(shard.index()) {
-            until.store(now.saturating_add(MEMO_SECS), Ordering::Relaxed);
+            until.store(
+                now.as_second().saturating_add(MEMO.as_secs()),
+                Ordering::Relaxed,
+            );
         }
     }
 }
@@ -86,12 +92,6 @@ impl DynamoStore {
     }
 }
 
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
-
 impl Store for DynamoStore {
     async fn load_counters(&self, event_id: &str) -> Result<Option<Counters>, StoreError> {
         // Every admission attempt, refused or not, reads this one item, and a
@@ -101,7 +101,7 @@ impl Store for DynamoStore {
         // pause takes effect at most a second late.
         if let Ok(guard) = self.counters.lock()
             && let Some((at, cached)) = guard.as_ref()
-            && at.elapsed() < Duration::from_secs(MEMO_SECS)
+            && at.elapsed() < MEMO.unsigned_abs()
         {
             return Ok(cached.clone());
         }
@@ -162,7 +162,7 @@ impl Store for DynamoStore {
         request_id: &str,
         position: u64,
         digest: &SecretDigest,
-        now: u64,
+        now: Timestamp,
     ) -> Result<(), StoreError> {
         // One `UpdateItem` serves both populations. A live joiner already has
         // the row, written at registration with `status = issued`; a pre-queue
@@ -184,8 +184,14 @@ impl Store for DynamoStore {
             .set(QUEUE_POSITION_ATTR, AttributeValue::N(position.to_string()))
             // The guard lets this write land once per row, so this is the
             // first admission and every later session expires from it (#237).
-            .set(ADMITTED_AT_ATTR, AttributeValue::N(now.to_string()))
-            .set_if_not_exists(ENTRY_TIME_ATTR, AttributeValue::N(now.to_string()))
+            .set(
+                ADMITTED_AT_ATTR,
+                AttributeValue::N(now.as_second().to_string()),
+            )
+            .set_if_not_exists(
+                ENTRY_TIME_ATTR,
+                AttributeValue::N(now.as_second().to_string()),
+            )
             // A live joiner's row has the digest already; a pre-queue member's
             // is created here, and its later calls read this row first.
             .set_if_not_exists(
@@ -194,7 +200,12 @@ impl Store for DynamoStore {
             )
             .set(
                 POSITIONS_TTL_ATTR,
-                AttributeValue::N(now.saturating_add(POSITION_TTL_SECS).to_string()),
+                AttributeValue::N(
+                    now.checked_add(POSITION_TTL)
+                        .map_err(|e| StoreError(format!("position ttl: {e}")))?
+                        .as_second()
+                        .to_string(),
+                ),
             )
             .build();
         let guard = Condition::attribute_not_exists(POSITIONS_KEY_ATTR)
@@ -239,7 +250,7 @@ impl Store for DynamoStore {
     }
 
     async fn take_slot(&self, event_id: &str, shard: Shard) -> Result<bool, StoreError> {
-        let now = now_secs();
+        let now = Timestamp::now();
         if self.spent.is_spent(shard, now) {
             return Ok(false);
         }
@@ -328,7 +339,8 @@ fn position_from_item(item: &HashMap<String, AttributeValue>) -> Option<Position
     let admitted_at = item
         .get(ADMITTED_AT_ATTR)
         .and_then(|v| v.as_n().ok())
-        .and_then(|s| s.parse::<u64>().ok());
+        .and_then(|s| s.parse::<i64>().ok())
+        .and_then(|secs| Timestamp::from_second(secs).ok());
     Some(PositionRow {
         position,
         status,
@@ -412,12 +424,12 @@ mod tests {
         let spent = SpentShards::default();
         let shard = Shard::new(3).unwrap();
         let other = Shard::new(4).unwrap();
-        assert!(!spent.is_spent(shard, 100));
-        spent.mark(shard, 100);
-        assert!(spent.is_spent(shard, 100));
-        assert!(spent.is_spent(shard, 100 + MEMO_SECS));
-        assert!(!spent.is_spent(shard, 101 + MEMO_SECS));
+        assert!(!spent.is_spent(shard, Timestamp::constant(100, 0)));
+        spent.mark(shard, Timestamp::constant(100, 0));
+        assert!(spent.is_spent(shard, Timestamp::constant(100, 0)));
+        assert!(spent.is_spent(shard, Timestamp::constant(100 + MEMO.as_secs(), 0)));
+        assert!(!spent.is_spent(shard, Timestamp::constant(101 + MEMO.as_secs(), 0)));
         // One shard running out says nothing about the others.
-        assert!(!spent.is_spent(other, 100));
+        assert!(!spent.is_spent(other, Timestamp::constant(100, 0)));
     }
 }

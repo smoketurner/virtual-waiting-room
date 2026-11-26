@@ -9,7 +9,7 @@ use lambda_http::http::{Method, StatusCode};
 use lambda_http::{Body, Error, Request, Response};
 use tracing::{error, warn};
 use wr_common::SigningKey;
-use wr_common::http::{epoch_seconds, received_at};
+use wr_common::http::received_at;
 
 use crate::page::{WaitHtml, encode_component};
 use crate::{
@@ -25,7 +25,7 @@ pub struct AppState<S: Store, Q: JoinQueue> {
     pub key: SigningKey,
     pub event_id: String,
     pub session_cookie_name: String,
-    pub session_ttl_secs: u64,
+    pub session: jiff::SignedDuration,
 }
 
 fn header<'a>(req: &'a Request, name: &str) -> Option<&'a str> {
@@ -49,12 +49,7 @@ pub async fn handle<S: Store, Q: JoinQueue>(
         return handle_enter(state, &req, now).await;
     }
     if req.method() == Method::GET && path.ends_with(WAIT_PATH) {
-        return handle_wait(
-            state,
-            &req,
-            epoch_seconds(now).ok_or("request time is before the epoch")?,
-        )
-        .await;
+        return handle_wait(state, &req, now).await;
     }
     Ok(Response::builder()
         .status(StatusCode::NOT_FOUND)
@@ -83,9 +78,7 @@ async fn handle_enter<S: Store, Q: JoinQueue>(
     {
         return redirect(&location, None);
     }
-    let millis =
-        u64::try_from(now.as_millisecond()).map_err(|_| "request time is before the epoch")?;
-    let identity = match Identity::mint(millis) {
+    let identity = match Identity::mint(now) {
         Ok(identity) => identity,
         Err(e) => {
             error!(error = %e, event = "nojs_join_failed", "could not mint an identity");
@@ -114,7 +107,7 @@ async fn handle_enter<S: Store, Q: JoinQueue>(
 async fn handle_wait<S: Store, Q: JoinQueue>(
     state: &AppState<S, Q>,
     req: &Request,
-    now: u64,
+    now: Timestamp,
 ) -> Result<Response<Body>, Error> {
     let next = safe_next(req.uri().query().and_then(next_param));
     let Some(identity) = header(req, "cookie").and_then(identity_from_cookies) else {
@@ -123,7 +116,7 @@ async fn handle_wait<S: Store, Q: JoinQueue>(
     let minting = Minting {
         key: &state.key,
         event_id: &state.event_id,
-        session_ttl_secs: state.session_ttl_secs,
+        session: state.session,
     };
     let viewer = header(req, "cloudfront-viewer-address").and_then(viewer_ip);
     let admission = match admit(
@@ -153,7 +146,7 @@ async fn handle_wait<S: Store, Q: JoinQueue>(
             Some(&session_set_cookie(
                 &state.session_cookie_name,
                 &credential,
-                state.session_ttl_secs,
+                state.session,
             )),
         ),
         WaitOutcome::Show(WaitPage::Lost) => page(
@@ -180,7 +173,7 @@ async fn handle_unanswered<S: Store, Q: JoinQueue>(
     state: &AppState<S, Q>,
     identity: &Identity,
     next: &str,
-    now: u64,
+    now: Timestamp,
 ) -> Result<Response<Body>, Error> {
     match identity.unanswered(now) {
         Unanswered::InFlight => page(StatusCode::OK, &WaitPage::Joining, next, None),
@@ -289,7 +282,7 @@ mod tests {
                 origin_concurrency: Some(10),
                 message: None,
                 stored_control: wr_common::StoredControl::Open,
-                fail_open_until: 0,
+                fail_open_until: None,
                 starts_at: None,
             })))
         }
@@ -319,7 +312,7 @@ mod tests {
             _request_id: &str,
             _position: u64,
             _digest: &wr_common::SecretDigest,
-            _now: u64,
+            _now: Timestamp,
         ) -> impl std::future::Future<Output = Result<(), StoreError>> + Send {
             std::future::ready(Ok(()))
         }
@@ -363,7 +356,7 @@ mod tests {
             key: SigningKey::new(b"a-test-signing-key"),
             event_id: "evt".to_owned(),
             session_cookie_name: "vwr_session".to_owned(),
-            session_ttl_secs: 3600,
+            session: jiff::SignedDuration::from_hours(1),
         }
     }
 
@@ -386,11 +379,12 @@ mod tests {
     }
 
     /// The second every wait in these tests is served at.
-    const NOW: u64 = 1_700_000_000;
+    const NOW: Timestamp = Timestamp::constant(1_700_000_000, 0);
 
     /// A cookie whose join was sent `ago` seconds before [`NOW`].
-    fn stamped_cookie(secret: &str, ago: u64, rejoins: u8) -> String {
-        format!("{IDENTITY_COOKIE}={ID}.{secret}.{}.{rejoins}", NOW - ago)
+    fn stamped_cookie(secret: &str, ago: i64, rejoins: u8) -> String {
+        let joined = NOW.as_second() - ago;
+        format!("{IDENTITY_COOKIE}={ID}.{secret}.{joined}.{rejoins}")
     }
 
     fn identity_cookie(secret: &str) -> String {
@@ -438,7 +432,10 @@ mod tests {
         );
         let cookie = response.headers()["set-cookie"].to_str().unwrap();
         assert!(
-            cookie.starts_with(&format!("{IDENTITY_COOKIE}={ID}.{SECRET}.{NOW}.1;")),
+            cookie.starts_with(&format!(
+                "{IDENTITY_COOKIE}={ID}.{SECRET}.{}.1;",
+                NOW.as_second()
+            )),
             "{cookie}"
         );
     }
@@ -589,7 +586,7 @@ mod tests {
         assert_eq!(response.headers()["location"], "/checkout");
         let cookie = response.headers()["set-cookie"].to_str().unwrap();
         let credential = cookie.split(';').next().unwrap().split_once('=').unwrap().1;
-        let session = Session::verify(credential, &state.key, 1).unwrap();
+        let session = Session::verify(credential, &state.key, Timestamp::constant(1, 0)).unwrap();
         assert_eq!(session.request_id, ID);
         assert_eq!(session.ip_tag, state.key.ip_tag("198.51.100.7"));
     }

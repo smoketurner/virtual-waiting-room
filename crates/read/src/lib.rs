@@ -9,6 +9,7 @@ pub mod http;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use jiff::{SignedDuration, Timestamp};
 use serde::Serialize;
 #[cfg(test)]
 use wr_common::StoredControl;
@@ -112,9 +113,23 @@ impl CountersCache {
 /// Terraform-set, not an admin lever — see the ADR for why.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct PollPolicy {
-    pub floor_ms: u32,
-    pub ceiling_ms: u32,
+    /// Published as `floor_ms`.
+    #[serde(rename = "floor_ms", serialize_with = "as_millis")]
+    pub floor: SignedDuration,
+    /// Published as `ceiling_ms`.
+    #[serde(rename = "ceiling_ms", serialize_with = "as_millis")]
+    pub ceiling: SignedDuration,
     pub divisor: u32,
+}
+
+/// A duration as the whole milliseconds the waiting page reads.
+fn as_millis<S: serde::Serializer>(d: &SignedDuration, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_i64(i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// A duration as the whole seconds the waiting page reads.
+fn as_seconds<S: serde::Serializer>(d: &SignedDuration, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_i64(d.as_secs())
 }
 
 /// Sanity bounds a published policy must fall within, mirroring
@@ -151,8 +166,8 @@ pub fn parse_poll_policy(
         return None;
     }
     Some(PollPolicy {
-        floor_ms,
-        ceiling_ms,
+        floor: SignedDuration::from_millis(i64::from(floor_ms)),
+        ceiling: SignedDuration::from_millis(i64::from(ceiling_ms)),
         divisor,
     })
 }
@@ -206,13 +221,15 @@ pub struct StatusResponse {
     /// movement it observes once it has enough of it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin_concurrency: Option<u32>,
-    /// How long an admitted visitor's session lasts.
-    pub session_seconds: u64,
+    /// How long an admitted visitor's session lasts. Published as
+    /// `session_seconds`.
+    #[serde(rename = "session_seconds", serialize_with = "as_seconds")]
+    pub session: SignedDuration,
     /// The adaptive poll policy (#69), absent when Terraform has
     /// not set one — the client then keeps its own fixed-interval default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub poll_policy: Option<PollPolicy>,
-    /// The scheduled start, epoch seconds, so the waiting page can count down
+    /// The scheduled start, published as epoch seconds, so the waiting page can count down
     /// during `pre_queue` (issue #128). Absent when no start time is set, which
     /// is what the page distinguishes to decide between a countdown and "the
     /// event isn't open yet".
@@ -221,8 +238,11 @@ pub struct StatusResponse {
     /// the edge with request collapsing, so one origin fetch answers every
     /// simultaneous poll and a relative value would be served stale to all but
     /// the request that produced it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub starts_at: Option<u64>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        with = "jiff::fmt::serde::timestamp::second::optional"
+    )]
+    pub starts_at: Option<Timestamp>,
 }
 
 /// A resolved `/queue_num` response.
@@ -252,14 +272,14 @@ pub enum ResolvedQueueNum {
 
 /// Builds the `/status` payload from the counters item, the deploy-time poll
 /// policy (`None` when Terraform has not set one), the session length, and
-/// `now` (epoch seconds), which resolves the stored admission control against
-/// the fail-open epoch (issue #71).
+/// `now`, which resolves the stored admission control against the fail-open
+/// deadline (issue #71).
 #[must_use]
 pub fn status(
     counters: &Counters,
     poll_policy: Option<PollPolicy>,
-    session_seconds: u64,
-    now: u64,
+    session: SignedDuration,
+    now: Timestamp,
 ) -> StatusResponse {
     StatusResponse {
         event_id: counters.event_id.clone(),
@@ -274,7 +294,7 @@ pub fn status(
         shuffle_seed: counters.shuffle_seed.map(hex::encode),
         message: counters.message.clone(),
         origin_concurrency: counters.origin_concurrency,
-        session_seconds,
+        session,
         poll_policy,
         starts_at: counters.starts_at,
     }
@@ -352,7 +372,7 @@ mod tests {
             message: None,
             origin_concurrency: None,
             stored_control: StoredControl::Open,
-            fail_open_until: 0,
+            fail_open_until: None,
             starts_at: None,
         }
     }
@@ -362,7 +382,7 @@ mod tests {
             r: "req-1".to_owned(),
             s,
             l,
-            t: 1_788_000_000,
+            t: Timestamp::constant(1_788_000_000, 0),
             h: None,
         }
     }
@@ -380,10 +400,16 @@ mod tests {
             message: None,
             origin_concurrency: None,
             stored_control: StoredControl::Open,
-            fail_open_until: 0,
+            fail_open_until: None,
             starts_at: None,
         };
-        let json = serde_json::to_value(status(&counters, None, 3600, 0)).unwrap();
+        let json = serde_json::to_value(status(
+            &counters,
+            None,
+            SignedDuration::from_secs(3600),
+            Timestamp::constant(0, 0),
+        ))
+        .unwrap();
         assert_eq!(json["phase"], "pre_queue");
         assert!(json.get("participant_count").is_none());
         assert!(json.get("prequeue_offsets").is_none());
@@ -398,7 +424,13 @@ mod tests {
     fn status_publishes_the_seed_once_opened() {
         let counters = opened_counters([1; SHARDS], [0xAB; 32]);
         assert!(counters.open_outputs().is_some());
-        let json = serde_json::to_value(status(&counters, None, 3600, 0)).unwrap();
+        let json = serde_json::to_value(status(
+            &counters,
+            None,
+            SignedDuration::from_secs(3600),
+            Timestamp::constant(0, 0),
+        ))
+        .unwrap();
         assert_eq!(json["shuffle_seed"], "ab".repeat(32));
     }
 
@@ -409,7 +441,13 @@ mod tests {
         // indices, and check the result against the positions the room serves.
         let counts = [3, 0, 5, 1, 0, 0, 2, 0, 0, 4];
         let counters = opened_counters(counts, [42u8; 32]);
-        let json = serde_json::to_value(status(&counters, None, 3600, 0)).unwrap();
+        let json = serde_json::to_value(status(
+            &counters,
+            None,
+            SignedDuration::from_secs(3600),
+            Timestamp::constant(0, 0),
+        ))
+        .unwrap();
 
         let seed = Seed(
             hex::decode(json["shuffle_seed"].as_str().unwrap())
@@ -446,7 +484,13 @@ mod tests {
             *b = i as u8;
         }
         let counters = opened_counters([1; SHARDS], seed);
-        let json = serde_json::to_value(status(&counters, None, 3600, 0)).unwrap();
+        let json = serde_json::to_value(status(
+            &counters,
+            None,
+            SignedDuration::from_secs(3600),
+            Timestamp::constant(0, 0),
+        ))
+        .unwrap();
         let published = json["shuffle_seed"].as_str().unwrap();
         assert_eq!(published.len(), 64);
         assert_eq!(published, published.to_lowercase());
@@ -460,15 +504,27 @@ mod tests {
         // an event that has no start time.
         let mut counters = opened_counters([1; SHARDS], [7u8; 32]);
         counters.starts_at = None;
-        let json = serde_json::to_value(status(&counters, None, 3600, 0)).unwrap();
+        let json = serde_json::to_value(status(
+            &counters,
+            None,
+            SignedDuration::from_secs(3600),
+            Timestamp::constant(0, 0),
+        ))
+        .unwrap();
         assert!(json.get("starts_at").is_none());
     }
 
     #[test]
     fn status_publishes_the_scheduled_start() {
         let mut counters = opened_counters([1; SHARDS], [7u8; 32]);
-        counters.starts_at = Some(1_800_000_000);
-        let json = serde_json::to_value(status(&counters, None, 3600, 0)).unwrap();
+        counters.starts_at = Some(Timestamp::constant(1_800_000_000, 0));
+        let json = serde_json::to_value(status(
+            &counters,
+            None,
+            SignedDuration::from_secs(3600),
+            Timestamp::constant(0, 0),
+        ))
+        .unwrap();
         assert_eq!(json["starts_at"], 1_800_000_000_u64);
     }
 
@@ -478,7 +534,13 @@ mod tests {
         // client that cannot read it from /status cannot construct a request
         // that passes the edge validator.
         let counters = opened_counters([1; SHARDS], [7u8; 32]);
-        let json = serde_json::to_value(status(&counters, None, 3600, 0)).unwrap();
+        let json = serde_json::to_value(status(
+            &counters,
+            None,
+            SignedDuration::from_secs(3600),
+            Timestamp::constant(0, 0),
+        ))
+        .unwrap();
         assert_eq!(json["event_id"], "evt-1");
         assert!(json["event_id"].as_str().is_some_and(|s| !s.is_empty()));
     }
@@ -486,7 +548,13 @@ mod tests {
     #[test]
     fn status_exposes_open_outputs_when_active() {
         let counters = opened_counters([2, 2, 2, 2, 2, 0, 0, 0, 0, 0], [3u8; 32]);
-        let json = serde_json::to_value(status(&counters, None, 3600, 0)).unwrap();
+        let json = serde_json::to_value(status(
+            &counters,
+            None,
+            SignedDuration::from_secs(3600),
+            Timestamp::constant(0, 0),
+        ))
+        .unwrap();
         assert_eq!(json["phase"], "active");
         assert_eq!(json["participant_count"], 10);
         assert_eq!(json["serving_position"], 5);
@@ -497,14 +565,26 @@ mod tests {
     fn status_surfaces_the_broadcast_message_when_set() {
         let mut counters = opened_counters([1; SHARDS], [7u8; 32]);
         counters.message = Some("Doors open at noon".to_owned());
-        let json = serde_json::to_value(status(&counters, None, 3600, 0)).unwrap();
+        let json = serde_json::to_value(status(
+            &counters,
+            None,
+            SignedDuration::from_secs(3600),
+            Timestamp::constant(0, 0),
+        ))
+        .unwrap();
         assert_eq!(json["message"], "Doors open at noon");
     }
 
     #[test]
     fn status_omits_the_message_when_absent() {
         let counters = opened_counters([1; SHARDS], [7u8; 32]);
-        let json = serde_json::to_value(status(&counters, None, 3600, 0)).unwrap();
+        let json = serde_json::to_value(status(
+            &counters,
+            None,
+            SignedDuration::from_secs(3600),
+            Timestamp::constant(0, 0),
+        ))
+        .unwrap();
         assert!(json.get("message").is_none());
     }
 
@@ -512,7 +592,13 @@ mod tests {
     fn status_publishes_the_origin_concurrency_when_set() {
         let mut counters = opened_counters([1; SHARDS], [7u8; 32]);
         counters.origin_concurrency = Some(250);
-        let json = serde_json::to_value(status(&counters, None, 3600, 0)).unwrap();
+        let json = serde_json::to_value(status(
+            &counters,
+            None,
+            SignedDuration::from_secs(3600),
+            Timestamp::constant(0, 0),
+        ))
+        .unwrap();
         assert_eq!(json["origin_concurrency"], 250);
         assert_eq!(json["session_seconds"], 3600);
     }
@@ -523,14 +609,26 @@ mod tests {
         // zero": the first means the operator has not started admitting and no
         // estimate can be made, the second would read as an infinite wait.
         let counters = opened_counters([1; SHARDS], [7u8; 32]);
-        let json = serde_json::to_value(status(&counters, None, 3600, 0)).unwrap();
+        let json = serde_json::to_value(status(
+            &counters,
+            None,
+            SignedDuration::from_secs(3600),
+            Timestamp::constant(0, 0),
+        ))
+        .unwrap();
         assert!(json.get("origin_concurrency").is_none());
     }
 
     #[test]
     fn status_omits_poll_policy_when_unset() {
         let counters = opened_counters([1; SHARDS], [7u8; 32]);
-        let json = serde_json::to_value(status(&counters, None, 3600, 0)).unwrap();
+        let json = serde_json::to_value(status(
+            &counters,
+            None,
+            SignedDuration::from_secs(3600),
+            Timestamp::constant(0, 0),
+        ))
+        .unwrap();
         assert!(json.get("poll_policy").is_none());
     }
 
@@ -538,11 +636,17 @@ mod tests {
     fn status_publishes_poll_policy_when_set() {
         let counters = opened_counters([1; SHARDS], [7u8; 32]);
         let policy = PollPolicy {
-            floor_ms: 5000,
-            ceiling_ms: 30000,
+            floor: SignedDuration::from_millis(5000),
+            ceiling: SignedDuration::from_millis(30000),
             divisor: 10,
         };
-        let json = serde_json::to_value(status(&counters, Some(policy), 3600, 0)).unwrap();
+        let json = serde_json::to_value(status(
+            &counters,
+            Some(policy),
+            SignedDuration::from_secs(3600),
+            Timestamp::constant(0, 0),
+        ))
+        .unwrap();
         assert_eq!(json["poll_policy"]["floor_ms"], 5000);
         assert_eq!(json["poll_policy"]["ceiling_ms"], 30000);
         assert_eq!(json["poll_policy"]["divisor"], 10);
@@ -553,8 +657,8 @@ mod tests {
         assert_eq!(
             parse_poll_policy(Some("5000"), Some("30000"), Some("10")),
             Some(PollPolicy {
-                floor_ms: 5000,
-                ceiling_ms: 30000,
+                floor: SignedDuration::from_millis(5000),
+                ceiling: SignedDuration::from_millis(30000),
                 divisor: 10,
             })
         );
@@ -607,8 +711,8 @@ mod tests {
         assert_eq!(
             parse_poll_policy(Some("5000"), Some("5000"), Some("1")),
             Some(PollPolicy {
-                floor_ms: 5000,
-                ceiling_ms: 5000,
+                floor: SignedDuration::from_millis(5000),
+                ceiling: SignedDuration::from_millis(5000),
                 divisor: 1,
             })
         );
@@ -642,8 +746,8 @@ mod tests {
         assert_eq!(
             parse_poll_policy(Some("1000"), Some("300000"), Some("1000")),
             Some(PollPolicy {
-                floor_ms: 1000,
-                ceiling_ms: 300_000,
+                floor: SignedDuration::from_millis(1000),
+                ceiling: SignedDuration::from_millis(300_000),
                 divisor: 1000,
             }),
             "the bounds themselves are inclusive"
@@ -659,8 +763,8 @@ mod tests {
         // this pins the contract the way the repo's other frozen wire
         // encodings already do (.kiro/steering/testing.md).
         let policy = PollPolicy {
-            floor_ms: 1,
-            ceiling_ms: 2,
+            floor: SignedDuration::from_millis(1),
+            ceiling: SignedDuration::from_millis(2),
             divisor: 3,
         };
         assert_eq!(
@@ -691,8 +795,8 @@ mod tests {
                 && ceiling >= floor;
             prop_assert_eq!(result.is_some(), expected_some);
             if let Some(policy) = result {
-                prop_assert_eq!(policy.floor_ms, floor);
-                prop_assert_eq!(policy.ceiling_ms, ceiling);
+                prop_assert_eq!(policy.floor, SignedDuration::from_millis(i64::from(floor)));
+                prop_assert_eq!(policy.ceiling, SignedDuration::from_millis(i64::from(ceiling)));
                 prop_assert_eq!(policy.divisor, divisor);
             }
         }
@@ -703,7 +807,7 @@ mod tests {
         #[test]
         fn the_published_seed_decodes_back_to_the_bytes_it_encodes(bytes in any::<[u8; 32]>()) {
             let counters = opened_counters([1; SHARDS], bytes);
-            let published = status(&counters, None, 3600, 0).shuffle_seed;
+            let published = status(&counters, None, SignedDuration::from_secs(3600), Timestamp::constant(0, 0)).shuffle_seed;
             prop_assert_eq!(hex::decode(published.unwrap_or_default()), Ok(bytes.to_vec()));
         }
     }
@@ -713,17 +817,35 @@ mod tests {
         // Active event -> running; pause it -> paused; fail-open -> fail_open.
         let mut counters = opened_counters([1; SHARDS], [7u8; 32]);
         assert_eq!(
-            serde_json::to_value(status(&counters, None, 3600, 0)).unwrap()["serving_state"],
+            serde_json::to_value(status(
+                &counters,
+                None,
+                SignedDuration::from_secs(3600),
+                Timestamp::constant(0, 0)
+            ))
+            .unwrap()["serving_state"],
             "running"
         );
         counters.stored_control = StoredControl::Paused;
         assert_eq!(
-            serde_json::to_value(status(&counters, None, 3600, 0)).unwrap()["serving_state"],
+            serde_json::to_value(status(
+                &counters,
+                None,
+                SignedDuration::from_secs(3600),
+                Timestamp::constant(0, 0)
+            ))
+            .unwrap()["serving_state"],
             "paused"
         );
-        counters.fail_open_until = 100;
+        counters.fail_open_until = Some(Timestamp::constant(100, 0));
         assert_eq!(
-            serde_json::to_value(status(&counters, None, 3600, 50)).unwrap()["serving_state"],
+            serde_json::to_value(status(
+                &counters,
+                None,
+                SignedDuration::from_secs(3600),
+                Timestamp::constant(50, 0)
+            ))
+            .unwrap()["serving_state"],
             "fail_open"
         );
     }
@@ -734,7 +856,13 @@ mod tests {
         let mut counters = opened_counters([1; SHARDS], [7u8; 32]);
         counters.phase = Phase::Idle;
         assert_eq!(
-            serde_json::to_value(status(&counters, None, 3600, 0)).unwrap()["serving_state"],
+            serde_json::to_value(status(
+                &counters,
+                None,
+                SignedDuration::from_secs(3600),
+                Timestamp::constant(0, 0)
+            ))
+            .unwrap()["serving_state"],
             "closed"
         );
     }
@@ -752,7 +880,7 @@ mod tests {
             message: None,
             origin_concurrency: None,
             stored_control: StoredControl::Open,
-            fail_open_until: 0,
+            fail_open_until: None,
             starts_at: None,
         };
         assert_eq!(
@@ -815,7 +943,7 @@ mod tests {
             r: "req-1".to_owned(),
             s: SHARDS as u8,
             l: 0,
-            t: 1_788_000_000,
+            t: Timestamp::constant(1_788_000_000, 0),
             h: None,
         };
         assert_eq!(queue_num(&counters, &bad), Err(QueueNumError::BadShard));

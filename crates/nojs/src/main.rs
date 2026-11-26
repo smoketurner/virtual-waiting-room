@@ -52,13 +52,15 @@ async fn init() -> Result<AppState<DynamoStore, SqsJoinQueue>, Error> {
         session_cookie_name: env::var("SESSION_COOKIE_NAME")
             .unwrap_or_else(|_| "vwr_session".to_owned()),
         // Required, for the reason generate_token gives.
-        session_ttl_secs: {
+        session: {
             let raw = env::var("SESSION_TTL_SECS")?;
-            raw.parse().map_err(|_| {
-                Error::from(format!(
-                    "SESSION_TTL_SECS is set to {raw:?}, which is not a whole number of seconds"
-                ))
-            })?
+            raw.parse()
+                .map(jiff::SignedDuration::from_secs)
+                .map_err(|_| {
+                    Error::from(format!(
+                        "SESSION_TTL_SECS is set to {raw:?}, which is not a whole number of seconds"
+                    ))
+                })?
         },
     })
 }

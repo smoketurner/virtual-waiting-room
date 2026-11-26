@@ -7,12 +7,9 @@ use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::put_item::PutItemError;
 use aws_sdk_dynamodb::types::{AttributeValue, KeysAndAttributes, ReturnValue};
 use wr_common::expr::{
-    Condition, Key, POSITION_TTL_SECS, POSITIONS_KEY_ATTR, SHARD_COUNT_ATTR, SHARD_INDEX_ATTR,
-    Update,
+    Condition, Key, POSITION_TTL, POSITIONS_KEY_ATTR, SHARD_COUNT_ATTR, SHARD_INDEX_ATTR, Update,
 };
 use wr_common::{Counters, PositionItem, PositionStatus, PreQueueItem, Shard};
-
-use jiff::Timestamp;
 
 use crate::{PositionWrite, PreQueueWrite, Store, StoreError, WriteOutcome};
 
@@ -75,13 +72,15 @@ impl Store for DynamoStore {
     }
 
     async fn put_position(&self, write: &PositionWrite) -> Result<WriteOutcome, StoreError> {
-        let now = stored_seconds(write.at)?;
         let item = PositionItem {
             request_id: write.request_id.clone(),
             queue_position: write.position,
-            entry_time: now,
+            entry_time: write.at,
             status: PositionStatus::Issued,
-            ttl: now.saturating_add(POSITION_TTL_SECS),
+            ttl: write
+                .at
+                .checked_add(POSITION_TTL)
+                .map_err(|e| StoreError(format!("position ttl: {e}")))?,
             h: Some(write.digest.clone()),
         };
         let attrs: HashMap<String, AttributeValue> =
@@ -172,7 +171,7 @@ impl Store for DynamoStore {
             r: write.request_id.clone(),
             s: shard,
             l: write.local_index,
-            t: stored_seconds(write.at)?,
+            t: write.at,
             h: Some(write.digest.clone()),
         };
         let attrs: HashMap<String, AttributeValue> =
@@ -248,12 +247,6 @@ impl Store for DynamoStore {
         }
         Ok(found)
     }
-}
-
-/// A join's time as the epoch seconds the rows store.
-fn stored_seconds(at: Timestamp) -> Result<u64, StoreError> {
-    wr_common::http::epoch_seconds(at)
-        .ok_or_else(|| StoreError(format!("join time {at} is before the epoch")))
 }
 
 /// The first local index of a just-claimed block: the shard's count after the

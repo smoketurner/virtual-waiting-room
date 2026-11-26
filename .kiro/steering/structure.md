@@ -46,9 +46,10 @@ examples/                     Deployable example + generated variable reference 
 openapi/                      OpenAPI spec (N8) — not built
 ```
 
-Every Lambda crate follows the same three-file split, and new ones should: `lib.rs` is pure
-logic generic over a `Store` trait, `dynamo.rs` is the SDK-backed implementation, `main.rs` is
-runtime wiring.
+Every Lambda crate follows the same split, and new ones should: `lib.rs` is pure logic generic
+over a `Store` trait, `dynamo.rs` is the SDK-backed implementation, `http.rs` (API Gateway) or
+`handler.rs` (SQS) is the handler, generic over the `Store` and taking its time from the event,
+and `main.rs` is runtime wiring. Time passed between functions is a `jiff::Timestamp`.
 
 ## Two document layers, kept in sync
 

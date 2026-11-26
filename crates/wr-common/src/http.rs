@@ -14,13 +14,6 @@ pub fn received_at(req: &Request) -> Option<Timestamp> {
     Timestamp::from_millisecond(context.request_time_epoch).ok()
 }
 
-/// `now` as the whole epoch seconds the stored attributes use, or `None`
-/// before the epoch.
-#[must_use]
-pub fn epoch_seconds(now: Timestamp) -> Option<u64> {
-    u64::try_from(now.as_second()).ok()
-}
-
 /// `req` stamped the way API Gateway delivers it, arriving at `at`.
 #[must_use]
 pub fn received(req: Request, at: Timestamp) -> Request {
@@ -43,16 +36,10 @@ mod tests {
         let at = Timestamp::from_millisecond(1_788_000_000_250).unwrap();
         let req = received(Request::new(Body::Empty), at);
         assert_eq!(received_at(&req), Some(at));
-        assert_eq!(epoch_seconds(at), Some(1_788_000_000));
     }
 
     #[test]
     fn a_request_api_gateway_did_not_stamp_has_no_time() {
         assert_eq!(received_at(&Request::new(Body::Empty)), None);
-    }
-
-    #[test]
-    fn a_time_before_the_epoch_has_no_epoch_seconds() {
-        assert_eq!(epoch_seconds(Timestamp::from_second(-1).unwrap()), None);
     }
 }

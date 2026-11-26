@@ -94,6 +94,7 @@ mod tests {
     use wr_common::{PositionItem, PositionStatus};
 
     use super::*;
+    use jiff::Timestamp;
 
     #[test]
     fn reads_the_position_assign_position_wrote() {
@@ -102,9 +103,9 @@ mod tests {
         let written = PositionItem {
             request_id: "018f3a2b-7c9d-7e1f-abcd-0123456789ab".to_owned(),
             queue_position: 4_242,
-            entry_time: 1_788_000_000,
+            entry_time: Timestamp::constant(1_788_000_000, 0),
             status: PositionStatus::Issued,
-            ttl: 1_788_086_700,
+            ttl: Timestamp::constant(1_788_086_700, 0),
             h: None,
         };
         let item: std::collections::HashMap<String, AttributeValue> =

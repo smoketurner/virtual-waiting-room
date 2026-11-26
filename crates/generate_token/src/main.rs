@@ -62,15 +62,17 @@ async fn init() -> Result<AppState<DynamoStore>, Error> {
         // Required, with no default: the controller counts a slot as taken
         // for exactly this long, so a session minted for longer than it
         // counts is a visitor over the origin's limit.
-        session_ttl_secs: session_ttl_secs()?,
+        session: session_ttl()?,
     })
 }
 
-fn session_ttl_secs() -> Result<u64, Error> {
+fn session_ttl() -> Result<jiff::SignedDuration, Error> {
     let raw = env::var("SESSION_TTL_SECS")?;
-    raw.parse().map_err(|_| {
-        Error::from(format!(
-            "SESSION_TTL_SECS is set to {raw:?}, which is not a whole number of seconds"
-        ))
-    })
+    raw.parse()
+        .map(jiff::SignedDuration::from_secs)
+        .map_err(|_| {
+            Error::from(format!(
+                "SESSION_TTL_SECS is set to {raw:?}, which is not a whole number of seconds"
+            ))
+        })
 }

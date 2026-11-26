@@ -8,14 +8,14 @@ use open_event::sqs::JoinBacklog;
 use open_event::{Backlog, OpenResult, Store, StoreError, open_event, wait_for_drain};
 use serde::Deserialize;
 
-use std::time::{Duration, SystemTime};
+use jiff::{SignedDuration, Timestamp};
 
 /// The pause between reads of the join queue while it drains.
-const DRAIN_PAUSE: Duration = Duration::from_secs(1);
+const DRAIN_PAUSE: SignedDuration = SignedDuration::from_secs(1);
 
 /// What the open keeps of its deadline for the open itself: one `BatchGetItem`
 /// and one conditional `UpdateItem`.
-const OPEN_RESERVE: Duration = Duration::from_secs(10);
+const OPEN_RESERVE: SignedDuration = SignedDuration::from_secs(10);
 
 /// The scheduler payload names the event to open.
 #[derive(Debug, Deserialize)]
@@ -57,13 +57,20 @@ async fn handle(
     // Let the consumers catch up on joins accepted before the start, so they
     // are in the cohort rather than behind it (issue #239). As long as the
     // invocation allows, and never a reason not to open.
-    let polls = drain_polls(event.context.deadline(), SystemTime::now());
+    let deadline = i64::try_from(event.context.deadline)
+        .ok()
+        .and_then(|ms| Timestamp::from_millisecond(ms).ok())
+        .ok_or("the invocation carried no usable deadline")?;
+    let polls = drain_polls(deadline, Timestamp::now());
     let progress = JoinProgress {
         queue: backlog,
         store,
         event_id: &event.payload.event_id,
     };
-    let drain = wait_for_drain(&progress, polls, || tokio::time::sleep(DRAIN_PAUSE)).await;
+    let drain = wait_for_drain(&progress, polls, || {
+        tokio::time::sleep(DRAIN_PAUSE.unsigned_abs())
+    })
+    .await;
     tracing::info!(drain = ?drain, "join queue checked before the open");
 
     let mut seed = [0u8; 32];
@@ -94,11 +101,11 @@ impl Backlog for JoinProgress<'_> {
 
 /// How many reads of the join queue fit before `deadline`, keeping
 /// [`OPEN_RESERVE`] for the open itself.
-fn drain_polls(deadline: SystemTime, now: SystemTime) -> u32 {
+fn drain_polls(deadline: Timestamp, now: Timestamp) -> u32 {
     let left = deadline
         .duration_since(now)
-        .unwrap_or(Duration::ZERO)
-        .saturating_sub(OPEN_RESERVE);
+        .saturating_sub(OPEN_RESERVE)
+        .max(SignedDuration::ZERO);
     u32::try_from(left.as_secs() / DRAIN_PAUSE.as_secs()).unwrap_or(u32::MAX)
 }
 
@@ -108,9 +115,9 @@ mod tests {
 
     #[test]
     fn the_drain_runs_until_the_open_must_go_ahead() {
-        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
-        assert_eq!(drain_polls(now + Duration::from_mins(15), now), 890);
-        assert_eq!(drain_polls(now + Duration::from_secs(10), now), 0);
-        assert_eq!(drain_polls(now, now + Duration::from_secs(5)), 0);
+        let now = Timestamp::constant(1_000, 0);
+        assert_eq!(drain_polls(now + SignedDuration::from_mins(15), now), 890);
+        assert_eq!(drain_polls(now + SignedDuration::from_secs(10), now), 0);
+        assert_eq!(drain_polls(now, now + SignedDuration::from_secs(5)), 0);
     }
 }

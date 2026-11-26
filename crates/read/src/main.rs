@@ -31,7 +31,7 @@ async fn main() -> Result<(), Error> {
         event_id: std::env::var("EVENT_ID")?,
         counters_cache: CountersCache::new(COUNTERS_TTL),
         poll_policy: load_poll_policy(),
-        session_seconds: std::env::var("SESSION_TTL_SECS")?.parse()?,
+        session: jiff::SignedDuration::from_secs(std::env::var("SESSION_TTL_SECS")?.parse()?),
         monotonic: std::time::Instant::now,
     };
 
