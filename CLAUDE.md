@@ -30,6 +30,7 @@ make validate        # terraform validate the dev root
 make fmt             # terraform fmt -recursive across infra/
 make stack-emulator  # start the AWS Emulator (Docker) the local stack runs against
 make stack           # run the shipped binaries locally and check the design (docs/LOCAL_STACK.md)
+make sim             # the functions' logic on simulated time, at real scale (docs/LOCAL_STACK.md)
 make apply           # real deploy — only when explicitly asked
 prek run             # pre-commit hooks (fmt, actionlint, zizmor, shellcheck)
 ```

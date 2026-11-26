@@ -2,9 +2,7 @@
 // waiting.js clears knownPosition on a "closed" tick and asks no
 // /_wr/v1/queue_num that tick (the closed branch calls forgetPosition() then
 // `return schedule()`), so the first running tick after a reopen re-asks —
-// the behaviour the Rust harness mirrors in
-// crates/harness/src/bin/load/visitor.rs's `run()` and its test
-// `backoff_forgets_position_across_close_so_re_asks_after_reopen`.
+// the behaviour crates/harness/src/visitor.rs's `run()` mirrors.
 //
 // Tests against the shipped waiting.js, loaded under node:vm (see
 // vm-client.js for why — a file split that could be unit-tested directly

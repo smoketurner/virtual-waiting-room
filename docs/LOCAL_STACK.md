@@ -16,6 +16,34 @@ JavaScript). A run writes `report.txt`, `report.json` and every function's log u
 `target/stack-runs/<run>/`. It exits 0 when every check passes, 1 when one fails, and 3 when the
 harness could not keep up and the result is inconclusive.
 
+## Simulated time: `make sim`
+
+`make sim` runs the same scenario, edge, queue, visitors and checks with the functions as their
+libraries instead of their binaries, in one process on tokio's paused clock: when every task is
+waiting, the clock jumps to the next timer. A run takes as long as its work, not as long as the
+event, so real session lengths and crowds fit: a 609 s run of 2,000 visitors takes under a
+second, and 100,000 visitors over 2.8 hours of event take about four minutes.
+
+```bash
+make sim SIM_ARGS="--visitors 2000 --concurrency 400 --session 120 --countdown 30"
+make sim SIM_ARGS="--visitors 500000 --concurrency 1000 --session 900 --countdown 1800 --tickets 20000"
+```
+
+- `read`, `generate_token` and `assign_position` answer through their library handlers, the open
+  runs `open_event`'s drain wait and open, and the controller its `run_pass`, all over one
+  in-memory store (`crates/harness/src/memory.rs`) that keeps each `dynamo.rs`'s write
+  conditions and DynamoDB's 1,000 writes/s per key.
+- The gate verifies the session cookie with `wr_common::Session`, which the conformance vectors
+  hold to the CloudFront Function.
+- `--tickets` sells 1 to 4 tickets to each admitted visitor; at the last one the operator sets a
+  sold-out message and ends the event, and the visitors still waiting leave.
+- It cannot show what only the shipped system can: the binaries, their `DynamoDB` expressions,
+  the JavaScript gate and page, eventually consistent reads, and each environment's own cache.
+  `make stack` checks those.
+
+On the stack's calibration scenario (seed 41) the two agree: 90% of the slots held, at most 400
+live against 400, arrival to admission 292 s against 294 s at the median.
+
 ## What runs, and what stands in
 
 | Part | In the local stack |

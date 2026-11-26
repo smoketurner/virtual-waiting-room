@@ -52,21 +52,19 @@ CONTROLLER_ARTIFACT := $(ARTIFACTS)/controller/bootstrap/bootstrap.zip
 TOKEN_ARTIFACT      := $(ARTIFACTS)/generate_token/bootstrap/bootstrap.zip
 NOJS_ARTIFACT       := $(ARTIFACTS)/nojs/bootstrap/bootstrap.zip
 
-# Local load generation. `harness` is a development tool, not a Lambda, so it is
-# deliberately absent from LAMBDA_CRATES and never packaged. Override on the
-# command line: make load VISITORS=2000 POLLING=every-tick
-VISITORS := 500
-SECONDS  := 30
-POLLING  := hold-position
+# The local tools (`crates/harness`) are not Lambdas, so they are deliberately
+# absent from LAMBDA_CRATES and never packaged. Extra flags go in SIM_ARGS:
+# make sim SIM_ARGS="--visitors 500000 --concurrency 1000 --tickets 20000"
+SIM_ARGS :=
 
 # The local stack: the shipped Lambda binaries against the AWS Emulator, with the
 # edge modelled by the harness (crates/harness). Extra flags go in
-# STACK_ARGS, e.g. make stack STACK_ARGS="--visitors 20000 --rate 200".
+# STACK_ARGS, e.g. make stack STACK_ARGS="--visitors 20000 --concurrency 2000".
 EMULATOR_HOME := $(CURDIR)/target/stack-emulator
 EMULATOR_PORT := 9297
 STACK_ARGS    :=
 
-.PHONY: help build init plan apply destroy fmt validate clean load stack-emulator stack
+.PHONY: help build init plan apply destroy fmt validate clean sim stack-emulator stack
 
 help: ## Show this help.
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -101,8 +99,8 @@ validate: build init ## Build the Lambdas then terraform validate the dev root.
 clean: ## Remove staged Lambda artifacts.
 	rm -rf -- $(ARTIFACTS)
 
-load: ## Generate waiting-room load locally and report origin requests per visitor.
-	cargo run -q -p harness -- --visitors $(VISITORS) --seconds $(SECONDS) --polling $(POLLING)
+sim: ## Run the waiting room's own logic on simulated time and check the design's claims.
+	cargo run --release -q -p harness --bin sim -- $(SIM_ARGS)
 
 stack-emulator: ## Build and start the AWS Emulator the local stack runs against.
 	docker build -q -t vwr-aws-emulator crates/harness/emulator

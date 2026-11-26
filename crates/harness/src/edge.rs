@@ -555,3 +555,110 @@ fn percent_decode(s: &str) -> String {
     }
     String::from_utf8_lossy(&out).into_owned()
 }
+
+#[cfg(test)]
+mod tests {
+    #![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
+
+    use std::sync::atomic::AtomicU64;
+
+    use super::*;
+    use crate::backend::Reply;
+
+    /// A `read` that counts its invocations and takes a moment to answer, so
+    /// concurrent misses overlap it.
+    struct Counting {
+        calls: AtomicU64,
+        status: u16,
+    }
+
+    impl Backend for Counting {
+        fn invoke(&self, _api: Api, _event: serde_json::Value) -> Reply<'_> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Ok(json!({ "statusCode": self.status, "body": "{}" }))
+            })
+        }
+
+        fn gate(&self, _viewer: serde_json::Value) -> Reply<'_> {
+            Box::pin(async { Ok(json!({ "pass": false, "status": 403 })) })
+        }
+    }
+
+    fn edge(status: u16) -> (Arc<Edge>, Arc<Counting>) {
+        let backend = Arc::new(Counting {
+            calls: AtomicU64::new(0),
+            status,
+        });
+        let edge = Edge::new(
+            Throttles {
+                account_rate: 1e9,
+                account_burst: 1e9,
+                join_rate: 1e9,
+                join_burst: 1e9,
+                method_rate: 1e9,
+                method_burst: 1e9,
+            },
+            backend.clone(),
+            Arc::new(JoinQueue::new("test://join".to_owned(), 0.0, 1)),
+            "evt",
+            Arc::new(Metrics::new(Instant::now())),
+        );
+        (Arc::new(edge), backend)
+    }
+
+    fn status() -> ViewerRequest {
+        ViewerRequest {
+            method: "GET",
+            path: STATUS.to_owned(),
+            viewer_ip: "10.0.0.1".to_owned(),
+            ..ViewerRequest::default()
+        }
+    }
+
+    async fn burst(edge: &Arc<Edge>, n: usize) -> Vec<u16> {
+        let mut handles = Vec::with_capacity(n);
+        for _ in 0..n {
+            let edge = Arc::clone(edge);
+            handles.push(tokio::spawn(
+                async move { edge.request(status()).await.status },
+            ));
+        }
+        let mut statuses = Vec::with_capacity(n);
+        for h in handles {
+            statuses.push(h.await.unwrap());
+        }
+        statuses
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cohort_missing_together_makes_one_origin_fetch() {
+        let (edge, backend) = edge(200);
+        let statuses = burst(&edge, 500).await;
+        assert!(statuses.iter().all(|&s| s == 200));
+        assert_eq!(backend.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_cached_answer_serves_until_its_ttl_then_one_more_fetch() {
+        let (edge, backend) = edge(200);
+        burst(&edge, 10).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        burst(&edge, 10).await;
+        assert_eq!(backend.calls.load(Ordering::Relaxed), 1, "inside the TTL");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        burst(&edge, 10).await;
+        assert_eq!(backend.calls.load(Ordering::Relaxed), 2, "after it");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_error_is_cached_like_cloudfront_caches_it() {
+        // `error_caching_min_ttl` holds a 5xx for a second, so a failing
+        // origin is asked once a second, not once a viewer.
+        let (edge, backend) = edge(503);
+        let statuses = burst(&edge, 100).await;
+        assert!(statuses.iter().all(|&s| s == 503));
+        assert_eq!(backend.calls.load(Ordering::Relaxed), 1);
+    }
+}

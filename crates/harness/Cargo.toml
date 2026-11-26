@@ -11,10 +11,6 @@ publish = false
 path = "src/lib.rs"
 
 [[bin]]
-name = "harness"
-path = "src/bin/load/main.rs"
-
-[[bin]]
 name = "stack"
 path = "src/bin/stack/main.rs"
 
