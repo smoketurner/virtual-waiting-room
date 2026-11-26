@@ -60,7 +60,7 @@ SECONDS  := 30
 POLLING  := hold-position
 
 # The local stack: the shipped Lambda binaries against the AWS Emulator, with the
-# edge modelled by the harness (crates/harness/src/stack). Extra flags go in
+# edge modelled by the harness (crates/harness). Extra flags go in
 # STACK_ARGS, e.g. make stack STACK_ARGS="--visitors 20000 --rate 200".
 EMULATOR_HOME := $(CURDIR)/target/stack-emulator
 EMULATOR_PORT := 9297

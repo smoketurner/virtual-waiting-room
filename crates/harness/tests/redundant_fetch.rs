@@ -3,7 +3,7 @@
 //!
 //! `harness` is a binary crate with no library target, so an integration test
 //! cannot `use harness::...`. Instead this compiles the real source unchanged
-//! via `#[path = "../src/edge.rs"] mod edge;`.
+//! via `#[path = "../src/bin/load/edge.rs"] mod edge;`.
 //!
 //! The invariant this guards: a waiter whose cache-check missed but whose
 //! "become leader" re-check lands after the leader has finished (inserted
@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use tokio::time::timeout;
 
-#[path = "../src/edge.rs"]
+#[path = "../src/bin/load/edge.rs"]
 mod edge;
 
 use edge::{Disposition, Edge};

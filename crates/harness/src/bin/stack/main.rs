@@ -19,13 +19,7 @@
 //! and Node.js for the gate.
 
 mod aws;
-mod edge;
 mod lambda;
-mod metrics;
-mod queue;
-mod report;
-mod rng;
-mod visitor;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -38,9 +32,10 @@ use base64::Engine as _;
 use tokio::io::AsyncBufReadExt as _;
 use tokio::time::Instant;
 
-use crate::report::{Published, Registration, Report};
-use crate::rng::Rng;
-use crate::visitor::{Outcome, Record, World};
+use harness::report::{Published, Registration, Report};
+use harness::rng::Rng;
+use harness::visitor::{Outcome, Record, World};
+use harness::{edge, metrics, queue, report, visitor};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Arrival {
@@ -339,7 +334,7 @@ async fn run() -> Result<Verdict> {
     })
     .await?;
 
-    let metrics = Arc::new(metrics::Metrics::new(started_std));
+    let metrics = Arc::new(metrics::Metrics::new(started));
     let edge = Arc::new(edge::Edge::new(
         // AWS's default account limit and the stage throttles `core/api.tf`
         // defaults to, shrunk by --scale for a scaled-down model of a larger
@@ -352,10 +347,12 @@ async fn run() -> Result<Verdict> {
             method_rate: 10_000.0 * args.scale,
             method_burst: 5_000.0 * args.scale,
         },
-        Arc::clone(&read),
-        Arc::clone(&generate_token),
+        Arc::new(lambda::Shipped::new(
+            Arc::clone(&read),
+            Arc::clone(&generate_token),
+            format!("http://127.0.0.1:{gate_port}/"),
+        )),
         Arc::clone(&queue),
-        format!("http://127.0.0.1:{gate_port}/"),
         &event_id,
         Arc::clone(&metrics),
     ));
@@ -367,9 +364,9 @@ async fn run() -> Result<Verdict> {
         let queue = Arc::clone(&queue);
         let assign = Arc::clone(&assign);
         let stop = stop_rx.clone();
-        pollers.push(tokio::spawn(
-            async move { queue.poll(&assign, &stop).await },
-        ));
+        pollers.push(tokio::spawn(async move {
+            queue.poll(assign.as_ref(), &stop).await
+        }));
     }
 
     // The open schedule and the controller's ten-second cadence.

@@ -1,0 +1,1128 @@
+//! One simulated waiting visitor, following the same state machine as
+//! `waiting.js`.
+//!
+//! This is a model of the client, so it can disagree with the client and report
+//! a number that is wrong in the client's favour. Two things keep it honest:
+//! the cadence constants are the client's own, and [`Polling::EveryTick`]
+//! reproduces the behaviour the client had before it learned to hold a position,
+//! so a run can show the difference the change actually makes rather than
+//! asserting it.
+//!
+//! Deliberately absent from [`Polling::Backoff`]: Page Visibility. This model
+//! is all-foreground — every visitor polls the whole run — so its numbers are
+//! the hidden-share-0 row of `DESIGN.md` §12, not a claim that a real cohort
+//! never backgrounds a tab. Browser throttling and the visibility handler
+//! both change what a hidden tab costs, in *either* direction depending on
+//! the browser (§12's iOS suspension row goes one way, Chrome's throttle the
+//! other), and this harness has no way to observe either one.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+use crate::edge::{Disposition, Edge};
+
+/// `waiting.js`: `POLL_MS`.
+const POLL_MS: u64 = 5000;
+/// `waiting.js`: `JITTER_MS`.
+const JITTER_MS: u64 = 1500;
+/// `waiting.js`: the TTL on both polled cache policies.
+const POLLED_TTL: Duration = Duration::from_secs(1);
+/// `waiting.js`: `FIRST_ASK_TARGET_RPS`.
+const FIRST_ASK_TARGET_RPS: u64 = 5000;
+/// `waiting.js`: `FIRST_ASK_MAX_SPREAD_MS`.
+const FIRST_ASK_MAX_SPREAD_MS: u64 = 120_000;
+
+/// `waiting.js` (#69): the deploy-time poll-policy defaults —
+/// `terraform.tfvars`' `poll_floor_ms`/`poll_ceiling_ms`/`poll_divisor`.
+const POLL_FLOOR_MS: u64 = 5000;
+const POLL_CEILING_MS: u64 = 30_000;
+const POLL_DIVISOR: u64 = 10;
+/// `waiting.js`: `JITTER_FRACTION`, proportional jitter over the computed
+/// interval rather than [`JITTER_MS`]'s flat window.
+const JITTER_FRACTION: f64 = 0.3;
+
+/// `waiting.js`: `intervalFor`. Proportional to the wait this visitor can
+/// see, clamped to `[floor, ceiling]`; falls back to the floor with no wait
+/// to be proportional to.
+#[must_use]
+pub fn interval_for(wait_seconds: f64, floor_ms: u64, ceiling_ms: u64, divisor: u64) -> u64 {
+    // Deliberately not `wait_seconds <= 0.0`: that is false for NaN, and a
+    // NaN wait must fall back to the floor exactly like a non-positive one.
+    #[expect(
+        clippy::neg_cmp_op_on_partial_ord,
+        reason = "the negation is exactly what mirrors waiting.js's !(waitSeconds > 0), catching NaN"
+    )]
+    if !(wait_seconds > 0.0) {
+        return floor_ms;
+    }
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "divisor is a small configured value, far below f64's exact-integer range"
+    )]
+    let raw = (wait_seconds * 1000.0) / divisor as f64;
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "floor_ms/ceiling_ms are milliseconds far below f64's exact-integer range"
+    )]
+    let clamped = raw.max(floor_ms as f64).min(ceiling_ms as f64);
+    #[expect(
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation,
+        reason = "clamped is finite and within [floor_ms, ceiling_ms], both valid u64"
+    )]
+    let out = clamped as u64;
+    out
+}
+
+/// `waiting.js`: `intervalForPosition`.
+#[must_use]
+pub fn interval_for_position(ahead: u64, rate: u64) -> u64 {
+    if rate == 0 {
+        return POLL_FLOOR_MS;
+    }
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "positions and rates far below f64's exact-integer range at any realistic event size"
+    )]
+    let wait_seconds = ahead as f64 / rate as f64;
+    interval_for(wait_seconds, POLL_FLOOR_MS, POLL_CEILING_MS, POLL_DIVISOR)
+}
+
+/// The window a cohort of `participants` spreads its one position request over.
+///
+/// Mirrors `scheduleFirstAsk`. Without it a cohort asks in unison the moment
+/// the event opens, and a run reports a spike the shipped client does not
+/// actually produce.
+#[must_use]
+pub fn first_ask_spread_ms(participants: u64) -> u64 {
+    (participants * 1000 / FIRST_ASK_TARGET_RPS).min(FIRST_ASK_MAX_SPREAD_MS)
+}
+
+/// How a visitor treats their queue position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Polling {
+    /// Ask once and hold it, because a position cannot change. The shipped
+    /// client.
+    ///
+    /// A position cannot be asked for before the open — it does not exist until
+    /// the seed does — so the whole cohort asks in the window just after it,
+    /// spread only as far as the client's own spread reaches.
+    HoldPosition,
+    /// Ask again on every poll. What the client did before, kept so a run can
+    /// measure the cost of the difference instead of taking it on trust.
+    EveryTick,
+    /// Fetch the registration's `(shard, local index)` once during the
+    /// countdown, then compute the position locally from the open outputs on
+    /// `/status`.
+    ///
+    /// The row exists from the moment registration lands, so this ask is not
+    /// tied to the open, and afterwards the visitor needs nothing of their own
+    /// — only the shared `/status` document, which is keyed on path and
+    /// collapses.
+    ///
+    /// Measuring it is what showed that being free of the open is worth less
+    /// than it sounds. Asking on arrival reproduces the arrival rush, which for
+    /// a scheduled event is a wall of people just before the start: against a
+    /// late-arriving million, that peaks around six times higher than waiting
+    /// for the open and spreading deliberately. Given the same spread the two
+    /// land within a few per cent of each other, which says the spread is doing
+    /// the work and the timing is close to incidental.
+    DerivePosition,
+    /// The adaptive client (#69): holds its position exactly like
+    /// [`Polling::HoldPosition`], but spaces its polls out with distance from
+    /// the front instead of polling at a fixed interval regardless of wait.
+    Backoff,
+}
+
+/// What one visitor did, summed across the run.
+#[derive(Debug, Default)]
+pub struct VisitorTally {
+    pub status_requests: AtomicU64,
+    pub queue_num_requests: AtomicU64,
+    /// Milliseconds each visitor spent present and polling, summed across the
+    /// cohort. Under `--countdown`/`--arrival` a visitor sleeps until their
+    /// arrival offset and issues no requests before it, so this is the only
+    /// honest denominator for a per-visitor-per-minute rate: `visitors × run
+    /// length` would count time nobody was in the room.
+    pub active_ms: AtomicU64,
+}
+
+/// A deterministic jitter source. Real jitter is `Math.random()`; a run that
+/// cannot be repeated is a poor measuring instrument, so this is seeded per
+/// visitor and produces the same schedule every time.
+struct Jitter(u64);
+
+impl Jitter {
+    fn new(seed: u64) -> Self {
+        // Odd seed keeps the generator's period full for every visitor index.
+        Self(seed.wrapping_mul(2) | 1)
+    }
+
+    /// xorshift64: adequate for spreading polls, and not used for anything
+    /// where the quality of the randomness matters.
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn interval(&mut self) -> Duration {
+        Duration::from_millis(POLL_MS + self.next() % JITTER_MS)
+    }
+
+    /// `waiting.js`: `jitter()` under the adaptive policy —
+    /// `Math.round(nextIntervalMs * (1 + Math.random() * JITTER_FRACTION))`.
+    fn proportional(&mut self, base_ms: u64) -> Duration {
+        // next() % 1_000_000 / 1_000_000.0 mirrors Math.random()'s [0, 1) range
+        // closely enough for spreading polls; exactness does not matter here.
+        let fraction = (self.next() % 1_000_000) as f64 / 1_000_000.0;
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "base_ms is a poll interval in milliseconds, far below f64's exact-integer range"
+        )]
+        let scaled = (base_ms as f64 * (1.0 + fraction * JITTER_FRACTION)).round();
+        #[expect(
+            clippy::cast_sign_loss,
+            clippy::cast_possible_truncation,
+            reason = "scaled is finite, non-negative (base_ms and fraction both >= 0), and well below u64::MAX"
+        )]
+        let ms = scaled as u64;
+        Duration::from_millis(ms)
+    }
+}
+
+/// When a cohort turns up during the countdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arrival {
+    /// Evenly across the countdown. Convenient, and not what happens.
+    Uniform,
+    /// Bunched towards the start, which is how a scheduled event actually
+    /// fills: a trickle when the countdown opens and a wall of people in the
+    /// last minutes before it starts.
+    Late,
+}
+
+/// Where in the countdown one visitor arrives.
+///
+/// `Late` raises a uniform draw to a power below one, which pulls the mass
+/// towards the end of the window. It is a shape, not a fitted model — the point
+/// is to stop assuming the flattering case, not to predict a real audience.
+fn arrival_offset_ms(arrival: Arrival, countdown_ms: u64, draw: u64) -> u64 {
+    if countdown_ms == 0 {
+        return 0;
+    }
+    let u = (draw % 1_000_000) as f64 / 1_000_000.0;
+    let fraction = match arrival {
+        Arrival::Uniform => u,
+        Arrival::Late => u.powf(0.2),
+    };
+    (countdown_ms as f64 * fraction) as u64
+}
+
+/// What every visitor in a run shares.
+#[derive(Debug, Clone, Copy)]
+pub struct RunSettings {
+    pub polling: Polling,
+    /// Window the cohort spreads its one position request over.
+    pub spread_ms: u64,
+    /// How long the countdown runs before the open. A position becomes askable
+    /// only after this; a registration row is askable from the start.
+    pub countdown_ms: u64,
+    pub arrival: Arrival,
+    pub deadline: tokio::time::Instant,
+    /// Visitors admitted per second, for [`Polling::Backoff`]'s interval
+    /// calculation. Ignored by every other polling mode.
+    pub target_rate: u64,
+}
+
+/// Runs one visitor until the deadline, driving requests through the edge.
+pub async fn run<F, Fut>(
+    edge: Arc<Edge>,
+    request_id: String,
+    seed: u64,
+    settings: RunSettings,
+    origin: Arc<F>,
+    tally: Arc<VisitorTally>,
+) where
+    F: Fn(String) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = (u16, String)> + Send,
+{
+    let mut jitter = Jitter::new(seed);
+    let mut held_position: Option<u64> = None;
+    let started = tokio::time::Instant::now();
+    // When this visitor turns up. Nothing they do can happen before it.
+    let arrives_at = arrival_offset_ms(settings.arrival, settings.countdown_ms, jitter.next());
+
+    let first_ask_after = Duration::from_millis(match settings.polling {
+        // Readable the moment the row lands, so this ask is not tied to the
+        // open — but arriving is not the same as being spread. A real audience
+        // turns up in a rush just before the start, so asking on arrival
+        // reproduces that rush exactly. The deliberate spread is what flattens
+        // a cohort, so apply it here too, starting from when each visitor
+        // arrives rather than from the open.
+        Polling::DerivePosition => {
+            arrives_at
+                + if settings.spread_ms == 0 {
+                    0
+                } else {
+                    jitter.next() % settings.spread_ms
+                }
+        }
+        // Cannot be asked before the open, so the wait is the countdown plus
+        // this visitor's slice of the client's spread.
+        Polling::HoldPosition | Polling::Backoff => {
+            settings.countdown_ms
+                + if settings.spread_ms == 0 {
+                    0
+                } else {
+                    jitter.next() % settings.spread_ms
+                }
+        }
+        Polling::EveryTick => settings.countdown_ms,
+    });
+
+    // Nothing happens before this visitor turns up, and once they have, their
+    // first poll lands somewhere inside the polling interval rather than on the
+    // same tick as everyone else's.
+    tokio::time::sleep(Duration::from_millis(arrives_at + jitter.next() % POLL_MS)).await;
+
+    // From here on the visitor is in the room. Everything before this point is
+    // time they were not waiting and caused no origin requests, so it is not
+    // theirs to be divided by.
+    let turned_up_at = tokio::time::Instant::now();
+
+    let mut serving_position = 0u64;
+
+    while tokio::time::Instant::now() < settings.deadline {
+        // /status: keyed on path alone, so the whole cohort shares one entry.
+        let status_origin = Arc::clone(&origin);
+        let (_, status_body, _) = edge
+            .serve("/_wr/v1/status", "/_wr/v1/status", POLLED_TTL, move || {
+                let o = status_origin;
+                async move { o("/_wr/v1/status".to_owned()).await }
+            })
+            .await;
+        tally.status_requests.fetch_add(1, Ordering::Relaxed);
+        if let Some(serving) = parse_serving_position(&status_body) {
+            serving_position = serving;
+        }
+        let closed = is_closed(&status_body);
+        // `waiting.js`'s closed branch calls `forgetPosition()` then `return
+        // schedule()` — it clears `knownPosition` and asks no `/_wr/v1/queue_num`
+        // that tick, so the next running poll re-asks. Clearing `held_position`
+        // here is the forget; the `!closed` ask gate on `HoldPosition`/`Backoff`
+        // below is the skip. Together they force the same re-ask on the first
+        // running tick after a `closed → running` reopen, where without this
+        // `held_position` would stay `Some(stale)` and the ask gate would stay
+        // false forever.
+        //
+        // `DerivePosition` is exempt from both: its defining `/_wr/v1/queue_num`
+        // ask is timed to land *during* the closed countdown (`first_ask_after`
+        // above deliberately omits `countdown_ms`), and it holds that one fetch
+        // forever — the registration row exists from the moment it lands, not
+        // from the open. Forgetting on every closed tick would re-open the ask
+        // gate each poll and re-fetch on every tick instead of fetching once.
+        if closed && !matches!(settings.polling, Polling::DerivePosition) {
+            held_position = None;
+        }
+
+        let ask = match settings.polling {
+            // The old client asked on every tick and knew nothing of a spread.
+            // `!closed` mirrors the client's `return schedule()` in the closed
+            // branch: a closed tick asks no `/_wr/v1/queue_num`.
+            Polling::EveryTick => !closed && started.elapsed() >= first_ask_after,
+            // Not gated on `!closed`: the defining ask lands during the closed
+            // countdown, and the closed-tick clearing above is exempted so the
+            // single fetch sticks. Both halves of the exemption are coupled —
+            // removing either alone either blocks the ask entirely or re-asks
+            // every closed tick.
+            Polling::DerivePosition => {
+                held_position.is_none() && started.elapsed() >= first_ask_after
+            }
+            Polling::HoldPosition | Polling::Backoff => {
+                !closed && held_position.is_none() && started.elapsed() >= first_ask_after
+            }
+        };
+
+        if ask {
+            // /queue_num: the request id is in the cache key, so this entry is
+            // this visitor's alone and no other visitor can ever hit it.
+            let path = format!("/_wr/v1/queue_num?request_id={request_id}");
+            let key = path.clone();
+            let qn_origin = Arc::clone(&origin);
+            let (status, body, disposition) = edge
+                .serve("/_wr/v1/queue_num", &key, POLLED_TTL, move || {
+                    let o = qn_origin;
+                    async move { o(path).await }
+                })
+                .await;
+            tally.queue_num_requests.fetch_add(1, Ordering::Relaxed);
+            debug_assert_ne!(
+                disposition,
+                Disposition::Collapsed,
+                "a per-visitor key cannot collapse with another visitor's"
+            );
+
+            if status == 200
+                && let Some(position) = parse_position(&body)
+            {
+                held_position = Some(position);
+            }
+        }
+
+        let sleep = match settings.polling {
+            Polling::Backoff => {
+                // `waiting.js`: closed ⇒ the ceiling, unconditionally.
+                // Otherwise ahead === 0 or unknown ⇒ the floor; otherwise
+                // intervalForPosition. Mirrors the client's own clamp exactly.
+                let interval_ms = if closed {
+                    POLL_CEILING_MS
+                } else {
+                    match held_position {
+                        Some(position) => {
+                            let ahead = position.saturating_sub(serving_position);
+                            if ahead == 0 {
+                                POLL_FLOOR_MS
+                            } else {
+                                interval_for_position(ahead, settings.target_rate)
+                            }
+                        }
+                        None => POLL_FLOOR_MS,
+                    }
+                };
+                jitter.proportional(interval_ms)
+            }
+            _ => jitter.interval(),
+        };
+        tokio::time::sleep(sleep).await;
+    }
+
+    // A visitor whose arrival offset lands past the deadline never entered the
+    // loop and contributes nothing here, which is right: they issued no
+    // requests either.
+    let active_ms = u64::try_from(turned_up_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+    tally.active_ms.fetch_add(active_ms, Ordering::Relaxed);
+}
+
+/// Pulls `position` out of a `/queue_num` body without a JSON dependency on the
+/// response shape beyond the one field this needs.
+fn parse_position(body: &str) -> Option<u64> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .get("position")?
+        .as_u64()
+}
+
+/// Pulls `serving_position` out of a `/status` body, the same way
+/// `parse_position` reads `/queue_num`.
+fn parse_serving_position(body: &str) -> Option<u64> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .get("serving_position")?
+        .as_u64()
+}
+
+/// Whether a `/status` body reports `serving_state: "closed"`.
+///
+/// `waiting.js` maps this row to the ceiling unconditionally — a closed event
+/// has forgotten every visitor's position (`forgetPosition()`), so there is
+/// nothing to be proportional to. Checked separately from
+/// `held_position` because a real client can hold a position across other
+/// serving states but never across `closed`.
+fn is_closed(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    value.get("serving_state").and_then(|s| s.as_str()) == Some("closed")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jitter_is_repeatable_for_a_given_visitor() {
+        // A measurement that cannot be repeated cannot be compared against the
+        // next run, which is the whole point of having one.
+        let mut a = Jitter::new(7);
+        let mut b = Jitter::new(7);
+        assert_eq!(a.interval(), b.interval());
+        assert_eq!(a.interval(), b.interval());
+    }
+
+    #[test]
+    fn jitter_stays_inside_the_clients_window() {
+        let mut j = Jitter::new(3);
+        for _ in 0..1000 {
+            let ms = j.interval().as_millis() as u64;
+            assert!((POLL_MS..POLL_MS + JITTER_MS).contains(&ms), "{ms}");
+        }
+    }
+
+    #[test]
+    fn different_visitors_get_different_schedules() {
+        let mut a = Jitter::new(1);
+        let mut b = Jitter::new(2);
+        assert_ne!(a.interval(), b.interval());
+    }
+
+    #[test]
+    fn position_is_read_from_a_queue_num_body() {
+        assert_eq!(
+            parse_position(r#"{"position":4242,"live_join":true}"#),
+            Some(4242)
+        );
+        assert_eq!(parse_position(r#"{"error":"not registered"}"#), None);
+        assert_eq!(parse_position("not json"), None);
+    }
+
+    #[test]
+    fn serving_position_is_read_from_a_status_body() {
+        assert_eq!(
+            parse_serving_position(r#"{"serving_position":90,"phase":"active"}"#),
+            Some(90)
+        );
+        assert_eq!(parse_serving_position(r#"{"phase":"pre_queue"}"#), None);
+        assert_eq!(parse_serving_position("not json"), None);
+    }
+
+    #[test]
+    fn closed_is_read_from_a_status_body() {
+        assert!(is_closed(r#"{"serving_state":"closed"}"#));
+        assert!(!is_closed(r#"{"serving_state":"running"}"#));
+        assert!(!is_closed(r#"{"serving_state":"paused"}"#));
+        assert!(!is_closed(r#"{"phase":"active"}"#), "field absent");
+        assert!(!is_closed("not json"));
+    }
+
+    #[test]
+    fn interval_for_a_zero_or_negative_wait_is_the_floor() {
+        assert_eq!(interval_for(0.0, 5000, 30_000, 10), 5000);
+        assert_eq!(interval_for(-1.0, 5000, 30_000, 10), 5000);
+    }
+
+    #[test]
+    fn interval_for_clamps_to_the_floor_and_ceiling() {
+        assert_eq!(
+            interval_for(0.001, 5000, 30_000, 10),
+            5000,
+            "below the floor"
+        );
+        assert_eq!(
+            interval_for(1_000_000.0, 5000, 30_000, 10),
+            30_000,
+            "above the ceiling"
+        );
+        // A 100s wait at divisor 10 is exactly the midpoint: neither clamp
+        // applies.
+        assert_eq!(interval_for(100.0, 5000, 30_000, 10), 10_000);
+    }
+
+    #[test]
+    fn interval_for_position_falls_back_to_the_floor_with_no_rate() {
+        assert_eq!(interval_for_position(1000, 0), POLL_FLOOR_MS);
+    }
+
+    #[test]
+    fn proportional_jitter_never_shrinks_the_interval() {
+        let mut j = Jitter::new(11);
+        for _ in 0..1000 {
+            let ms = j.proportional(5000).as_millis() as u64;
+            assert!((5000..=6500).contains(&ms), "{ms}");
+        }
+    }
+
+    /// Simulates polling to admission with `interval_for_position` (no
+    /// jitter): starting `ahead0` positions back at `rate` positions/sec,
+    /// how many polls until `ahead` reaches zero.
+    fn polls_to_admission(ahead0: u64, rate: u64) -> u64 {
+        let mut ahead = ahead0;
+        let mut polls = 0u64;
+        while ahead > 0 {
+            polls += 1;
+            let interval_ms = interval_for_position(ahead, rate);
+            let moved = (rate * interval_ms / 1000).max(1);
+            ahead = ahead.saturating_sub(moved);
+        }
+        polls
+    }
+
+    /// The same descent at today's fixed floor-only interval — one poll
+    /// every `POLL_FLOOR_MS`, moving `rate * POLL_FLOOR_MS / 1000` positions
+    /// each time, regardless of how far away the front is.
+    fn polls_to_admission_fixed(ahead0: u64, rate: u64) -> u64 {
+        ahead0.div_ceil((rate * POLL_FLOOR_MS / 1000).max(1))
+    }
+
+    #[test]
+    fn backoff_poll_count_matches_the_geometric_closed_form_away_from_the_clamps() {
+        // Divisor 10, rate 1000/s: the floor/ceiling clamps engage at ahead
+        // 50,000 and 300,000, so descending from 200,000 to the floor
+        // threshold exercises intervalFor's unclamped middle branch only.
+        // There, each poll's own interval is exactly the remaining wait
+        // divided by the divisor, so the remaining wait shrinks by a factor
+        // of (1 - 1/divisor) every poll — a geometric decay, whose poll
+        // count to reach any fixed threshold is logarithmic in the starting
+        // wait rather than linear in it.
+        let rate = 1000u64;
+        let divisor = 10u64;
+        let ahead_floor_threshold = rate * POLL_FLOOR_MS * divisor / 1000; // 50_000
+        let ahead0 = 200_000u64;
+
+        let mut ahead = ahead0;
+        let mut polls = 0u64;
+        while ahead > ahead_floor_threshold {
+            polls += 1;
+            let interval_ms = interval_for_position(ahead, rate);
+            let moved = rate * interval_ms / 1000;
+            ahead = ahead.saturating_sub(moved);
+        }
+
+        let ratio = ahead_floor_threshold as f64 / ahead0 as f64;
+        let expected = ratio.ln() / (1.0 - 1.0 / divisor as f64).ln();
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "the closed form is a small positive poll count for these inputs"
+        )]
+        let expected = expected.ceil() as u64;
+        // Rounding each interval down to a whole millisecond and each move
+        // down to a whole position can only make the discrete simulation
+        // run a little long against the continuous closed form.
+        assert!(
+            polls >= expected && polls <= expected + 3,
+            "polls={polls} expected~={expected}"
+        );
+    }
+
+    #[test]
+    fn backoff_poll_count_over_a_full_wait_is_materially_below_a_fixed_interval() {
+        // A visitor 1,000,000 positions back at a modest 100/s target rate —
+        // deep enough to spend most of the wait ceiling-clamped, exactly the
+        // realistic case: even bounded at the ceiling, polling less often
+        // there is most of where the saving comes from over the full wait.
+        let ahead0 = 1_000_000u64;
+        let rate = 100u64;
+
+        let backoff = polls_to_admission(ahead0, rate);
+        let fixed = polls_to_admission_fixed(ahead0, rate);
+
+        assert!(
+            backoff.saturating_mul(3) < fixed,
+            "backoff={backoff} fixed={fixed}"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::panic,
+        reason = "test-only parsing of variables.tf; any failure to parse is itself the signal something drifted"
+    )]
+    fn harness_constants_match_terraform_defaults() {
+        // POLL_FLOOR_MS/POLL_CEILING_MS/POLL_DIVISOR are hand-copied from
+        // infra/modules/core/variables.tf's poll_floor_ms/poll_ceiling_ms/
+        // poll_divisor defaults, tied only by a doc comment. Pinning the
+        // source file here means a Terraform default change is caught in
+        // this test instead of silently invalidating every harness
+        // measurement while the rest of the suite stays green.
+        //
+        // This pins `core`'s defaults only, not the dev root's
+        // (infra/environments/dev/variables.tf, example.tfvars) — `core` is
+        // the canonical default every other root inherits from, so it is the
+        // right anchor, but a dev-root override diverging from it would not
+        // trip this test.
+        let variables_tf = include_str!("../../../../../infra/modules/core/variables.tf");
+        for (name, expected) in [
+            ("poll_floor_ms", POLL_FLOOR_MS),
+            ("poll_ceiling_ms", POLL_CEILING_MS),
+            ("poll_divisor", POLL_DIVISOR),
+        ] {
+            let block_start = variables_tf
+                .find(&format!("variable \"{name}\" {{"))
+                .unwrap_or_else(|| panic!("variable \"{name}\" not found in variables.tf"));
+            let default_needle = "default     = ";
+            let default_start = variables_tf[block_start..]
+                .find(default_needle)
+                .map(|i| block_start + i + default_needle.len())
+                .unwrap_or_else(|| panic!("no default found for {name} in variables.tf"));
+            let rest = &variables_tf[default_start..];
+            let line_end = rest.find('\n').unwrap_or(rest.len());
+            let actual: u64 = rest[..line_end].trim().parse().unwrap_or_else(|_| {
+                panic!(
+                    "could not parse {name}'s default as a number: {:?}",
+                    &rest[..line_end]
+                )
+            });
+            assert_eq!(
+                actual, expected,
+                "{name}'s Terraform default drifted from the harness constant"
+            );
+        }
+    }
+
+    // --- End-to-end: the actual saving, through the real run()/Edge path ----
+
+    /// Runs `visitors` simulated visitors through the real `run()` loop and
+    /// `Edge` cache for `run_secs`, and returns the total client requests
+    /// across every endpoint.
+    ///
+    /// The origin reports `serving_state: "closed"` and refuses `/queue_num`
+    /// with a non-200 for the first `closed_secs` of (virtual,
+    /// `tokio::time`-paused) elapsed time, and reports `"running"` with a
+    /// real position after — exercising `Polling::Backoff`'s `closed ⇒
+    /// ceiling` branch when `closed_secs` outlasts `run_secs`, with
+    /// `held_position` genuinely `None`: a closed tick clears it
+    /// (`forgetPosition()`) and asks no `/queue_num` (`!closed` gate), so
+    /// the ceiling can only be coming from the `closed` check, not the
+    /// position-based fallback.
+    ///
+    /// `settings.countdown_ms` is always 0 here: it drives visitor arrival
+    /// spread and `first_ask_after`, neither of which this helper is
+    /// isolating, and coupling it to `closed_secs` would delay most visitors'
+    /// arrival past `run_secs` entirely. The branch under test reads the
+    /// origin's own response, not that setting.
+    ///
+    /// Once running, a huge, unreachable `ahead` (the origin answers a
+    /// position far beyond what `target_rate` could drain in `run_secs`)
+    /// keeps `Polling::Backoff` clamped at the ceiling for the rest of the
+    /// run, so its request count is deterministic: exactly one `/status` and
+    /// one `/queue_num` per visitor, however the ceiling's jitter draws land.
+    async fn measure_client_requests(
+        polling: Polling,
+        visitors: u64,
+        run_secs: u64,
+        closed_secs: u64,
+    ) -> u64 {
+        let edge = Arc::new(Edge::new(Duration::from_secs(10), run_secs));
+        let tally = Arc::new(VisitorTally::default());
+        let started = tokio::time::Instant::now();
+        let origin = Arc::new(move |path: String| async move {
+            let closed = started.elapsed().as_secs() < closed_secs;
+            if path.starts_with("/_wr/v1/status") {
+                if closed {
+                    (
+                        200,
+                        r#"{"serving_state":"closed","serving_position":0}"#.to_owned(),
+                    )
+                } else {
+                    (
+                        200,
+                        r#"{"serving_state":"running","serving_position":0,"origin_concurrency":5,"session_seconds":1}"#
+                            .to_owned(),
+                    )
+                }
+            } else if closed {
+                // Mirrors read's real 409 ("event not yet open") before the
+                // open: no position is answered, so held_position must not
+                // be set from this.
+                (409, r#"{"error":"event not yet open"}"#.to_owned())
+            } else {
+                (200, r#"{"position":100000000,"live_join":true}"#.to_owned())
+            }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(run_secs);
+        let settings = RunSettings {
+            polling,
+            spread_ms: 0,
+            countdown_ms: 0,
+            arrival: Arrival::Uniform,
+            deadline,
+            target_rate: 5,
+        };
+
+        let mut tasks = Vec::with_capacity(visitors as usize);
+        for n in 0..visitors {
+            tasks.push(tokio::spawn(run(
+                Arc::clone(&edge),
+                format!("req-{n}"),
+                n + 1,
+                settings,
+                Arc::clone(&origin),
+                Arc::clone(&tally),
+            )));
+        }
+        #[expect(
+            clippy::unwrap_used,
+            reason = "a panicked visitor task is a test bug, not an expected outcome"
+        )]
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        let mut total = 0u64;
+        for (_, client, _, _, _) in edge.snapshot().await {
+            total += client;
+        }
+        total
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backoff_issues_materially_fewer_client_requests_end_to_end() {
+        // Closes the gap the tester flagged: the headline saving was only a
+        // println! from a manual run, backed by a proxy test that re-derives
+        // poll counts from a standalone simulation rather than driving the
+        // real async run()/Edge path — so a wiring regression (target_rate
+        // not reaching the client, say) would pass every existing test.
+        //
+        // 25s is shorter than the ceiling's minimum wake time (30s), so
+        // Backoff is bounded at exactly one status poll and one queue_num
+        // ask per visitor regardless of jitter — deterministic without
+        // needing to control Math.random()'s Rust twin.
+        const VISITORS: u64 = 10;
+        const RUN_SECS: u64 = 25;
+
+        let hold = measure_client_requests(Polling::HoldPosition, VISITORS, RUN_SECS, 0).await;
+        let backoff = measure_client_requests(Polling::Backoff, VISITORS, RUN_SECS, 0).await;
+
+        assert_eq!(
+            backoff,
+            VISITORS * 2,
+            "ceiling-clamped Backoff must be exactly one /status + one /queue_num per visitor"
+        );
+        assert!(
+            backoff.saturating_mul(2) < hold,
+            "backoff={backoff} hold={hold}: expected backoff materially below hold-position"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backoff_polls_a_closed_event_at_the_ceiling_not_the_floor() {
+        // The test above never observes serving_state: "closed" (its
+        // closed_secs is 0), so it does not exercise the closed ⇒ ceiling
+        // branch above — re-inverting it back to the floor would
+        // leave every existing test green. closed_secs longer than the run
+        // means every /status answer is "closed": the closed branch mirrors
+        // `waiting.js`'s `forgetPosition()` + `return schedule()`, so
+        // `held_position` is cleared and no `/_wr/v1/queue_num` is asked while
+        // closed. Backoff must fall through to the ceiling on the closed
+        // check alone, with no position-based path (the other end of the
+        // `if closed {} else {}` in the sleep arm) to coincidentally agree.
+        const VISITORS: u64 = 10;
+        const RUN_SECS: u64 = 25;
+        const CLOSED_SECS: u64 = 9999; // outlasts the run: never leaves "closed"
+
+        let total =
+            measure_client_requests(Polling::Backoff, VISITORS, RUN_SECS, CLOSED_SECS).await;
+
+        // Ceiling-clamped (>= 30s, jitter up to 39s) exceeds the 25s run, so
+        // exactly one /status poll per visitor and no /_wr/v1/queue_num ask — a
+        // closed tick asks none, matching the client's `return schedule()`.
+        // Losing the closed check (falling through to
+        // `None => POLL_FLOOR_MS`) would instead produce several /status
+        // rounds per visitor in 25s.
+        assert_eq!(
+            total, VISITORS,
+            "closed ⇒ ceiling: exactly one status poll per visitor and no queue_num ask"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backoff_forgets_position_across_close_so_re_asks_after_reopen() {
+        // The shipped client's closed branch calls `forgetPosition()` (clears
+        // `knownPosition`) and `return schedule()` (asks no `/_wr/v1/queue_num` that
+        // tick), so on the first running tick after a `closed → running`
+        // reopen `knownPosition` is null, the cache-hit guard falls through,
+        // and the chain re-asks `/_wr/v1/queue_num`. The harness's `run()` models
+        // the closed branch's ceiling interval but, before the fix that cleared
+        // `held_position` on a closed tick and gated the ask on `!closed`, did
+        // not model `forgetPosition()`: `held_position` survived a close, so
+        // the ask gate (`held_position.is_none() && …`) stayed false after a
+        // reopen and the after-reopen re-ask the client makes never happened.
+        //
+        // Three phases — running [0,25s), closed [25,50s), running [50,120s) —
+        // with `/_wr/v1/queue_num` answering 409 while closed and
+        // `{"position":100000000}` while open. `countdown_ms`/`spread_ms` are
+        // 0 so `first_ask_after` is 0 and the whole cohort asks from the first
+        // poll; `arrives_at` is 0 (`arrival_offset_ms` short-circuits on a zero
+        // countdown), so the only pre-loop sleep is the sub-interval arrival
+        // jitter (`jitter.next() % POLL_MS`, 0–5s).
+        //
+        // Backoff's first sleep is the ceiling (30s) + proportional jitter
+        // (≤ ~9s, `JITTER_FRACTION = 0.3`), so the second poll lands at
+        // 30–44s — strictly inside the closed phase [25,50s). The post-close
+        // ceiling sleep (another 30–39s) lands the third poll at 60–83s —
+        // strictly inside the reopen [50,120s). These bounds hold for every
+        // seed, so the schedule is jitter-invariant: each visitor asks
+        // `/_wr/v1/queue_num` exactly twice — once before the close, once after the
+        // reopen. Before the fix the after-reopen re-ask never happened
+        // (`held_position` stayed `Some(stale)`), so the count was one per
+        // visitor rather than two.
+        const VISITORS: u64 = 6;
+        const RUN_SECS: u64 = 120;
+        const CLOSE_START_SECS: u64 = 25;
+        const CLOSE_END_SECS: u64 = 50;
+
+        let edge = Arc::new(Edge::new(Duration::from_secs(10), RUN_SECS));
+        let tally = Arc::new(VisitorTally::default());
+        let started = tokio::time::Instant::now();
+        let origin = Arc::new(move |path: String| async move {
+            let elapsed = started.elapsed().as_secs();
+            let closed = (CLOSE_START_SECS..CLOSE_END_SECS).contains(&elapsed);
+            if path.starts_with("/_wr/v1/status") {
+                if closed {
+                    (
+                        200,
+                        r#"{"serving_state":"closed","serving_position":0}"#.to_owned(),
+                    )
+                } else {
+                    (
+                        200,
+                        r#"{"serving_state":"running","serving_position":0,"origin_concurrency":5,"session_seconds":1}"#
+                            .to_owned(),
+                    )
+                }
+            } else if closed {
+                (409, r#"{"error":"event not yet open"}"#.to_owned())
+            } else {
+                (200, r#"{"position":100000000,"live_join":true}"#.to_owned())
+            }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(RUN_SECS);
+        let settings = RunSettings {
+            polling: Polling::Backoff,
+            spread_ms: 0,
+            countdown_ms: 0,
+            arrival: Arrival::Uniform,
+            deadline,
+            target_rate: 5,
+        };
+
+        let mut tasks = Vec::with_capacity(VISITORS as usize);
+        for n in 0..VISITORS {
+            tasks.push(tokio::spawn(run(
+                Arc::clone(&edge),
+                format!("req-{n}"),
+                n + 1,
+                settings,
+                Arc::clone(&origin),
+                Arc::clone(&tally),
+            )));
+        }
+        #[expect(
+            clippy::unwrap_used,
+            reason = "a panicked visitor task is a test bug, not an expected outcome"
+        )]
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        let queue_num = tally.queue_num_requests.load(Ordering::Relaxed);
+        assert_eq!(
+            queue_num,
+            VISITORS * 2,
+            "expected one /_wr/v1/queue_num ask before the close and one after the reopen per visitor; \
+             harness only made {queue_num} (the after-reopen re-ask is missing — held_position is \
+             not cleared on a closed tick)"
+        );
+    }
+
+    // --- DerivePosition: ask once *during* the closed countdown ---------------
+
+    #[tokio::test(start_paused = true)]
+    async fn derive_position_asks_once_per_visitor_during_a_permanently_closed_countdown() {
+        // `Polling::DerivePosition`'s defining `/_wr/v1/queue_num` ask is timed to
+        // land *during* the closed countdown — `first_ask_after` deliberately
+        // omits `countdown_ms` (see the match above), unlike `HoldPosition`/
+        // `Backoff` whose ask cannot exist before the open. The countdown is
+        // served under `serving_state: "closed"`, so a `!closed` gate on the
+        // ask and an unconditional `held_position = None` clearing on every
+        // closed tick both break the mode. The gate alone blocks every
+        // during-countdown ask (zero asks); lifting only the gate leaves the
+        // clearing re-triggering the ask on every closed tick (one per poll,
+        // not one per visitor). Both halves must be exempted together.
+        //
+        // The origin is permanently `"closed"` and answers `/_wr/v1/queue_num` 200,
+        // so every ask that fires is a during-countdown ask; with `spread_ms =
+        // 0` and `Arrival::Uniform`, `first_ask_after == arrives_at < countdown`
+        // deterministically, and the ask fires on each visitor's first poll.
+        // Expected: exactly `VISITORS` asks. HEAD makes 0; a gate-only fix
+        // makes one per closed tick (far more than `VISITORS`).
+        const VISITORS: u64 = 10;
+        const RUN_SECS: u64 = 60;
+        const COUNTDOWN_MS: u64 = 30_000;
+
+        let edge = Arc::new(Edge::new(Duration::from_secs(10), RUN_SECS));
+        let tally = Arc::new(VisitorTally::default());
+        let origin = Arc::new(|path: String| async move {
+            if path.starts_with("/_wr/v1/status") {
+                (
+                    200,
+                    r#"{"serving_state":"closed","serving_position":0}"#.to_owned(),
+                )
+            } else {
+                (200, r#"{"position":100000000,"live_join":true}"#.to_owned())
+            }
+        });
+        let settings = RunSettings {
+            polling: Polling::DerivePosition,
+            spread_ms: 0,
+            countdown_ms: COUNTDOWN_MS,
+            arrival: Arrival::Uniform,
+            deadline: tokio::time::Instant::now() + Duration::from_secs(RUN_SECS),
+            target_rate: 5,
+        };
+
+        let mut tasks = Vec::with_capacity(VISITORS as usize);
+        for n in 0..VISITORS {
+            tasks.push(tokio::spawn(run(
+                Arc::clone(&edge),
+                format!("req-{n}"),
+                n + 1,
+                settings,
+                Arc::clone(&origin),
+                Arc::clone(&tally),
+            )));
+        }
+        #[expect(
+            clippy::unwrap_used,
+            reason = "a panicked visitor task is a test bug, not an expected outcome"
+        )]
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        let queue_num = tally.queue_num_requests.load(Ordering::Relaxed);
+        assert_eq!(
+            queue_num, VISITORS,
+            "DerivePosition must ask /_wr/v1/queue_num once per visitor during the closed countdown; \
+             got {queue_num} (0 ⇒ the !closed gate blocks the ask while closed; >VISITORS ⇒ the \
+             held_position clearing re-triggers the ask every closed tick)"
+        );
+    }
+
+    // --- The report's denominator: time visitors were actually in the room ---
+
+    /// Runs `visitors` through the real `run()` loop for `run_secs` with the
+    /// given arrival shape and returns the cohort's total active milliseconds —
+    /// the denominator `report` divides by.
+    async fn measure_active_ms(
+        visitors: u64,
+        run_secs: u64,
+        countdown_s: u64,
+        arrival: Arrival,
+    ) -> u64 {
+        let edge = Arc::new(Edge::new(Duration::from_secs(10), run_secs));
+        let tally = Arc::new(VisitorTally::default());
+        let origin = Arc::new(|path: String| async move {
+            if path.starts_with("/_wr/v1/status") {
+                (
+                    200,
+                    r#"{"serving_state":"running","serving_position":0,"origin_concurrency":5,"session_seconds":1}"#
+                        .to_owned(),
+                )
+            } else {
+                (200, r#"{"position":100000000,"live_join":true}"#.to_owned())
+            }
+        });
+        let settings = RunSettings {
+            polling: Polling::HoldPosition,
+            spread_ms: 0,
+            countdown_ms: countdown_s * 1000,
+            arrival,
+            deadline: tokio::time::Instant::now() + Duration::from_secs(run_secs),
+            target_rate: 5,
+        };
+
+        let mut tasks = Vec::with_capacity(visitors as usize);
+        for n in 0..visitors {
+            tasks.push(tokio::spawn(run(
+                Arc::clone(&edge),
+                format!("req-{n}"),
+                n + 1,
+                settings,
+                Arc::clone(&origin),
+                Arc::clone(&tally),
+            )));
+        }
+        #[expect(
+            clippy::unwrap_used,
+            reason = "a panicked visitor task is a test bug, not an expected outcome"
+        )]
+        for task in tasks {
+            task.await.unwrap();
+        }
+        tally.active_ms.load(Ordering::Relaxed)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn with_no_countdown_every_visitor_is_active_for_the_whole_run() {
+        // Everyone turns up at t=0, so the measured denominator must match what
+        // `visitors × run length` always assumed — bar each visitor's sub-poll
+        // arrival jitter. This is the case the old formula got right, and it
+        // has to stay right.
+        const VISITORS: u64 = 20;
+        const RUN_SECS: u64 = 120;
+
+        let active = measure_active_ms(VISITORS, RUN_SECS, 0, Arrival::Uniform).await;
+
+        // Each visitor turns up within one poll interval of t=0 and leaves on
+        // the first loop check past the deadline, so their active time is the
+        // run give or take one interval either side. Nothing subtracts an
+        // arrival delay, because there is none to subtract.
+        let whole_run = VISITORS * RUN_SECS * 1000;
+        let slack = VISITORS * (POLL_MS + JITTER_MS);
+        assert!(
+            (whole_run - slack..=whole_run + slack).contains(&active),
+            "active={active} expected within one poll interval per visitor of {whole_run}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_countdown_excludes_the_time_before_each_visitor_arrives() {
+        // The bug: `report` divided by `visitors × run length` however late
+        // visitors turned up, so a run that spends half its length filling the
+        // room charged every request against ~1.5x the waiting that happened.
+        // A visitor sleeping until their arrival offset causes no origin
+        // requests, so that time is not theirs to be divided by.
+        const VISITORS: u64 = 50;
+        const RUN_SECS: u64 = 120;
+        const COUNTDOWN_S: u64 = 60;
+
+        let active = measure_active_ms(VISITORS, RUN_SECS, COUNTDOWN_S, Arrival::Uniform).await;
+
+        // Each visitor is active for `RUN_SECS - arrives_at`, and a uniform
+        // arrival lands in [0, COUNTDOWN_S], so no visitor can exceed the run
+        // and none can fall below what is left after the whole countdown.
+        let most = VISITORS * RUN_SECS * 1000;
+        let least = VISITORS * (RUN_SECS - COUNTDOWN_S) * 1000 - VISITORS * POLL_MS;
+        assert!(
+            (least..=most).contains(&active),
+            "active={active} outside the arithmetically possible {least}..={most}"
+        );
+        // A uniform mean arrival at COUNTDOWN_S/2 puts the mean active time at
+        // RUN_SECS - COUNTDOWN_S/2 = 90s. Pinning the mean is what catches the
+        // bug: the old denominator claimed 120s per visitor.
+        let mean_active_s = active / VISITORS / 1000;
+        assert!(
+            (80..=100).contains(&mean_active_s),
+            "mean active {mean_active_s}s: expected ~90s, not the run's full {RUN_SECS}s"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_late_arrival_shape_is_active_for_less_time_than_a_uniform_one() {
+        // `Arrival::Late` bunches arrivals towards the end of the countdown, so
+        // the cohort is present for less of the run and the understatement the
+        // old denominator produced was correspondingly larger. The denominator
+        // has to track the shape, not just the fact that a countdown was set.
+        const VISITORS: u64 = 50;
+        const RUN_SECS: u64 = 120;
+        const COUNTDOWN_S: u64 = 60;
+
+        let uniform = measure_active_ms(VISITORS, RUN_SECS, COUNTDOWN_S, Arrival::Uniform).await;
+        let late = measure_active_ms(VISITORS, RUN_SECS, COUNTDOWN_S, Arrival::Late).await;
+
+        // `u.powf(0.2)` puts the mean arrival around 50s of the 60s countdown
+        // against the uniform 30s, so the late cohort is present for roughly
+        // 70s of the run against 90s. A margin well outside the per-visitor
+        // overshoot jitter, so this fails if the denominator stops tracking
+        // arrivals rather than passing on a coin flip.
+        assert!(
+            late * 10 < uniform * 9,
+            "late={late} uniform={uniform}: a later-arriving cohort must wait for materially \
+             less of the run, not within jitter of the same"
+        );
+    }
+}

@@ -26,7 +26,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, Request, Response, StatusCode};
 
-use super::queue::JoinQueue;
+use harness::queue::JoinQueue;
 
 /// AWS's documented example key pair. The emulator runs with signing off and
 /// `ExtendDB`'s dev image accepts this pair, so nothing secret is involved.

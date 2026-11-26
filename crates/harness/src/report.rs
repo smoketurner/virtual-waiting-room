@@ -10,7 +10,7 @@ use std::fmt::Write as _;
 
 use serde::Serialize;
 
-use super::visitor::{Outcome, Record};
+use crate::visitor::{Outcome, Record};
 
 #[derive(Debug, Serialize)]
 pub struct Check {

@@ -7,13 +7,16 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "harness"
-path = "src/main.rs"
+path = "src/bin/load/main.rs"
 
 [[bin]]
 name = "stack"
-path = "src/stack/main.rs"
+path = "src/bin/stack/main.rs"
 
 [dependencies]
 anyhow = { workspace = true, features = ["std"] }
