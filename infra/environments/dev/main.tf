@@ -33,7 +33,6 @@ module "core" {
   oidc_require_email_verified = var.oidc_require_email_verified
   signing_key_generation      = var.signing_key_generation
   origin_key_generation       = var.origin_key_generation
-  expected_join_rate          = var.expected_join_rate
 
   # Adaptive poll policy (#69), published on /status.
   poll_floor_ms   = var.poll_floor_ms

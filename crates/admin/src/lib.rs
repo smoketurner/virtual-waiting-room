@@ -195,18 +195,10 @@ pub struct ScheduleError(pub String);
 /// this is idempotent: firing it twice, or firing it into a schedule that has
 /// already run, is a no-op rather than a second permutation.
 pub trait Opener {
-    /// Performs the open and reports whether this call was the one that did it.
-    fn open_now(&self) -> impl Future<Output = Result<OpenNow, OpenError>> + Send;
-}
-
-/// What an [`Opener::open_now`] found.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OpenNow {
-    /// This call opened the event.
-    Opened,
-    /// The event was already open; nothing changed. A scheduled open that had
-    /// already fired, or a double-submitted form.
-    AlreadyOpen,
+    /// Asks for the open. It lands once the join queue has drained, which can
+    /// take longer than an operator's request may wait (issue #239), so this
+    /// reports only that the open was accepted; the phase shows when it lands.
+    fn open_now(&self) -> impl Future<Output = Result<(), OpenError>> + Send;
 }
 
 /// An open failure.
@@ -1114,19 +1106,17 @@ pub async fn apply_start_time<S: Store, K: OpenSchedule>(
 /// yet open" to every pre-queue visitor, because nothing would have written
 /// the permutation seed their position is derived from.
 ///
-/// Idempotent by construction: an event the schedule already opened reports
-/// [`OpenNow::AlreadyOpen`] and nothing changes. The audit stamp is written
-/// only when this call was the one that opened it, so the record does not
-/// claim an open it did not perform.
+/// Idempotent by construction: an open into an event the schedule already
+/// opened changes nothing. The audit stamp records that the operator asked for
+/// the open, once the open has accepted the request.
 ///
-/// The open is the authoritative write, so the stamp follows it. The stamp is
+/// The request comes first, so a refused one records nothing. The stamp is
 /// guarded against regression: if a concurrent mutation advanced
 /// `last_action_epoch_ms` past this request's arrival time during the open
 /// invoke, the stamp no-ops (`Conflict`, logged) rather than overwriting the
 /// newer writer's audit fields and debounce anchor. A failed stamp is logged
-/// rather than returned: the event is open either way, and reporting failure
-/// would invite an operator to press the button again looking for an open that
-/// has already happened.
+/// rather than returned: the open is on its way either way, and reporting
+/// failure would invite an operator to press the button again.
 ///
 /// # Errors
 ///
@@ -1142,7 +1132,7 @@ pub async fn apply_open_now<S: Store, O: Opener>(
     event_id: &str,
     actor: &str,
     now: ArrivalTime,
-) -> Result<OpenNow, ApplyError> {
+) -> Result<(), ApplyError> {
     let Some(state) = store.load(event_id).await? else {
         return Err(ActionError::NotFound.into());
     };
@@ -1162,19 +1152,18 @@ pub async fn apply_open_now<S: Store, O: Opener>(
     }
     debounce_check(&state, now)?;
 
-    let outcome = opener
+    opener
         .open_now()
         .await
         .map_err(|e| StoreError::Backend(e.to_string()))?;
 
-    if outcome == OpenNow::Opened
-        && let Err(e) = store
-            .stamp_action(event_id, AdminAction::OpenNow, actor, now)
-            .await
+    if let Err(e) = store
+        .stamp_action(event_id, AdminAction::OpenNow, actor, now)
+        .await
     {
-        tracing::error!(error = %e, event = "open_audit_failed", "event was opened but the audit stamp failed");
+        tracing::error!(error = %e, event = "open_audit_failed", "open was requested but the audit stamp failed");
     }
-    Ok(outcome)
+    Ok(())
 }
 
 /// Turns the edge gate's session IP binding on or off (issue #61, ADR-0036).
@@ -1508,17 +1497,17 @@ mod tests {
     /// read-modify-write shape closely enough to exercise the write ordering
     /// `apply_fail_open`/`apply_recover` depend on.
     /// An [`Opener`] that counts its invocations, so a test can tell "the open
-    /// ran and reported already-open" from "the open never ran".
+    /// was asked for" from "the open never ran".
     struct FakeOpener {
         calls: Mutex<u32>,
-        result: Result<OpenNow, &'static str>,
+        result: Result<(), &'static str>,
     }
 
     impl FakeOpener {
-        fn reporting(outcome: OpenNow) -> Self {
+        fn accepting() -> Self {
             Self {
                 calls: Mutex::new(0),
-                result: Ok(outcome),
+                result: Ok(()),
             }
         }
 
@@ -1535,7 +1524,7 @@ mod tests {
     }
 
     impl Opener for FakeOpener {
-        fn open_now(&self) -> impl Future<Output = Result<OpenNow, OpenError>> + Send {
+        fn open_now(&self) -> impl Future<Output = Result<(), OpenError>> + Send {
             *self.calls.lock().unwrap() += 1;
             std::future::ready(self.result.map_err(|e| OpenError(e.to_owned())))
         }
@@ -2498,15 +2487,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_now_opens_the_event_and_records_who_did_it() {
+    async fn open_now_asks_for_the_open_and_records_who_asked() {
         let store = FakeStore::with_phase(Phase::PreQueue);
-        let opener = FakeOpener::reporting(OpenNow::Opened);
+        let opener = FakeOpener::accepting();
 
-        let outcome = apply_open_now(&store, &opener, "evt", "op@x", ts(1_000))
+        apply_open_now(&store, &opener, "evt", "op@x", ts(1_000))
             .await
             .unwrap();
-
-        assert_eq!(outcome, OpenNow::Opened);
         assert_eq!(opener.calls(), 1);
         let state = store.load("evt").await.unwrap().unwrap();
         assert_eq!(state.last_action.as_deref(), Some("open_now"));
@@ -2515,24 +2502,6 @@ mod tests {
         // The admin writes no phase of its own: the open's conditional update
         // carries the phase along with the seed it derives from.
         assert_eq!(*store.phase.lock().unwrap(), Phase::PreQueue);
-    }
-
-    #[tokio::test]
-    async fn an_open_that_was_already_open_is_not_recorded_as_an_opening() {
-        // A schedule that fired a second earlier, or a double-submitted form.
-        // The button is reported as succeeding — the event *is* open — but the
-        // audit line must not claim an operator opened it.
-        let store = FakeStore::with_phase(Phase::PreQueue);
-        let opener = FakeOpener::reporting(OpenNow::AlreadyOpen);
-
-        let outcome = apply_open_now(&store, &opener, "evt", "op@x", ts(1_000))
-            .await
-            .unwrap();
-
-        assert_eq!(outcome, OpenNow::AlreadyOpen);
-        assert_eq!(opener.calls(), 1);
-        let state = store.load("evt").await.unwrap().unwrap();
-        assert_eq!(state.last_action, None, "nothing was opened to record");
     }
 
     #[tokio::test]
@@ -2557,7 +2526,7 @@ mod tests {
         // the invoke: a second invoke is a second cold start and a second
         // `UpdateItem` for an answer already known.
         let store = FakeStore::with_phase(Phase::PreQueue);
-        let opener = FakeOpener::reporting(OpenNow::Opened);
+        let opener = FakeOpener::accepting();
 
         apply_open_now(&store, &opener, "evt", "op@x", ts(1_000))
             .await
@@ -2577,7 +2546,7 @@ mod tests {
             missing: true,
             ..FakeStore::default()
         };
-        let opener = FakeOpener::reporting(OpenNow::Opened);
+        let opener = FakeOpener::accepting();
 
         let err = apply_open_now(&store, &opener, "evt", "op@x", ts(1_000)).await;
 
@@ -2597,13 +2566,11 @@ mod tests {
             conflict: true,
             ..FakeStore::with_phase(Phase::PreQueue)
         };
-        let opener = FakeOpener::reporting(OpenNow::Opened);
+        let opener = FakeOpener::accepting();
 
-        let outcome = apply_open_now(&store, &opener, "evt", "op@x", ts(1_000))
+        apply_open_now(&store, &opener, "evt", "op@x", ts(1_000))
             .await
             .unwrap();
-
-        assert_eq!(outcome, OpenNow::Opened);
     }
 
     #[tokio::test]
@@ -2628,15 +2595,14 @@ mod tests {
         *store.last_action_by.lock().unwrap() = Some("opB@x".to_owned());
         *store.last_action_at.lock().unwrap() = Some(ts(1_100).timestamp().to_string());
         *store.last_time.lock().unwrap() = Some(ts(1_100).timestamp());
-        let opener = FakeOpener::reporting(OpenNow::Opened);
+        let opener = FakeOpener::accepting();
 
-        let outcome = apply_open_now(&store, &opener, "evt", "opA@x", ts(1_000))
+        apply_open_now(&store, &opener, "evt", "opA@x", ts(1_000))
             .await
             .unwrap();
 
         // The swallowed stamp conflict is invisible to the operator: the open
         // succeeded.
-        assert_eq!(outcome, OpenNow::Opened);
         assert_eq!(opener.calls(), 1);
         // And the audit line was NOT regressed to the older open stamp.
         let state = store.load("evt").await.unwrap().unwrap();
@@ -2678,13 +2644,11 @@ mod tests {
         *store.last_action.lock().unwrap() = Some("set_concurrency".to_owned());
         *store.last_action_by.lock().unwrap() = Some("opB@x".to_owned());
         *store.last_time.lock().unwrap() = Some(ts(500).timestamp());
-        let opener = FakeOpener::reporting(OpenNow::Opened);
+        let opener = FakeOpener::accepting();
 
-        let outcome = apply_open_now(&store, &opener, "evt", "opA@x", ts(3_000))
+        apply_open_now(&store, &opener, "evt", "opA@x", ts(3_000))
             .await
             .unwrap();
-
-        assert_eq!(outcome, OpenNow::Opened);
         let state = store.load("evt").await.unwrap().unwrap();
         assert_eq!(state.last_action.as_deref(), Some("open_now"));
         assert_eq!(state.last_action_by.as_deref(), Some("opA@x"));
@@ -2981,7 +2945,7 @@ mod tests {
         // `IllegalTransition` shape `apply_phase` uses — the dashboard hides
         // the form on `idle`, so this catches a hand-crafted POST.
         let store = FakeStore::with_phase(Phase::Idle);
-        let opener = FakeOpener::reporting(OpenNow::Opened);
+        let opener = FakeOpener::accepting();
 
         let err = apply_open_now(&store, &opener, "evt", "op@x", ts(1_000)).await;
 
@@ -3009,7 +2973,7 @@ mod tests {
         // to close. Recovery back to `active` routes through `apply_phase`
         // (which requires a cohort), not through Open now.
         let store = FakeStore::with_phase(Phase::Maintenance);
-        let opener = FakeOpener::reporting(OpenNow::Opened);
+        let opener = FakeOpener::accepting();
 
         let err = apply_open_now(&store, &opener, "evt", "op@x", ts(1_000)).await;
 
@@ -3036,13 +3000,12 @@ mod tests {
         // hidden when `opened`, so this only catches a hand-crafted POST.
         // The open is the `pre_queue → active` step — running it from
         // `active` is not legal, so it is refused at the handler rather than
-        // relying on the database's seed guard to report `AlreadyOpen`. The
-        // race where the schedule fires between the load and the invoke is
-        // still safe: a `pre_queue` load passes this check and the open's own
-        // conditional write reports `AlreadyOpen` (see
-        // `an_open_that_was_already_open_is_not_recorded_as_an_opening`).
+        // relying on the database's seed guard. The race where the schedule
+        // fires between the load and the invoke is still safe: a `pre_queue`
+        // load passes this check and the open's own conditional write changes
+        // nothing.
         let store = FakeStore::opened_with_phase(Phase::Active);
-        let opener = FakeOpener::reporting(OpenNow::AlreadyOpen);
+        let opener = FakeOpener::accepting();
 
         let err = apply_open_now(&store, &opener, "evt", "op@x", ts(1_000)).await;
 
@@ -3066,17 +3029,15 @@ mod tests {
     #[tokio::test]
     async fn open_now_from_pre_queue_still_invokes_the_open() {
         // Regression guard: the phase precondition must not reject the one
-        // phase the open is legal from. A pre_queue event the schedule has
-        // already opened still reports `AlreadyOpen` through the open's own
-        // conditional write, not through the handler's phase check.
+        // phase the open is legal from. A pre_queue event the schedule is
+        // already opening is left to the open's own conditional write, not to
+        // the handler's phase check.
         let store = FakeStore::with_phase(Phase::PreQueue);
-        let opener = FakeOpener::reporting(OpenNow::Opened);
+        let opener = FakeOpener::accepting();
 
-        let outcome = apply_open_now(&store, &opener, "evt", "op@x", ts(1_000))
+        apply_open_now(&store, &opener, "evt", "op@x", ts(1_000))
             .await
             .unwrap();
-
-        assert_eq!(outcome, OpenNow::Opened);
         assert_eq!(opener.calls(), 1);
     }
 

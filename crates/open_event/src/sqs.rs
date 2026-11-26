@@ -1,9 +1,9 @@
-//! The `aws-sdk-sqs`-backed [`Backlog`]: the join queue's waiting count.
+//! The join queue's waiting count, half of the open's [`crate::Backlog`].
 
 use aws_sdk_sqs::Client;
 use aws_sdk_sqs::types::QueueAttributeName;
 
-use crate::{Backlog, StoreError};
+use crate::StoreError;
 
 /// The join queue, read for how many messages are waiting.
 pub struct JoinBacklog {
@@ -18,8 +18,13 @@ impl JoinBacklog {
     }
 }
 
-impl Backlog for JoinBacklog {
-    async fn waiting(&self) -> Result<u64, StoreError> {
+impl JoinBacklog {
+    /// Messages waiting to be picked up: `ApproximateNumberOfMessages`.
+    ///
+    /// # Errors
+    ///
+    /// The queue's attributes could not be read or carried no count.
+    pub async fn waiting(&self) -> Result<u64, StoreError> {
         let out = self
             .client
             .get_queue_attributes()

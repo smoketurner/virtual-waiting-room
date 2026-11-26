@@ -245,11 +245,6 @@ variable "origin_key_generation" {
   default     = 1
 }
 
-variable "expected_join_rate" {
-  description = "Peak joins per second expected, or 0 if unknown. Above 4,000 the plan fails unless warm_throughput_write_units covers it."
-  type        = number
-  default     = 0
-}
 
 variable "oidc_require_email_verified" {
   description = "Whether an admin login needs the provider's email_verified claim to be present and true. Turn off only for a provider that omits the claim and verifies every address."

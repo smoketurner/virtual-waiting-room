@@ -167,6 +167,10 @@ async fn main() -> ExitCode {
     }
 }
 
+/// How long a caller behind API Gateway waits for an environment and a
+/// response.
+const API_GATEWAY_TIMEOUT: Duration = Duration::from_secs(29);
+
 const FUNCTIONS: [&str; 4] = ["read", "generate_token", "assign_position", "open_event"];
 const PROTECTED_PATH: &str = "/shop/checkout";
 const SIGNING_KEY_PARAMETER: &str = "/stack/signing-key";
@@ -293,6 +297,7 @@ async fn run() -> Result<Verdict> {
             ("SESSION_TTL_SECS", args.session.to_string()),
         ]),
         log_dir: &logs,
+        timeout: API_GATEWAY_TIMEOUT,
     })
     .await?;
     let token_bin = bin("generate_token");
@@ -308,6 +313,7 @@ async fn run() -> Result<Verdict> {
             ("SIGNING_KEY_FINGERPRINT", "local".to_owned()),
         ]),
         log_dir: &logs,
+        timeout: API_GATEWAY_TIMEOUT,
     })
     .await?;
     let assign_bin = bin("assign_position");
@@ -318,6 +324,7 @@ async fn run() -> Result<Verdict> {
         max_environments: args.max_environments,
         env: common(&[]),
         log_dir: &logs,
+        timeout: Duration::from_secs(30),
     })
     .await?;
     let open_bin = bin("open_event");
@@ -328,6 +335,7 @@ async fn run() -> Result<Verdict> {
         max_environments: 1,
         env: common(&[("JOIN_QUEUE_URL", queue.url().to_owned())]),
         log_dir: &logs,
+        timeout: Duration::from_mins(15),
     })
     .await?;
 
@@ -550,6 +558,7 @@ async fn run() -> Result<Verdict> {
         published: published.as_ref(),
         registrations: &registrations,
         opened: opened.is_ok(),
+        open_at_ms: args.countdown.saturating_mul(1000),
         open_took,
         passes: &passes,
         elapsed,
@@ -670,6 +679,8 @@ struct Evidence<'a> {
     published: Option<&'a Published>,
     registrations: &'a [Registration],
     opened: bool,
+    /// When the open fired, ms from the start of the run.
+    open_at_ms: u64,
     open_took: Duration,
     passes: &'a [Result<controller::PassOutcome, String>],
     elapsed: Duration,
@@ -772,6 +783,21 @@ fn build_report(e: &Evidence<'_>) -> Report {
             e.open_took.as_secs_f64(),
             e.published.is_some()
         ),
+    );
+    let behind = e
+        .records
+        .iter()
+        .filter(|x| x.live_join && x.joined_ms.is_some_and(|j| j < e.open_at_ms))
+        .count();
+    let before = e
+        .records
+        .iter()
+        .filter(|x| x.joined_ms.is_some_and(|j| j < e.open_at_ms))
+        .count();
+    r.check(
+        "Every join accepted before the open is in the cohort",
+        behind == 0,
+        format!("{before} joins accepted before the open, {behind} numbered behind the cohort"),
     );
     if let Some(published) = e.published {
         let recomputed = report::audit(published, e.registrations);

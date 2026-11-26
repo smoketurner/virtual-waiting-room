@@ -45,6 +45,7 @@ One record per decision. Each states the context, the decision, and its conseque
 | [0039](0039-meter-admissions-not-the-cursor.md) | Meter admissions with a budget taken at issuance; the no-show estimator is removed (amends 0022, 0033; budget law amended by 0041) |
 | [0040](0040-what-the-published-seed-proves.md) | The published seed proves the arithmetic, not the draw; a beacon-derived seed is not adopted |
 | [0041](0041-meter-origin-concurrency.md) | Meter origin concurrency: the budget is the free slots, counted from fixed-length sessions (amends 0039) |
+| [0042](0042-the-open-waits-out-the-join-backlog.md) | The open waits for the join queue to catch up, however long; Open now invokes it asynchronously (amends 0025) |
 
 ## Open
 

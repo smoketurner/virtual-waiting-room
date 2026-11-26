@@ -1,6 +1,7 @@
 # ADR-0025: The operator owns the open schedule's time; Terraform owns the schedule
 
-**Status:** Accepted
+**Status:** Accepted. Amended by [0042](0042-the-open-waits-out-the-join-backlog.md): Open now
+invokes the open asynchronously, so the `RequestResponse` reasoning below no longer holds.
 
 ## 1. Context
 

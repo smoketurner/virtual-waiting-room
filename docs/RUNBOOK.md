@@ -211,7 +211,7 @@ These are logged (`$.fields.event`) without an alarm of their own:
 | Event | What happened | What to do |
 |---|---|---|
 | `controller_pass_failed` | One controller pass failed and was skipped; the next computes the same free slots from the same state | Harmless once. If continuous the queue has stopped: check the `controller` function's logs |
-| `open_drain_timed_out` | The join queue did not empty within 15 s, so the open went ahead; joins still queued are numbered behind the cohort | Check `assign_position`'s concurrency and the tables' pre-warming before the next event |
+| `open_drain_timed_out` | The join queue had not caught up when the open reached its 900 s deadline, so it went ahead; joins still queued are numbered behind the cohort | Check `assign_position`'s concurrency and the tables' pre-warming before the next event |
 | `open_drain_unreadable` | The open could not read the join queue and did not wait for it | Check `open_event`'s `sqs:GetQueueAttributes` grant |
 | `nojs_join_resent` | A no-JavaScript join had not registered after 60 s and was sent again | Expected occasionally. Many at once means the join consumer is behind |
 | `nojs_join_lost` | A no-JavaScript join never registered after three resends; the visitor was shown the form again | Check the join queue, its dead-letter queue and `assign_position` |

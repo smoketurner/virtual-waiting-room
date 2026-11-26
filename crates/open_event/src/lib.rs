@@ -149,55 +149,58 @@ pub async fn open_event<S: Store>(
     Ok(OpenResult::Opened(Box::new(values)))
 }
 
-/// How many times [`wait_for_drain`] reads the join queue before giving up and
-/// letting the open proceed. With the caller pausing a second between reads
-/// this is a quarter of a minute, short enough that the operator's "Open now"
-/// -- which waits for the answer through API Gateway's 29 s limit -- still
-/// gets one.
-pub const DRAIN_POLLS: u32 = 15;
-
-/// How many consecutive reads must find the queue empty. `SQS` reports an
-/// approximate count, so a single zero is not yet an empty queue.
+/// How many consecutive reads must find the queue caught up. `SQS` reports an
+/// approximate count, so a single reading is not yet a drained queue.
 pub const DRAIN_QUIET_POLLS: u32 = 2;
 
-/// The join queue's backlog, as the open sees it.
+/// The join queue's backlog, and how fast it is being cleared, as the open
+/// sees them.
 pub trait Backlog {
     /// Messages waiting to be picked up -- accepted joins nothing has started
     /// processing.
     fn waiting(&self) -> impl Future<Output = Result<u64, StoreError>> + Send;
+
+    /// Registrations counted into the cohort so far: the sum of the shard
+    /// counts.
+    fn counted(&self) -> impl Future<Output = Result<u64, StoreError>> + Send;
 }
 
 /// Whether the join queue was seen to drain before the open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Drain {
-    /// The queue read empty [`DRAIN_QUIET_POLLS`] times running.
+    /// The queue read caught up [`DRAIN_QUIET_POLLS`] times running.
     Drained,
-    /// It never did within [`DRAIN_POLLS`] reads; this many were waiting at
-    /// the last one.
+    /// It never did within the reads the open had time for; this many were
+    /// waiting at the last one.
     TimedOut { waiting: u64 },
-    /// The queue could not be read. The open goes ahead: it must not depend on
-    /// a read that only makes it fairer.
+    /// The queue or the shard counts could not be read. The open goes ahead:
+    /// it must not depend on a read that only makes it fairer.
     Unknown,
 }
 
-/// Waits for the join queue to empty before the open reads the shard counts
-/// (issue #239).
+/// Waits for the join queue to catch up before the open reads the shard
+/// counts (issue #239).
 ///
 /// A join answered 200 before the start is a registration the visitor believes
 /// they hold, but it is only in the cohort once `assign_position` has claimed
 /// its index. Arrivals bunch in the last minute, which is when the consumers
 /// are furthest behind, and the open reads only the counters: everything still
 /// queued at that instant would be numbered behind the whole cohort. So the
-/// open gives the consumers a bounded moment to catch up first.
+/// open waits for the consumers to catch up, however long the backlog takes,
+/// and how fast joins arrive decides only how late the open lands, never who
+/// is in the cohort.
 ///
-/// "Empty" is messages *waiting*, not messages in flight. Joins keep arriving
-/// throughout, so there is always a batch in flight; one that has claimed its
-/// indices is counted by the open, and one that has not is the straggler case
-/// the batch itself already repairs.
+/// Caught up is a queue holding no more than the consumers counted since the
+/// last read: whatever is waiting is cleared by the next one. An empty queue
+/// is not the test, because joins keep arriving after the start and a queue
+/// under steady traffic rarely reads empty twice. In-flight messages are not
+/// waited for: a batch that has claimed its indices is counted by the open,
+/// and one that has not is the straggler case the batch itself repairs.
 ///
-/// `pause` separates the reads. It is a parameter so the wait is testable
+/// `polls` is how many reads the open has time for before it must go ahead
+/// anyway; `pause` separates them. Both are parameters so the wait is testable
 /// without a clock.
-pub async fn wait_for_drain<B, P, F>(backlog: &B, pause: P) -> Drain
+pub async fn wait_for_drain<B, P, F>(backlog: &B, polls: u32, pause: P) -> Drain
 where
     B: Backlog,
     P: Fn() -> F,
@@ -205,18 +208,26 @@ where
 {
     let mut quiet = 0u32;
     let mut waiting = 0u64;
-    for poll in 0..DRAIN_POLLS {
+    let mut last: Option<u64> = None;
+    for poll in 0..polls {
         if poll > 0 {
             pause().await;
         }
-        waiting = match backlog.waiting().await {
-            Ok(waiting) => waiting,
+        let read = match backlog.waiting().await {
+            Ok(w) => backlog.counted().await.map(|c| (w, c)),
+            Err(err) => Err(err),
+        };
+        let counted;
+        (waiting, counted) = match read {
+            Ok(read) => read,
             Err(err) => {
                 tracing::error!(error = %err, event = "open_drain_unreadable", "could not read the join queue; opening without waiting for it");
                 return Drain::Unknown;
             }
         };
-        quiet = if waiting == 0 {
+        let cleared = last.map_or(0, |prev| counted.saturating_sub(prev));
+        last = Some(counted);
+        quiet = if waiting <= cleared {
             quiet.saturating_add(1)
         } else {
             0
@@ -446,16 +457,25 @@ mod tests {
 
     // --- waiting for the join queue (issue #239) ------------------------------
 
+    const POLLS: u32 = 15;
+
     /// A backlog that answers from a script, then repeats its last answer.
+    /// The shard counts stand still unless a test scripts them.
     struct ScriptedBacklog {
         script: Vec<Result<u64, ()>>,
+        counted: Vec<u64>,
         reads: Mutex<usize>,
     }
 
     impl ScriptedBacklog {
         fn new(script: Vec<Result<u64, ()>>) -> Self {
+            Self::counting(script, vec![0])
+        }
+
+        fn counting(script: Vec<Result<u64, ()>>, counted: Vec<u64>) -> Self {
             Self {
                 script,
+                counted,
                 reads: Mutex::new(0),
             }
         }
@@ -474,12 +494,19 @@ mod tests {
                 self.script[index].map_err(|()| StoreError("queue unreadable".to_owned())),
             )
         }
+
+        fn counted(&self) -> impl Future<Output = Result<u64, StoreError>> + Send {
+            // Read after `waiting`, so the read it pairs with is one behind.
+            let reads = *self.reads.lock().unwrap();
+            let index = reads.saturating_sub(1).min(self.counted.len() - 1);
+            std::future::ready(Ok(self.counted[index]))
+        }
     }
 
     #[tokio::test]
     async fn an_empty_queue_is_confirmed_with_a_second_read() {
         let backlog = ScriptedBacklog::new(vec![Ok(0)]);
-        let drain = wait_for_drain(&backlog, || std::future::ready(())).await;
+        let drain = wait_for_drain(&backlog, POLLS, || std::future::ready(())).await;
         assert_eq!(drain, Drain::Drained);
         assert_eq!(backlog.reads(), DRAIN_QUIET_POLLS as usize);
     }
@@ -487,9 +514,41 @@ mod tests {
     #[tokio::test]
     async fn the_open_waits_while_joins_are_still_queued() {
         let backlog = ScriptedBacklog::new(vec![Ok(4_000), Ok(900), Ok(0), Ok(0)]);
-        let drain = wait_for_drain(&backlog, || std::future::ready(())).await;
+        let drain = wait_for_drain(&backlog, POLLS, || std::future::ready(())).await;
         assert_eq!(drain, Drain::Drained);
         assert_eq!(backlog.reads(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_backlog_longer_than_a_fixed_wait_is_waited_out() {
+        // Ten minutes of backlog at one read a second: the open waits for it
+        // rather than numbering those joins behind the cohort.
+        let mut script = vec![Ok(250_000); 600];
+        script.extend([Ok(0), Ok(0)]);
+        let counted = (0..602).map(|read| read * 4_000).collect();
+        let backlog = ScriptedBacklog::counting(script, counted);
+        let drain = wait_for_drain(&backlog, 890, || std::future::ready(())).await;
+        assert_eq!(drain, Drain::Drained);
+        assert_eq!(backlog.reads(), 602);
+    }
+
+    #[tokio::test]
+    async fn joins_arriving_after_the_start_do_not_hold_the_open() {
+        // Steady traffic: a few joins always waiting, each read finding the
+        // consumers have counted more than that since the last one.
+        let backlog = ScriptedBacklog::counting(vec![Ok(30)], vec![0, 200, 400, 600]);
+        let drain = wait_for_drain(&backlog, POLLS, || std::future::ready(())).await;
+        assert_eq!(drain, Drain::Drained);
+        assert_eq!(backlog.reads(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_backlog_the_consumers_are_not_clearing_holds_the_open() {
+        // More waiting than the consumers count in a second: still behind.
+        let backlog =
+            ScriptedBacklog::counting(vec![Ok(5_000)], (0..15).map(|r| r * 4_000).collect());
+        let drain = wait_for_drain(&backlog, POLLS, || std::future::ready(())).await;
+        assert_eq!(drain, Drain::TimedOut { waiting: 5_000 });
     }
 
     #[tokio::test]
@@ -497,7 +556,7 @@ mod tests {
         // The count is approximate: a zero followed by more messages was not
         // an empty queue.
         let backlog = ScriptedBacklog::new(vec![Ok(0), Ok(50), Ok(0), Ok(0)]);
-        let drain = wait_for_drain(&backlog, || std::future::ready(())).await;
+        let drain = wait_for_drain(&backlog, POLLS, || std::future::ready(())).await;
         assert_eq!(drain, Drain::Drained);
         assert_eq!(backlog.reads(), 4);
     }
@@ -505,15 +564,15 @@ mod tests {
     #[tokio::test]
     async fn a_queue_that_never_drains_does_not_hold_the_open_forever() {
         let backlog = ScriptedBacklog::new(vec![Ok(10_000)]);
-        let drain = wait_for_drain(&backlog, || std::future::ready(())).await;
+        let drain = wait_for_drain(&backlog, POLLS, || std::future::ready(())).await;
         assert_eq!(drain, Drain::TimedOut { waiting: 10_000 });
-        assert_eq!(backlog.reads(), DRAIN_POLLS as usize);
+        assert_eq!(backlog.reads(), POLLS as usize);
     }
 
     #[tokio::test]
     async fn an_unreadable_queue_does_not_block_the_open() {
         let backlog = ScriptedBacklog::new(vec![Ok(10), Err(())]);
-        let drain = wait_for_drain(&backlog, || std::future::ready(())).await;
+        let drain = wait_for_drain(&backlog, POLLS, || std::future::ready(())).await;
         assert_eq!(drain, Drain::Unknown);
         assert_eq!(backlog.reads(), 2);
     }

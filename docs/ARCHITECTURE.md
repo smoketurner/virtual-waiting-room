@@ -136,9 +136,10 @@ within the batch and any id that already has a `PreQueue` row, and claims a cont
 local indices on that shard with one `ADD n`. Each row `{r, s, l, t, h}` is written with
 `attribute_not_exists(r)`. Shard striping is [ADR-0015](adr/0015-stripe-prequeue-counter.md).
 
-**The open.** `open_event` first gives the join consumers a bounded moment to catch up: it polls
-the queue's waiting count once a second, up to 15 times, until it reads zero twice running, and
-opens regardless (#239; `open_drain_timed_out`, `open_drain_unreadable`). It then reads the ten
+**The open.** `open_event` first waits for the join consumers to catch up: once a second it reads
+the queue's waiting count and the shard counts, until twice running no more is waiting than was
+counted since the last read, for as long as its 900 s timeout allows, and opens regardless (#239;
+`open_drain_timed_out`, `open_drain_unreadable`). It then reads the ten
 shard counts with one consistent `BatchGetItem`, computes
 `offset[s] = Σ counts[0..s)` and `N`, and writes seed, `N`, offsets, `queue_counter = N` and
 `phase = active` in one `UpdateItem` guarded by `attribute_not_exists(shuffle_seed) AND phase =

@@ -98,7 +98,7 @@ same guarded mark; every session minted for the row expires from it (#237).
 | `assign_position` | `PreQueue` | `PutItem` if `attribute_not_exists(r)` | — | 1 per registrant |
 | `assign_position` | `Counters` | `UpdateItem ADD queue_counter`, `ALL_NEW` | — | 1 per live batch, +1 per straggler fix-up |
 | `assign_position` | `Positions` | `PutItem` if `attribute_not_exists(request_id)` | — | 1 per live joiner |
-| `open_event` | `Counters` | `BatchGetItem` of ten pre-queue shards, after an SQS `GetQueueAttributes` wait of up to 15 s for the join queue to drain (#239) | Strong | Once per event |
+| `open_event` | `Counters` | `BatchGetItem` of ten pre-queue shards, read once a second, with an SQS `GetQueueAttributes`, while the join queue drains (#239), then once for the open | Strong | Once per event |
 | `open_event` | `Counters` | `UpdateItem` open, guarded | — | Once per event |
 | `open_event` | `Counters` | `GetItem` projecting `shuffle_seed` | Eventual | Only when the open's guard fails, to tell "already open" from "wrong phase" |
 | `read` | `Counters` | `GetItem` event | Eventual, 1 s in-process cache | ≤ 1/s per execution environment |

@@ -73,7 +73,7 @@ the full shape. The values you will normally set:
 | `gate_rules` | `""` | Which requests the gate covers, one rule per line, same grammar as the dashboard's rules form (`p /checkout`, `c <cookie>`, `u <agent substring>`, `h <header> <value>`). Empty is dormant: everything passes through. |
 | `starts_at`, `starts_at_timezone` | `""`, `UTC` | When the event opens, local date-time with no zone, and its IANA zone. Set, the first apply seeds the event in the pre-queue phase and arms the open schedule. Empty leaves the event idle until an operator presses **Open now**. |
 | `session_ttl_seconds` | `900` | Lifetime of an admitted visitor's session, and how long each one holds a slot of `origin_concurrency`. See [below](#choosing-the-session-lifetime). |
-| `warm_throughput_write_units`, `warm_throughput_read_units` | `0` | Table pre-warm ahead of an event; 0 is none. See the runbook's readiness checklist. |
+| `warm_throughput_write_units`, `warm_throughput_read_units` | `0` | Table pre-warm ahead of an event; 0 is none. Shortens the open's wait for the join queue; not needed for every join to be counted. |
 | `poll_floor_ms`, `poll_ceiling_ms`, `poll_divisor` | `5000`, `30000`, `10` | Adaptive poll interval published on `/status` ([ADR-0023](adr/0023-adaptive-poll-interval.md)). |
 | `flat_rate_plan_tier` | `null` | `BUSINESS` or `PREMIUM` subscribes to a CloudFront flat-rate plan and attaches the edge web ACL. See [Edge protection](#edge-protection-on-a-flat-rate-plan). |
 | `waf_managed_rules_mode` | `count` | `count` or `enforce` for the managed rules (plan only). |
@@ -81,7 +81,6 @@ the full shape. The values you will normally set:
 | `waf_nojs_wait_ip_limit` | `300` | No-JavaScript waiting-page requests per IP per 5 minutes before a 429 (plan only). |
 | `waf_require_token_cookie` | `true` | A JavaScript API request holding a WAF token must carry it as the cookie, or it is blocked; `false` counts instead (plan only). |
 | `signing_key_generation`, `origin_key_generation` | `1`, `1` | Raise by one to rotate the session signing key or the CloudFront-to-API key. See [Rotating keys](#rotating-keys). |
-| `expected_join_rate` | `0` | Peak joins per second expected, 0 if unknown. Above 4,000 the plan fails unless `warm_throughput_write_units` covers it. |
 | `nojs_enabled` | `true` | `false` closes the no-JavaScript queue at the edge (plan only). |
 
 Terraform seeds `origin_concurrency`, `gate_rules` and the open schedule once; after that the

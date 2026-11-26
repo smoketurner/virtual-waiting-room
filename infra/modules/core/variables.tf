@@ -21,18 +21,13 @@ variable "tags" {
 # they are not toggles.
 
 variable "warm_throughput_write_units" {
-  description = "Warm write units/s to pre-provision per table ahead of an event, sized to the target admission rate. 0 = no pre-warm. If set, AWS enforces a minimum of 4000."
+  description = "Warm write units/s to pre-provision per table ahead of an event. 0 = no pre-warm. A cold table still takes every join: the open waits for the queue to drain, so pre-warming only shortens that wait. If set, AWS enforces a minimum of 4000."
   type        = number
   default     = 0
 
   validation {
     condition     = var.warm_throughput_write_units == 0 || var.warm_throughput_write_units >= 4000
     error_message = "warm_throughput_write_units must be 0 (no pre-warm) or >= 4000 (AWS DynamoDB warm-throughput minimum)."
-  }
-
-  validation {
-    condition     = var.expected_join_rate <= 4000 || var.warm_throughput_write_units >= var.expected_join_rate
-    error_message = "expected_join_rate is above the 4,000 writes/s an un-warmed on-demand table serves: set warm_throughput_write_units to at least expected_join_rate."
   }
 }
 
@@ -187,16 +182,6 @@ variable "origin_key_generation" {
   }
 }
 
-variable "expected_join_rate" {
-  description = "The peak joins per second this event is expected to take, or 0 if unknown. Above 4,000, the on-demand tables' cold ceiling, the plan fails unless warm_throughput_write_units covers it: a throttled join is retried and can land behind the cohort it registered for (issue #251)."
-  type        = number
-  default     = 0
-
-  validation {
-    condition     = var.expected_join_rate >= 0
-    error_message = "expected_join_rate must be 0 (unknown) or a positive rate."
-  }
-}
 
 variable "oidc_require_email_verified" {
   description = "Whether an admin login needs the provider's email_verified claim to be present and true (issue #243). Turn off only for a provider that omits the claim and verifies every address; an explicit false is refused either way."
