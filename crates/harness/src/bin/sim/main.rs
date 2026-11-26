@@ -13,8 +13,12 @@
 //! What it cannot show is how the shipped binaries, their `DynamoDB`
 //! expressions and the JavaScript gate behave; `stack` runs those.
 //!
+//! With `--tickets`, the origin sells that many tickets, 1 to 4 to each
+//! visitor it admits, and the operator ends the event when they are gone: the
+//! visitors still waiting see it and leave.
+//!
 //! ```text
-//! cargo run --release -p harness --bin sim -- --visitors 500000 --concurrency 1000 --session 900 --countdown 1800
+//! cargo run --release -p harness --bin sim -- --visitors 500000 --concurrency 1000 --session 900 --countdown 1800 --tickets 20000
 //! ```
 
 use std::collections::BTreeMap;
@@ -42,6 +46,8 @@ const SESSION_COOKIE: &str = "vwr_session";
 
 struct Args {
     scenario: Scenario,
+    /// Tickets the origin sells before the event is ended.
+    tickets: Option<u64>,
     pollers: usize,
     max_seconds: i64,
     out: PathBuf,
@@ -61,6 +67,7 @@ fn parse_args() -> Result<Args> {
             scale: 1.0,
             seed: 1,
         },
+        tickets: None,
         pollers: 8,
         max_seconds: 7 * 24 * 3600,
         out: PathBuf::from("target/sim-runs/latest"),
@@ -88,6 +95,7 @@ fn parse_args() -> Result<Args> {
             "--duplicate-rate" => a.scenario.duplicate_rate = value()?.parse()?,
             "--scale" => a.scenario.scale = value()?.parse()?,
             "--seed" => a.scenario.seed = value()?.parse()?,
+            "--tickets" => a.tickets = Some(value()?.parse()?),
             "--pollers" => a.pollers = value()?.parse()?,
             "--max-seconds" => a.max_seconds = value()?.parse()?,
             "--out" => a.out = PathBuf::from(value()?),
@@ -132,7 +140,8 @@ async fn run(errors: &ErrorCount) -> Result<bool> {
     std::fs::create_dir_all(&args.out)?;
     let scenario = &args.scenario;
     let started = Instant::now();
-    let open_at = clock::now() + scenario.countdown;
+    let run_start = clock::now();
+    let open_at = run_start + scenario.countdown;
 
     let memory = Memory::new(scenario.session);
     memory.seed(Counters {
@@ -153,7 +162,14 @@ async fn run(errors: &ErrorCount) -> Result<bool> {
     let mut key_bytes = [0u8; 32];
     harness::rng::Rng::new(scenario.seed ^ 0x006b_6579).fill(&mut key_bytes);
     let key = SigningKey::new(&key_bytes);
-    let functions = Arc::new(Functions::new(&memory, key, scenario.session));
+    let venue = args.tickets.map(|tickets| Venue {
+        left: tickets,
+        sold: 0,
+        buyers: 0,
+        sold_out_at: None,
+        rng: harness::rng::Rng::new(scenario.seed ^ 0x7469_636b),
+    });
+    let functions = Arc::new(Functions::new(&memory, key, scenario.session, venue));
 
     let queue = Arc::new(queue::JoinQueue::new(
         "sim://join".to_owned(),
@@ -302,6 +318,17 @@ async fn run(errors: &ErrorCount) -> Result<bool> {
         failed_invocations: functions.failed.load(Ordering::Relaxed),
         logged_errors: &logged_errors,
     });
+    if let Some(venue) = functions.venue.as_ref().and_then(|v| v.lock().ok()) {
+        report.fact("tickets sold", venue.sold);
+        report.fact("buyers", venue.buyers);
+        report.fact(
+            "sold out after (s)",
+            venue.sold_out_at.map_or_else(
+                || "not sold out".to_owned(),
+                |at| at.duration_since(run_start).as_secs().to_string(),
+            ),
+        );
+    }
     report.fact(
         "wall clock (s)",
         format!("{:.1}", wall.elapsed().as_secs_f64()),
@@ -322,17 +349,61 @@ fn say(line: &str) {
     println!("[sim] {line}");
 }
 
-/// The functions behind the edge, as their libraries.
+/// The tickets the origin has to sell.
+struct Venue {
+    left: u64,
+    sold: u64,
+    buyers: u64,
+    sold_out_at: Option<jiff::Timestamp>,
+    rng: harness::rng::Rng,
+}
+
+impl Venue {
+    /// A visitor the gate let in buys 1 to 4 of what is left. Returns whether
+    /// that sold the last one.
+    fn sell(&mut self) -> bool {
+        if self.left == 0 {
+            return false;
+        }
+        let draw = (self.rng.unit() * 4.0).floor();
+        let wanted = if draw >= 3.0 {
+            4
+        } else if draw >= 2.0 {
+            3
+        } else if draw >= 1.0 {
+            2
+        } else {
+            1
+        };
+        let bought = wanted.min(self.left);
+        self.left -= bought;
+        self.sold += bought;
+        self.buyers += 1;
+        if self.left == 0 {
+            self.sold_out_at = Some(clock::now());
+            return true;
+        }
+        false
+    }
+}
+
+/// The functions behind the edge, as their libraries, and the origin's sale.
 struct Functions {
     read: read::http::Ctx<Memory>,
     generate_token: generate_token::http::AppState<Memory>,
     memory: Memory,
+    venue: Option<Mutex<Venue>>,
     /// Invocations that returned an error.
     failed: AtomicU64,
 }
 
 impl Functions {
-    fn new(memory: &Memory, key: SigningKey, session: SignedDuration) -> Self {
+    fn new(
+        memory: &Memory,
+        key: SigningKey,
+        session: SignedDuration,
+        venue: Option<Venue>,
+    ) -> Self {
         Self {
             read: read::http::Ctx {
                 store: memory.clone(),
@@ -351,6 +422,7 @@ impl Functions {
                 session,
             },
             memory: memory.clone(),
+            venue: venue.map(Mutex::new),
             failed: AtomicU64::new(0),
         }
     }
@@ -406,6 +478,19 @@ impl Backend for Functions {
                 })
                 .is_some_and(|s| s.event_id == EVENT_ID);
             if valid {
+                // The origin sells; when the last ticket goes, the operator
+                // says so and ends the event.
+                let sold_out = self
+                    .venue
+                    .as_ref()
+                    .and_then(|v| v.lock().ok())
+                    .is_some_and(|mut v| v.sell());
+                if sold_out {
+                    self.memory.update_counters(EVENT_ID, |c| {
+                        c.message = Some("Sold out".to_owned());
+                        c.phase = Phase::PostEvent;
+                    });
+                }
                 return Ok(serde_json::json!({ "pass": true }));
             }
             let navigation = viewer
@@ -511,6 +596,27 @@ mod tests {
     #![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
 
     use super::*;
+
+    #[test]
+    fn the_venue_sells_one_to_four_and_never_more_than_it_has() {
+        let mut venue = Venue {
+            left: 1_000,
+            sold: 0,
+            buyers: 0,
+            sold_out_at: None,
+            rng: harness::rng::Rng::new(3),
+        };
+        let mut sold_out = false;
+        while !sold_out {
+            let before = venue.left;
+            sold_out = venue.sell();
+            assert!((1..=4).contains(&(before - venue.left)));
+        }
+        assert_eq!((venue.left, venue.sold), (0, 1_000));
+        // Somewhere between all fours and all ones.
+        assert!((250..=1_000).contains(&venue.buyers));
+        assert!(!venue.sell(), "nothing is left to sell");
+    }
 
     #[test]
     fn a_response_keeps_its_status_body_and_cookies() {

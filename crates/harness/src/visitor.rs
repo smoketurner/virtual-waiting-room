@@ -48,6 +48,9 @@ pub enum Outcome {
     GaveUp(&'static str),
     /// The run ended first.
     StillWaiting,
+    /// The event ended while they waited, and they left, as a person reading
+    /// the operator's message does.
+    Left,
 }
 
 /// Everything the report needs about one visitor. Times are milliseconds from
@@ -389,6 +392,9 @@ impl Visitor<'_> {
             };
             match state {
                 "closed" => {
+                    if s.get("phase").and_then(|v| v.as_str()) == Some("post_event") {
+                        return Outcome::Left;
+                    }
                     known = None;
                     self.next_ms = self.policy.ceiling;
                     if s.get("phase").and_then(|v| v.as_str()) == Some("pre_queue") {

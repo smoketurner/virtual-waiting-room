@@ -319,6 +319,7 @@ pub fn outcome_counts(records: &[Record]) -> BTreeMap<String, u64> {
             Outcome::NoShow => "no-show".to_owned(),
             Outcome::StillWaiting => "still waiting at the end".to_owned(),
             Outcome::GaveUp(why) => format!("gave up: {why}"),
+            Outcome::Left => "left when the event ended".to_owned(),
         };
         *out.entry(key).or_default() += 1;
     }
@@ -391,7 +392,9 @@ pub fn build(e: &Evidence<'_>) -> Report {
         .records
         .iter()
         .filter(|x| {
-            x.joined_ms.is_some() && x.position.is_none() && x.outcome != Outcome::StillWaiting
+            x.joined_ms.is_some()
+                && x.position.is_none()
+                && !matches!(x.outcome, Outcome::StillWaiting | Outcome::Left)
         })
         .count();
     let gave_up = e
