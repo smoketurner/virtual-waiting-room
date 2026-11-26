@@ -375,6 +375,7 @@ impl Edge {
                 "path": format!("/dev{}", req.path),
                 "stage": "dev",
                 "requestId": format!("req-{id}"),
+                "requestTimeEpoch": crate::clock::now().as_millisecond(),
                 "accountId": ACCOUNT_ID,
                 "apiId": "local",
                 "identity": { "sourceIp": req.viewer_ip },

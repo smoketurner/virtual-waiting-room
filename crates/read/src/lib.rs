@@ -1,6 +1,10 @@
 //! Read-path logic for the `read` Lambda: the `/status` payload and the
 //! `/queue_num` position resolution. Pure functions over the domain types so
-//! they run without AWS; the handler fetches the items and calls these.
+//! they run without AWS; [`http`] fetches the items through a [`Store`] and
+//! calls these.
+
+pub mod dynamo;
+pub mod http;
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -12,6 +16,32 @@ use wr_common::{
     Counters, Phase, PreQueueItem, ResolveError, ResolvedPosition, SHARDS, ServingState, resolve,
     serving_state,
 };
+
+/// A store failure.
+#[derive(Debug, thiserror::Error)]
+#[error("read store error: {0}")]
+pub struct StoreError(pub String);
+
+/// The three items the read path reads.
+pub trait Store: Send + Sync {
+    /// The event's `Counters` item, or `None` if there is no such event.
+    fn load_counters(
+        &self,
+        event_id: &str,
+    ) -> impl Future<Output = Result<Option<Counters>, StoreError>> + Send;
+
+    /// The visitor's pre-queue registration, if any.
+    fn load_prequeue(
+        &self,
+        request_id: &str,
+    ) -> impl Future<Output = Result<Option<PreQueueItem>, StoreError>> + Send;
+
+    /// A live joiner's position, if any.
+    fn load_position(
+        &self,
+        request_id: &str,
+    ) -> impl Future<Output = Result<Option<u64>, StoreError>> + Send;
+}
 
 /// Holds the event's `Counters` item for a beat inside one execution
 /// environment.

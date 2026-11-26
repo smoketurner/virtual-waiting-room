@@ -26,6 +26,7 @@ aws-sdk-ssm = { workspace = true, features = ["behavior-version-latest", "defaul
 axum = { workspace = true, features = ["http1", "tokio"] }
 base64 = { workspace = true, features = ["std"] }
 controller = { workspace = true }
+jiff = { workspace = true, features = ["std"] }
 serde = { workspace = true, features = ["derive", "std"] }
 reqwest = { workspace = true, features = ["json", "rustls-tls-webpki-roots-no-provider", "http2"] }
 rustls = { workspace = true, features = ["aws_lc_rs", "std", "tls12"] }

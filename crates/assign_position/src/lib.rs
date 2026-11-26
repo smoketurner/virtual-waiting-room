@@ -56,6 +56,7 @@
 //! The batch logic is generic over the [`Store`] port so it runs without AWS;
 //! the SDK-backed implementation lives in `dynamo`.
 
+use jiff::Timestamp;
 use std::collections::HashSet;
 use std::future::Future;
 
@@ -63,6 +64,7 @@ use serde::Deserialize;
 use wr_common::{Assignment, Counters, Phase, SecretDigest, Shard};
 
 pub mod dynamo;
+pub mod handler;
 
 /// A join message body enqueued by the ingest API.
 #[derive(Debug, Clone, Deserialize)]
@@ -81,6 +83,8 @@ pub struct JoinMessage {
 pub struct BatchRecord {
     pub message_id: String,
     pub body: String,
+    /// When SQS accepted the join: the registration's time.
+    pub sent_at: Timestamp,
 }
 
 /// A position write to attempt: the request, the queue position it claimed,
@@ -90,6 +94,8 @@ pub struct PositionWrite {
     pub request_id: String,
     pub position: u64,
     pub digest: SecretDigest,
+    /// When the join was accepted.
+    pub at: Timestamp,
 }
 
 /// A pre-queue registration write to attempt: the request, the `(shard, local
@@ -100,6 +106,8 @@ pub struct PreQueueWrite {
     pub shard: Shard,
     pub local_index: u64,
     pub digest: SecretDigest,
+    /// When the join was accepted.
+    pub at: Timestamp,
 }
 
 /// The persistence port the batch logic drives.
@@ -279,7 +287,7 @@ pub async fn process_batch<S: Store>(
     for record in records {
         match classify_record(&record.body, event_id) {
             RecordVerdict::Accept(msg) => {
-                valid.push((record.message_id.clone(), msg));
+                valid.push((record.message_id.clone(), msg, record.sent_at));
             }
             RecordVerdict::Reject(reason) => drops.record(reason),
         }
@@ -316,14 +324,14 @@ pub async fn process_batch<S: Store>(
                 valid = valid.len(),
                 "no Counters item; failing batch until the event is set up"
             );
-            for (message_id, _) in &valid {
+            for (message_id, _, _) in &valid {
                 outcome.failures.push(message_id.clone());
             }
             return outcome;
         }
         Err(err) => {
             tracing::error!(error = %err, "counters read failed; retrying batch");
-            for (message_id, _) in &valid {
+            for (message_id, _, _) in &valid {
                 outcome.failures.push(message_id.clone());
             }
             return outcome;
@@ -365,7 +373,7 @@ pub async fn process_batch<S: Store>(
             valid = valid.len(),
             "event not open and not in pre_queue; failing batch until opened or advanced to pre_queue"
         );
-        for (message_id, _) in &valid {
+        for (message_id, _, _) in &valid {
             outcome.failures.push(message_id.clone());
         }
     }
@@ -399,7 +407,7 @@ async fn registered_ids_or_unknown<S: Store>(store: &S, request_ids: &[String]) 
 async fn process_live_batch<S: Store>(
     store: &S,
     event_id: &str,
-    valid: Vec<(String, JoinMessage)>,
+    valid: Vec<(String, JoinMessage, Timestamp)>,
     outcome: &mut BatchOutcome,
 ) {
     let n = valid.len() as u64;
@@ -407,7 +415,7 @@ async fn process_live_batch<S: Store>(
         Ok(end) => end,
         Err(err) => {
             tracing::error!(error = %err, "queue_counter claim failed; retrying batch");
-            for (message_id, _) in &valid {
+            for (message_id, _, _) in &valid {
                 outcome.failures.push(message_id.clone());
             }
             return;
@@ -419,10 +427,11 @@ async fn process_live_batch<S: Store>(
     // is a guard against a counter that was reset, never normal arithmetic.
     let start = end.saturating_sub(n).saturating_add(1);
 
-    for (offset, (message_id, msg)) in valid.into_iter().enumerate() {
+    for (offset, (message_id, msg, sent_at)) in valid.into_iter().enumerate() {
         let write = PositionWrite {
             request_id: msg.request_id,
             digest: msg.h,
+            at: sent_at,
             // Saturating for the same reason `start` itself is: a wrapped
             // position is indistinguishable from a valid low one, never a
             // harmless gap.
@@ -445,7 +454,7 @@ async fn process_prequeue_batch<S: Store>(
     store: &S,
     event_id: &str,
     shard: Shard,
-    valid: Vec<(String, JoinMessage)>,
+    valid: Vec<(String, JoinMessage, Timestamp)>,
     outcome: &mut BatchOutcome,
 ) {
     // In-batch dedupe: a browser that denies every storage tier re-sends the
@@ -455,9 +464,9 @@ async fn process_prequeue_batch<S: Store>(
     // them rather than one each.
     let mut seen_in_batch = HashSet::new();
     let mut deduped = Vec::with_capacity(valid.len());
-    for (message_id, msg) in valid {
+    for (message_id, msg, sent_at) in valid {
         if seen_in_batch.insert(msg.request_id.clone()) {
-            deduped.push((message_id, msg));
+            deduped.push((message_id, msg, sent_at));
         }
     }
 
@@ -467,12 +476,12 @@ async fn process_prequeue_batch<S: Store>(
     // authoritative guard; this only avoids paying for the claim.
     let ids: Vec<String> = deduped
         .iter()
-        .map(|(_, msg)| msg.request_id.clone())
+        .map(|(_, msg, _)| msg.request_id.clone())
         .collect();
     let already_registered = registered_ids_or_unknown(store, &ids).await;
-    let group: Vec<(String, JoinMessage)> = deduped
+    let group: Vec<(String, JoinMessage, Timestamp)> = deduped
         .into_iter()
-        .filter(|(_, msg)| !already_registered.contains(&msg.request_id))
+        .filter(|(_, msg, _)| !already_registered.contains(&msg.request_id))
         .collect();
 
     if group.is_empty() {
@@ -484,7 +493,7 @@ async fn process_prequeue_batch<S: Store>(
         Ok(start) => start,
         Err(err) => {
             tracing::error!(error = %err, shard = shard.index(), "prequeue shard claim failed; retrying batch");
-            for (message_id, _) in &group {
+            for (message_id, _, _) in &group {
                 outcome.failures.push(message_id.clone());
             }
             return;
@@ -495,10 +504,11 @@ async fn process_prequeue_batch<S: Store>(
     // docs), carried into the fix-up below.
     let mut written = Vec::new();
 
-    for (offset, (message_id, msg)) in group.into_iter().enumerate() {
+    for (offset, (message_id, msg, sent_at)) in group.into_iter().enumerate() {
         let write = PreQueueWrite {
             request_id: msg.request_id,
             digest: msg.h,
+            at: sent_at,
             shard,
             // Saturating: a wrapped local index would be a duplicate global
             // index, not a gap, which is what the shard claim's own
@@ -596,6 +606,7 @@ async fn fixup_stragglers<S: Store>(store: &S, event_id: &str, written: Vec<PreQ
             request_id: write.request_id,
             position: start.saturating_add(offset as u64),
             digest: write.digest,
+            at: write.at,
         };
         if let Err(err) = store.put_position(&position_write).await {
             tracing::error!(error = %err, "straggler position write failed; leaving to self-heal");
@@ -804,8 +815,12 @@ mod tests {
         BatchRecord {
             message_id: message_id.to_owned(),
             body: format!(r#"{{"request_id":"{request_id}","event_id":"evt-1","h":"{DIGEST}"}}"#),
+            sent_at: SENT_AT,
         }
     }
+
+    /// When the test joins were accepted.
+    const SENT_AT: Timestamp = Timestamp::constant(1_788_000_000, 0);
 
     fn counters_with_phase(phase: Phase) -> Counters {
         Counters {
@@ -894,6 +909,7 @@ mod tests {
             BatchRecord {
                 message_id: "m2".to_owned(),
                 body: "not json".to_owned(),
+                sent_at: SENT_AT,
             },
             rec("m3", BAD_SHAPE_ID),
         ];
@@ -913,6 +929,7 @@ mod tests {
         let body = |h: &str| BatchRecord {
             message_id: "m".to_owned(),
             body: format!(r#"{{"request_id":"{VALID_ID}","event_id":"evt-1"{h}}}"#),
+            sent_at: SENT_AT,
         };
         let records = vec![body(""), body(r#","h":"short""#), body(r#","h":null"#)];
         let outcome = run_open(&store, &records).await;
@@ -934,6 +951,7 @@ mod tests {
         let records = vec![BatchRecord {
             message_id: "m1".to_owned(),
             body: "garbage".to_owned(),
+            sent_at: SENT_AT,
         }];
         let outcome = run_open(&store, &records).await;
         assert_eq!(outcome.failures, Vec::<String>::new());
@@ -992,6 +1010,10 @@ mod tests {
         let mut positions: Vec<u64> = writes.iter().map(|w| w.position).collect();
         positions.sort_unstable();
         assert_eq!(positions, vec![COHORT + 1, COHORT + 2]);
+        assert!(
+            writes.iter().all(|w| w.at == SENT_AT),
+            "a position is stamped with when its join was accepted"
+        );
         for position in positions {
             assert!(
                 position >= COHORT,
@@ -1055,6 +1077,11 @@ mod tests {
         let outcome = run_open(&store, &records).await;
         assert_eq!(outcome.failures, Vec::<String>::new());
         assert_eq!(store.prequeue_writes.lock().unwrap().len(), 1);
+        assert_eq!(
+            store.prequeue_writes.lock().unwrap()[0].at,
+            SENT_AT,
+            "a registration is stamped with when its join was accepted"
+        );
     }
 
     // --- routing: open outputs, not phase -----------------------------------

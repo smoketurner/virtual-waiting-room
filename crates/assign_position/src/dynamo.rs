@@ -12,6 +12,8 @@ use wr_common::expr::{
 };
 use wr_common::{Counters, PositionItem, PositionStatus, PreQueueItem, Shard};
 
+use jiff::Timestamp;
+
 use crate::{PositionWrite, PreQueueWrite, Store, StoreError, WriteOutcome};
 
 /// The maximum number of keys `BatchGetItem` accepts in one call.
@@ -73,7 +75,7 @@ impl Store for DynamoStore {
     }
 
     async fn put_position(&self, write: &PositionWrite) -> Result<WriteOutcome, StoreError> {
-        let now = now_epoch_secs();
+        let now = stored_seconds(write.at)?;
         let item = PositionItem {
             request_id: write.request_id.clone(),
             queue_position: write.position,
@@ -170,7 +172,7 @@ impl Store for DynamoStore {
             r: write.request_id.clone(),
             s: shard,
             l: write.local_index,
-            t: now_epoch_secs(),
+            t: stored_seconds(write.at)?,
             h: Some(write.digest.clone()),
         };
         let attrs: HashMap<String, AttributeValue> =
@@ -248,11 +250,10 @@ impl Store for DynamoStore {
     }
 }
 
-/// Current Unix time in whole seconds.
-fn now_epoch_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
+/// A join's time as the epoch seconds the rows store.
+fn stored_seconds(at: Timestamp) -> Result<u64, StoreError> {
+    wr_common::http::epoch_seconds(at)
+        .ok_or_else(|| StoreError(format!("join time {at} is before the epoch")))
 }
 
 /// The first local index of a just-claimed block: the shard's count after the

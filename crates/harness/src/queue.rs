@@ -35,7 +35,7 @@ struct Message {
     id: String,
     body: String,
     receives: u32,
-    sent_ms: u128,
+    sent_ms: i64,
 }
 
 #[derive(Debug, Default)]
@@ -64,7 +64,6 @@ pub struct JoinQueue {
     /// Probability that a delivery is made twice (at-least-once).
     duplicate_rate: f64,
     rng: Mutex<Rng>,
-    started: Instant,
 }
 
 impl JoinQueue {
@@ -76,7 +75,6 @@ impl JoinQueue {
             url,
             duplicate_rate,
             rng: Mutex::new(Rng::new(seed)),
-            started: Instant::now(),
         }
     }
 
@@ -95,7 +93,7 @@ impl JoinQueue {
                 id,
                 body,
                 receives: 0,
-                sent_ms: self.started.elapsed().as_millis(),
+                sent_ms: crate::clock::now().as_millisecond(),
             });
         }
         self.ready.notify_one();

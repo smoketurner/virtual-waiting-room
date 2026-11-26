@@ -19,6 +19,7 @@ use wr_common::{
 };
 
 pub mod dynamo;
+pub mod http;
 
 /// A store failure worth retrying.
 #[derive(Debug, thiserror::Error)]

@@ -7,6 +7,7 @@
 //! `stack`.
 
 pub mod backend;
+pub mod clock;
 pub mod edge;
 pub mod metrics;
 pub mod queue;

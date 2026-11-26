@@ -26,6 +26,7 @@
 
 use std::future::Future;
 
+pub mod http;
 pub mod page;
 pub mod sqs;
 
