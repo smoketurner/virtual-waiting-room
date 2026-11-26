@@ -1,6 +1,11 @@
 # ADR-0017: Andon-cord emergency controls for the admin plane
 
-**Status:** Accepted
+**Status:** Accepted. The controls stand; the storage and names below do not. `admission_paused`
+and `force_fail_open` became `StoredControl` (`open`/`paused`) plus a `fail_open_until` deadline
+([0021](0021-edge-function-gate.md)), the gate enforces fail-open rather than a deferred authorizer
+([0032](0032-remove-the-origin-authorizer.md)), the rate became origin concurrency
+([0041](0041-meter-origin-concurrency.md)), and the visitor-facing half is superseded by
+[0019](0019-visitor-facing-serving-state.md).
 
 ## Context
 

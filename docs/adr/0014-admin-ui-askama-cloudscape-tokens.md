@@ -3,7 +3,8 @@
 **Status:** Accepted — the askama, server-rendered, React-free architecture stands.
 The **Cloudscape design-token** styling is **superseded by ADR-0018** (the Vouch
 design language). Everything below about *how* the UI is rendered still holds; only
-the visual token source changed.
+the visual token source changed. The SigV4 admin authentication it mentions was replaced by OIDC
+([ADR-0016](0016-admin-oidc-dynamodb-sessions.md)).
 
 ## Context
 

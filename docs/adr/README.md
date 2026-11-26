@@ -1,7 +1,9 @@
 # Architecture Decision Records
 
 One record per decision. Each states the context, the decision, and its consequences.
-`DESIGN.md` describes the system as built; these explain why it is built that way.
+`DESIGN.md` describes the system as built; these explain why it is built that way. A record's
+body is left as written; where the system has moved on, its Status line says so and names the
+record that moved it. There is no 0020.
 
 | ADR | Decision |
 |---|---|
@@ -13,20 +15,20 @@ One record per decision. Each states the context, the decision, and its conseque
 | [0006](0006-controller-driven-expiry-not-ttl.md) | Drive position expiry from the controller, not DynamoDB TTL (superseded by 0031) |
 | [0007](0007-single-tenant-deployment.md) | Deploy single-tenant into the client's account |
 | [0008](0008-partition-isolation-not-shuffle-sharding.md) | Isolate concurrent events by partition, not shuffle sharding |
-| [0009](0009-fail-open.md) | Fail open when the waiting room is unavailable |
-| [0010](0010-client-supplied-request-id.md) | Client supplies the request identifier (amended by 0035) |
+| [0009](0009-fail-open.md) | Fail open when the waiting room is unavailable (mechanism replaced: 0021, 0032) |
+| [0010](0010-client-supplied-request-id.md) | Client supplies the request identifier (amended by 0028, 0035) |
 | [0011](0011-session-cookie-after-token.md) | Establish a session after validating the admission token (amended by 0032) |
 | [0012](0012-anti-ddos-count-mode.md) | Ship the anti-DDoS rule group in Count mode |
-| [0013](0013-cache-behaviour-separation.md) | Separate cache behaviours to preserve request collapsing |
+| [0013](0013-cache-behaviour-separation.md) | Separate cache behaviours to preserve request collapsing (poll interval amended by 0023) |
 | [0014](0014-admin-ui-askama-cloudscape-tokens.md) | Render the admin UI with askama compile-time templates (styling superseded by 0018) |
 | [0015](0015-stripe-prequeue-counter.md) | Stripe the pre-queue registration counter across 10 partition keys |
 | [0016](0016-admin-oidc-dynamodb-sessions.md) | Authenticate the admin UI with OIDC and DynamoDB sessions |
-| [0017](0017-andon-cord-emergency-controls.md) | Give the operator an andon cord and guarded emergency controls |
+| [0017](0017-andon-cord-emergency-controls.md) | Give the operator an andon cord and guarded emergency controls (storage amended by 0021; visitor-facing half superseded by 0019) |
 | [0018](0018-admin-vouch-design-language.md) | Style the admin UI with the Vouch design language (supersedes 0014's styling) |
 | [0019](0019-visitor-facing-serving-state.md) | Express the visitor-facing serving state as one enum |
-| [0021](0021-edge-function-gate.md) | Gate the protected origin with a CloudFront Function |
-| [0022](0022-durable-controller-cadence.md) | Build the controller's 10-second cadence from durable waits (control law amended by 0039) |
-| [0023](0023-adaptive-poll-interval.md) | Scale the client poll interval with distance to the front |
+| [0021](0021-edge-function-gate.md) | Gate the protected origin with a CloudFront Function (narrowed by 0032; amended by 0024, 0036) |
+| [0022](0022-durable-controller-cadence.md) | Build the controller's 10-second cadence from durable waits (control law amended by 0039, 0041) |
+| [0023](0023-adaptive-poll-interval.md) | Scale the client poll interval with distance to the front (amended by 0031, 0039, 0041) |
 | [0024](0024-jws-credentials.md) | Carry credentials as a JWS (amends 0011; amended by 0032) |
 | [0025](0025-operator-owned-seal-schedule.md) | The operator owns the open schedule's time; Terraform owns the schedule (revised: Open now, and `active` is not operator-settable) |
 | [0026](0026-entry-tickets.md) | One position per identity, from a customer-signed entry ticket (superseded by 0028) |
@@ -55,5 +57,5 @@ Decisions deferred until measurement or a client engagement supplies the input.
 |---|---|
 | Bot Control Common versus Targeted | Run Targeted in Count mode during a real event and measure what it catches that Common does not. Ten times the per-request cost, and a flat-rate plan cannot carry it at all (ADR-0038). |
 | Flat-rate versus pay-as-you-go CloudFront pricing | Flat-rate is the path for an event that runs the edge web ACL: the plan bundles its cost ([ADR-0038](0038-edge-web-acl-on-flat-rate-plan.md)). `flat_rate_plan_tier` creates the subscription. PAYG stays the default for a deployment without the web ACL; the crossover is otherwise non-monotonic in event size, poll interval and Bot Control tier. |
-| Standby inflow measurement placement | Authorizer-local versus centrally aggregated. |
-| Connector breadth | Product scope: the competitor ships 25+ platform connectors; we ship a CloudFront/origin authorizer. |
+| Standby inflow measurement placement | At the gate versus centrally aggregated. |
+| Connector breadth | Product scope: the competitor ships 25+ platform connectors; we ship the CloudFront gate only. |

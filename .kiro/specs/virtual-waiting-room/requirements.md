@@ -90,7 +90,7 @@ activation queues FIFO.
 
 **F2.4** — As the system, I want a client-supplied identifier so joins are idempotent.
 - WHEN a client joins, THE SYSTEM SHALL require a client-supplied request identifier (UUIDv7).
-- Acceptance: A join without a valid UUIDv7 is rejected at the gateway with 400.
+- Acceptance: A join with no request id, or one longer than a UUID, is rejected at the gateway with 400. One that is not UUID-shaped is accepted and dropped by `assign_position` without a position; the version is not checked.
 
 **F2.5** — As a retrying client, I want idempotent joins.
 - WHEN a join is repeated with the same request ID, THE SYSTEM SHALL NOT consume an additional position.
@@ -104,7 +104,7 @@ activation queues FIFO.
 
 **F3.1** — As a waiting visitor, I want to see my progress.
 - THE SYSTEM SHALL let a visitor read their own position and the current serving position.
-- Acceptance: `GET /queue_num` and `GET /status` return correct values.
+- Acceptance: `GET /_wr/v1/queue_num` and `GET /_wr/v1/status` return correct values.
 
 **F3.2** — As an operator, I want to throttle admission during the event.
 - WHEN the operator changes the origin concurrency, THE SYSTEM SHALL keep no more admitted visitors' sessions live at once than the new limit.
@@ -143,7 +143,7 @@ activation queues FIFO.
 
 **F4.4** — As a client, I want a lost join to be recoverable.
 - IF a join is lost downstream, THEN THE SYSTEM SHALL allow the client to recover it.
-- Acceptance: `GET /queue_num` returns 404; the client re-joins with the same request id and succeeds because no row exists for it yet.
+- Acceptance: `GET /_wr/v1/queue_num` returns 404; the client re-joins with the same request id and succeeds because no row exists for it yet.
 
 **F4.5** — As a client, I want throttling handled gracefully.
 - WHEN the client receives HTTP 429, THE client SHALL retry with jittered backoff.

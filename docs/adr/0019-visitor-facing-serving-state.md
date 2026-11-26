@@ -1,6 +1,10 @@
 # ADR-0019: The visitor-facing serving state is one enum
 
-**Status:** Accepted
+**Status:** Accepted. The enum stands. Since written: `/status` carries no `admission_paused`
+field, the stored form is `StoredControl` plus a `fail_open_until` deadline rather than
+`fail_open`/`recover` methods, fail-open is enforced today by the gate
+([0021](0021-edge-function-gate.md)), and the target rate is origin concurrency
+([0041](0041-meter-origin-concurrency.md)).
 
 ## Context
 

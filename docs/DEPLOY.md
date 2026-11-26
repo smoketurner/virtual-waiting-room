@@ -19,7 +19,7 @@ nobody.
 
 - **Rust**, **cargo-lambda** (`cargo install cargo-lambda`) and **zig**. Verified with
   cargo-lambda 1.9.2.
-- **Terraform** >= 1.9 (verified with 1.16.1).
+- **Terraform** >= 1.9 (CI runs 1.17.2).
 - **uv**, to run the smoke test. It installs `boto3` from the script's inline metadata.
 - **AWS credentials** with rights to create the stack: Lambda, DynamoDB, SQS, API Gateway, IAM,
   CloudFront, SSM, CloudWatch, S3 and EventBridge Scheduler. `aws sso login` or `aws configure`.
@@ -171,7 +171,14 @@ make apply
 
 The smoke test registers visitors, opens the event, checks that no two visitors get the same
 position, and checks that a request without the API key is refused. It reads everything it needs
-from `terraform output` and never modifies Terraform state:
+from `terraform output` and never modifies Terraform state.
+
+**It is destructive to the event.** It first runs `scripts/reset-env.py --phase pre_queue --yes`,
+which deletes every row in `PreQueue`, `Positions` and `Tokens` (operator sessions included),
+rewrites the event item with the script's origin concurrency of 5 rather than the seeded one, and
+disables the open schedule. It then opens the event, which cannot be undone, and leaves it active
+with 12 synthetic visitors. Run it on a stack with no real registrations, and reset the event and
+set its concurrency and start time again before using it. `--no-reset` skips only the reset:
 
 ```bash
 AWS_PROFILE=dev-admin uv run scripts/smoke_test.py

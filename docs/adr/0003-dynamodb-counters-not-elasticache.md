@@ -1,6 +1,7 @@
 # ADR-0003: Use DynamoDB atomic counters, not a cache tier
 
-**Status:** Accepted
+**Status:** Accepted. Two details below were not built as written: there is no opt-in VPC variable,
+and the signing key is in SSM Parameter Store, not Secrets Manager.
 
 ## Context
 

@@ -1,6 +1,10 @@
 # ADR-0009: Fail open when the waiting room is unavailable
 
-**Status:** Accepted
+**Status:** Accepted. The mechanism below is not the one built: there is no bypass cookie and no
+per-client fail-closed setting (both went with the origin authorizer,
+[0032](0032-remove-the-origin-authorizer.md)). Fail-open is an operator-set deadline,
+`fail_open_until`, which the gate honours ([0021](0021-edge-function-gate.md)); for a regional
+impairment see [0034](0034-single-region-failure-domain.md).
 
 ## Context
 

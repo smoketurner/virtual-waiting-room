@@ -43,7 +43,7 @@ activation queues first-in, first-out (FIFO).
 | F2.1 | The system MUST accept joins after the event opens, assigning positions in arrival order. | A visitor joining at T+5min receives a position after all pre-queue participants. |
 | F2.2 | Each visitor MUST receive a unique queue position. No position may be issued twice. | Under concurrent load, the set of issued positions contains zero duplicates. |
 | F2.3 | Queue positions MAY contain gaps. | Not a defect. Gap rate is measured and reported, not eliminated. |
-| F2.4 | The client MUST supply its own request identifier (UUIDv7) when joining. | A join without a valid UUIDv7 is rejected at the gateway with 400. |
+| F2.4 | The client MUST supply its own request identifier (UUIDv7) when joining. | A join with no request id, or one longer than a UUID, is rejected at the gateway with 400. One that is not UUID-shaped is accepted and dropped by `assign_position` without a position; the version is not checked. |
 | F2.5 | Repeating a join with the same request ID MUST NOT consume an additional position. | Duplicate submission returns the original position. |
 | F2.6 | Malformed joins MUST NOT consume queue positions. | Sending N malformed payloads leaves the counter unchanged. |
 
@@ -51,7 +51,7 @@ activation queues first-in, first-out (FIFO).
 
 | ID | Requirement | Acceptance |
 |---|---|---|
-| F3.1 | A visitor MUST be able to read their own position and the current serving position. | `GET /queue_num` and `GET /status` return correct values. |
+| F3.1 | A visitor MUST be able to read their own position and the current serving position. | `GET /_wr/v1/queue_num` and `GET /_wr/v1/status` return correct values. |
 | F3.2 | The operator MUST be able to control the origin concurrency, how many admitted visitors the origin holds at once, during the event. | `POST /_wr/admin/concurrency` changes the limit; no more sessions than it are ever live, and the change takes effect within one controller pass. |
 | F3.3 | Admitted visitors MUST receive a cryptographically verifiable credential. | The session cookie is signed; the edge gate verifies it locally, with no backend call. |
 | F3.4 | The protected origin MUST be unreachable without a valid session. | A request with no credential, an expired one, or one for another event is refused at the edge. |
@@ -65,7 +65,7 @@ activation queues first-in, first-out (FIFO).
 | F4.1 | If the waiting room is unavailable, visitors MUST proceed to the origin rather than being blocked. | With the waiting room API returning 5xx, the origin remains reachable. |
 | F4.2 | The fail-open bypass MUST be time-limited and the client MUST retry in the background. | Bypass expires; normal queueing resumes without user action. |
 | F4.3 | Fail-open MUST be overridable per client. | A client requiring fail-closed can configure it, with the tradeoff documented. |
-| F4.4 | A join lost downstream MUST be recoverable by the client. | `GET /queue_num` returns 404; the client re-joins with the same request id, and the retry succeeds because no row exists for it yet. |
+| F4.4 | A join lost downstream MUST be recoverable by the client. | `GET /_wr/v1/queue_num` returns 404; the client re-joins with the same request id, and the retry succeeds because no row exists for it yet. |
 | F4.5 | The client MUST treat HTTP 429 as expected and retry with jittered backoff. | Under gateway throttling, no user-visible error; joins succeed on retry. |
 
 ### 1.6 Operator experience
@@ -128,7 +128,7 @@ pre-event preparation in §4.
 | N3 | The system MUST NOT require us to operate shared infrastructure on clients' behalf. | No component runs in a Smoke Turner account. |
 | N4 | The system MUST support commercial AWS regions. GovCloud (US) is out of scope until a gate exists for it. | The commercial variant deploys and passes functional tests. GovCloud offers no CloudFront Function, so it has no gate ([ADR-0032](adr/0032-remove-the-origin-authorizer.md)). |
 | N5 | Infrastructure MUST be expressed as Terraform. | No manual console steps in the deployment path. |
-| N7 | Bot and abuse mitigation MUST be present at the edge. | The gate refuses every request without a valid session at viewer-request, and the join burst reaches SQS with no compute in the path. Every REST API method requires an API key only CloudFront holds. With `flat_rate_plan_tier` set, the edge web ACL challenges every JavaScript API call, rate-limits per token and per IP, and runs managed rules in Count until promoted; it is off by default because on pay-as-you-go it bills against N1 ([ADR-0038](adr/0038-edge-web-acl-on-flat-rate-plan.md)). |
+| N7 | Bot and abuse mitigation MUST be present at the edge. | The gate refuses every request without a valid session at viewer-request, and the join burst reaches SQS with no compute in the path. Every REST API method requires an API key only CloudFront holds, so a request straight to `execute-api` is refused with 403. With `flat_rate_plan_tier` set, the edge web ACL challenges every JavaScript API call and never the no-JavaScript queue ([ADR-0037](adr/0037-no-javascript-queue.md)), rate-limits per token and per IP, and runs managed rules in Count until promoted; it is off by default because on pay-as-you-go it bills against N1 ([ADR-0038](adr/0038-edge-web-acl-on-flat-rate-plan.md)). |
 | N8 | The API MUST be documented as an OpenAPI specification. | Spec published; client and admin surfaces generated from it. |
 | N9 | Concurrent events in one deployment MUST be isolated from each other. | One event driven to its throughput ceiling does not increase queue-join latency or error rate for another. |
 | N10 | Client polling cost MUST scale with distance to the front, not with waiting visitors × a fixed interval. | Poll count is O(log) in the starting wait; the harness client-request total under `--polling backoff` is materially below `--polling hold-position` at identical settings. |
@@ -141,10 +141,10 @@ Contractual deliverables. Without these the capacity requirements in §2 are not
 
 | ID | Requirement | Acceptance |
 |---|---|---|
-| O1 | DynamoDB tables MUST be pre-warmed before each event. | Warm throughput ≥ the event's target write rate, verified before T−0 by the dashboard's Readiness panel ([RUNBOOK.md](RUNBOOK.md)). |
+| O1 | DynamoDB tables MUST be pre-warmed before each event. | Warm throughput (`warm_throughput_write_units`) ≥ the event's target write rate, verified before T−0 by the dashboard's Readiness panel ([RUNBOOK.md](RUNBOOK.md)). |
 | O2 | Service quota increases MUST be filed with lead time. | API Gateway RPS and DynamoDB per-table WRU confirmed raised before T−0; the Readiness panel shows the limits in force. |
 | O3 | A load test at the event's origin concurrency MUST be executed before the event. | Report produced and reviewed with the client. |
-| O4 | The operator MUST be able to adjust the origin concurrency, hold, or stop mid-event. | Every control is a dashboard form; [RUNBOOK.md](RUNBOOK.md) says what each does and what a waiting visitor sees. |
+| O4 | The operator MUST be able to adjust the origin concurrency, hold, or stop mid-event. | Every control is a dashboard form that works with JavaScript disabled; [RUNBOOK.md](RUNBOOK.md) says what each does and what a waiting visitor sees. |
 | O5 | New WAF rules MUST be observed in Count mode before being promoted to Block. | No rule enters Block without one event's worth of Count data. |
 | O6 | Cost MUST be modelled per client before the event. | Written estimate covering CloudFront, WAF, Bot Control, DynamoDB, and pre-warming. |
 

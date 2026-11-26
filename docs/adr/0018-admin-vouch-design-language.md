@@ -1,6 +1,8 @@
 # ADR-0018: Style the admin UI in the Vouch design language
 
-**Status:** Accepted (supersedes the styling of ADR-0014)
+**Status:** Accepted (supersedes the styling of ADR-0014). Since amended: Inter and JetBrains Mono
+are bundled (`crates/admin/static/fonts`) and served under `font-src 'self'`, not left to system
+fallbacks.
 
 ## Context
 

@@ -1,6 +1,6 @@
 # Local stack
 
-`make stack` runs the whole waiting room on one machine and checks the design's claims against
+`make stack` runs the waiting room's visitor path on one machine and checks the design's claims against
 what happens. Nothing is deployed and no AWS account is used. It complements a run against a
 deployment; it does not replace one (see [What it cannot show](#what-it-cannot-show)).
 
@@ -85,6 +85,8 @@ fails the machine was saturated, and the run says it is inconclusive.
 - **Latency**, cold starts, and the behaviour of many CloudFront edge locations, each with its
   own cache.
 - **IAM**, the WAF web ACL, and the Terraform itself.
+- **The operator console and the no-JavaScript queue.** `admin` (with its OIDC login and its
+  KeyValueStore writer) and `nojs` are not run, by `make stack` or by `make sim`.
 - **Scale beyond one machine.** A laptop handles tens of thousands of visitors at full rate. For
   a larger event, scale the visitors, the concurrency and API Gateway's limits down together
   (`--scale`), which keeps the shape of the crowd against the throttles.
