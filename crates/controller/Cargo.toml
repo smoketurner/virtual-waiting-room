@@ -21,7 +21,6 @@ aws-sdk-dynamodb = { workspace = true, features = ["behavior-version-latest", "d
 jiff = { workspace = true, features = ["std"] }
 lambda_runtime = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-serde_dynamo = { workspace = true, features = ["aws-sdk-dynamodb+1"] }
 serde_json = { workspace = true, features = ["std"] }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
