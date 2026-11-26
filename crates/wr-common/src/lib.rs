@@ -14,6 +14,7 @@
 
 pub mod crypto;
 pub mod expr;
+pub mod http;
 pub mod ids;
 pub mod items;
 pub mod permutation;

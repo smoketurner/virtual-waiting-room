@@ -9,6 +9,7 @@
 //! under one budget and distribute nothing. Readers that need them fetch them
 //! explicitly.
 
+use jiff::Timestamp;
 use std::collections::HashMap;
 
 use aws_sdk_dynamodb::types::AttributeValue;
@@ -48,8 +49,9 @@ pub struct PreQueueItem {
     pub s: u8,
     /// Local index within the shard.
     pub l: u64,
-    /// Registration timestamp, epoch seconds.
-    pub t: u64,
+    /// When the join was accepted, stored as epoch seconds.
+    #[serde(with = "jiff::fmt::serde::timestamp::second::required")]
+    pub t: Timestamp,
     /// The digest of the visitor's possession secret (issue #62, ADR-0035).
     /// Optional on read only so a row from before it existed still decodes;
     /// `generate_token` refuses a row without one.
@@ -73,8 +75,9 @@ pub struct PositionItem {
     /// Server-stamped arrival time in epoch seconds. Authoritative: a
     /// client-supplied request id may also carry a timestamp (a `UUIDv7`
     /// shape), but that one is untrusted and, since issue #59, not even
-    /// guaranteed to be present.
-    pub entry_time: u64,
+    /// guaranteed to be present. Stored as epoch seconds.
+    #[serde(with = "jiff::fmt::serde::timestamp::second::required")]
+    pub entry_time: Timestamp,
     pub status: PositionStatus,
     /// The digest of the visitor's possession secret (issue #62, ADR-0035),
     /// written at a live join, or copied from the `PreQueue` row when the
@@ -87,7 +90,9 @@ pub struct PositionItem {
     /// people for waiting the length of the queue they are waiting in, so
     /// nothing reads this to decide whether a visitor may be admitted; the
     /// controller's no-show correction is what compensates for absentees.
-    pub ttl: u64,
+    /// Stored as epoch seconds, the form `DynamoDB` TTL reads.
+    #[serde(with = "jiff::fmt::serde::timestamp::second::required")]
+    pub ttl: Timestamp,
 }
 
 /// The single `Counters` item for an event: all sequences, the sharded
@@ -118,13 +123,13 @@ pub struct Counters {
     /// `Open` / `Paused`. Never `FailOpen` — that is resolved from
     /// `fail_open_until` by [`crate::ids::resolve`], not stored here.
     pub stored_control: StoredControl,
-    /// Epoch-seconds fail-open deadline: `now < fail_open_until` means the
-    /// waiting room is bypassed. `0` means no fail-open window is in force.
-    /// Self-expiring by construction, so a control plane that engages it and
-    /// then dies cannot leave the deployment open indefinitely.
-    pub fail_open_until: u64,
-    /// The scheduled event start, epoch seconds; absent when no start time is
-    /// set. Written by the admin, which arms the `EventBridge` schedule in the
+    /// The fail-open deadline: `now < fail_open_until` means the waiting room
+    /// is bypassed. `None` (stored as `0`) means no fail-open window is in
+    /// force. Self-expiring by construction, so a control plane that engages
+    /// it and then dies cannot leave the deployment open indefinitely.
+    pub fail_open_until: Option<Timestamp>,
+    /// The scheduled event start, stored as epoch seconds; absent when no
+    /// start time is set. Written by the admin, which arms the `EventBridge` schedule in the
     /// same action: the schedule is what fires the open, this is what the
     /// waiting page counts down to.
     ///
@@ -134,7 +139,7 @@ pub struct Counters {
     /// event must be told the event is not open, while one arriving after a
     /// scheduled start has passed must be told it is opening, so collapsing the
     /// two would erase a distinction the read path needs.
-    pub starts_at: Option<u64>,
+    pub starts_at: Option<Timestamp>,
 }
 
 /// The fixed pre-queue index space and permutation seed, once the event has
@@ -216,6 +221,16 @@ impl Counters {
                 .and_then(|s| s.parse::<u64>().ok())
         };
 
+        // A stored time is epoch seconds; one before the epoch was never
+        // written by anything and reads as absent.
+        let when = |key: &str| -> Option<Timestamp> {
+            item.get(key)
+                .and_then(|v| v.as_n().ok())
+                .and_then(|s| s.parse::<i64>().ok())
+                .filter(|&secs| secs >= 0)
+                .and_then(|secs| Timestamp::from_second(secs).ok())
+        };
+
         let shuffle_seed = item
             .get("shuffle_seed")
             .and_then(|v| v.as_b().ok())
@@ -260,8 +275,9 @@ impl Counters {
                 .filter(|s| !s.is_empty())
                 .cloned(),
             stored_control: stored_control_of(item),
-            fail_open_until: num("fail_open_until").unwrap_or(0),
-            starts_at: num(STARTS_AT_ATTR),
+            // Stored as 0 when no window is in force.
+            fail_open_until: when("fail_open_until").filter(|&until| until > Timestamp::UNIX_EPOCH),
+            starts_at: when(STARTS_AT_ATTR),
         }
     }
 }
@@ -413,7 +429,7 @@ mod tests {
             r: "018f3a2b-7c9d-7e1f-abcd-0123456789ab".to_owned(),
             s: 7,
             l: 42,
-            t: 1_788_000_000,
+            t: Timestamp::constant(1_788_000_000, 0),
             h: Some(
                 crate::SecretDigest::parse("DwBzhbb51LfusnSGBa_hqYSgo7-j8BTQnip4TOnlzRo").unwrap(),
             ),
@@ -429,9 +445,9 @@ mod tests {
         let item = PositionItem {
             request_id: "req-1".to_owned(),
             queue_position: 4_242,
-            entry_time: 1_788_000_000,
+            entry_time: Timestamp::constant(1_788_000_000, 0),
             status: PositionStatus::Issued,
-            ttl: 1_900_000_000,
+            ttl: Timestamp::constant(1_900_000_000, 0),
             h: None,
         };
         let av: std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue> =
@@ -467,9 +483,9 @@ mod tests {
         let mut item = PositionItem {
             request_id: "req-1".to_owned(),
             queue_position: 1,
-            entry_time: 1,
+            entry_time: Timestamp::constant(1, 0),
             status: PositionStatus::Issued,
-            ttl: 1,
+            ttl: Timestamp::constant(1, 0),
             h: None,
         };
         item.h = Some(
@@ -502,9 +518,9 @@ mod tests {
         let item = PositionItem {
             request_id: "req-1".to_owned(),
             queue_position: 7,
-            entry_time: 1_788_000_000,
+            entry_time: Timestamp::constant(1_788_000_000, 0),
             status: PositionStatus::Issued,
-            ttl: 1_900_000_000,
+            ttl: Timestamp::constant(1_900_000_000, 0),
             h: None,
         };
         let av: std::collections::HashMap<String, AttributeValue> =
@@ -531,7 +547,7 @@ mod tests {
             message: None,
             origin_concurrency: None,
             stored_control: StoredControl::Open,
-            fail_open_until: 0,
+            fail_open_until: None,
             starts_at: None,
         }
     }
@@ -581,7 +597,7 @@ mod tests {
             r: format!("r-{s}-{l}"),
             s,
             l,
-            t: 0,
+            t: Timestamp::constant(0, 0),
             h: None,
         }
     }
@@ -674,7 +690,11 @@ mod tests {
         let counters = Counters::from_item("evt-1", &item);
         assert_eq!(counters.stored_control, StoredControl::Paused);
         assert_eq!(
-            crate::resolve(counters.stored_control, 2_000, 1_000),
+            crate::resolve(
+                counters.stored_control,
+                Some(Timestamp::constant(2_000, 0)),
+                Timestamp::constant(1_000, 0)
+            ),
             crate::AdmissionControl::FailOpen
         );
     }
@@ -695,7 +715,7 @@ mod tests {
         // only by accident.
         assert!(counters.origin_concurrency.is_none());
         assert_eq!(counters.stored_control, StoredControl::Open);
-        assert_eq!(counters.fail_open_until, 0);
+        assert_eq!(counters.fail_open_until, None);
         // Absent, not zero: the waiting page tells "no start time set" from "a
         // start time that has passed", and a defaulted 0 would read as the
         // latter for every event that was never scheduled.
@@ -711,7 +731,7 @@ mod tests {
         );
         assert_eq!(
             Counters::from_item("evt-1", &item).starts_at,
-            Some(1_800_000_000)
+            Some(Timestamp::constant(1_800_000_000, 0))
         );
     }
 
@@ -739,7 +759,7 @@ mod tests {
         );
         assert_eq!(
             Counters::from_item("evt-1", &item).fail_open_until,
-            1_800_000_000
+            Some(Timestamp::constant(1_800_000_000, 0))
         );
     }
 

@@ -18,6 +18,7 @@ path = "src/lib.rs"
 aws-config = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 aws-sdk-dynamodb = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 aws-sdk-ssm = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+jiff = { workspace = true, features = ["std"] }
 lambda_http = { workspace = true, features = ["apigw_rest", "tracing"] }
 lambda_runtime = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

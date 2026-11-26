@@ -28,6 +28,7 @@
 //! ([`ADR-0032`](../../../docs/adr/0032-remove-the-origin-authorizer.md)).
 
 use aws_lc_rs::hmac;
+use jiff::Timestamp;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 
@@ -36,9 +37,9 @@ use serde::{Deserialize, Serialize};
 struct Claims {
     aud: String,
     sub: String,
-    exp: u64,
+    exp: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    iat: Option<u64>,
+    iat: Option<i64>,
     /// The viewer's network tag at minting ([`SigningKey::ip_tag`], issue
     /// #61). Private claim; absent when the viewer address was unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -167,10 +168,11 @@ fn validation() -> Validation {
 pub struct Session {
     pub event_id: String,
     pub request_id: String,
-    /// Epoch-seconds issue time.
-    pub issued_at: u64,
-    /// Epoch-seconds hard expiry (the cap; a sliding window re-issues).
-    pub expires_at: u64,
+    /// Issue time; whole epoch seconds on the wire.
+    pub issued_at: Timestamp,
+    /// Hard expiry (the cap; a sliding window re-issues); whole epoch seconds
+    /// on the wire.
+    pub expires_at: Timestamp,
     /// [`SigningKey::ip_tag`] of the viewer that redeemed it. The gate
     /// compares it only while the operator has IP binding on (issue #61).
     pub ip_tag: Option<String>,
@@ -214,31 +216,35 @@ impl Session {
             &Claims {
                 aud: self.event_id.clone(),
                 sub: self.request_id.clone(),
-                exp: self.expires_at,
-                iat: Some(self.issued_at),
+                exp: self.expires_at.as_second(),
+                iat: Some(self.issued_at.as_second()),
                 cip: self.ip_tag.clone(),
             },
         )
     }
 
     /// Verifies a signed session against `key` and checks it has not expired at
-    /// `now` (epoch seconds).
+    /// `now`.
     ///
     /// # Errors
     ///
     /// [`VerifyError::Malformed`] if the string is not well-formed;
     /// [`VerifyError::BadSignature`] if the MAC does not match under this kind;
     /// [`VerifyError::Expired`] if `now >= expires_at`.
-    pub fn verify(session: &str, key: &SigningKey, now: u64) -> Result<Self, VerifyError> {
+    pub fn verify(session: &str, key: &SigningKey, now: Timestamp) -> Result<Self, VerifyError> {
         let claims = verify_claims(key, Kind::Session, session)?;
-        if now >= claims.exp {
+        let expires_at = Timestamp::from_second(claims.exp).map_err(|_| VerifyError::Malformed)?;
+        if now >= expires_at {
             return Err(VerifyError::Expired);
         }
         Ok(Self {
             event_id: claims.aud,
             request_id: claims.sub,
-            issued_at: claims.iat.ok_or(VerifyError::Malformed)?,
-            expires_at: claims.exp,
+            issued_at: claims
+                .iat
+                .and_then(|iat| Timestamp::from_second(iat).ok())
+                .ok_or(VerifyError::Malformed)?,
+            expires_at,
             ip_tag: claims.cip,
         })
     }
@@ -382,6 +388,7 @@ mod tests {
     #![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
 
     use super::*;
+
     use proptest::prelude::*;
 
     /// A fixed vector, so a change of hash, encoding or input form (bytes of
@@ -435,8 +442,8 @@ mod tests {
         Session {
             event_id: "smoke".to_owned(),
             request_id: "018f3a2b-7c9d-7e1f-abcd-0123456789ab".to_owned(),
-            issued_at: 1_000_000_000,
-            expires_at: 2_000_000_000,
+            issued_at: Timestamp::constant(1_000_000_000, 0),
+            expires_at: Timestamp::constant(2_000_000_000, 0),
             ip_tag: None,
         }
     }
@@ -447,7 +454,12 @@ mod tests {
         let mut t = session();
         t.ip_tag = k.ip_tag("198.51.100.7");
         assert!(t.ip_tag.is_some());
-        let back = Session::verify(&t.sign(&k).unwrap(), &k, 1_500_000_000).unwrap();
+        let back = Session::verify(
+            &t.sign(&k).unwrap(),
+            &k,
+            Timestamp::constant(1_500_000_000, 0),
+        )
+        .unwrap();
         assert_eq!(back.ip_tag, t.ip_tag);
     }
 
@@ -480,7 +492,7 @@ mod tests {
     #[test]
     fn session_round_trips() {
         let signed = session().sign(&key()).unwrap();
-        let back = Session::verify(&signed, &key(), 1_500_000_000).unwrap();
+        let back = Session::verify(&signed, &key(), Timestamp::constant(1_500_000_000, 0)).unwrap();
         assert_eq!(back, session());
     }
 
@@ -488,7 +500,7 @@ mod tests {
     fn expired_session_is_rejected() {
         let signed = session().sign(&key()).unwrap();
         assert_eq!(
-            Session::verify(&signed, &key(), 2_000_000_001),
+            Session::verify(&signed, &key(), Timestamp::constant(2_000_000_001, 0)),
             Err(VerifyError::Expired)
         );
     }
@@ -514,7 +526,7 @@ mod tests {
         };
         let signed = session().sign(&underived).unwrap();
         assert_eq!(
-            Session::verify(&signed, &derived, 1_500_000_000),
+            Session::verify(&signed, &derived, Timestamp::constant(1_500_000_000, 0)),
             Err(VerifyError::BadSignature),
             "a session signed under the raw secret must not verify"
         );
@@ -525,7 +537,7 @@ mod tests {
         let signed = session().sign(&key()).unwrap();
         let other = SigningKey::new(b"a-different-32-byte-signing-keyy");
         assert_eq!(
-            Session::verify(&signed, &other, 1_500_000_000),
+            Session::verify(&signed, &other, Timestamp::constant(1_500_000_000, 0)),
             Err(VerifyError::BadSignature)
         );
     }
@@ -541,7 +553,7 @@ mod tests {
         let tampered: String = chars.into_iter().collect();
         let forged = format!("{}.{tampered}.{}", parts[0], parts[2]);
         assert_eq!(
-            Session::verify(&forged, &key(), 1_500_000_000),
+            Session::verify(&forged, &key(), Timestamp::constant(1_500_000_000, 0)),
             Err(VerifyError::BadSignature)
         );
     }
@@ -582,14 +594,17 @@ mod tests {
     fn malformed_strings_are_rejected() {
         let k = key();
         assert_eq!(
-            Session::verify("no-dot-here", &k, 0),
+            Session::verify("no-dot-here", &k, Timestamp::constant(0, 0)),
             Err(VerifyError::Malformed)
         );
         assert_eq!(
-            Session::verify("bad*.chars", &k, 0),
+            Session::verify("bad*.chars", &k, Timestamp::constant(0, 0)),
             Err(VerifyError::Malformed)
         );
-        assert_eq!(Session::verify("", &k, 0), Err(VerifyError::Malformed));
+        assert_eq!(
+            Session::verify("", &k, Timestamp::constant(0, 0)),
+            Err(VerifyError::Malformed)
+        );
     }
 
     proptest! {
@@ -597,18 +612,18 @@ mod tests {
         fn any_session_round_trips(
             event_id in "[a-z0-9-]{1,40}",
             request_id in "[a-z0-9-]{1,40}",
-            expires_at in 2u64..u64::MAX,
+            expires_at in 2i64..Timestamp::MAX.as_second(),
         ) {
             let k = key();
             let t = Session {
                 event_id,
                 request_id,
-                issued_at: expires_at - 1,
-                expires_at,
+                issued_at: Timestamp::constant(expires_at - 1, 0),
+                expires_at: Timestamp::constant(expires_at, 0),
                 ip_tag: None,
             };
             let signed = t.sign(&k).unwrap();
-            let back = Session::verify(&signed, &k, expires_at - 1).unwrap();
+            let back = Session::verify(&signed, &k, Timestamp::constant(expires_at - 1, 0)).unwrap();
             prop_assert_eq!(back, t);
         }
 
@@ -617,8 +632,8 @@ mod tests {
         #[test]
         fn verify_never_panics_on_arbitrary_input(s in ".{0,120}") {
             let k = key();
-            prop_assert!(Session::verify(&s, &k, 0).is_err());
-            prop_assert!(Session::verify(&s, &k, 0).is_err());
+            prop_assert!(Session::verify(&s, &k, Timestamp::constant(0, 0)).is_err());
+            prop_assert!(Session::verify(&s, &k, Timestamp::constant(0, 0)).is_err());
         }
     }
 }

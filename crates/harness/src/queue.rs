@@ -11,14 +11,15 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use axum::http::StatusCode;
 use serde_json::json;
 use tokio::sync::Notify;
+use tokio::time::Instant;
 
-use super::lambda::Function;
-use super::rng::Rng;
+use crate::backend::Consumer;
+use crate::rng::Rng;
 
 /// `core/main.tf`: 6 × the 30 s function timeout + the 1 s batching window.
 pub const VISIBILITY_TIMEOUT: Duration = Duration::from_secs(181);
@@ -34,7 +35,7 @@ struct Message {
     id: String,
     body: String,
     receives: u32,
-    sent_ms: u128,
+    sent_ms: i64,
 }
 
 #[derive(Debug, Default)]
@@ -63,7 +64,6 @@ pub struct JoinQueue {
     /// Probability that a delivery is made twice (at-least-once).
     duplicate_rate: f64,
     rng: Mutex<Rng>,
-    started: Instant,
 }
 
 impl JoinQueue {
@@ -75,7 +75,6 @@ impl JoinQueue {
             url,
             duplicate_rate,
             rng: Mutex::new(Rng::new(seed)),
-            started: Instant::now(),
         }
     }
 
@@ -94,7 +93,7 @@ impl JoinQueue {
                 id,
                 body,
                 receives: 0,
-                sent_ms: self.started.elapsed().as_millis(),
+                sent_ms: crate::clock::now().as_millisecond(),
             });
         }
         self.ready.notify_one();
@@ -190,7 +189,7 @@ impl JoinQueue {
 
     /// One poller of the event source mapping: collect a batch, invoke the
     /// function, delete what it processed. Runs until `stop` fires.
-    pub async fn poll(&self, function: &Function, stop: &tokio::sync::watch::Receiver<bool>) {
+    pub async fn poll(&self, consumer: &dyn Consumer, stop: &tokio::sync::watch::Receiver<bool>) {
         loop {
             if *stop.borrow() {
                 return;
@@ -209,7 +208,7 @@ impl JoinQueue {
                 let more = self.take(BATCH_SIZE - batch.len());
                 batch.extend(more);
             }
-            let failed = match function.invoke(&self.event(&batch)).await {
+            let failed = match consumer.deliver(self.event(&batch)).await {
                 Ok(reply) => batch_failures(&reply),
                 // A failed invocation fails the whole batch.
                 Err(_) => batch.iter().map(|m| m.id.clone()).collect(),

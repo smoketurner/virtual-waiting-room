@@ -40,13 +40,37 @@ pub const MAX_FAIL_OPEN_MINUTES: u32 = 1440;
 /// diverge. `fail_open_until` mirrors `Counters.fail_open_until`, which is a different
 /// fact from a second copy: the epoch self-resolves on both sides, so there is
 /// nothing to reconcile.
+/// A gate time on the wire: epoch seconds, `0` for none, which is how the
+/// edge gate reads `s` and `f`.
+mod gate_time {
+    use jiff::Timestamp;
+    use serde::{Deserialize as _, Deserializer, Serializer};
+
+    #[expect(
+        clippy::ref_option,
+        reason = "serde's `with` hands the field by reference"
+    )]
+    pub fn serialize<S: Serializer>(at: &Option<Timestamp>, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_i64(at.map_or(0, Timestamp::as_second))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Timestamp>, D::Error> {
+        match i64::deserialize(d)? {
+            0 => Ok(None),
+            secs => Timestamp::from_second(secs)
+                .map(Some)
+                .map_err(serde::de::Error::custom),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct GateConfig {
     pub v: u8,
-    #[serde(rename = "s")]
-    pub enforce_from: u64,
-    #[serde(rename = "f")]
-    pub fail_open_until: u64,
+    #[serde(rename = "s", with = "gate_time")]
+    pub enforce_from: Option<Timestamp>,
+    #[serde(rename = "f", with = "gate_time")]
+    pub fail_open_until: Option<Timestamp>,
     #[serde(rename = "r")]
     pub rules: Vec<ProtectionRule>,
     /// Whether the gate refuses a session redeemed from another network
@@ -266,7 +290,7 @@ pub trait Store {
     fn set_starts_at(
         &self,
         event_id: &str,
-        starts_at: Option<(u64, &str)>,
+        starts_at: Option<(Timestamp, &str)>,
         action: AdminAction,
         actor: &str,
         now: ArrivalTime,
@@ -302,7 +326,7 @@ pub trait Store {
     fn set_fail_open_until(
         &self,
         event_id: &str,
-        until: u64,
+        until: Option<Timestamp>,
         action: AdminAction,
         actor: &str,
         now: ArrivalTime,
@@ -376,10 +400,10 @@ pub struct ControlState {
     /// anything but `Open` the controller admits nobody and the queue and
     /// positions stay intact; `origin_concurrency` is preserved across a hold.
     pub stored_control: StoredControl,
-    /// Epoch-seconds fail-open deadline; `0` means no window is in force.
+    /// The fail-open deadline; `None` means no window is in force.
     /// Orthogonal to `stored_control`: an operator can queue a pause during a
-    /// fail-open window, and it takes effect the moment this epoch lapses.
-    pub fail_open_until: u64,
+    /// fail-open window, and it takes effect the moment this deadline lapses.
+    pub fail_open_until: Option<Timestamp>,
     /// The last mutating action, who performed it (OIDC email), and when
     /// (RFC3339). Surfaced as "last changed by X at T".
     pub last_action: Option<String>,
@@ -390,9 +414,8 @@ pub struct ControlState {
     /// not a representable instant — an unusable stamp is the same as no
     /// stamp, and treating it as one would reject every later action.
     pub last_action_time: Option<Timestamp>,
-    /// The scheduled event start, epoch seconds; `None` when unscheduled
-    /// (issue #128).
-    pub starts_at: Option<u64>,
+    /// The scheduled event start; `None` when unscheduled (issue #128).
+    pub starts_at: Option<Timestamp>,
     /// The IANA zone the operator chose the start time in, so the form
     /// re-renders in the zone they typed rather than snapping to UTC.
     /// `None` when unscheduled.
@@ -540,7 +563,7 @@ pub enum ActionError {
 pub struct StartTime {
     /// The absolute instant, so the waiting page counts down to the same
     /// moment regardless of where the visitor is.
-    pub epoch_secs: u64,
+    pub at: Timestamp,
     /// `YYYY-MM-DDTHH:MM:SS`, no zone suffix. `EventBridge` Scheduler takes the
     /// zone separately and rejects an expression that carries one itself.
     pub expression: String,
@@ -577,7 +600,7 @@ pub const DEFAULT_TIMEZONE: &str = "UTC";
 pub fn parse_start_time(
     input: &str,
     timezone: &str,
-    now_secs: u64,
+    now: Timestamp,
 ) -> Result<StartTime, ActionError> {
     let tz = jiff::tz::TimeZone::get(timezone).map_err(|_| ActionError::UnknownTimezone)?;
 
@@ -615,32 +638,27 @@ pub fn parse_start_time(
         return Err(ActionError::InvalidStartTime);
     }
 
-    let epoch_secs =
-        u64::try_from(zoned.timestamp().as_second()).map_err(|_| ActionError::InvalidStartTime)?;
-    if epoch_secs <= now_secs {
+    let at = zoned.timestamp();
+    if at <= now {
         return Err(ActionError::StartTimeInPast);
     }
 
     Ok(StartTime {
-        epoch_secs,
+        at,
         expression: normalized,
         timezone: timezone.to_owned(),
     })
 }
 
-/// Renders a stored UTC epoch back into the `YYYY-MM-DDTHH:MM` wall-clock form
-/// in `timezone`, for pre-filling the dashboard field with what the operator
+/// Renders a stored start back into the `YYYY-MM-DDTHH:MM` wall-clock form in
+/// `timezone`, for pre-filling the dashboard field with what the operator
 /// originally typed.
 ///
-/// Returns `None` for an unknown zone or an epoch outside the representable
-/// range, neither of which any value this crate writes can be.
+/// Returns `None` for an unknown zone, which no value this crate writes is.
 #[must_use]
-pub fn format_start_time(epoch_secs: u64, timezone: &str) -> Option<String> {
+pub fn format_start_time(at: Timestamp, timezone: &str) -> Option<String> {
     let tz = jiff::tz::TimeZone::get(timezone).ok()?;
-    let secs = i64::try_from(epoch_secs).ok()?;
-    let zoned = jiff::Timestamp::from_second(secs)
-        .ok()?
-        .to_zoned_datetime(tz);
+    let zoned = at.to_zoned_datetime(tz);
     // datetime-local round-trips minutes, not seconds.
     Some(format!("{}", zoned.datetime().strftime("%Y-%m-%dT%H:%M")))
 }
@@ -983,20 +1001,22 @@ pub async fn apply_fail_open<S: Store, E: EdgeConfigStore>(
     if store.load(event_id).await?.is_none() {
         return Err(ActionError::NotFound.into());
     }
-    let now_secs = now.epoch_seconds();
-    let until = now_secs.saturating_add(u64::from(minutes).saturating_mul(60));
+    let until = now
+        .timestamp()
+        .checked_add(SignedDuration::from_mins(i64::from(minutes)))
+        .map_err(|_| ActionError::InvalidDuration)?;
 
-    edge_read_modify_write(edge, |cfg| cfg.fail_open_until = until)
+    edge_read_modify_write(edge, |cfg| cfg.fail_open_until = Some(until))
         .await
         .map_err(|e| StoreError::Backend(e.to_string()))?;
 
     store
-        .set_fail_open_until(event_id, until, AdminAction::FailOpen, actor, now)
+        .set_fail_open_until(event_id, Some(until), AdminAction::FailOpen, actor, now)
         .await?;
     Ok(())
 }
 
-/// Clears the fail-open epoch (issue #71). This is not "resume": it only
+/// Clears the fail-open deadline (issue #71). This is not "resume": it only
 /// clears `fail_open_until`, so an operator who queued a pause during the
 /// window lands in `Paused`, not `Open` — `apply_resume` is the separate
 /// action for that. Writes `DynamoDB` first: a crash between the two writes
@@ -1018,10 +1038,10 @@ pub async fn apply_recover<S: Store, E: EdgeConfigStore>(
         return Err(ActionError::NotFound.into());
     }
     store
-        .set_fail_open_until(event_id, 0, AdminAction::Recover, actor, now)
+        .set_fail_open_until(event_id, None, AdminAction::Recover, actor, now)
         .await?;
 
-    edge_read_modify_write(edge, |cfg| cfg.fail_open_until = 0)
+    edge_read_modify_write(edge, |cfg| cfg.fail_open_until = None)
         .await
         .map_err(|e| StoreError::Backend(e.to_string()))?;
     Ok(())
@@ -1076,7 +1096,7 @@ pub async fn apply_start_time<S: Store, K: OpenSchedule>(
         return Ok(());
     }
 
-    let start = parse_start_time(at, timezone, now.epoch_seconds())?;
+    let start = parse_start_time(at, timezone, now.timestamp())?;
     schedule
         .set_start_time(Some((&start.expression, &start.timezone)))
         .await
@@ -1084,7 +1104,7 @@ pub async fn apply_start_time<S: Store, K: OpenSchedule>(
     store
         .set_starts_at(
             event_id,
-            Some((start.epoch_secs, &start.timezone)),
+            Some((start.at, &start.timezone)),
             AdminAction::SetStartTime,
             actor,
             now,
@@ -1437,7 +1457,7 @@ mod tests {
         concurrency: Mutex<Option<u32>>,
         message: Mutex<Option<String>>,
         control: Mutex<StoredControl>,
-        fail_open_until: Mutex<u64>,
+        fail_open_until: Mutex<Option<Timestamp>>,
         /// The audit label the last control change recorded.
         control_action: Mutex<Option<AdminAction>>,
         /// The four ADR-0017 §6 audit fields, mirroring `apply_audit_values` in
@@ -1450,7 +1470,7 @@ mod tests {
         /// The most recent `set_rules_audit` call's digest + count, if any.
         rules_audit: Mutex<Option<(String, usize)>>,
         /// The scheduled start (issue #128), `None` when unscheduled.
-        starts_at: Mutex<Option<u64>>,
+        starts_at: Mutex<Option<Timestamp>>,
         /// The cohort size the open wrote, `None` until the open has run. It
         /// is the admin's proof that the seed and offsets landed too, all four
         /// being one conditional update.
@@ -1475,7 +1495,7 @@ mod tests {
                 concurrency: Mutex::new(None),
                 message: Mutex::new(None),
                 control: Mutex::new(StoredControl::Open),
-                fail_open_until: Mutex::new(0),
+                fail_open_until: Mutex::new(None),
                 starts_at: Mutex::new(None),
                 starts_at_timezone: Mutex::new(None),
                 participant_count: Mutex::new(None),
@@ -1583,7 +1603,7 @@ mod tests {
         /// representable here (and provably fails safe) rather than
         /// structurally unrepresentable the way the prior decoupled fake was.
         etag: Mutex<u64>,
-        writes: Mutex<Vec<u64>>,
+        writes: Mutex<Vec<Option<Timestamp>>>,
         /// Armed before the call under test: the *next* `write_config`
         /// simulates a concurrent writer committing first — the store's value
         /// advances to `injected` and the version bumps *before* the
@@ -1599,8 +1619,8 @@ mod tests {
                 cfg: Mutex::new(GateConfig {
                     bind_ip: false,
                     v: 1,
-                    enforce_from: 0,
-                    fail_open_until: 0,
+                    enforce_from: None,
+                    fail_open_until: None,
                     rules: Vec::new(),
                 }),
                 etag: Mutex::new(1),
@@ -1759,7 +1779,7 @@ mod tests {
         fn set_starts_at(
             &self,
             _event_id: &str,
-            starts_at: Option<(u64, &str)>,
+            starts_at: Option<(Timestamp, &str)>,
             action: AdminAction,
             actor: &str,
             now: ArrivalTime,
@@ -1768,7 +1788,7 @@ mod tests {
             let result = if self.starts_at_write_fails {
                 Err(StoreError::Backend("starts_at write failed".to_owned()))
             } else {
-                *self.starts_at.lock().unwrap() = starts_at.map(|(secs, _)| secs);
+                *self.starts_at.lock().unwrap() = starts_at.map(|(at, _)| at);
                 *self.starts_at_timezone.lock().unwrap() = starts_at.map(|(_, tz)| tz.to_owned());
                 self.stamp_audit(action, actor, now);
                 Ok(())
@@ -1802,7 +1822,7 @@ mod tests {
         fn set_fail_open_until(
             &self,
             _event_id: &str,
-            until: u64,
+            until: Option<Timestamp>,
             action: AdminAction,
             actor: &str,
             now: ArrivalTime,
@@ -1990,9 +2010,14 @@ mod tests {
     fn a_start_time_is_read_in_the_operators_zone_not_utc() {
         // 10:00 in New York on a summer date is 14:00 UTC. Reading the field as
         // UTC would open the event four hours early.
-        let start = parse_start_time("2030-06-15T10:00", "America/New_York", 0).unwrap();
-        let utc = parse_start_time("2030-06-15T14:00", "UTC", 0).unwrap();
-        assert_eq!(start.epoch_secs, utc.epoch_secs);
+        let start = parse_start_time(
+            "2030-06-15T10:00",
+            "America/New_York",
+            Timestamp::constant(0, 0),
+        )
+        .unwrap();
+        let utc = parse_start_time("2030-06-15T14:00", "UTC", Timestamp::constant(0, 0)).unwrap();
+        assert_eq!(start.at, utc.at);
         // The expression keeps the operator's wall clock; the zone travels
         // beside it, so the schedule fires at 10:00 local whatever the offset
         // is by then.
@@ -2005,12 +2030,24 @@ mod tests {
         // The point of storing a zone rather than an offset: 10:00 New York is
         // UTC-4 in June and UTC-5 in January, so a fixed offset chosen at
         // scheduling time would be an hour wrong on one side of the change.
-        let summer = parse_start_time("2030-06-15T10:00", "America/New_York", 0).unwrap();
-        let winter = parse_start_time("2030-01-15T10:00", "America/New_York", 0).unwrap();
-        let summer_utc = parse_start_time("2030-06-15T14:00", "UTC", 0).unwrap();
-        let winter_utc = parse_start_time("2030-01-15T15:00", "UTC", 0).unwrap();
-        assert_eq!(summer.epoch_secs, summer_utc.epoch_secs);
-        assert_eq!(winter.epoch_secs, winter_utc.epoch_secs);
+        let summer = parse_start_time(
+            "2030-06-15T10:00",
+            "America/New_York",
+            Timestamp::constant(0, 0),
+        )
+        .unwrap();
+        let winter = parse_start_time(
+            "2030-01-15T10:00",
+            "America/New_York",
+            Timestamp::constant(0, 0),
+        )
+        .unwrap();
+        let summer_utc =
+            parse_start_time("2030-06-15T14:00", "UTC", Timestamp::constant(0, 0)).unwrap();
+        let winter_utc =
+            parse_start_time("2030-01-15T15:00", "UTC", Timestamp::constant(0, 0)).unwrap();
+        assert_eq!(summer.at, summer_utc.at);
+        assert_eq!(winter.at, winter_utc.at);
     }
 
     #[test]
@@ -2018,7 +2055,11 @@ mod tests {
         // 02:30 never happens in New York on the spring-forward date; an
         // operator told it is scheduled should be told otherwise instead.
         assert_eq!(
-            parse_start_time("2030-03-10T02:30", "America/New_York", 0),
+            parse_start_time(
+                "2030-03-10T02:30",
+                "America/New_York",
+                Timestamp::constant(0, 0)
+            ),
             Err(ActionError::InvalidStartTime)
         );
     }
@@ -2033,19 +2074,22 @@ mod tests {
             "not-a-time",
             "",
         ] {
-            assert!(parse_start_time(bad, "UTC", 0).is_err(), "accepted {bad:?}");
+            assert!(
+                parse_start_time(bad, "UTC", Timestamp::constant(0, 0)).is_err(),
+                "accepted {bad:?}"
+            );
         }
         assert_eq!(
-            parse_start_time(FUTURE, "Mars/Olympus_Mons", 0),
+            parse_start_time(FUTURE, "Mars/Olympus_Mons", Timestamp::constant(0, 0)),
             Err(ActionError::UnknownTimezone)
         );
     }
 
     #[test]
     fn a_start_time_in_the_past_is_rejected_rather_than_clamped() {
-        let start = parse_start_time(FUTURE, "UTC", 0).unwrap();
+        let start = parse_start_time(FUTURE, "UTC", Timestamp::constant(0, 0)).unwrap();
         assert_eq!(
-            parse_start_time(FUTURE, "UTC", start.epoch_secs),
+            parse_start_time(FUTURE, "UTC", start.at),
             Err(ActionError::StartTimeInPast)
         );
     }
@@ -2053,9 +2097,9 @@ mod tests {
     #[test]
     fn start_time_round_trips_through_the_form_value() {
         for tz in ["UTC", "America/New_York", "Australia/Sydney"] {
-            let start = parse_start_time(FUTURE, tz, 0).unwrap();
+            let start = parse_start_time(FUTURE, tz, Timestamp::constant(0, 0)).unwrap();
             assert_eq!(
-                format_start_time(start.epoch_secs, tz).as_deref(),
+                format_start_time(start.at, tz).as_deref(),
                 Some(FUTURE),
                 "{tz} did not round trip"
             );
@@ -2679,7 +2723,7 @@ mod tests {
             .await
             .unwrap();
 
-        let until = 1 + 30 * 60; // now/1000 seconds + minutes*60
+        let until = Some(Timestamp::constant(1 + 30 * 60, 0)); // now/1000 seconds + minutes*60
         // The break-glass functional write still landed on both stores.
         assert_eq!(*store.fail_open_until.lock().unwrap(), until);
         assert_eq!(edge.cfg.lock().unwrap().fail_open_until, until);
@@ -2726,7 +2770,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(*store.fail_open_until.lock().unwrap() > 0);
+        assert!(store.fail_open_until.lock().unwrap().is_some());
         assert_eq!(
             *store.last_time.lock().unwrap(),
             Some(ts(3_000).timestamp()),
@@ -2902,22 +2946,22 @@ mod tests {
         // unchanged.
         let store = FakeStore::with_phase(Phase::Active);
         let concurrent_at = ts(1_100).timestamp();
-        *store.fail_open_until.lock().unwrap() = 1_000_000;
+        *store.fail_open_until.lock().unwrap() = Some(Timestamp::constant(1_000_000, 0));
         *store.last_action.lock().unwrap() = Some("set_concurrency".to_owned());
         *store.last_action_by.lock().unwrap() = Some("opB@x".to_owned());
         *store.last_action_at.lock().unwrap() = Some(concurrent_at.to_string());
         *store.last_time.lock().unwrap() = Some(concurrent_at);
         let edge = FakeEdgeStore::default();
-        edge.cfg.lock().unwrap().fail_open_until = 1_000_000;
+        edge.cfg.lock().unwrap().fail_open_until = Some(Timestamp::constant(1_000_000, 0));
 
         apply_recover(&store, &edge, "evt", "opA@x", ts(1_000))
             .await
             .unwrap();
 
         // The functional clear still landed on both stores.
-        assert_eq!(*store.fail_open_until.lock().unwrap(), 0);
-        assert_eq!(edge.cfg.lock().unwrap().fail_open_until, 0);
-        assert_eq!(edge.writes.lock().unwrap().last(), Some(&0));
+        assert_eq!(*store.fail_open_until.lock().unwrap(), None);
+        assert_eq!(edge.cfg.lock().unwrap().fail_open_until, None);
+        assert_eq!(edge.writes.lock().unwrap().last(), Some(&None));
         // The anchor was NOT regressed, and the audit line stays on opB.
         assert_eq!(
             *store.last_time.lock().unwrap(),
@@ -3152,12 +3196,16 @@ mod tests {
         // stored_control would still collapse Paused/Open together, so the
         // resolved AdmissionControl is what the operator-facing read proves.
         let store = FakeStore {
-            fail_open_until: Mutex::new(1000),
+            fail_open_until: Mutex::new(Some(Timestamp::constant(1000, 0))),
             phase: Mutex::new(Phase::Active),
             ..Default::default()
         };
         let state = store.load("evt").await.unwrap().unwrap();
-        let resolved = wr_common::resolve(state.stored_control, state.fail_open_until, 500);
+        let resolved = wr_common::resolve(
+            state.stored_control,
+            state.fail_open_until,
+            Timestamp::constant(500, 0),
+        );
         assert_eq!(resolved, wr_common::AdmissionControl::FailOpen);
         assert_eq!(
             wr_common::serving_state(state.phase, resolved),
@@ -3173,14 +3221,17 @@ mod tests {
         // rather than sitting blocked behind a state machine that used to
         // treat FailOpen as a fourth value pause/resume had to route around.
         let store = FakeStore {
-            fail_open_until: Mutex::new(1_000_000),
+            fail_open_until: Mutex::new(Some(Timestamp::constant(1_000_000, 0))),
             phase: Mutex::new(Phase::Active),
             ..Default::default()
         };
         apply_pause(&store, "evt", "op@x", ts(1000)).await.unwrap();
         assert_eq!(*store.control.lock().unwrap(), StoredControl::Paused);
         // The epoch is untouched by a pause.
-        assert_eq!(*store.fail_open_until.lock().unwrap(), 1_000_000);
+        assert_eq!(
+            *store.fail_open_until.lock().unwrap(),
+            Some(Timestamp::constant(1_000_000, 0))
+        );
     }
 
     #[tokio::test]
@@ -3280,7 +3331,7 @@ mod tests {
         apply_fail_open(&store, &edge, "evt", "30", "op@x", ts(1_000_000))
             .await
             .unwrap();
-        let until = 1_000 + 30 * 60; // now/1000 + minutes*60
+        let until = Some(Timestamp::constant(1_000 + 30 * 60, 0)); // now/1000 + minutes*60
         assert_eq!(*store.fail_open_until.lock().unwrap(), until);
         assert_eq!(edge.cfg.lock().unwrap().fail_open_until, until);
         // Order: the edge write happened, and it is the only write recorded
@@ -3297,13 +3348,13 @@ mod tests {
         // unchanged through a fail-open write.
         let store = FakeStore::with_phase(Phase::Active);
         let edge = FakeEdgeStore::default();
-        edge.cfg.lock().unwrap().enforce_from = 42;
+        edge.cfg.lock().unwrap().enforce_from = Some(Timestamp::constant(42, 0));
         edge.cfg.lock().unwrap().rules = vec![ProtectionRule::PathPrefix("/checkout".to_owned())];
         apply_fail_open(&store, &edge, "evt", "5", "op@x", ts(0))
             .await
             .unwrap();
         let cfg = edge.cfg.lock().unwrap();
-        assert_eq!(cfg.enforce_from, 42);
+        assert_eq!(cfg.enforce_from, Some(Timestamp::constant(42, 0)));
         assert_eq!(
             cfg.rules,
             vec![ProtectionRule::PathPrefix("/checkout".to_owned())]
@@ -3328,8 +3379,8 @@ mod tests {
         let concurrent = GateConfig {
             bind_ip: false,
             v: 1,
-            enforce_from: 0,
-            fail_open_until: 0,
+            enforce_from: None,
+            fail_open_until: None,
             rules: vec![ProtectionRule::PathPrefix("/concurrent".to_owned())],
         };
         *edge.inject_on_next_write.lock().unwrap() = Some(concurrent.clone());
@@ -3344,7 +3395,7 @@ mod tests {
             "the concurrent writer's rules must survive the retry"
         );
         assert!(
-            final_cfg.fail_open_until > 0,
+            final_cfg.fail_open_until.is_some(),
             "this action's own mutation must still apply on top of the concurrent change"
         );
     }
@@ -3368,8 +3419,8 @@ mod tests {
         let concurrent_fail_open = GateConfig {
             bind_ip: false,
             v: 1,
-            enforce_from: 0,
-            fail_open_until: 9_000,
+            enforce_from: None,
+            fail_open_until: Some(Timestamp::constant(9_000, 0)),
             rules: Vec::new(),
         };
         *edge.inject_on_next_write.lock().unwrap() = Some(concurrent_fail_open.clone());
@@ -3401,13 +3452,13 @@ mod tests {
         let edge = FakeEdgeStore::default();
         // A break-glass is currently engaged, so `recover` has something to
         // clear against a non-empty `fail_open_until`.
-        edge.cfg.lock().unwrap().fail_open_until = 5_000;
+        edge.cfg.lock().unwrap().fail_open_until = Some(Timestamp::constant(5_000, 0));
         let concurrent_rules = vec![ProtectionRule::PathPrefix("/concurrent".to_owned())];
         *edge.inject_on_next_write.lock().unwrap() = Some(GateConfig {
             bind_ip: false,
             v: 1,
-            enforce_from: 0,
-            fail_open_until: 5_000,
+            enforce_from: None,
+            fail_open_until: Some(Timestamp::constant(5_000, 0)),
             rules: concurrent_rules.clone(),
         });
 
@@ -3421,7 +3472,7 @@ mod tests {
             "the concurrent set_rules' ruleset must survive the recovery"
         );
         assert_eq!(
-            final_cfg.fail_open_until, 0,
+            final_cfg.fail_open_until, None,
             "recover must still clear the epoch on top of the concurrent change"
         );
     }
@@ -3437,7 +3488,7 @@ mod tests {
         apply_fail_open(&store, &edge, "evt", "10", "op@x", ts(0))
             .await
             .unwrap();
-        assert!(*store.fail_open_until.lock().unwrap() > 0);
+        assert!(store.fail_open_until.lock().unwrap().is_some());
         // Pausing is untouched by engaging fail-open.
         assert_eq!(*store.control.lock().unwrap(), StoredControl::Paused);
     }
@@ -3484,8 +3535,8 @@ mod tests {
         let probe_cfg = GateConfig {
             bind_ip: false,
             v: 1,
-            enforce_from: 0,
-            fail_open_until: 0,
+            enforce_from: None,
+            fail_open_until: None,
             rules: rules.clone(),
         };
         let encoded = encode_gate_config(&probe_cfg).unwrap();
@@ -3538,7 +3589,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(edge.cfg.lock().unwrap().fail_open_until > 0);
+        assert!(edge.cfg.lock().unwrap().fail_open_until.is_some());
     }
 
     #[tokio::test]
@@ -3548,15 +3599,15 @@ mod tests {
         apply_fail_open(&store, &edge, "evt", "10", "op@x", ts(0))
             .await
             .unwrap();
-        assert!(*store.fail_open_until.lock().unwrap() > 0);
+        assert!(store.fail_open_until.lock().unwrap().is_some());
 
         apply_recover(&store, &edge, "evt", "op@y", ts(5_000))
             .await
             .unwrap();
-        assert_eq!(*store.fail_open_until.lock().unwrap(), 0);
-        assert_eq!(edge.cfg.lock().unwrap().fail_open_until, 0);
+        assert_eq!(*store.fail_open_until.lock().unwrap(), None);
+        assert_eq!(edge.cfg.lock().unwrap().fail_open_until, None);
         // Last recorded edge write is the clearing 0.
-        assert_eq!(edge.writes.lock().unwrap().last(), Some(&0));
+        assert_eq!(edge.writes.lock().unwrap().last(), Some(&None));
     }
 
     #[tokio::test]
@@ -3566,7 +3617,7 @@ mod tests {
         // in Paused, not Open.
         let store = FakeStore {
             control: Mutex::new(StoredControl::Paused),
-            fail_open_until: Mutex::new(1_000_000),
+            fail_open_until: Mutex::new(Some(Timestamp::constant(1_000_000, 0))),
             phase: Mutex::new(Phase::Active),
             ..Default::default()
         };
@@ -3574,7 +3625,7 @@ mod tests {
         apply_recover(&store, &edge, "evt", "op@x", ts(0))
             .await
             .unwrap();
-        assert_eq!(*store.fail_open_until.lock().unwrap(), 0);
+        assert_eq!(*store.fail_open_until.lock().unwrap(), None);
         assert_eq!(*store.control.lock().unwrap(), StoredControl::Paused);
     }
 
@@ -3617,8 +3668,8 @@ mod tests {
         // document: a ruleset change must not clobber fields it does not own.
         let store = FakeStore::with_phase(Phase::Active);
         let edge = FakeEdgeStore::default();
-        edge.cfg.lock().unwrap().enforce_from = 42;
-        edge.cfg.lock().unwrap().fail_open_until = 99;
+        edge.cfg.lock().unwrap().enforce_from = Some(Timestamp::constant(42, 0));
+        edge.cfg.lock().unwrap().fail_open_until = Some(Timestamp::constant(99, 0));
         apply_set_rules(
             &store,
             &edge,
@@ -3630,8 +3681,8 @@ mod tests {
         .await
         .unwrap();
         let cfg = edge.cfg.lock().unwrap();
-        assert_eq!(cfg.enforce_from, 42);
-        assert_eq!(cfg.fail_open_until, 99);
+        assert_eq!(cfg.enforce_from, Some(Timestamp::constant(42, 0)));
+        assert_eq!(cfg.fail_open_until, Some(Timestamp::constant(99, 0)));
     }
 
     #[tokio::test]
@@ -3785,8 +3836,8 @@ mod tests {
         GateConfig {
             bind_ip: false,
             v: 1,
-            enforce_from: 0,
-            fail_open_until: 0,
+            enforce_from: None,
+            fail_open_until: None,
             rules: Vec::new(),
         }
     }

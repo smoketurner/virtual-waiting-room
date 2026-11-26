@@ -30,6 +30,7 @@ make validate        # terraform validate the dev root
 make fmt             # terraform fmt -recursive across infra/
 make stack-emulator  # start the AWS Emulator (Docker) the local stack runs against
 make stack           # run the shipped binaries locally and check the design (docs/LOCAL_STACK.md)
+make sim             # the functions' logic on simulated time, at real scale (docs/LOCAL_STACK.md)
 make apply           # real deploy — only when explicitly asked
 prek run             # pre-commit hooks (fmt, actionlint, zizmor, shellcheck)
 ```
@@ -155,12 +156,19 @@ rather than a path that encodes which layer a type lives in.
 the Lambdas. `nojs` is the queue for a visitor without JavaScript (ADR-0037): it depends on
 `generate_token`'s library so a session is only ever minted by `generate_token::admit`.
 
-Every Lambda crate follows the same three-file split, and new ones should:
+Every Lambda crate follows the same split, and new ones should:
 
 - `lib.rs` — pure logic, generic over a `Store` trait (the persistence port). AWS-free, so
   the logic is tested without AWS.
 - `dynamo.rs` — the SDK-backed `Store` implementation.
-- `main.rs` — runtime wiring, environment variables, handler.
+- `http.rs` (API Gateway) or `handler.rs` (SQS) — the request or event handler, generic over the
+  `Store`, in the library so a local simulation runs the same request code as Lambda. It takes
+  its time from the event (API Gateway's `requestTimeEpoch`, SQS's `SentTimestamp`), never from
+  the system clock.
+- `main.rs` — runtime wiring and environment variables.
+
+Time passed between functions is a `jiff::Timestamp`; epoch seconds appear only where a value is
+stored or put on the wire.
 
 `admin` is an Axum Lambda rendering askama compile-time templates, styled with the Vouch design
 language as one self-contained plain-CSS stylesheet — no React, no bundler, no runtime npm
@@ -177,8 +185,8 @@ Four DynamoDB tables, all on-demand with PITR: `Counters` (PK `event_id`), `PreQ
 
 The event's own `Counters` item holds the sequences, phase, seed, origin concurrency, message, and
 the operator's admission override: `admission_control` (the `StoredControl` wire string, `open` or
-`paused` only — never `fail_open`, issue #71) and `fail_open_until` (an epoch-seconds deadline,
-`0` = no window). `wr_common::resolve(stored, fail_open_until, now)` is the only thing that
+`paused` only — never `fail_open`, issue #71) and `fail_open_until` (an
+`Option<Timestamp>` deadline, stored as epoch seconds with `0` for no window). `wr_common::resolve(stored, fail_open_until, now)` is the only thing that
 produces the third, resolved value, `AdmissionControl::FailOpen`; nothing parses it back out of
 storage. `queue_counter` and `serving_counter` must stay on the item — sharding a sequence
 destroys ordering — and both are low-rate: one claim per ingest batch, one advance per controller

@@ -1,270 +1,664 @@
-//! A model of the CDN in front of the read path, built to count what reaches
-//! the origin.
+//! The edge: what CloudFront and API Gateway do between a visitor and the
+//! functions.
 //!
-//! Not an emulator. It reproduces the three behaviours origin load actually
-//! depends on, and nothing else:
-//!
-//! - **Cache key composition.** `/status` is keyed on path alone, so every
-//!   waiting visitor shares one entry. `/queue_num` adds the request id,
-//!   so every visitor has their own and no two ever share a hit. That single
-//!   difference is what decides whether origin load is flat or proportional to
-//!   the number of people waiting.
-//! - **Request collapsing.** Concurrent misses for one key produce one origin
-//!   fetch, and the rest wait for it. Without this a cohort's first poll after
-//!   an expiry is one origin request per visitor, and a model that skipped it
-//!   would report the fan-out as far worse than it is.
-//! - **Negative caching.** Errors are cached for the larger of the error TTL
-//!   and the response's own max-age, and a waiting visitor polls a 404 for as
-//!   long as their position is unassigned, so leaving it out would overstate
-//!   origin load for the whole join window.
-//!
-//! Deliberately absent: multiple edge locations, eviction under memory
-//! pressure, and anything about latency or quotas. Those change the numbers on
-//! real infrastructure; they do not change whether a cache key is shared.
+//! - **Behaviours.** Paths are routed the way `edge/main.tf` orders its cache
+//!   behaviours: the polled API, the join, the write API, the pages, and the
+//!   protected default behind the gate.
+//! - **Caching and collapsing.** The polled paths are cached for the 1 s
+//!   minimum TTL — `/status` on its path alone, `/queue_num` on its query —
+//!   and concurrent misses on one key make one origin fetch. Errors CloudFront
+//!   caches (404, 429, 5xx) are held for the 1 s `error_caching_min_ttl`. This
+//!   is one edge location; a real event spreads across many, each with its own
+//!   cache.
+//! - **API Gateway.** The account's 10,000 requests/s token bucket (5,000
+//!   burst) and the stage's per-method throttles from `core/api.tf`; the join
+//!   method's content-type rule and JSON schema; the REST proxy event the
+//!   functions receive.
+//! - **The gate.** The [`Backend`]'s gate decides every protected request.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::{Mutex, broadcast};
-// `tokio::time::Instant`, not `std::time::Instant`: the cache's expiry clock
-// must follow the runtime's time source so a paused `#[tokio::test]` advances
-// it alongside the poll sleeps. `std::time::Instant` is the real wall clock and
-// never moves during a paused test, so a 1s TTL would never expire and the
-// cache would serve the first phase's body for the whole run. In production
-// (no pause) the two clocks are identical.
+use anyhow::Result;
+use serde_json::json;
+use tokio::sync::OnceCell;
 use tokio::time::Instant;
 
-/// What the CDN did with one client request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Disposition {
-    /// Served from a stored entry.
-    Hit,
-    /// Fetched from the origin.
-    Miss,
-    /// Waited on another request's in-flight fetch of the same key.
-    Collapsed,
+use crate::backend::{Api, Backend};
+use crate::metrics::Metrics;
+use crate::queue::JoinQueue;
+
+/// A request as a visitor's browser sends it.
+#[derive(Debug, Clone, Default)]
+pub struct ViewerRequest {
+    pub method: &'static str,
+    pub path: String,
+    pub query: Vec<(String, String)>,
+    pub cookies: Vec<(String, String)>,
+    pub body: Option<String>,
+    pub content_type: Option<&'static str>,
+    /// Navigation (`Accept: text/html`) or a script's fetch.
+    pub navigation: bool,
+    pub viewer_ip: String,
 }
 
-/// One cached response.
+/// What the browser gets back.
 #[derive(Debug, Clone)]
-struct Entry {
-    status: u16,
-    body: String,
-    expires_at: Instant,
+pub struct ViewerResponse {
+    pub status: u16,
+    pub body: Arc<String>,
+    pub set_cookies: Vec<String>,
 }
 
-/// A fetch already in flight for a key, so arrivals can wait rather than
-/// starting a second one.
-type Inflight = broadcast::Sender<(u16, String)>;
+impl ViewerResponse {
+    fn new(status: u16, body: impl Into<String>) -> Self {
+        Self {
+            status,
+            body: Arc::new(body.into()),
+            set_cookies: Vec::new(),
+        }
+    }
 
-/// Per-endpoint tallies. Client requests are what visitors sent; origin
-/// requests are what got through, which is the number the design's claims are
-/// really about.
-#[derive(Debug, Default)]
-pub struct Counts {
-    pub client: AtomicU64,
-    pub origin: AtomicU64,
-    pub hits: AtomicU64,
-    pub collapsed: AtomicU64,
+    #[must_use]
+    pub fn json(&self) -> Option<serde_json::Value> {
+        serde_json::from_str(&self.body).ok()
+    }
 }
 
-/// The cache, its in-flight fetches, and the tallies.
+/// A token bucket, as API Gateway throttles with.
 #[derive(Debug)]
-pub struct Edge {
-    entries: Mutex<HashMap<String, Entry>>,
-    inflight: Mutex<HashMap<String, Inflight>>,
-    counts: Mutex<HashMap<String, Arc<Counts>>>,
-    /// Minimum lifetime for an error response, independent of its own headers.
-    error_ttl: Duration,
-    /// Origin requests bucketed by the second they happened in.
-    ///
-    /// A total says how much work an event costs; the peak second says whether
-    /// it fits through a throttle. They can differ by orders of magnitude when
-    /// a cohort does something in unison, which is exactly the case here.
-    per_second: Vec<AtomicU64>,
-    started: Instant,
+struct Bucket {
+    rate: f64,
+    burst: f64,
+    tokens: f64,
+    last: Instant,
 }
+
+impl Bucket {
+    fn new(rate: f64, burst: f64) -> Self {
+        Self {
+            rate,
+            burst,
+            tokens: burst,
+            last: Instant::now(),
+        }
+    }
+
+    fn refill(&mut self, now: Instant) {
+        let elapsed = now.duration_since(self.last).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.rate).min(self.burst);
+        self.last = now;
+    }
+}
+
+/// The throttle limits a run uses.
+#[derive(Debug, Clone, Copy)]
+pub struct Throttles {
+    pub account_rate: f64,
+    pub account_burst: f64,
+    pub join_rate: f64,
+    pub join_burst: f64,
+    pub method_rate: f64,
+    pub method_burst: f64,
+}
+
+struct Gateway {
+    account: Bucket,
+    methods: HashMap<&'static str, Bucket>,
+}
+
+impl Gateway {
+    /// Takes one token from the method's bucket and the account's, or neither.
+    fn admit(&mut self, method: &'static str) -> bool {
+        let now = Instant::now();
+        self.account.refill(now);
+        let Some(bucket) = self.methods.get_mut(method) else {
+            return false;
+        };
+        bucket.refill(now);
+        if bucket.tokens >= 1.0 && self.account.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            self.account.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Cached {
+    response: ViewerResponse,
+    expires: Instant,
+}
+
+type Slot = Arc<OnceCell<Cached>>;
+
+pub struct Edge {
+    gateway: Mutex<Gateway>,
+    cache: Mutex<HashMap<String, Slot>>,
+    backend: Arc<dyn Backend>,
+    queue: Arc<JoinQueue>,
+    event_id_max: usize,
+    pub metrics: Arc<Metrics>,
+    request_ids: AtomicU64,
+}
+
+/// The account the proxy event's request context names.
+pub const ACCOUNT_ID: &str = "000000000000";
+
+/// The JavaScript API paths and their API Gateway method keys.
+const STATUS: &str = "/_wr/v1/status";
+const QUEUE_NUM: &str = "/_wr/v1/queue_num";
+const JOIN: &str = "/_wr/v1/join";
+const GENERATE_TOKEN: &str = "/_wr/v1/generate_token";
 
 impl Edge {
     #[must_use]
-    pub fn new(error_ttl: Duration, run_seconds: u64) -> Self {
-        Self {
-            entries: Mutex::new(HashMap::new()),
-            inflight: Mutex::new(HashMap::new()),
-            counts: Mutex::new(HashMap::new()),
-            error_ttl,
-            per_second: (0..=run_seconds).map(|_| AtomicU64::new(0)).collect(),
-            started: Instant::now(),
-        }
-    }
-
-    /// The busiest second of the run, and which second it was.
-    #[must_use]
-    pub fn peak_origin_per_second(&self) -> (u64, u64) {
-        self.per_second
-            .iter()
-            .enumerate()
-            .map(|(second, count)| (count.load(Ordering::Relaxed), second as u64))
-            .max()
-            .unwrap_or((0, 0))
-    }
-
-    /// Origin requests per second, in order.
-    #[must_use]
-    pub fn origin_timeline(&self) -> Vec<u64> {
-        self.per_second
-            .iter()
-            .map(|c| c.load(Ordering::Relaxed))
-            .collect()
-    }
-
-    fn record_origin(&self) {
-        let second = self.started.elapsed().as_secs() as usize;
-        if let Some(bucket) = self.per_second.get(second) {
-            bucket.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    /// Tallies for one endpoint, created on first use.
-    pub async fn counts_for(&self, endpoint: &str) -> Arc<Counts> {
-        let mut counts = self.counts.lock().await;
-        Arc::clone(
-            counts
-                .entry(endpoint.to_owned())
-                .or_insert_with(|| Arc::new(Counts::default())),
-        )
-    }
-
-    /// Every endpoint's tallies, for the report.
-    pub async fn snapshot(&self) -> Vec<(String, u64, u64, u64, u64)> {
-        let counts = self.counts.lock().await;
-        let mut rows: Vec<_> = counts
-            .iter()
-            .map(|(endpoint, c)| {
-                (
-                    endpoint.clone(),
-                    c.client.load(Ordering::Relaxed),
-                    c.origin.load(Ordering::Relaxed),
-                    c.hits.load(Ordering::Relaxed),
-                    c.collapsed.load(Ordering::Relaxed),
-                )
-            })
-            .collect();
-        rows.sort_by(|a, b| a.0.cmp(&b.0));
-        rows
-    }
-
-    /// Serves one request, going to the origin only when nothing usable is
-    /// cached and no identical fetch is already running.
-    ///
-    /// `key` is the composed cache key — the caller decides what belongs in it,
-    /// because that composition is the thing under test.
-    pub async fn serve<F, Fut>(
-        &self,
-        endpoint: &str,
-        key: &str,
-        ttl: Duration,
-        fetch: F,
-    ) -> (u16, String, Disposition)
-    where
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = (u16, String)>,
-    {
-        let counts = self.counts_for(endpoint).await;
-        counts.client.fetch_add(1, Ordering::Relaxed);
-
-        let now = Instant::now();
-        {
-            let entries = self.entries.lock().await;
-            if let Some(entry) = entries.get(key)
-                && entry.expires_at > now
-            {
-                counts.hits.fetch_add(1, Ordering::Relaxed);
-                return (entry.status, entry.body.clone(), Disposition::Hit);
-            }
-        }
-
-        // Join an identical fetch rather than starting a second one. The
-        // receiver is taken while holding the lock so a fetch cannot finish and
-        // be forgotten between the lookup and the subscribe.
-        let waiter = {
-            let inflight = self.inflight.lock().await;
-            inflight.get(key).map(broadcast::Sender::subscribe)
-        };
-        if let Some(mut rx) = waiter {
-            counts.collapsed.fetch_add(1, Ordering::Relaxed);
-            return match rx.recv().await {
-                Ok((status, body)) => (status, body, Disposition::Collapsed),
-                // The leader died without publishing; report it rather than
-                // silently making this look like a successful collapse.
-                Err(_) => (502, String::from("collapse failed"), Disposition::Collapsed),
-            };
-        }
-
-        let (tx, _) = broadcast::channel(1);
-        {
-            let mut inflight = self.inflight.lock().await;
-            // Another task may have become leader while this one was deciding.
-            if let Some(existing) = inflight.get(key) {
-                let mut rx = existing.subscribe();
-                drop(inflight);
-                counts.collapsed.fetch_add(1, Ordering::Relaxed);
-                return match rx.recv().await {
-                    Ok((status, body)) => (status, body, Disposition::Collapsed),
-                    Err(_) => (502, String::from("collapse failed"), Disposition::Collapsed),
-                };
-            }
-            // A previous leader may have finished and populated `entries`
-            // between the cache check above and here — its in-flight entry is
-            // already gone, so the `inflight` re-check above would miss it and
-            // this task would start a redundant origin fetch. Re-check the
-            // cache while holding `inflight` so no leader can remove its entry
-            // between this read and the insert below.
-            {
-                let now = Instant::now();
-                let entries = self.entries.lock().await;
-                if let Some(entry) = entries.get(key)
-                    && entry.expires_at > now
-                {
-                    drop(inflight);
-                    counts.hits.fetch_add(1, Ordering::Relaxed);
-                    return (entry.status, entry.body.clone(), Disposition::Hit);
-                }
-            }
-            inflight.insert(key.to_owned(), tx.clone());
-        }
-
-        counts.origin.fetch_add(1, Ordering::Relaxed);
-        self.record_origin();
-        let (status, body) = fetch().await;
-
-        // An error outlives its own max-age: a waiting visitor polls a 404 for
-        // the whole time their position is unassigned, and caching it for only
-        // the response TTL would send nearly every one of those polls through.
-        let lifetime = if status >= 400 {
-            ttl.max(self.error_ttl)
-        } else {
-            ttl
-        };
-        {
-            let mut entries = self.entries.lock().await;
-            entries.insert(
-                key.to_owned(),
-                Entry {
-                    status,
-                    body: body.clone(),
-                    expires_at: Instant::now() + lifetime,
-                },
+    pub fn new(
+        throttles: Throttles,
+        backend: Arc<dyn Backend>,
+        queue: Arc<JoinQueue>,
+        event_id: &str,
+        metrics: Arc<Metrics>,
+    ) -> Self {
+        let mut methods = HashMap::new();
+        methods.insert(JOIN, Bucket::new(throttles.join_rate, throttles.join_burst));
+        for path in [STATUS, QUEUE_NUM, GENERATE_TOKEN] {
+            methods.insert(
+                path,
+                Bucket::new(throttles.method_rate, throttles.method_burst),
             );
         }
-        {
-            let mut inflight = self.inflight.lock().await;
-            inflight.remove(key);
+        Self {
+            gateway: Mutex::new(Gateway {
+                account: Bucket::new(throttles.account_rate, throttles.account_burst),
+                methods,
+            }),
+            cache: Mutex::new(HashMap::new()),
+            backend,
+            queue,
+            event_id_max: event_id.len(),
+            metrics,
+            request_ids: AtomicU64::new(0),
         }
-        let _ = tx.send((status, body.clone()));
+    }
 
-        (status, body, Disposition::Miss)
+    /// One viewer request, end to end.
+    pub async fn request(&self, req: ViewerRequest) -> ViewerResponse {
+        let path = req.path.clone();
+        let route: &'static str = match path.as_str() {
+            STATUS => STATUS,
+            QUEUE_NUM => QUEUE_NUM,
+            JOIN => JOIN,
+            GENERATE_TOKEN => GENERATE_TOKEN,
+            p if p.starts_with("/_wr/") => "pages",
+            _ => "protected",
+        };
+        let response = match route {
+            STATUS => self.cached(route, STATUS.to_owned(), &req).await,
+            QUEUE_NUM => {
+                let mut key = QUEUE_NUM.to_owned();
+                for (k, v) in &req.query {
+                    if k == "request_id" || k == "event_id" {
+                        key.push_str(&format!("&{k}={v}"));
+                    }
+                }
+                self.cached(route, key, &req).await
+            }
+            JOIN => self.join(&req),
+            GENERATE_TOKEN => self.api(route, &req).await,
+            "pages" => ViewerResponse::new(200, "<html></html>"),
+            _ => self.protected(&req).await,
+        };
+        self.metrics.viewer(route, response.status);
+        response
+    }
+
+    async fn cached(
+        &self,
+        route: &'static str,
+        key: String,
+        req: &ViewerRequest,
+    ) -> ViewerResponse {
+        loop {
+            let slot = {
+                let Ok(mut cache) = self.cache.lock() else {
+                    return ViewerResponse::new(500, "cache poisoned");
+                };
+                let fresh = cache
+                    .get(&key)
+                    .filter(|slot| slot.get().is_none_or(|c| c.expires > Instant::now()));
+                if let Some(slot) = fresh {
+                    Arc::clone(slot)
+                } else {
+                    let slot: Slot = Arc::new(OnceCell::new());
+                    cache.insert(key.clone(), Arc::clone(&slot));
+                    slot
+                }
+            };
+            let mut fetched = false;
+            let cached = slot
+                .get_or_init(|| async {
+                    fetched = true;
+                    let response = self.api(route, req).await;
+                    let ttl = match response.status {
+                        200 | 404 | 429 | 500 | 502 | 503 | 504 => Duration::from_secs(1),
+                        _ => Duration::ZERO,
+                    };
+                    Cached {
+                        response,
+                        expires: Instant::now() + ttl,
+                    }
+                })
+                .await;
+            if fetched {
+                self.metrics.origin(route);
+            }
+            if cached.expires > Instant::now() || fetched {
+                return cached.response.clone();
+            }
+            // An uncacheable answer someone else fetched: fetch our own.
+        }
+    }
+
+    fn join(&self, req: &ViewerRequest) -> ViewerResponse {
+        if !self.throttle(JOIN) {
+            return ViewerResponse::new(429, r#"{"message":"Too Many Requests"}"#);
+        }
+        if req.content_type != Some("application/json") {
+            return ViewerResponse::new(415, r#"{"message":"Unsupported Media Type"}"#);
+        }
+        let Some(body) = req.body.as_deref() else {
+            return ViewerResponse::new(400, r#"{"message":"Invalid request body"}"#);
+        };
+        if !self.join_schema_accepts(body) {
+            return ViewerResponse::new(400, r#"{"message":"Invalid request body"}"#);
+        }
+        self.queue.send(body.to_owned());
+        self.metrics.origin(JOIN);
+        ViewerResponse::new(200, "{}")
+    }
+
+    /// `aws_api_gateway_model.join`: exactly `request_id`, `event_id` and `h`,
+    /// each a bounded string, `h` 43 base64url characters.
+    fn join_schema_accepts(&self, body: &str) -> bool {
+        let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(body)
+        else {
+            return false;
+        };
+        if map.len() != 3 {
+            return false;
+        }
+        let field = |name: &str, min: usize, max: usize| {
+            map.get(name)
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| (min..=max).contains(&s.len()))
+        };
+        let h_ok = map.get("h").and_then(|v| v.as_str()).is_some_and(|h| {
+            h.len() == 43
+                && h.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        });
+        field("request_id", 1, 36) && field("event_id", 1, self.event_id_max) && h_ok
+    }
+
+    fn throttle(&self, method: &'static str) -> bool {
+        let admitted = self
+            .gateway
+            .lock()
+            .map(|mut g| g.admit(method))
+            .unwrap_or(false);
+        if !admitted {
+            self.metrics.throttled(method);
+        }
+        admitted
+    }
+
+    /// API Gateway in front of a Lambda proxy integration.
+    async fn api(&self, route: &'static str, req: &ViewerRequest) -> ViewerResponse {
+        if !self.throttle(route) {
+            return ViewerResponse::new(429, r#"{"message":"Too Many Requests"}"#);
+        }
+        let api = if route == GENERATE_TOKEN {
+            Api::GenerateToken
+        } else {
+            Api::Read
+        };
+        let event = self.proxy_event(req);
+        match self.backend.invoke(api, event).await {
+            Ok(reply) => proxy_response(&reply),
+            Err(_) => ViewerResponse::new(502, r#"{"message":"Internal server error"}"#),
+        }
+    }
+
+    fn proxy_event(&self, req: &ViewerRequest) -> serde_json::Value {
+        let id = self.request_ids.fetch_add(1, Ordering::Relaxed);
+        let query: serde_json::Map<String, serde_json::Value> = req
+            .query
+            .iter()
+            .map(|(k, v)| (k.clone(), json!(v)))
+            .collect();
+        let multi_query: serde_json::Map<String, serde_json::Value> = req
+            .query
+            .iter()
+            .map(|(k, v)| (k.clone(), json!([v])))
+            .collect();
+        let mut headers = serde_json::Map::new();
+        if let Some(ct) = req.content_type {
+            headers.insert("content-type".to_owned(), json!(ct));
+        }
+        // `origin_request_policy.generate_token` forwards the viewer address.
+        headers.insert(
+            "cloudfront-viewer-address".to_owned(),
+            json!(format!("{}:443", req.viewer_ip)),
+        );
+        let multi_headers: serde_json::Map<String, serde_json::Value> = headers
+            .iter()
+            .map(|(k, v)| (k.clone(), json!([v])))
+            .collect();
+        json!({
+            "resource": req.path,
+            "path": req.path,
+            "httpMethod": req.method,
+            "headers": headers,
+            "multiValueHeaders": multi_headers,
+            "queryStringParameters": if query.is_empty() { serde_json::Value::Null } else { json!(query) },
+            "multiValueQueryStringParameters": if multi_query.is_empty() { serde_json::Value::Null } else { json!(multi_query) },
+            "pathParameters": null,
+            "stageVariables": null,
+            "requestContext": {
+                "resourcePath": req.path,
+                "httpMethod": req.method,
+                "path": format!("/dev{}", req.path),
+                "stage": "dev",
+                "requestId": format!("req-{id}"),
+                "requestTimeEpoch": crate::clock::now().as_millisecond(),
+                "accountId": ACCOUNT_ID,
+                "apiId": "local",
+                "identity": { "sourceIp": req.viewer_ip },
+                "protocol": "HTTP/1.1",
+            },
+            "body": req.body,
+            "isBase64Encoded": false,
+        })
+    }
+
+    /// The protected behaviour: the gate decides, and a request it passes
+    /// reaches the client origin, which counts it.
+    async fn protected(&self, req: &ViewerRequest) -> ViewerResponse {
+        let cookies: serde_json::Map<String, serde_json::Value> = req
+            .cookies
+            .iter()
+            .map(|(k, v)| (k.clone(), json!(v)))
+            .collect();
+        let accept = if req.navigation {
+            "text/html"
+        } else {
+            "application/json"
+        };
+        let viewer = json!({
+            "method": req.method,
+            "uri": req.path,
+            "ip": req.viewer_ip,
+            "headers": { "accept": accept },
+            "cookies": cookies,
+        });
+        let decision = match self.backend.gate(viewer).await {
+            Ok(d) => d,
+            Err(e) => return ViewerResponse::new(599, format!("gate: {e:#}")),
+        };
+        if decision.get("pass").and_then(serde_json::Value::as_bool) == Some(true) {
+            if decision.get("failed").and_then(serde_json::Value::as_bool) == Some(true) {
+                self.metrics.gate_failed_open();
+            }
+            self.metrics.origin("protected");
+            return ViewerResponse::new(200, "origin");
+        }
+        let status = decision
+            .get("status")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|s| u16::try_from(s).ok())
+            .unwrap_or(403);
+        ViewerResponse::new(status, decision.to_string())
+    }
+}
+
+/// Maps a Lambda proxy response back to what the viewer receives.
+fn proxy_response(reply: &serde_json::Value) -> ViewerResponse {
+    let status = reply
+        .get("statusCode")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|s| u16::try_from(s).ok())
+        .unwrap_or(502);
+    let body = reply
+        .get("body")
+        .and_then(|b| b.as_str())
+        .unwrap_or_default()
+        .to_owned();
+    let mut response = ViewerResponse::new(status, body);
+    let mut cookies: Vec<String> = Vec::new();
+    if let Some(list) = reply.get("cookies").and_then(|c| c.as_array()) {
+        cookies.extend(list.iter().filter_map(|v| v.as_str().map(str::to_owned)));
+    }
+    for key in ["multiValueHeaders", "headers"] {
+        if !cookies.is_empty() {
+            break;
+        }
+        let Some(headers) = reply.get(key).and_then(|h| h.as_object()) else {
+            continue;
+        };
+        for (name, value) in headers {
+            if !name.eq_ignore_ascii_case("set-cookie") {
+                continue;
+            }
+            match value {
+                serde_json::Value::Array(values) => {
+                    cookies.extend(values.iter().filter_map(|v| v.as_str().map(str::to_owned)));
+                }
+                other => cookies.extend(other.as_str().map(str::to_owned)),
+            }
+        }
+    }
+    response.set_cookies = cookies;
+    response
+}
+
+/// Serves the edge over HTTP, for pages driven by the shipped `waiting.js`.
+///
+/// # Errors
+///
+/// The port cannot be bound.
+pub async fn serve(edge: Arc<Edge>) -> Result<std::net::SocketAddr> {
+    let app = axum::Router::new().fallback(over_http).with_state(edge);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    Ok(addr)
+}
+
+async fn over_http(
+    axum::extract::State(edge): axum::extract::State<Arc<Edge>>,
+    req: axum::http::Request<axum::body::Body>,
+) -> axum::http::Response<axum::body::Body> {
+    let (parts, body) = req.into_parts();
+    let header = |name: &str| {
+        parts
+            .headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let query = parts
+        .uri
+        .query()
+        .unwrap_or_default()
+        .split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .map(|(k, v)| (k.to_owned(), percent_decode(v)))
+        .collect();
+    let cookies = header("cookie")
+        .split(';')
+        .filter_map(|kv| kv.split_once('='))
+        .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
+        .collect();
+    let body = axum::body::to_bytes(body, 1024 * 1024)
+        .await
+        .unwrap_or_default();
+    let method = match parts.method.as_str() {
+        "POST" => "POST",
+        _ => "GET",
+    };
+    let request = ViewerRequest {
+        method,
+        path: parts.uri.path().to_owned(),
+        query,
+        cookies,
+        body: (!body.is_empty()).then(|| String::from_utf8_lossy(&body).into_owned()),
+        content_type: header("content-type")
+            .starts_with("application/json")
+            .then_some("application/json"),
+        navigation: header("accept").contains("text/html"),
+        viewer_ip: "10.255.0.1".to_owned(),
+    };
+    let response = edge.request(request).await;
+    let mut out = axum::http::Response::new(axum::body::Body::from(response.body.to_string()));
+    *out.status_mut() = axum::http::StatusCode::from_u16(response.status)
+        .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+    for cookie in &response.set_cookies {
+        if let Ok(value) = axum::http::HeaderValue::from_str(cookie) {
+            out.headers_mut().append("set-cookie", value);
+        }
+    }
+    out
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let decoded = (bytes[i] == b'%')
+            .then(|| s.get(i + 1..i + 3))
+            .flatten()
+            .and_then(|h| u8::from_str_radix(h, 16).ok());
+        if let Some(b) = decoded {
+            out.push(b);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(clippy::unwrap_used, reason = "test code panics on setup failure")]
+
+    use std::sync::atomic::AtomicU64;
+
+    use super::*;
+    use crate::backend::Reply;
+
+    /// A `read` that counts its invocations and takes a moment to answer, so
+    /// concurrent misses overlap it.
+    struct Counting {
+        calls: AtomicU64,
+        status: u16,
+    }
+
+    impl Backend for Counting {
+        fn invoke(&self, _api: Api, _event: serde_json::Value) -> Reply<'_> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Ok(json!({ "statusCode": self.status, "body": "{}" }))
+            })
+        }
+
+        fn gate(&self, _viewer: serde_json::Value) -> Reply<'_> {
+            Box::pin(async { Ok(json!({ "pass": false, "status": 403 })) })
+        }
+    }
+
+    fn edge(status: u16) -> (Arc<Edge>, Arc<Counting>) {
+        let backend = Arc::new(Counting {
+            calls: AtomicU64::new(0),
+            status,
+        });
+        let edge = Edge::new(
+            Throttles {
+                account_rate: 1e9,
+                account_burst: 1e9,
+                join_rate: 1e9,
+                join_burst: 1e9,
+                method_rate: 1e9,
+                method_burst: 1e9,
+            },
+            backend.clone(),
+            Arc::new(JoinQueue::new("test://join".to_owned(), 0.0, 1)),
+            "evt",
+            Arc::new(Metrics::new(Instant::now())),
+        );
+        (Arc::new(edge), backend)
+    }
+
+    fn status() -> ViewerRequest {
+        ViewerRequest {
+            method: "GET",
+            path: STATUS.to_owned(),
+            viewer_ip: "10.0.0.1".to_owned(),
+            ..ViewerRequest::default()
+        }
+    }
+
+    async fn burst(edge: &Arc<Edge>, n: usize) -> Vec<u16> {
+        let mut handles = Vec::with_capacity(n);
+        for _ in 0..n {
+            let edge = Arc::clone(edge);
+            handles.push(tokio::spawn(
+                async move { edge.request(status()).await.status },
+            ));
+        }
+        let mut statuses = Vec::with_capacity(n);
+        for h in handles {
+            statuses.push(h.await.unwrap());
+        }
+        statuses
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cohort_missing_together_makes_one_origin_fetch() {
+        let (edge, backend) = edge(200);
+        let statuses = burst(&edge, 500).await;
+        assert!(statuses.iter().all(|&s| s == 200));
+        assert_eq!(backend.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_cached_answer_serves_until_its_ttl_then_one_more_fetch() {
+        let (edge, backend) = edge(200);
+        burst(&edge, 10).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        burst(&edge, 10).await;
+        assert_eq!(backend.calls.load(Ordering::Relaxed), 1, "inside the TTL");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        burst(&edge, 10).await;
+        assert_eq!(backend.calls.load(Ordering::Relaxed), 2, "after it");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_error_is_cached_like_cloudfront_caches_it() {
+        // `error_caching_min_ttl` holds a 5xx for a second, so a failing
+        // origin is asked once a second, not once a viewer.
+        let (edge, backend) = edge(503);
+        let statuses = burst(&edge, 100).await;
+        assert!(statuses.iter().all(|&s| s == 503));
+        assert_eq!(backend.calls.load(Ordering::Relaxed), 1);
     }
 }

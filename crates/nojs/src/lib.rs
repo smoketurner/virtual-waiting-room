@@ -24,8 +24,10 @@
 //! This module is AWS-free: the join queue is a port ([`JoinQueue`]) and the
 //! admission store is `generate_token`'s.
 
+use jiff::{SignedDuration, Timestamp};
 use std::future::Future;
 
+pub mod http;
 pub mod page;
 pub mod sqs;
 
@@ -38,14 +40,14 @@ use wr_common::{PossessionSecret, SecretDigest};
 pub const IDENTITY_COOKIE: &str = "vwr_nojs";
 pub const IDENTITY_COOKIE_PATH: &str = "/_wr/v1/";
 /// How long the identity is kept, matching the script's storage.
-pub const IDENTITY_MAX_AGE_SECS: u64 = 86_400;
+pub const IDENTITY_MAX_AGE: SignedDuration = SignedDuration::from_hours(24);
 
 /// How long a join may go unanswered before it is taken for lost and sent
 /// again (issue #251). The ingest's worst-case delivery latency is about 20
 /// seconds (the event source mapping's batch window on a quiet queue), so a
 /// join still in flight is not resent; `waiting.js` clears the same window
 /// with its `MAX_MISSES`.
-pub const REJOIN_AFTER_SECS: u64 = 60;
+pub const REJOIN_AFTER: SignedDuration = SignedDuration::from_mins(1);
 /// How many times a lost join is sent again before the visitor is told and
 /// given the form back. Bounded so a join nothing will ever accept does not
 /// cost a queue write a minute for the cookie's whole day.
@@ -66,8 +68,9 @@ pub const WAIT_PATH: &str = "/_wr/v1/wait";
 pub struct Identity {
     pub request_id: String,
     pub secret: PossessionSecret,
-    /// Epoch seconds at which the join was last put on the queue.
-    pub joined_at: u64,
+    /// When the join was last put on the queue, to the whole second the
+    /// cookie carries.
+    pub joined_at: Timestamp,
     /// How many times it has been sent again since the first.
     pub rejoins: u8,
 }
@@ -91,13 +94,13 @@ pub enum Unanswered {
 pub struct RngUnavailable;
 
 impl Identity {
-    /// Mints a fresh identity: a `UUIDv7` whose timestamp is `now_ms` and 32
+    /// Mints a fresh identity at `now`: a `UUIDv7` carrying that time and 32
     /// random bytes of secret, both from the aws-lc-rs RNG.
     ///
     /// # Errors
     ///
     /// [`RngUnavailable`] if the RNG cannot be read.
-    pub fn mint(now_ms: u64) -> Result<Self, RngUnavailable> {
+    pub fn mint(now: Timestamp) -> Result<Self, RngUnavailable> {
         use aws_lc_rs::rand::{SecureRandom, SystemRandom};
         use base64::Engine as _;
 
@@ -106,7 +109,9 @@ impl Identity {
         let mut secret = [0u8; 32];
         rng.fill(&mut id_bits).map_err(|_| RngUnavailable)?;
         rng.fill(&mut secret).map_err(|_| RngUnavailable)?;
-        let request_id = uuid::Builder::from_unix_timestamp_millis(now_ms, &id_bits)
+        // API Gateway's time is never before the epoch.
+        let millis = u64::try_from(now.as_millisecond()).unwrap_or_default();
+        let request_id = uuid::Builder::from_unix_timestamp_millis(millis, &id_bits)
             .into_uuid()
             .to_string();
         let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(secret);
@@ -114,7 +119,7 @@ impl Identity {
         Ok(Self {
             request_id,
             secret,
-            joined_at: now_ms / 1000,
+            joined_at: whole_second(now),
             rejoins: 0,
         })
     }
@@ -133,7 +138,8 @@ impl Identity {
         Some(Self {
             request_id: request_id.to_owned(),
             secret: PossessionSecret::parse(secret).ok()?,
-            joined_at: parse_decimal(joined_at)?,
+            joined_at: Timestamp::from_second(i64::try_from(parse_decimal(joined_at)?).ok()?)
+                .ok()?,
             rejoins: u8::try_from(parse_decimal(rejoins)?).ok()?,
         })
     }
@@ -145,12 +151,12 @@ impl Identity {
             "{}.{}.{}.{}",
             self.request_id,
             self.secret.expose(),
-            self.joined_at,
+            self.joined_at.as_second(),
             self.rejoins
         )
     }
 
-    /// What to do at `now` (epoch seconds) when no registration exists for
+    /// What to do at `now` when no registration exists for
     /// this identity (issue #251).
     ///
     /// A join the queue or the ingest lost leaves nothing behind, so the only
@@ -159,15 +165,15 @@ impl Identity {
     /// a first join that was merely slow is not given a second one. A stamp
     /// from the future counts as just sent.
     #[must_use]
-    pub fn unanswered(&self, now: u64) -> Unanswered {
-        if now.saturating_sub(self.joined_at) <= REJOIN_AFTER_SECS {
+    pub fn unanswered(&self, now: Timestamp) -> Unanswered {
+        if now.duration_since(self.joined_at) <= REJOIN_AFTER {
             return Unanswered::InFlight;
         }
         match self.rejoins.checked_add(1) {
             Some(rejoins) if rejoins <= MAX_REJOINS => Unanswered::Resend(Self {
                 request_id: self.request_id.clone(),
                 secret: self.secret.clone(),
-                joined_at: now,
+                joined_at: whole_second(now),
                 rejoins,
             }),
             Some(_) | None => Unanswered::GaveUp,
@@ -178,8 +184,9 @@ impl Identity {
     #[must_use]
     pub fn set_cookie(&self) -> String {
         format!(
-            "{IDENTITY_COOKIE}={}; Path={IDENTITY_COOKIE_PATH}; Max-Age={IDENTITY_MAX_AGE_SECS}; Secure; HttpOnly; SameSite=Lax",
-            self.cookie_value()
+            "{IDENTITY_COOKIE}={}; Path={IDENTITY_COOKIE_PATH}; Max-Age={}; Secure; HttpOnly; SameSite=Lax",
+            self.cookie_value(),
+            IDENTITY_MAX_AGE.as_secs()
         )
     }
 
@@ -199,6 +206,12 @@ impl Identity {
 
 /// A plain decimal number: digits only, so `+5` and a 40-digit string a
 /// visitor typed into their cookie are both refused rather than interpreted.
+/// `at` truncated to the whole second the cookie carries, so an identity
+/// round-trips through it.
+fn whole_second(at: Timestamp) -> Timestamp {
+    Timestamp::from_second(at.as_second()).unwrap_or(at)
+}
+
 fn parse_decimal(text: &str) -> Option<u64> {
     if text.is_empty() || text.len() > 20 || !text.bytes().all(|b| b.is_ascii_digit()) {
         return None;
@@ -392,21 +405,25 @@ mod tests {
     const SECRET: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
     /// The second the test identity's join was sent at.
-    const JOINED: u64 = 1_700_000_000;
+    const JOINED_SECS: i64 = 1_700_000_000;
+    const JOINED: Timestamp = Timestamp::constant(JOINED_SECS, 0);
 
     fn identity() -> Identity {
-        Identity::parse(&format!("{ID}.{SECRET}.{JOINED}.0")).unwrap()
+        Identity::parse(&format!("{ID}.{SECRET}.{JOINED_SECS}.0")).unwrap()
     }
 
     #[test]
     fn a_minted_identity_round_trips_through_its_cookie() {
-        let minted = Identity::mint(1_700_000_000_000).unwrap();
+        let minted = Identity::mint(Timestamp::constant(1_700_000_000, 0)).unwrap();
         assert!(wr_common::is_uuid_shape(&minted.request_id));
         assert_eq!(
             Identity::parse(&minted.cookie_value()),
             Some(minted.clone())
         );
-        assert_ne!(Identity::mint(1_700_000_000_000).unwrap(), minted);
+        assert_ne!(
+            Identity::mint(Timestamp::constant(1_700_000_000, 0)).unwrap(),
+            minted
+        );
     }
 
     #[test]
@@ -419,21 +436,21 @@ mod tests {
 
     #[test]
     fn only_a_well_formed_identity_cookie_is_an_identity() {
-        let header = format!("other=1; {IDENTITY_COOKIE}={ID}.{SECRET}.{JOINED}.0; x=y");
+        let header = format!("other=1; {IDENTITY_COOKIE}={ID}.{SECRET}.{JOINED_SECS}.0; x=y");
         assert_eq!(identity_from_cookies(&header), Some(identity()));
         for bad in [
             format!("{IDENTITY_COOKIE}={ID}"),
-            format!("{IDENTITY_COOKIE}={ID}.short.{JOINED}.0"),
-            format!("{IDENTITY_COOKIE}=not-a-uuid.{SECRET}.{JOINED}.0"),
-            format!("x{IDENTITY_COOKIE}={ID}.{SECRET}.{JOINED}.0"),
+            format!("{IDENTITY_COOKIE}={ID}.short.{JOINED_SECS}.0"),
+            format!("{IDENTITY_COOKIE}=not-a-uuid.{SECRET}.{JOINED_SECS}.0"),
+            format!("x{IDENTITY_COOKIE}={ID}.{SECRET}.{JOINED_SECS}.0"),
             // Without the join stamp there is no telling a lost join from a
             // slow one (issue #251), so it is no identity.
             format!("{IDENTITY_COOKIE}={ID}.{SECRET}"),
-            format!("{IDENTITY_COOKIE}={ID}.{SECRET}.{JOINED}"),
-            format!("{IDENTITY_COOKIE}={ID}.{SECRET}.{JOINED}.0.0"),
+            format!("{IDENTITY_COOKIE}={ID}.{SECRET}.{JOINED_SECS}"),
+            format!("{IDENTITY_COOKIE}={ID}.{SECRET}.{JOINED_SECS}.0.0"),
             format!("{IDENTITY_COOKIE}={ID}.{SECRET}.+5.0"),
-            format!("{IDENTITY_COOKIE}={ID}.{SECRET}.{JOINED}.256"),
-            format!("{IDENTITY_COOKIE}={ID}.{SECRET}.{JOINED}.-1"),
+            format!("{IDENTITY_COOKIE}={ID}.{SECRET}.{JOINED_SECS}.256"),
+            format!("{IDENTITY_COOKIE}={ID}.{SECRET}.{JOINED_SECS}.-1"),
             format!("{IDENTITY_COOKIE}={ID}.{SECRET}.{}.0", "9".repeat(21)),
             String::new(),
         ] {
@@ -468,7 +485,7 @@ mod tests {
 
     #[test]
     fn a_minted_identity_is_stamped_with_when_it_joined() {
-        let minted = Identity::mint(1_700_000_000_999).unwrap();
+        let minted = Identity::mint(Timestamp::constant(1_700_000_000, 999_000_000)).unwrap();
         assert_eq!((minted.joined_at, minted.rejoins), (JOINED, 0));
     }
 
@@ -476,27 +493,37 @@ mod tests {
     fn an_unanswered_join_is_left_alone_while_it_can_still_be_in_flight() {
         // The ingest may take 20 s on a quiet queue; a resend inside that is
         // a duplicate message for a place that is simply late.
-        for elapsed in [0, 20, REJOIN_AFTER_SECS] {
+        for elapsed in [
+            SignedDuration::ZERO,
+            SignedDuration::from_secs(20),
+            REJOIN_AFTER,
+        ] {
             assert_eq!(
                 identity().unanswered(JOINED + elapsed),
                 Unanswered::InFlight,
-                "{elapsed}s"
+                "{elapsed:?}"
             );
         }
         // A stamp ahead of this clock is treated as just sent.
-        assert_eq!(identity().unanswered(JOINED - 500), Unanswered::InFlight);
+        assert_eq!(
+            identity().unanswered(JOINED - SignedDuration::from_secs(500)),
+            Unanswered::InFlight
+        );
     }
 
     #[test]
     fn an_overdue_join_is_resent_as_the_same_join_and_restamped() {
-        let now = JOINED + REJOIN_AFTER_SECS + 1;
+        let now = JOINED + REJOIN_AFTER + SignedDuration::from_secs(1);
         let resent = resent(identity().unanswered(now)).unwrap();
         assert_eq!(resent.joined_at, now);
         assert_eq!(resent.rejoins, 1);
         // Same id, same digest: assign_position cannot give it a second place.
         assert_eq!(resent.join_message("evt"), identity().join_message("evt"));
         // Restamped, so the next reload waits a full window before the next.
-        assert_eq!(resent.unanswered(now + 5), Unanswered::InFlight);
+        assert_eq!(
+            resent.unanswered(now + SignedDuration::from_secs(5)),
+            Unanswered::InFlight
+        );
         assert_eq!(Identity::parse(&resent.cookie_value()), Some(resent));
     }
 
@@ -505,13 +532,16 @@ mod tests {
         let mut held = identity();
         let mut now = JOINED;
         for expected in 1..=MAX_REJOINS {
-            now += REJOIN_AFTER_SECS + 1;
+            now += REJOIN_AFTER + SignedDuration::from_secs(1);
             let resent = resent(held.unanswered(now)).unwrap();
             assert_eq!(resent.rejoins, expected);
             held = resent;
         }
-        assert_eq!(held.unanswered(now + 5), Unanswered::InFlight);
-        now += REJOIN_AFTER_SECS + 1;
+        assert_eq!(
+            held.unanswered(now + SignedDuration::from_secs(5)),
+            Unanswered::InFlight
+        );
+        now += REJOIN_AFTER + SignedDuration::from_secs(1);
         assert_eq!(held.unanswered(now), Unanswered::GaveUp);
 
         // A count a visitor wrote into the cookie cannot overflow into more.
@@ -588,7 +618,7 @@ mod tests {
         assert_eq!(
             outcome(Admission::Admitted {
                 position: 1,
-                expires_at: 2,
+                expires_at: Timestamp::constant(2, 0),
                 credential: "jws".to_owned()
             }),
             WaitOutcome::Admit {

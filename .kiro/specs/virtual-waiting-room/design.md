@@ -25,7 +25,8 @@ them, and the invariants a change must not break. It does not repeat the narrati
 | Waiting page (`edge/pages/`) | `waiting.html` + `waiting.js` in S3 under `/_wr/*`, ungated | DESIGN §8, §9 |
 
 Every Lambda crate is split into `lib.rs` (pure logic, generic over a `Store` trait), `dynamo.rs`
-(the SDK-backed `Store`) and `main.rs` (wiring). Tests mock the `Store`, never the logic.
+(the SDK-backed `Store`), `http.rs` or `handler.rs` (the handler, generic over the `Store`, timed
+by its event) and `main.rs` (wiring). Tests mock the `Store`, never the logic.
 
 ## Interfaces
 

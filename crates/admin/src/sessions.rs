@@ -13,6 +13,7 @@
 //!   session's CSRF token (issue #243) for ~8 h. The cookie carries only the
 //!   opaque `<id>`.
 
+use jiff::{SignedDuration, Timestamp};
 use std::collections::HashMap;
 
 use aws_sdk_dynamodb::Client;
@@ -22,9 +23,9 @@ use wr_common::expr::{Key, TOKENS_TTL_ATTR};
 use crate::arrival::ArrivalTime;
 
 /// TTL for a pending login transaction (PKCE verifier + nonce).
-const PKCE_TTL_SECS: u64 = 600;
+const PKCE_TTL: SignedDuration = SignedDuration::from_mins(10);
 /// TTL for an authenticated session.
-const SESSION_TTL_SECS: u64 = 8 * 60 * 60;
+const SESSION_TTL: SignedDuration = SignedDuration::from_hours(8);
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -75,14 +76,14 @@ pub struct SessionStore {
 /// unit-tested without a live `Client`.
 fn pending_login_from(
     attributes: Option<&HashMap<String, AttributeValue>>,
-    now: u64,
+    now: Timestamp,
 ) -> Option<PendingLogin> {
     let item = attributes?;
     let expired = item
         .get(TOKENS_TTL_ATTR)
         .and_then(|v| v.as_n().ok())
-        .and_then(|n| n.parse::<u64>().ok())
-        .is_some_and(|exp| now >= exp);
+        .and_then(|n| n.parse::<i64>().ok())
+        .is_some_and(|exp| now.as_second() >= exp);
     if expired {
         return None;
     }
@@ -108,14 +109,14 @@ fn pending_login_from(
 /// `take_pending`.
 fn session_from(
     attributes: Option<&HashMap<String, AttributeValue>>,
-    now: u64,
+    now: Timestamp,
 ) -> Option<AdminSession> {
     let item = attributes?;
     let expired = item
         .get(TOKENS_TTL_ATTR)
         .and_then(|v| v.as_n().ok())
-        .and_then(|n| n.parse::<u64>().ok())
-        .is_some_and(|exp| now >= exp);
+        .and_then(|n| n.parse::<i64>().ok())
+        .is_some_and(|exp| now.as_second() >= exp);
     if expired {
         return None;
     }
@@ -147,7 +148,11 @@ impl SessionStore {
         pending: &PendingLogin,
         now: ArrivalTime,
     ) -> Result<(), SessionError> {
-        let expires = now.epoch_seconds().saturating_add(PKCE_TTL_SECS);
+        let expires = now
+            .timestamp()
+            .checked_add(PKCE_TTL)
+            .unwrap_or(Timestamp::MAX)
+            .as_second();
         self.client
             .put_item()
             .table_name(&self.tokens_table)
@@ -186,10 +191,10 @@ impl SessionStore {
             .await
             .map_err(|e| SessionError::Backend(format!("take_pending: {e}")))?;
 
-        Ok(pending_login_from(out.attributes(), now.epoch_seconds()))
+        Ok(pending_login_from(out.attributes(), now.timestamp()))
     }
 
-    /// Creates a session expiring `SESSION_TTL_SECS` after `now`, with a fresh
+    /// Creates a session expiring [`SESSION_TTL`] after `now`, with a fresh
     /// CSRF token (issue #243), and returns its opaque id (for the cookie).
     ///
     /// # Errors
@@ -203,7 +208,11 @@ impl SessionStore {
     ) -> Result<String, SessionError> {
         let id = session_id(now)?;
         let csrf = csrf_token()?;
-        let expires = now.epoch_seconds().saturating_add(SESSION_TTL_SECS);
+        let expires = now
+            .timestamp()
+            .checked_add(SESSION_TTL)
+            .unwrap_or(Timestamp::MAX)
+            .as_second();
         self.client
             .put_item()
             .table_name(&self.tokens_table)
@@ -238,7 +247,7 @@ impl SessionStore {
             .await
             .map_err(|e| SessionError::Backend(format!("load_session: {e}")))?;
 
-        Ok(session_from(out.item(), now.epoch_seconds()))
+        Ok(session_from(out.item(), now.timestamp()))
     }
 
     /// Deletes a session (logout).
@@ -309,7 +318,7 @@ mod tests {
 
     // Fixed "current time" (2023-11-14 22:13:20 UTC) so the expiry tests are
     // independent of the wall clock and of DynamoDB's lazy TTL sweep.
-    const NOW: u64 = 1_700_000_000;
+    const NOW: i64 = 1_700_000_000;
 
     /// Builds a PKCE row shaped like the one `put_pending` writes.
     ///
@@ -321,7 +330,7 @@ mod tests {
     fn row(
         verifier: &str,
         nonce: &str,
-        expires_at: Option<u64>,
+        expires_at: Option<i64>,
     ) -> HashMap<String, AttributeValue> {
         let mut item = HashMap::from([
             (
@@ -346,7 +355,7 @@ mod tests {
         // nonce to the callback flow.
         let item = row("verifier", "nonce", Some(NOW - 1));
         assert_eq!(
-            pending_login_from(Some(&item), NOW),
+            pending_login_from(Some(&item), Timestamp::constant(NOW, 0)),
             None,
             "an expired PKCE transaction must not be returned as valid"
         );
@@ -357,16 +366,19 @@ mod tests {
         // `now >= exp` ⇒ expired: at the exact `expires_at` second the
         // transaction is gone, matching `load_session`.
         let item = row("verifier", "nonce", Some(NOW));
-        assert_eq!(pending_login_from(Some(&item), NOW), None);
+        assert_eq!(
+            pending_login_from(Some(&item), Timestamp::constant(NOW, 0)),
+            None
+        );
     }
 
     // ---- Happy / adjacent paths around the TTL window ----
 
     #[test]
     fn fresh_row_is_returned_with_verifier_and_nonce() {
-        let item = row("verifier-123", "nonce-456", Some(NOW + PKCE_TTL_SECS));
+        let item = row("verifier-123", "nonce-456", Some(NOW + PKCE_TTL.as_secs()));
         assert_eq!(
-            pending_login_from(Some(&item), NOW),
+            pending_login_from(Some(&item), Timestamp::constant(NOW, 0)),
             Some(PendingLogin {
                 pkce_verifier: "verifier-123".to_string(),
                 nonce: "nonce-456".to_string(),
@@ -377,22 +389,33 @@ mod tests {
     #[test]
     fn row_just_before_expiry_is_still_valid() {
         let item = row("v", "n", Some(NOW + 1));
-        assert!(pending_login_from(Some(&item), NOW).is_some());
+        assert!(pending_login_from(Some(&item), Timestamp::constant(NOW, 0)).is_some());
     }
 
     #[test]
     fn the_full_pkce_ttl_window_stays_valid() {
-        // `put_pending` writes `expires_at = now + PKCE_TTL_SECS`. The whole
+        // `put_pending` writes `expires_at = now + PKCE_TTL.as_secs()`. The whole
         // window must remain usable; only at/after `expires_at` does it expire.
         let written_at = NOW;
-        let item = row("v", "n", Some(written_at + PKCE_TTL_SECS));
-        let last_valid_second = written_at + PKCE_TTL_SECS - 1;
-        assert!(pending_login_from(Some(&item), last_valid_second).is_some());
+        let item = row("v", "n", Some(written_at + PKCE_TTL.as_secs()));
+        let last_valid_second = written_at + PKCE_TTL.as_secs() - 1;
+        assert!(
+            pending_login_from(Some(&item), Timestamp::constant(last_valid_second, 0)).is_some()
+        );
         assert_eq!(
-            pending_login_from(Some(&item), written_at + PKCE_TTL_SECS),
+            pending_login_from(
+                Some(&item),
+                Timestamp::constant(written_at + PKCE_TTL.as_secs(), 0)
+            ),
             None
         );
-        assert!(pending_login_from(Some(&item), written_at + PKCE_TTL_SECS + 999).is_none());
+        assert!(
+            pending_login_from(
+                Some(&item),
+                Timestamp::constant(written_at + PKCE_TTL.as_secs() + 999, 0)
+            )
+            .is_none()
+        );
     }
 
     // ---- Absent / sparse handles ----
@@ -401,7 +424,7 @@ mod tests {
     fn absent_attributes_yield_none() {
         // `DeleteItem` returns no attributes when the row never existed (or was
         // already consumed by a prior callback) — an invalid state.
-        assert_eq!(pending_login_from(None, NOW), None);
+        assert_eq!(pending_login_from(None, Timestamp::constant(NOW, 0)), None);
     }
 
     #[test]
@@ -410,7 +433,7 @@ mod tests {
         // row — only a present, numeric, past `expires_at` expires it.
         let item = row("v", "n", None);
         assert_eq!(
-            pending_login_from(Some(&item), NOW),
+            pending_login_from(Some(&item), Timestamp::constant(NOW, 0)),
             Some(PendingLogin {
                 pkce_verifier: "v".to_string(),
                 nonce: "n".to_string(),
@@ -428,7 +451,7 @@ mod tests {
             AttributeValue::N("not-a-number".to_string()),
         );
         assert_eq!(
-            pending_login_from(Some(&item), NOW),
+            pending_login_from(Some(&item), Timestamp::constant(NOW, 0)),
             Some(PendingLogin {
                 pkce_verifier: "v".to_string(),
                 nonce: "n".to_string(),
@@ -446,7 +469,10 @@ mod tests {
             "expires_at".to_string(),
             AttributeValue::N((NOW + 60).to_string()),
         );
-        assert_eq!(pending_login_from(Some(&item), NOW), None);
+        assert_eq!(
+            pending_login_from(Some(&item), Timestamp::constant(NOW, 0)),
+            None
+        );
     }
 
     #[test]
@@ -460,7 +486,10 @@ mod tests {
             "expires_at".to_string(),
             AttributeValue::N((NOW + 60).to_string()),
         );
-        assert_eq!(pending_login_from(Some(&item), NOW), None);
+        assert_eq!(
+            pending_login_from(Some(&item), Timestamp::constant(NOW, 0)),
+            None
+        );
     }
 
     #[test]
@@ -477,13 +506,19 @@ mod tests {
                 AttributeValue::N((NOW + 60).to_string()),
             ),
         ]);
-        assert_eq!(pending_login_from(Some(&item), NOW), None);
+        assert_eq!(
+            pending_login_from(Some(&item), Timestamp::constant(NOW, 0)),
+            None
+        );
     }
 
     #[test]
     fn empty_row_yields_none() {
         let item: HashMap<String, AttributeValue> = HashMap::new();
-        assert_eq!(pending_login_from(Some(&item), NOW), None);
+        assert_eq!(
+            pending_login_from(Some(&item), Timestamp::constant(NOW, 0)),
+            None
+        );
     }
 
     #[test]
@@ -494,7 +529,7 @@ mod tests {
             AttributeValue::S("z".to_string()),
         );
         assert_eq!(
-            pending_login_from(Some(&item), NOW),
+            pending_login_from(Some(&item), Timestamp::constant(NOW, 0)),
             Some(PendingLogin {
                 pkce_verifier: "v".to_string(),
                 nonce: "n".to_string(),
@@ -510,16 +545,16 @@ mod tests {
         // against is the one the request arrived at, so a login cannot expire
         // between the session check and the action it authorises.
         let arrival = ArrivalTime::for_test_millis(1_700_000_000_000);
-        assert_eq!(arrival.epoch_seconds(), NOW);
+        assert_eq!(arrival.timestamp(), Timestamp::constant(NOW, 0));
 
         let expired = row("v", "n", Some(NOW));
         assert_eq!(
-            pending_login_from(Some(&expired), arrival.epoch_seconds()),
+            pending_login_from(Some(&expired), arrival.timestamp()),
             None
         );
 
         let fresh = row("v", "n", Some(NOW + 1));
-        assert!(pending_login_from(Some(&fresh), arrival.epoch_seconds()).is_some());
+        assert!(pending_login_from(Some(&fresh), arrival.timestamp()).is_some());
     }
 
     // ---- Session ids ----
@@ -574,7 +609,7 @@ mod tests {
     // ---- Session rows and their CSRF token (issue #243) ----
 
     /// A session row shaped like the one `create_session` writes.
-    fn session_row(csrf: Option<&str>, expires_at: u64) -> HashMap<String, AttributeValue> {
+    fn session_row(csrf: Option<&str>, expires_at: i64) -> HashMap<String, AttributeValue> {
         let mut item = HashMap::from([
             ("subject".to_string(), AttributeValue::S("sub".to_string())),
             (
@@ -596,7 +631,7 @@ mod tests {
     fn a_session_row_carries_its_csrf_token() {
         let item = session_row(Some("tok"), NOW + 60);
         assert_eq!(
-            session_from(Some(&item), NOW),
+            session_from(Some(&item), Timestamp::constant(NOW, 0)),
             Some(AdminSession {
                 subject: "sub".to_string(),
                 email: "op@example.com".to_string(),
@@ -608,9 +643,18 @@ mod tests {
     #[test]
     fn a_session_row_without_a_csrf_token_is_no_session() {
         // Otherwise an empty stored token would match an empty submitted one.
-        assert_eq!(session_from(Some(&session_row(None, NOW + 60)), NOW), None);
         assert_eq!(
-            session_from(Some(&session_row(Some(""), NOW + 60)), NOW),
+            session_from(
+                Some(&session_row(None, NOW + 60)),
+                Timestamp::constant(NOW, 0)
+            ),
+            None
+        );
+        assert_eq!(
+            session_from(
+                Some(&session_row(Some(""), NOW + 60)),
+                Timestamp::constant(NOW, 0)
+            ),
             None
         );
     }
@@ -618,10 +662,13 @@ mod tests {
     #[test]
     fn an_expired_session_row_is_rejected() {
         assert_eq!(
-            session_from(Some(&session_row(Some("tok"), NOW)), NOW),
+            session_from(
+                Some(&session_row(Some("tok"), NOW)),
+                Timestamp::constant(NOW, 0)
+            ),
             None
         );
-        assert_eq!(session_from(None, NOW), None);
+        assert_eq!(session_from(None, Timestamp::constant(NOW, 0)), None);
     }
 
     #[test]

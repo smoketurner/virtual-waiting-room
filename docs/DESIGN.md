@@ -635,12 +635,17 @@ and ~5 requests per iOS discard-and-reload.
   Business allowance.
 - **iOS** suspends hidden tabs, compressing the ratio to 3.62x at hidden share 0.5 and 3.19x at
   0.75. Mobile is plausibly the majority of a consumer drop.
-- **Measured, the saving is smaller.** The harness (`crates/harness`, foreground only) measures
-  4.60x on `/status` alone against 4.27x modelled (`--visitors 4000 --seconds 60 --countdown 30
-  --target-rate 1 --arrival late`), but 2.66x (late) and 2.88x (uniform) end to end at 833/s with
-  a 180 s countdown. That puts adaptive at ~75–81M, inside Business with 35–40% headroom. Short
-  runs understate the saving: `make load VISITORS=1000000 SECONDS=90` reads 1.83x because the
-  first-ask spread (60 s when measured, now up to 120 s) dominates it. The harness cannot measure time-to-admission.
+- **Measured, the saving is smaller.** The ratios against the fixed-interval baseline were
+  measured with the load program at commit `788bf62`, since removed: 4.60x on `/status` alone
+  against 4.27x modelled, and 2.66x (late) to 2.88x (uniform) end to end at 833/s with a 180 s
+  countdown, which puts adaptive at ~75–81M.
+- **A whole sale, measured.** `make sim` (all visitors in the foreground) with 500,000 visitors,
+  a 30-minute late-arrival countdown, 1,000 at once for 15 minutes and 20,000 tickets: 7,997
+  buyers sold out 2.3 h after the first arrival, and the edge answered 103M `/status` polls and
+  about 2.7M other requests, ~210 a visitor, inside Business's 125M. The origin saw about one
+  `/status` fetch a second throughout. A quarter of the crowd (115,851) joined behind the cohort:
+  the last minute's joins exceed API Gateway's 7,000/s join limit (203,292 refusals), and a retry
+  accepted after the open is a live join.
 - **No T−0 herd.** Open discovery spreads over the ~39 s ceiling jitter plus `scheduleFirstAsk`'s
   window of up to 120 s, so peak `/_wr/v1/queue_num` load is no higher than that spread alone:
   about 8,500/s at a million, under API Gateway's 10,000/s default

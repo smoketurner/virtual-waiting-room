@@ -3,7 +3,7 @@
 //! The `EventBridge` Scheduler `rate()` minimum is one minute, but the design's
 //! cadence is 10 seconds. The schedule fires `rate(1 minute)` and each invoke
 //! starts one durable execution that runs [`controller::PASSES_PER_INVOKE`]
-//! passes [`controller::INTERVAL_SECS`] seconds apart, so one execution covers a
+//! passes [`controller::INTERVAL`] apart, so one execution covers a
 //! full minute at the 10-second cadence.
 //!
 //! Each pass is a durable step and each gap a durable wait. A wait suspends the
@@ -19,12 +19,11 @@
 //! than replay, leaving the retry decision to the strategy.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use aws_durable_execution_sdk as durable;
 use aws_durable_execution_sdk::{OperationErrorKind, RetryDecision, StepSemantics};
 use controller::dynamo::DynamoStore;
-use controller::{INTERVAL_SECS, PASSES_PER_INVOKE, PassOutcome, Store, run_pass};
+use controller::{INTERVAL, PASSES_PER_INVOKE, PassOutcome, Store, run_pass};
 use serde_json::Value;
 use wr_common::Phase;
 
@@ -44,13 +43,8 @@ async fn main() -> Result<(), lambda_runtime::Error> {
     // Required, and the same value `generate_token` mints with: a session the
     // controller thinks has ended while the gate still honours it is a visitor
     // over the origin's limit.
-    let session_secs: u64 = std::env::var("SESSION_TTL_SECS")?.parse()?;
-    let store = Arc::new(DynamoStore::new(
-        client,
-        counters_table,
-        event_id,
-        session_secs,
-    ));
+    let session = jiff::SignedDuration::from_secs(std::env::var("SESSION_TTL_SECS")?.parse()?);
+    let store = Arc::new(DynamoStore::new(client, counters_table, event_id, session));
 
     // Force one real read in the Init phase so the aws-lc-rs jitter-entropy seed
     // and the TLS handshake land on boosted Init CPU rather than the first
@@ -66,19 +60,8 @@ async fn main() -> Result<(), lambda_runtime::Error> {
     .await
 }
 
-/// Current epoch-seconds, sampled fresh on every pass rather than once per
-/// invocation: it is what lets a fail-open window that lapses mid-minute be
-/// observed on the very next pass instead of only at the next scheduled
-/// invoke, an hour of cadence away.
-fn now_secs() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
-
 /// Runs a minute of cadence as one durable execution: [`PASSES_PER_INVOKE`]
-/// checkpointed passes separated by [`INTERVAL_SECS`] durable waits.
+/// checkpointed passes separated by [`INTERVAL`] durable waits.
 ///
 /// Returns each pass's outcome so the execution history records what the minute
 /// did.
@@ -96,7 +79,10 @@ async fn handle(
         // every replay, so they are derived from the pass index alone.
         let outcome = ctx
             .step(move |_| async move {
-                run_pass(pass_store.as_ref(), &pass_event_id, now_secs())
+                // Sampled fresh on every pass rather than once per invocation:
+                // it is what lets a fail-open window that lapses mid-minute be
+                // observed on the very next pass.
+                run_pass(pass_store.as_ref(), &pass_event_id, jiff::Timestamp::now())
                     .await
                     .map_err(durable::BoxError::from)
             })
@@ -169,7 +155,7 @@ fn idles(outcome: &PassOutcome) -> bool {
 /// interval it does not use.
 async fn wait_for_next(ctx: &durable::DurableContext, pass: u32) -> Result<(), durable::BoxError> {
     if pass.saturating_add(1) < PASSES_PER_INVOKE {
-        ctx.wait(Duration::from_secs(INTERVAL_SECS))
+        ctx.wait(INTERVAL.unsigned_abs())
             .name(format!("cadence-{pass}"))
             .await?;
     }

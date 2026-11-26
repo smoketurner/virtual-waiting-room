@@ -7,8 +7,7 @@ use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::put_item::PutItemError;
 use aws_sdk_dynamodb::types::{AttributeValue, KeysAndAttributes, ReturnValue};
 use wr_common::expr::{
-    Condition, Key, POSITION_TTL_SECS, POSITIONS_KEY_ATTR, SHARD_COUNT_ATTR, SHARD_INDEX_ATTR,
-    Update,
+    Condition, Key, POSITION_TTL, POSITIONS_KEY_ATTR, SHARD_COUNT_ATTR, SHARD_INDEX_ATTR, Update,
 };
 use wr_common::{Counters, PositionItem, PositionStatus, PreQueueItem, Shard};
 
@@ -73,13 +72,15 @@ impl Store for DynamoStore {
     }
 
     async fn put_position(&self, write: &PositionWrite) -> Result<WriteOutcome, StoreError> {
-        let now = now_epoch_secs();
         let item = PositionItem {
             request_id: write.request_id.clone(),
             queue_position: write.position,
-            entry_time: now,
+            entry_time: write.at,
             status: PositionStatus::Issued,
-            ttl: now.saturating_add(POSITION_TTL_SECS),
+            ttl: write
+                .at
+                .checked_add(POSITION_TTL)
+                .map_err(|e| StoreError(format!("position ttl: {e}")))?,
             h: Some(write.digest.clone()),
         };
         let attrs: HashMap<String, AttributeValue> =
@@ -170,7 +171,7 @@ impl Store for DynamoStore {
             r: write.request_id.clone(),
             s: shard,
             l: write.local_index,
-            t: now_epoch_secs(),
+            t: write.at,
             h: Some(write.digest.clone()),
         };
         let attrs: HashMap<String, AttributeValue> =
@@ -246,13 +247,6 @@ impl Store for DynamoStore {
         }
         Ok(found)
     }
-}
-
-/// Current Unix time in whole seconds.
-fn now_epoch_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
 }
 
 /// The first local index of a just-claimed block: the shard's count after the

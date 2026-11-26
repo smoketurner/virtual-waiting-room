@@ -1,5 +1,6 @@
 //! Identifier newtypes and the event phase enum.
 
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 /// A waiting-room event id — the partition key of the `Counters` table and the
@@ -179,14 +180,18 @@ impl AdmissionControl {
     }
 }
 
-/// Resolves the stored control and the fail-open epoch into what a consumer
+/// Resolves the stored control and the fail-open deadline into what a consumer
 /// acts on right now. The only place [`AdmissionControl::FailOpen`] is
 /// produced: `now < fail_open_until` overrides whatever is stored, and once
-/// the epoch has passed the stored value is authoritative again with no write
+/// the deadline has passed the stored value is authoritative again with no write
 /// required on either side — natural expiry is simultaneous by construction.
 #[must_use]
-pub fn resolve(stored: StoredControl, fail_open_until: u64, now: u64) -> AdmissionControl {
-    if now < fail_open_until {
+pub fn resolve(
+    stored: StoredControl,
+    fail_open_until: Option<Timestamp>,
+    now: Timestamp,
+) -> AdmissionControl {
+    if fail_open_until.is_some_and(|until| now < until) {
         return AdmissionControl::FailOpen;
     }
     match stored {
@@ -371,15 +376,49 @@ mod tests {
     #[test]
     fn resolve_prefers_the_epoch_over_the_stored_value() {
         use StoredControl::{Open, Paused};
-        assert_eq!(resolve(Open, 100, 50), AdmissionControl::FailOpen);
-        assert_eq!(resolve(Paused, 100, 50), AdmissionControl::FailOpen);
+        assert_eq!(
+            resolve(
+                Open,
+                Some(Timestamp::constant(100, 0)),
+                Timestamp::constant(50, 0)
+            ),
+            AdmissionControl::FailOpen
+        );
+        assert_eq!(
+            resolve(
+                Paused,
+                Some(Timestamp::constant(100, 0)),
+                Timestamp::constant(50, 0)
+            ),
+            AdmissionControl::FailOpen
+        );
         // Once now reaches the epoch, the stored value is authoritative again,
         // with no write required on either side.
-        assert_eq!(resolve(Open, 100, 100), AdmissionControl::Open);
-        assert_eq!(resolve(Paused, 100, 100), AdmissionControl::Paused);
+        assert_eq!(
+            resolve(
+                Open,
+                Some(Timestamp::constant(100, 0)),
+                Timestamp::constant(100, 0)
+            ),
+            AdmissionControl::Open
+        );
+        assert_eq!(
+            resolve(
+                Paused,
+                Some(Timestamp::constant(100, 0)),
+                Timestamp::constant(100, 0)
+            ),
+            AdmissionControl::Paused
+        );
         // No epoch in force: stored value passes through unchanged.
-        assert_eq!(resolve(Open, 0, 1000), AdmissionControl::Open);
-        assert_eq!(resolve(Paused, 0, 1000), AdmissionControl::Paused);
+        assert_eq!(
+            resolve(Open, None, Timestamp::constant(1000, 0)),
+            AdmissionControl::Open
+        );
+        assert_eq!(
+            resolve(Paused, None, Timestamp::constant(1000, 0)),
+            AdmissionControl::Paused
+        );
     }
 
     #[test]

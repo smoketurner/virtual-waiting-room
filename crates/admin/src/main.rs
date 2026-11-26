@@ -506,7 +506,7 @@ async fn dashboard(State(state): State<Shared>, headers: HeaderMap, now: Arrival
                     &state.probe,
                     &state.edge,
                     state.warm_targets,
-                    now.epoch_seconds(),
+                    now.timestamp(),
                     readiness::PER_CHECK_TIMEOUT,
                 ),
             );
@@ -873,7 +873,7 @@ impl AppState {
     /// `now`.
     async fn store_load(&self, now: ArrivalTime) -> Result<Option<Dashboard>, String> {
         use admin::Store;
-        let now = now.epoch_seconds();
+        let now = now.timestamp();
         self.store
             .load(&self.event_id)
             .await

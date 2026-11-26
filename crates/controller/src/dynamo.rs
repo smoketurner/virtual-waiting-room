@@ -6,6 +6,7 @@
 //! its cap with its own `UpdateItem`. The admission log is one more item,
 //! replaced whole each pass.
 
+use jiff::{SignedDuration, Timestamp};
 use std::collections::HashMap;
 
 use aws_sdk_dynamodb::Client;
@@ -16,7 +17,7 @@ use wr_common::expr::{
     ADMISSION_LOG_ATTR, ADMISSION_PROVIDED_ATTR, Key, SHARD_CAP_ATTR, SHARD_COUNT_ATTR,
     SHARD_INDEX_ATTR, Update,
 };
-use wr_common::{Phase, SHARDS, Shard, StoredControl};
+use wr_common::{Counters, Phase, SHARDS, Shard, StoredControl};
 use wr_common::{shard_cap_of, shard_count_of, shard_index_of};
 
 use crate::{
@@ -29,7 +30,7 @@ pub struct DynamoStore {
     client: Client,
     counters_table: String,
     event_id: String,
-    session_secs: u64,
+    session: SignedDuration,
 }
 
 impl DynamoStore {
@@ -38,13 +39,13 @@ impl DynamoStore {
         client: Client,
         counters_table: String,
         event_id: String,
-        session_secs: u64,
+        session: SignedDuration,
     ) -> Self {
         Self {
             client,
             counters_table,
             event_id,
-            session_secs,
+            session,
         }
     }
 
@@ -54,10 +55,10 @@ impl DynamoStore {
     }
 }
 
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
+/// Now, rounded down to the whole second the log records.
+fn whole_second_now() -> Timestamp {
+    let now = Timestamp::now();
+    Timestamp::from_second(now.as_second()).unwrap_or(now)
 }
 
 fn num(item: &HashMap<String, AttributeValue>, attr: &str) -> u64 {
@@ -107,14 +108,14 @@ impl Store for DynamoStore {
         Ok(ControllerState {
             phase,
             stored_control,
-            fail_open_until: num(item, "fail_open_until"),
+            fail_open_until: Counters::from_item(event_id, item).fail_open_until,
             inputs: PassInputs {
                 shards: self.read_shards(event_id).await?,
-                shards_read_at: now_secs(),
+                shards_read_at: whole_second_now(),
                 serving_counter: num(item, "serving_counter"),
                 queue_counter: num(item, "queue_counter"),
                 origin_concurrency: u32::try_from(num(item, "origin_concurrency")).unwrap_or(0),
-                session_secs: self.session_secs,
+                session: self.session,
                 log: self.read_log(event_id).await?,
             },
         })
@@ -282,7 +283,7 @@ impl DynamoStore {
 fn entries_to_attr(log: &AdmissionLog) -> AttributeValue {
     let mut numbers = Vec::with_capacity(log.entries.len() * 2);
     for entry in &log.entries {
-        numbers.push(AttributeValue::N(entry.at.to_string()));
+        numbers.push(AttributeValue::N(entry.at.as_second().to_string()));
         numbers.push(AttributeValue::N(entry.admitted.to_string()));
     }
     AttributeValue::L(numbers)
@@ -303,7 +304,11 @@ fn log_from_item(item: &HashMap<String, AttributeValue>) -> Option<AdmissionLog>
     for [at, admitted] in pairs {
         let read = |v: &AttributeValue| v.as_n().ok().and_then(|n| n.parse::<u64>().ok());
         entries.push(LogEntry {
-            at: read(at)?,
+            at: at
+                .as_n()
+                .ok()
+                .and_then(|n| n.parse::<i64>().ok())
+                .and_then(|secs| Timestamp::from_second(secs).ok())?,
             admitted: read(admitted)?,
         });
     }
@@ -415,11 +420,11 @@ mod tests {
         let log = AdmissionLog {
             entries: vec![
                 LogEntry {
-                    at: 100,
+                    at: jiff::Timestamp::from_second(100).unwrap(),
                     admitted: 0,
                 },
                 LogEntry {
-                    at: 110,
+                    at: jiff::Timestamp::from_second(110).unwrap(),
                     admitted: u64::MAX,
                 },
             ],

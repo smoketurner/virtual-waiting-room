@@ -26,9 +26,8 @@ use jiff::Timestamp;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArrivalTime {
     at: Timestamp,
-    /// The same instant in epoch seconds and milliseconds, converted once in
-    /// the constructor where both are checked against the epoch.
-    epoch_seconds: u64,
+    /// The same instant in epoch milliseconds, converted once in the
+    /// constructor where it is checked against the epoch.
     epoch_millis: u64,
 }
 
@@ -41,28 +40,14 @@ impl ArrivalTime {
     /// reached yet — so there is no substitute value that is safe for both.
     /// The request is refused instead.
     fn new(at: Timestamp) -> Option<Self> {
-        let epoch_seconds = u64::try_from(at.as_second()).ok()?;
         let epoch_millis = u64::try_from(at.as_millisecond()).ok()?;
-        Some(Self {
-            at,
-            epoch_seconds,
-            epoch_millis,
-        })
+        Some(Self { at, epoch_millis })
     }
 
     /// The arrival instant, at full precision.
     #[must_use]
     pub fn timestamp(self) -> Timestamp {
         self.at
-    }
-
-    /// The arrival instant in epoch seconds, for the places that work in them
-    /// rather than in instants: the fail-open deadline the edge gate compares
-    /// against its own clock, the start-time validation, and the session and
-    /// login-transaction expiries.
-    #[must_use]
-    pub fn epoch_seconds(self) -> u64 {
-        self.epoch_seconds
     }
 
     /// The arrival instant in epoch milliseconds, the unit a `UUIDv7` carries in
@@ -200,8 +185,8 @@ mod tests {
         // request instead of picking one.
         assert!(ArrivalTime::new(Timestamp::from_second(-1).unwrap()).is_none());
         assert_eq!(
-            ArrivalTime::new(Timestamp::UNIX_EPOCH).map(ArrivalTime::epoch_seconds),
-            Some(0)
+            ArrivalTime::new(Timestamp::UNIX_EPOCH).map(ArrivalTime::timestamp),
+            Some(Timestamp::UNIX_EPOCH)
         );
     }
 

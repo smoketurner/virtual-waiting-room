@@ -345,3 +345,75 @@ pub fn build(crates: &[&str], out_dir: &Path) -> Result<HashMap<String, PathBuf>
     }
     Ok(built)
 }
+
+impl harness::backend::Consumer for Function {
+    fn deliver(&self, event: serde_json::Value) -> harness::backend::Reply<'_> {
+        Box::pin(async move { self.invoke(&event).await })
+    }
+}
+
+/// The shipped system behind the edge: the `read` and `generate_token`
+/// binaries, and the shipped CloudFront Function run by the Node sidecar.
+pub struct Shipped {
+    read: Arc<Function>,
+    generate_token: Arc<Function>,
+    gate: reqwest::Client,
+    gate_url: String,
+}
+
+impl Shipped {
+    #[must_use]
+    pub fn new(read: Arc<Function>, generate_token: Arc<Function>, gate_url: String) -> Self {
+        Self {
+            read,
+            generate_token,
+            // Idle connections are dropped well before Node's 60 s keep-alive
+            // closes them, or a request can be written to a socket the
+            // sidecar has just closed.
+            gate: reqwest::Client::builder()
+                .pool_max_idle_per_host(256)
+                .pool_idle_timeout(Duration::from_secs(20))
+                .build()
+                .unwrap_or_default(),
+            gate_url,
+        }
+    }
+
+    /// The sidecar is the harness's plumbing, not the system under test, so a
+    /// connection that fails is retried rather than reported as a refusal.
+    async fn ask_gate(&self, viewer: &serde_json::Value) -> Result<serde_json::Value> {
+        let mut last = None;
+        for _ in 0..3 {
+            match self.gate.post(&self.gate_url).json(viewer).send().await {
+                Ok(reply) => {
+                    anyhow::ensure!(
+                        reply.status().is_success(),
+                        "gate answered {}",
+                        reply.status()
+                    );
+                    return Ok(reply.json().await?);
+                }
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.map_or_else(|| anyhow::anyhow!("gate unreachable"), anyhow::Error::from))
+    }
+}
+
+impl harness::backend::Backend for Shipped {
+    fn invoke(
+        &self,
+        api: harness::backend::Api,
+        event: serde_json::Value,
+    ) -> harness::backend::Reply<'_> {
+        let function = match api {
+            harness::backend::Api::Read => &self.read,
+            harness::backend::Api::GenerateToken => &self.generate_token,
+        };
+        Box::pin(async move { function.invoke(&event).await })
+    }
+
+    fn gate(&self, viewer: serde_json::Value) -> harness::backend::Reply<'_> {
+        Box::pin(async move { self.ask_gate(&viewer).await })
+    }
+}

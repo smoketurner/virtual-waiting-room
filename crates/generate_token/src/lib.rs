@@ -11,6 +11,7 @@
 //! to a [`Grant`], and the handler in `main.rs` fetches the items, calls it,
 //! and signs the returned grant into a `Set-Cookie`.
 
+use jiff::{SignedDuration, Timestamp};
 use std::future::Future;
 
 use wr_common::{
@@ -19,6 +20,7 @@ use wr_common::{
 };
 
 pub mod dynamo;
+pub mod http;
 
 /// A store failure worth retrying.
 #[derive(Debug, thiserror::Error)]
@@ -73,7 +75,7 @@ pub trait Store {
         request_id: &str,
         position: u64,
         digest: &SecretDigest,
-        now: u64,
+        now: Timestamp,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 }
 
@@ -85,7 +87,7 @@ pub struct PositionRow {
     /// Absent only on a malformed row, which cannot be redeemed.
     pub digest: Option<SecretDigest>,
     /// When the visitor was first admitted, if they have been.
-    pub admitted_at: Option<u64>,
+    pub admitted_at: Option<Timestamp>,
 }
 
 /// Why a visitor is not being admitted right now.
@@ -131,7 +133,7 @@ pub struct Grant {
     /// When this visitor was first admitted, if they have been. They are
     /// entitled to their session again until it runs out, and have already
     /// taken their unit of budget.
-    pub admitted_at: Option<u64>,
+    pub admitted_at: Option<Timestamp>,
 }
 
 /// How many shards one admission tries before answering "at capacity". The
@@ -144,7 +146,7 @@ pub const SLOT_ATTEMPTS: u32 = 3;
 pub struct Minting<'a> {
     pub key: &'a SigningKey,
     pub event_id: &'a str,
-    pub session_ttl_secs: u64,
+    pub session: SignedDuration,
 }
 
 /// The outcome of [`admit`].
@@ -153,7 +155,7 @@ pub enum Admission {
     /// Admitted: the signed session credential, for a `Set-Cookie`.
     Admitted {
         position: u64,
-        expires_at: u64,
+        expires_at: Timestamp,
         credential: String,
     },
     /// Not admitted now, and why. [`Denied::StillQueued`] carries the
@@ -179,7 +181,7 @@ pub async fn admit<S: Store>(
     request_id: &str,
     secret: &PossessionSecret,
     viewer_ip: Option<&str>,
-    now: u64,
+    now: Timestamp,
 ) -> Result<Admission, StoreError> {
     let Some(counters) = store.load_counters(minting.event_id).await? else {
         return Ok(Admission::EventNotFound);
@@ -237,7 +239,11 @@ pub async fn admit<S: Store>(
         now
     };
 
-    let expires_at = admitted_at.saturating_add(minting.session_ttl_secs);
+    // A session end past jiff's range is no end at all: refuse it rather than
+    // sign one that never expires.
+    let Ok(expires_at) = admitted_at.checked_add(minting.session) else {
+        return Ok(Admission::Refused(Denied::SessionExpired));
+    };
     if expires_at <= now {
         return Ok(Admission::Refused(Denied::SessionExpired));
     }
@@ -300,8 +306,9 @@ async fn take_any_slot<S: Store>(store: &S, event_id: &str) -> bool {
 /// checks it on every protected request; `HttpOnly` because no page script
 /// needs it.
 #[must_use]
-pub fn session_set_cookie(name: &str, credential: &str, ttl_secs: u64) -> String {
-    format!("{name}={credential}; Path=/; Max-Age={ttl_secs}; Secure; HttpOnly; SameSite=Lax")
+pub fn session_set_cookie(name: &str, credential: &str, ttl: SignedDuration) -> String {
+    let max_age = ttl.as_secs();
+    format!("{name}={credential}; Path=/; Max-Age={max_age}; Secure; HttpOnly; SameSite=Lax")
 }
 
 /// The address part of a `CloudFront-Viewer-Address` header, which is
@@ -317,7 +324,7 @@ pub fn viewer_ip(header: &str) -> Option<&str> {
 /// Decides whether the visitor may be admitted.
 ///
 /// Both gates are checked, in this order: the event must be actively admitting
-/// (resolving the stored control against the fail-open epoch at `now`, issue
+/// (resolving the stored control against the fail-open deadline at `now`, issue
 /// #71), and the visitor's position must have been reached. A held event
 /// admits nobody even if their position was reached before the hold, which is
 /// what makes the operator's pause a real stop rather than a display state.
@@ -330,7 +337,7 @@ pub fn decide(
     prequeue: Option<&PreQueueItem>,
     position_row: Option<&PositionRow>,
     presented: &PossessionSecret,
-    now: u64,
+    now: Timestamp,
 ) -> Result<Grant, Denied> {
     use wr_common::AdmissionControl;
 
@@ -378,7 +385,7 @@ pub fn decide(
                 // A row marked admitted with no time is not one this code
                 // writes. Treating it as admitted at the epoch refuses it as
                 // expired, which is the direction that mints nothing.
-                Some(admitted_at.unwrap_or(0))
+                Some(admitted_at.unwrap_or(Timestamp::UNIX_EPOCH))
             }
             Some(&PositionRow {
                 status: PositionStatus::Issued,
@@ -481,7 +488,7 @@ mod tests {
             message: None,
             origin_concurrency: None,
             stored_control: StoredControl::Open,
-            fail_open_until: 0,
+            fail_open_until: None,
             starts_at: None,
         }
     }
@@ -503,7 +510,7 @@ mod tests {
             digest: Some(digest()),
             admitted_at: match status {
                 PositionStatus::Issued => None,
-                PositionStatus::Admitted => Some(1_700_000_000),
+                PositionStatus::Admitted => Some(Timestamp::constant(1_700_000_000, 0)),
             },
         }
     }
@@ -516,7 +523,7 @@ mod tests {
             None,
             Some(&row(3, PositionStatus::Issued)),
             &secret(),
-            0,
+            Timestamp::constant(0, 0),
         )
         .unwrap();
         assert_eq!(grant.position, 3);
@@ -529,7 +536,7 @@ mod tests {
             None,
             Some(&row(7, PositionStatus::Issued)),
             &secret(),
-            0,
+            Timestamp::constant(0, 0),
         )
         .unwrap_err();
         assert_eq!(
@@ -552,7 +559,7 @@ mod tests {
                 None,
                 Some(&row(4, PositionStatus::Issued)),
                 &secret(),
-                0
+                Timestamp::constant(0, 0)
             )
             .is_ok()
         );
@@ -562,7 +569,7 @@ mod tests {
                 None,
                 Some(&row(5, PositionStatus::Issued)),
                 &secret(),
-                0
+                Timestamp::constant(0, 0)
             )
             .is_err()
         );
@@ -578,7 +585,7 @@ mod tests {
                 None,
                 Some(&row(3, PositionStatus::Issued)),
                 &secret(),
-                0
+                Timestamp::constant(0, 0)
             )
             .unwrap_err(),
             Denied::NotAdmitting
@@ -591,14 +598,14 @@ mod tests {
         // credential, so nobody should be calling generate_token during the
         // window — but if one does, it must not mint.
         let mut c = counters(10);
-        c.fail_open_until = 1000;
+        c.fail_open_until = Some(Timestamp::constant(1000, 0));
         assert_eq!(
             decide(
                 &c,
                 None,
                 Some(&row(3, PositionStatus::Issued)),
                 &secret(),
-                500
+                Timestamp::constant(500, 0)
             )
             .unwrap_err(),
             Denied::NotAdmitting
@@ -610,7 +617,7 @@ mod tests {
                 None,
                 Some(&row(3, PositionStatus::Issued)),
                 &secret(),
-                1000
+                Timestamp::constant(1000, 0)
             )
             .is_ok()
         );
@@ -632,7 +639,7 @@ mod tests {
                     None,
                     Some(&row(3, PositionStatus::Issued)),
                     &secret(),
-                    0
+                    Timestamp::constant(0, 0)
                 )
                 .unwrap_err(),
                 Denied::NotAdmitting
@@ -649,10 +656,20 @@ mod tests {
         // the grant reports and `admit` acts on.
         for (status, admitted_at) in [
             (PositionStatus::Issued, None),
-            (PositionStatus::Admitted, Some(1_700_000_000)),
+            (
+                PositionStatus::Admitted,
+                Some(Timestamp::constant(1_700_000_000, 0)),
+            ),
         ] {
             assert_eq!(
-                decide(&counters(10), None, Some(&row(3, status)), &secret(), 0).unwrap(),
+                decide(
+                    &counters(10),
+                    None,
+                    Some(&row(3, status)),
+                    &secret(),
+                    Timestamp::constant(0, 0)
+                )
+                .unwrap(),
                 Grant {
                     position: 3,
                     digest: digest(),
@@ -665,7 +682,14 @@ mod tests {
     #[test]
     fn an_unregistered_visitor_is_refused() {
         assert_eq!(
-            decide(&counters(10), None, None, &secret(), 0).unwrap_err(),
+            decide(
+                &counters(10),
+                None,
+                None,
+                &secret(),
+                Timestamp::constant(0, 0)
+            )
+            .unwrap_err(),
             Denied::NotRegistered
         );
     }
@@ -677,10 +701,10 @@ mod tests {
             r: REQ.to_owned(),
             s: 3,
             l: 1,
-            t: 1_788_000_000,
+            t: Timestamp::constant(1_788_000_000, 0),
             h: Some(digest()),
         };
-        let grant = decide(&c, Some(&row), None, &secret(), 0).unwrap();
+        let grant = decide(&c, Some(&row), None, &secret(), Timestamp::constant(0, 0)).unwrap();
         // Inside the cohort.
         assert!(grant.position < c.participant_count.unwrap());
     }
@@ -695,11 +719,11 @@ mod tests {
             r: REQ.to_owned(),
             s: 0,
             l: 0,
-            t: 1_788_000_000,
+            t: Timestamp::constant(1_788_000_000, 0),
             h: Some(digest()),
         };
         assert_eq!(
-            decide(&c, Some(&row), None, &secret(), 0).unwrap_err(),
+            decide(&c, Some(&row), None, &secret(), Timestamp::constant(0, 0)).unwrap_err(),
             Denied::NotOpen
         );
     }
@@ -713,7 +737,7 @@ mod tests {
             r: REQ.to_owned(),
             s: 0,
             l: 2,
-            t: 1_788_000_000,
+            t: Timestamp::constant(1_788_000_000, 0),
             h: Some(digest()),
         };
         let grant = decide(
@@ -721,7 +745,7 @@ mod tests {
             Some(&pq),
             Some(&row(42, PositionStatus::Issued)),
             &secret(),
-            0,
+            Timestamp::constant(0, 0),
         )
         .unwrap();
         assert_eq!(grant.position, 42);
@@ -738,16 +762,17 @@ mod tests {
             r: REQ.to_owned(),
             s: 0,
             l: 1,
-            t: 1_788_000_000,
+            t: Timestamp::constant(1_788_000_000, 0),
             h: Some(digest()),
         };
-        let cohort_only = decide(&c, Some(&pq), None, &secret(), 0).unwrap();
+        let cohort_only =
+            decide(&c, Some(&pq), None, &secret(), Timestamp::constant(0, 0)).unwrap();
         let with_stray = decide(
             &c,
             Some(&pq),
             Some(&row(5_000, PositionStatus::Issued)),
             &secret(),
-            0,
+            Timestamp::constant(0, 0),
         )
         .unwrap();
         assert_eq!(with_stray.position, cohort_only.position);
@@ -763,16 +788,32 @@ mod tests {
             r: REQ.to_owned(),
             s: 0,
             l: 1,
-            t: 1_788_000_000,
+            t: Timestamp::constant(1_788_000_000, 0),
             h: Some(digest()),
         };
         let other = PossessionSecret::parse("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB").unwrap();
         let mut stray = row(5_000, PositionStatus::Issued);
         stray.digest = Some(other.digest());
         let c = counters(20);
-        assert!(decide(&c, Some(&pq), Some(&stray), &secret(), 0).is_ok());
+        assert!(
+            decide(
+                &c,
+                Some(&pq),
+                Some(&stray),
+                &secret(),
+                Timestamp::constant(0, 0)
+            )
+            .is_ok()
+        );
         assert_eq!(
-            decide(&c, Some(&pq), Some(&stray), &other, 0).unwrap_err(),
+            decide(
+                &c,
+                Some(&pq),
+                Some(&stray),
+                &other,
+                Timestamp::constant(0, 0)
+            )
+            .unwrap_err(),
             Denied::NotHolder
         );
     }
@@ -786,7 +827,14 @@ mod tests {
         paused.stored_control = StoredControl::Paused;
         for c in [counters(10), counters(3), paused] {
             assert_eq!(
-                decide(&c, None, Some(&row(3, PositionStatus::Issued)), &wrong, 0).unwrap_err(),
+                decide(
+                    &c,
+                    None,
+                    Some(&row(3, PositionStatus::Issued)),
+                    &wrong,
+                    Timestamp::constant(0, 0)
+                )
+                .unwrap_err(),
                 Denied::NotHolder
             );
         }
@@ -799,11 +847,18 @@ mod tests {
             r: REQ.to_owned(),
             s: 3,
             l: 1,
-            t: 1_788_000_000,
+            t: Timestamp::constant(1_788_000_000, 0),
             h: Some(digest()),
         };
         assert_eq!(
-            decide(&counters(u64::MAX), Some(&pq), None, &wrong, 0).unwrap_err(),
+            decide(
+                &counters(u64::MAX),
+                Some(&pq),
+                None,
+                &wrong,
+                Timestamp::constant(0, 0)
+            )
+            .unwrap_err(),
             Denied::NotHolder
         );
     }
@@ -817,7 +872,14 @@ mod tests {
             admitted_at: None,
         };
         assert_eq!(
-            decide(&counters(10), None, Some(&legacy), &secret(), 0).unwrap_err(),
+            decide(
+                &counters(10),
+                None,
+                Some(&legacy),
+                &secret(),
+                Timestamp::constant(0, 0)
+            )
+            .unwrap_err(),
             Denied::NotHolder
         );
     }
@@ -830,13 +892,20 @@ mod tests {
             r: REQ.to_owned(),
             s: 0,
             l: 2,
-            t: 1_788_000_000,
+            t: Timestamp::constant(1_788_000_000, 0),
             h: Some(digest()),
         };
         let mut admitted = row(3, PositionStatus::Admitted);
         admitted.digest = None;
         assert_eq!(
-            decide(&counters(10), Some(&pq), Some(&admitted), &secret(), 0).unwrap_err(),
+            decide(
+                &counters(10),
+                Some(&pq),
+                Some(&admitted),
+                &secret(),
+                Timestamp::constant(0, 0)
+            )
+            .unwrap_err(),
             Denied::NotHolder
         );
     }

@@ -26,7 +26,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, Request, Response, StatusCode};
 
-use super::queue::JoinQueue;
+use harness::queue::JoinQueue;
 
 /// AWS's documented example key pair. The emulator runs with signing off and
 /// `ExtendDB`'s dev image accepts this pair, so nothing secret is involved.
@@ -324,7 +324,7 @@ pub async fn seed_event(
     tables: &Tables,
     event_id: &str,
     origin_concurrency: u32,
-    starts_at: u64,
+    starts_at: jiff::Timestamp,
 ) -> Result<()> {
     let n = |v: u64| AttributeValue::N(v.to_string());
     ddb.put_item()
@@ -335,7 +335,10 @@ pub async fn seed_event(
         .item("queue_counter", n(0))
         .item("serving_counter", n(0))
         .item("origin_concurrency", n(u64::from(origin_concurrency)))
-        .item(wr_common::STARTS_AT_ATTR, n(starts_at))
+        .item(
+            wr_common::STARTS_AT_ATTR,
+            AttributeValue::N(starts_at.as_second().to_string()),
+        )
         .send()
         .await
         .context("seed the event item")?;

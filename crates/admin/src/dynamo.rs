@@ -9,7 +9,7 @@ use jiff::Timestamp;
 
 use crate::arrival::ArrivalTime;
 use wr_common::expr::Key;
-use wr_common::{Phase, StoredControl};
+use wr_common::{Counters, Phase, StoredControl};
 
 use crate::{ControlState, Store, StoreError};
 
@@ -17,6 +17,11 @@ use crate::{ControlState, Store, StoreError};
 pub struct DynamoStore {
     client: Client,
     counters_table: String,
+}
+
+/// The stored fail-open deadline: epoch seconds, `0` for no window.
+fn fail_open_value(until: Option<Timestamp>) -> AttributeValue {
+    AttributeValue::N(until.map_or(0, Timestamp::as_second).to_string())
 }
 
 impl DynamoStore {
@@ -69,7 +74,7 @@ impl DynamoStore {
     fn build_fail_open_until_req(
         &self,
         event_id: &str,
-        until: u64,
+        until: Option<Timestamp>,
         action: crate::AdminAction,
         actor: &str,
         now: ArrivalTime,
@@ -84,7 +89,7 @@ impl DynamoStore {
                 "SET fail_open_until = :u, last_action = :a, last_action_by = :by, \
                  last_action_at = :at, last_action_epoch_ms = :ms",
             )
-            .expression_attribute_values(":u", AttributeValue::N(until.to_string()));
+            .expression_attribute_values(":u", fail_open_value(until));
         req = apply_audit_values(req, action, actor, now);
         req
     }
@@ -97,13 +102,17 @@ impl DynamoStore {
     /// clear fail-open; the guard that rejected the first attempt only governs
     /// the *stamp*, not the functional write. Returns the builder without sending
     /// so a regression test can assert the fallback touches only `fail_open_until`.
-    fn build_fail_open_until_fallback_req(&self, event_id: &str, until: u64) -> UpdateReq {
+    fn build_fail_open_until_fallback_req(
+        &self,
+        event_id: &str,
+        until: Option<Timestamp>,
+    ) -> UpdateReq {
         self.client
             .update_item()
             .table_name(&self.counters_table)
             .set_key(Some(Key::Event { event_id }.build()))
             .update_expression("SET fail_open_until = :u")
-            .expression_attribute_values(":u", AttributeValue::N(until.to_string()))
+            .expression_attribute_values(":u", fail_open_value(until))
     }
 
     /// Builds the guarded `stamp_action` `UpdateItem` (audit fields + the
@@ -179,6 +188,8 @@ impl Store for DynamoStore {
         let str_attr =
             |key: &str| -> Option<String> { item.get(key).and_then(|v| v.as_s().ok()).cloned() };
 
+        // The times are read as every other Lambda reads them.
+        let counters = Counters::from_item(event_id, item);
         Ok(Some(ControlState {
             event_id: event_id.to_owned(),
             phase,
@@ -188,7 +199,7 @@ impl Store for DynamoStore {
             origin_concurrency: num("origin_concurrency").and_then(|n| u32::try_from(n).ok()),
             message: item.get("message").and_then(|v| v.as_s().ok()).cloned(),
             stored_control: wr_common::stored_control_of(item),
-            fail_open_until: num("fail_open_until").unwrap_or(0),
+            fail_open_until: counters.fail_open_until,
             last_action: str_attr("last_action"),
             last_action_by: str_attr("last_action_by"),
             last_action_at: str_attr("last_action_at"),
@@ -201,7 +212,7 @@ impl Store for DynamoStore {
                 .and_then(|v| v.as_n().ok())
                 .and_then(|n| n.parse().ok())
                 .and_then(|ms| Timestamp::from_millisecond(ms).ok()),
-            starts_at: num(wr_common::STARTS_AT_ATTR),
+            starts_at: counters.starts_at,
             starts_at_timezone: str_attr(wr_common::STARTS_AT_TZ_ATTR),
         }))
     }
@@ -322,7 +333,7 @@ impl Store for DynamoStore {
     async fn set_fail_open_until(
         &self,
         event_id: &str,
-        until: u64,
+        until: Option<Timestamp>,
         action: crate::AdminAction,
         actor: &str,
         now: ArrivalTime,
@@ -371,7 +382,7 @@ impl Store for DynamoStore {
     async fn set_starts_at(
         &self,
         event_id: &str,
-        starts_at: Option<(u64, &str)>,
+        starts_at: Option<(Timestamp, &str)>,
         action: crate::AdminAction,
         actor: &str,
         now: ArrivalTime,
@@ -391,9 +402,9 @@ impl Store for DynamoStore {
         // has already passed. Note both branches keep a SET clause: the audit
         // stamp is written either way, and a bare REMOVE would drop it.
         req = match starts_at {
-            Some((secs, tz)) => req
+            Some((at, tz)) => req
                 .update_expression(format!("SET {at_attr} = :s, {tz_attr} = :tz, {AUDIT}"))
-                .expression_attribute_values(":s", AttributeValue::N(secs.to_string()))
+                .expression_attribute_values(":s", AttributeValue::N(at.as_second().to_string()))
                 .expression_attribute_values(":tz", AttributeValue::S(tz.to_owned())),
             None => req.update_expression(format!("SET {AUDIT} REMOVE {at_attr}, {tz_attr}")),
         };
@@ -775,7 +786,7 @@ mod tests {
         let store = DynamoStore::for_test();
         let req = store.build_fail_open_until_req(
             "evt",
-            5_000,
+            Some(Timestamp::constant(5_000, 0)),
             crate::AdminAction::FailOpen,
             "op@x",
             ts(1_000),
@@ -806,7 +817,8 @@ mod tests {
         // re-introduce the regression the guard just prevented; carrying a
         // condition here would risk rejecting the break-glass write itself.
         let store = DynamoStore::for_test();
-        let req = store.build_fail_open_until_fallback_req("evt", 5_000);
+        let req =
+            store.build_fail_open_until_fallback_req("evt", Some(Timestamp::constant(5_000, 0)));
         assert_eq!(
             req.get_condition_expression().as_deref(),
             None,
@@ -930,7 +942,7 @@ mod tests {
         let outcome = store
             .set_fail_open_until(
                 "evt",
-                5_000,
+                Some(Timestamp::constant(5_000, 0)),
                 crate::AdminAction::FailOpen,
                 "opA@x",
                 ts(1_000),
@@ -1044,7 +1056,7 @@ mod tests {
         store
             .set_fail_open_until(
                 "evt",
-                5_000,
+                Some(Timestamp::constant(5_000, 0)),
                 crate::AdminAction::FailOpen,
                 "opA@x",
                 ts(1_000),
@@ -1123,7 +1135,7 @@ mod tests {
         let outcome = store
             .set_fail_open_until(
                 "evt",
-                5_000,
+                Some(Timestamp::constant(5_000, 0)),
                 crate::AdminAction::FailOpen,
                 "opA@x",
                 ts(1_000),
