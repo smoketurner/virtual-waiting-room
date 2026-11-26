@@ -1597,11 +1597,13 @@ dependencies = [
  "aws-config",
  "aws-sdk-dynamodb",
  "aws-sdk-ssm",
+ "aws_lambda_events",
  "axum",
  "base64 0.23.1",
  "controller",
  "generate_token",
  "jiff 1.0.1",
+ "lambda_http",
  "open_event",
  "read",
  "reqwest",
@@ -1610,6 +1612,8 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "wr-common",
 ]
 

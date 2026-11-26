@@ -14,4 +14,5 @@ pub mod metrics;
 pub mod queue;
 pub mod report;
 pub mod rng;
+pub mod scenario;
 pub mod visitor;

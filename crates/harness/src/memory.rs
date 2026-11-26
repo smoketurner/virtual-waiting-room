@@ -15,7 +15,7 @@
 //! real `dynamo.rs` against an emulator for those.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use controller::{
     AdmissionLog, ControllerState, PassDecision, PassInputs, ReleaseOutcome, ShardBudget,
@@ -55,10 +55,11 @@ struct Tables {
     writes: HashMap<String, (i64, u32)>,
 }
 
-/// The tables, and the session length the controller counts with.
-#[derive(Debug)]
+/// The tables, and the session length the controller counts with. Clones
+/// share the tables, as every function shares the real ones.
+#[derive(Debug, Clone)]
 pub struct Memory {
-    tables: Mutex<Tables>,
+    tables: Arc<Mutex<Tables>>,
     session: SignedDuration,
 }
 
@@ -74,7 +75,7 @@ impl Memory {
     #[must_use]
     pub fn new(session: SignedDuration) -> Self {
         Self {
-            tables: Mutex::new(Tables::default()),
+            tables: Arc::new(Mutex::new(Tables::default())),
             session,
         }
     }

@@ -61,8 +61,8 @@ pub struct Record {
     pub live_join: bool,
     pub position_known_ms: Option<u64>,
     pub admitted_ms: Option<u64>,
-    /// When the session `generate_token` minted ends, epoch seconds.
-    pub session_ends: Option<u64>,
+    /// When the session `generate_token` minted ends.
+    pub session_ends: Option<jiff::Timestamp>,
     pub outcome: Outcome,
     pub join_throttled: u32,
     pub capacity_refusals: u32,
@@ -530,7 +530,8 @@ impl Visitor<'_> {
                 if self.record.session_ends.is_none() {
                     self.record.session_ends = res
                         .json()
-                        .and_then(|b| b.get("expires_at").and_then(serde_json::Value::as_u64));
+                        .and_then(|b| b.get("expires_at").and_then(serde_json::Value::as_i64))
+                        .and_then(|secs| jiff::Timestamp::from_second(secs).ok());
                 }
                 let cookies: Vec<(String, String)> = res
                     .set_cookies

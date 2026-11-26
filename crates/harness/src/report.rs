@@ -8,8 +8,14 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 
+use jiff::{SignedDuration, Timestamp};
 use serde::Serialize;
 
+use std::time::Duration;
+
+use crate::metrics::Metrics;
+use crate::queue::QueueTotals;
+use crate::scenario::Scenario;
 use crate::visitor::{Outcome, Record};
 
 #[derive(Debug, Serialize)]
@@ -183,13 +189,22 @@ pub fn spearman(xs: &[f64], ys: &[f64]) -> f64 {
     cov / (vx * vy).sqrt()
 }
 
-/// The most sessions live at any instant, each running the `session` seconds
-/// before the end `generate_token` gave it.
+/// Each session's start and end in epoch seconds, from the end
+/// `generate_token` gave it and the session length.
+fn spans(ends: &[Timestamp], session: SignedDuration) -> Vec<(i64, i64)> {
+    let length = session.as_secs();
+    ends.iter()
+        .map(|end| (end.as_second().saturating_sub(length), end.as_second()))
+        .collect()
+}
+
+/// The most sessions live at any instant, each running `session` before the
+/// end `generate_token` gave it.
 #[must_use]
-pub fn peak_live(ends: &[u64], session: u64) -> u64 {
-    let mut edges: Vec<(u64, bool)> = Vec::with_capacity(ends.len() * 2);
-    for &end in ends {
-        edges.push((end.saturating_sub(session), true));
+pub fn peak_live(ends: &[Timestamp], session: SignedDuration) -> u64 {
+    let mut edges: Vec<(i64, bool)> = Vec::with_capacity(ends.len() * 2);
+    for (start, end) in spans(ends, session) {
+        edges.push((start, true));
         edges.push((end, false));
     }
     // An ending at the same second as a start frees its slot first: a session
@@ -209,16 +224,21 @@ pub fn peak_live(ends: &[u64], session: u64) -> u64 {
 }
 
 /// Sessions live in each second from the first session's start to the last
-/// one's end, and the epoch second the series starts at.
+/// one's end, and when the series starts.
 #[must_use]
-pub fn live_by_second(ends: &[u64], session: u64) -> (u64, Vec<u64>) {
-    let (Some(&first_end), Some(&last)) = (ends.iter().min(), ends.iter().max()) else {
-        return (0, Vec::new());
+pub fn live_by_second(
+    ends: &[Timestamp],
+    session: SignedDuration,
+) -> (Option<Timestamp>, Vec<u64>) {
+    let spans = spans(ends, session);
+    let (Some(first), Some(last)) = (
+        spans.iter().map(|&(start, _)| start).min(),
+        spans.iter().map(|&(_, end)| end).max(),
+    ) else {
+        return (None, Vec::new());
     };
-    let first = first_end.saturating_sub(session);
     let mut live = vec![0u64; usize::try_from(last - first).unwrap_or(0)];
-    for &end in ends {
-        let start = end.saturating_sub(session);
+    for (start, end) in spans {
         for second in start..end {
             if let Some(n) = usize::try_from(second - first)
                 .ok()
@@ -228,24 +248,24 @@ pub fn live_by_second(ends: &[u64], session: u64) -> (u64, Vec<u64>) {
             }
         }
     }
-    (first, live)
+    (Timestamp::from_second(first).ok(), live)
 }
 
 /// The share of `limit` slots held, second by second, from the first session's
 /// start to the last's: how full the origin was kept while anyone waited.
 #[must_use]
-pub fn occupancy(ends: &[u64], session: u64, limit: u64) -> Option<f64> {
-    let first = ends.iter().min()?.saturating_sub(session);
-    let last = ends.iter().max()?.saturating_sub(session);
+pub fn occupancy(ends: &[Timestamp], session: SignedDuration, limit: u64) -> Option<f64> {
+    let spans = spans(ends, session);
+    let first = spans.iter().map(|&(start, _)| start).min()?;
+    let last = spans.iter().map(|&(start, _)| start).max()?;
     if last <= first || limit == 0 {
         return None;
     }
-    let mut held = 0u64;
-    for &end in ends {
-        let start = end.saturating_sub(session);
-        held += end.min(last).saturating_sub(start.max(first));
+    let mut held = 0i64;
+    for (start, end) in spans {
+        held += (end.min(last) - start.max(first)).max(0);
     }
-    Some(held as f64 / ((last - first) * limit) as f64)
+    Some(held as f64 / ((last - first) as f64 * limit as f64))
 }
 
 /// The most admissions in any window of `width` seconds, and where it starts.
@@ -305,6 +325,331 @@ pub fn outcome_counts(records: &[Record]) -> BTreeMap<String, u64> {
     out
 }
 
+/// What a run collected, for the checks every tool makes.
+pub struct Evidence<'a> {
+    pub scenario: &'a Scenario,
+    pub records: &'a [Record],
+    pub metrics: &'a Metrics,
+    pub queue: QueueTotals,
+    /// What `/status` published after the open, if it did.
+    pub published: Option<&'a Published>,
+    pub registrations: &'a [Registration],
+    pub opened: bool,
+    /// When the open fired, ms from the start of the run.
+    pub open_at_ms: u64,
+    pub open_took: Duration,
+    pub passes: &'a [Result<controller::PassOutcome, String>],
+    pub elapsed: Duration,
+    /// Function invocations that returned an error.
+    pub failed_invocations: u64,
+    /// Error-level log events, by name.
+    pub logged_errors: &'a BTreeMap<String, u64>,
+}
+
+/// The facts and checks every tool reports.
+#[must_use]
+pub fn build(e: &Evidence<'_>) -> Report {
+    let mut r = Report::default();
+    let scenario = e.scenario;
+    let seconds = e.elapsed.as_secs();
+
+    r.fact("visitors", scenario.visitors);
+    r.fact("origin concurrency", scenario.concurrency);
+    r.fact("session length (s)", scenario.session.as_secs());
+    r.fact(
+        "arrival",
+        format!(
+            "{:?}, countdown {} s",
+            scenario.arrival,
+            scenario.countdown.as_secs()
+        ),
+    );
+    r.fact("no-show share", scenario.no_show);
+    r.fact("duplicate delivery rate", scenario.duplicate_rate);
+    r.fact("API Gateway limits scaled by", scenario.scale);
+    r.fact("run length (s)", seconds);
+    for (outcome, n) in outcome_counts(e.records) {
+        r.fact(format!("outcome: {outcome}"), n);
+    }
+
+    // --- positions ----------------------------------------------------------
+    let dupes = duplicate_positions(e.records);
+    r.check(
+        "No two visitors are told the same position",
+        dupes.is_empty(),
+        format!(
+            "{} positions told, {} duplicated{}",
+            e.records.iter().filter(|x| x.position.is_some()).count(),
+            dupes.len(),
+            dupes
+                .first()
+                .map_or(String::new(), |p| format!(" (first: {p})"))
+        ),
+    );
+
+    let joined_no_position = e
+        .records
+        .iter()
+        .filter(|x| {
+            x.joined_ms.is_some() && x.position.is_none() && x.outcome != Outcome::StillWaiting
+        })
+        .count();
+    let gave_up = e
+        .records
+        .iter()
+        .filter(|x| matches!(x.outcome, Outcome::GaveUp(_)))
+        .count();
+    r.check(
+        "Every visitor who joined is given a position, and no visitor gives up",
+        joined_no_position == 0 && gave_up == 0,
+        format!("{joined_no_position} joined without a position, {gave_up} gave up"),
+    );
+    let still = e
+        .records
+        .iter()
+        .filter(|x| x.outcome == Outcome::StillWaiting)
+        .count();
+    r.check(
+        "Every visitor who stays is admitted before the run ends",
+        still == 0,
+        format!("{still} still waiting at the deadline"),
+    );
+
+    // --- the open and the cohort --------------------------------------------
+    r.check(
+        "The scheduled open runs and writes the cohort",
+        e.opened && e.published.is_some(),
+        format!(
+            "open invoked: {}, took {:.1} s (including the queue drain wait), published: {}",
+            e.opened,
+            e.open_took.as_secs_f64(),
+            e.published.is_some()
+        ),
+    );
+    let behind = e
+        .records
+        .iter()
+        .filter(|x| x.live_join && x.joined_ms.is_some_and(|j| j < e.open_at_ms))
+        .count();
+    let before = e
+        .records
+        .iter()
+        .filter(|x| x.joined_ms.is_some_and(|j| j < e.open_at_ms))
+        .count();
+    r.check(
+        "Every join accepted before the open is in the cohort",
+        behind == 0,
+        format!("{before} joins accepted before the open, {behind} numbered behind the cohort"),
+    );
+    if let Some(published) = e.published {
+        let recomputed = audit(published, e.registrations);
+        let told: HashMap<&str, u64> = e
+            .records
+            .iter()
+            .filter(|x| !x.live_join)
+            .filter_map(|x| x.position.map(|p| (x.request_id.as_str(), p)))
+            .collect();
+        let mismatched = told
+            .iter()
+            .filter(|(id, p)| recomputed.get(**id).is_some_and(|q| q != *p))
+            .count();
+        let distinct: HashSet<u64> = recomputed.values().copied().collect();
+        let in_range = recomputed
+            .values()
+            .all(|&p| p < published.participant_count);
+        r.fact("cohort size (published)", published.participant_count);
+        r.fact("pre-queue rows", e.registrations.len());
+        r.check(
+            "Every cohort position recomputes from the published seed and offsets, and they are distinct",
+            mismatched == 0 && distinct.len() == recomputed.len() && in_range,
+            format!(
+                "{} rows recomputed, {} distinct, all < N: {in_range}; {} visitors cross-checked, {mismatched} disagree",
+                recomputed.len(),
+                distinct.len(),
+                told.len()
+            ),
+        );
+        let cohort: Vec<&Record> = e
+            .records
+            .iter()
+            .filter(|x| !x.live_join && x.position.is_some() && x.joined_ms.is_some())
+            .collect();
+        if cohort.len() >= 100 {
+            let xs: Vec<f64> = cohort
+                .iter()
+                .map(|x| x.joined_ms.unwrap_or(0) as f64)
+                .collect();
+            let ys: Vec<f64> = cohort
+                .iter()
+                .map(|x| x.position.unwrap_or(0) as f64)
+                .collect();
+            let rho = spearman(&xs, &ys);
+            let bound = 4.0 / (cohort.len() as f64).sqrt();
+            r.check(
+                "A cohort position is uncorrelated with when the visitor registered",
+                rho.abs() < bound,
+                format!(
+                    "Spearman rho {rho:+.4} over {} visitors (bound ±{bound:.4})",
+                    cohort.len()
+                ),
+            );
+        }
+    }
+
+    // --- admission ----------------------------------------------------------
+    let admissions = e.metrics.origin_series("protected", seconds);
+    let total_admitted: u64 = admissions.iter().sum();
+    r.fact("admissions reaching the origin", total_admitted);
+    let (busiest, start) = busiest_window(&admissions, 1);
+    r.fact(
+        "busiest second of admissions",
+        format!("{busiest} (from t={start} s)"),
+    );
+    let sessions: Vec<Timestamp> = e.records.iter().filter_map(|x| x.session_ends).collect();
+    let peak = peak_live(&sessions, scenario.session);
+    let (first_start, live) = live_by_second(&sessions, scenario.session);
+    r.fact(
+        "first session start",
+        first_start.map_or_else(|| "none".to_owned(), |t| t.to_string()),
+    );
+    r.series.insert("live sessions per second".to_owned(), live);
+    r.series
+        .insert("admissions per second".to_owned(), admissions.clone());
+    let limit = u64::from(scenario.concurrency);
+    r.check(
+        "No more sessions are ever live than the origin takes",
+        peak <= limit,
+        format!("most live at once: {peak} against {limit}"),
+    );
+    // While visitors are still waiting, the origin should be close to full.
+    // It runs a little under at each turnover: a slot is seen free up to a
+    // pass after its session ends, and its replacement has to poll in.
+    if let Some(occupancy) = occupancy(&sessions, scenario.session, limit) {
+        r.check(
+            "The origin stays near its limit while visitors are waiting",
+            occupancy >= 0.85,
+            format!(
+                "{:.0}% of the slots held, from the first admission to the last",
+                occupancy * 100.0
+            ),
+        );
+    }
+
+    // --- the edge -----------------------------------------------------------
+    let status_origin = e.metrics.origin_series("/_wr/v1/status", seconds);
+    let max_status = status_origin.iter().copied().max().unwrap_or(0);
+    r.check(
+        "/status reaches its origin about once a second however many are waiting",
+        max_status <= 2,
+        format!(
+            "busiest second: {max_status} origin fetches; {} in total over {seconds} s",
+            status_origin.iter().sum::<u64>()
+        ),
+    );
+    r.check(
+        "The gate never passes a request because it failed",
+        e.metrics.gate_failed_open_count() == 0,
+        format!("{} fail-open passes", e.metrics.gate_failed_open_count()),
+    );
+    r.fact(
+        "peak visitor requests per second",
+        e.metrics.peak_viewer_rate(),
+    );
+    for ((route, status), n) in e.metrics.viewer_totals() {
+        r.fact(format!("requests {route} {status}"), n);
+    }
+    for (route, n) in e.metrics.throttled_totals() {
+        r.fact(format!("API Gateway 429s on {route}"), n);
+    }
+    let mut known: Vec<u64> = e
+        .records
+        .iter()
+        .filter_map(|x| Some(x.position_known_ms?.saturating_sub(x.arrived_ms)))
+        .collect();
+    known.sort_unstable();
+    let mut admitted: Vec<u64> = e
+        .records
+        .iter()
+        .filter_map(|x| Some(x.admitted_ms?.saturating_sub(x.arrived_ms)))
+        .collect();
+    admitted.sort_unstable();
+    for (name, series) in [
+        ("arrival to position", &known),
+        ("arrival to admission", &admitted),
+    ] {
+        for p in [0.5, 0.9, 0.99] {
+            if let Some(v) = percentile(series, p) {
+                r.fact(
+                    format!("{name} p{:.0} (s)", p * 100.0),
+                    format!("{:.1}", v as f64 / 1000.0),
+                );
+            }
+        }
+    }
+
+    // --- the backend --------------------------------------------------------
+    r.check(
+        "No accepted join is dead-lettered",
+        e.queue.dead_lettered == 0,
+        format!(
+            "{} sent, {} delivered twice, {} dead-lettered, {} left",
+            e.queue.sent, e.queue.duplicated, e.queue.dead_lettered, e.queue.left
+        ),
+    );
+    let failed_passes = e.passes.iter().filter(|p| p.is_err()).count();
+    r.fact(
+        "controller passes",
+        format!("{} ({} failed)", e.passes.len(), failed_passes),
+    );
+    r.check(
+        "No function invocation fails and no function logs an error",
+        e.failed_invocations == 0 && e.logged_errors.is_empty() && failed_passes == 0,
+        format!(
+            "{} failed invocations, {failed_passes} failed controller passes, logged errors: {}",
+            e.failed_invocations,
+            if e.logged_errors.is_empty() {
+                "none".to_owned()
+            } else {
+                e.logged_errors
+                    .iter()
+                    .map(|(k, v)| format!("{k} x{v}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        ),
+    );
+    r
+}
+
+/// The open's values off a `/status` document, once it publishes them.
+#[must_use]
+pub fn parse_published(status: &serde_json::Value) -> Option<Published> {
+    let seed_hex = status.get("shuffle_seed")?.as_str()?;
+    let bytes = hex_decode(seed_hex)?;
+    let seed: [u8; 32] = bytes.try_into().ok()?;
+    let participant_count = status.get("participant_count")?.as_u64()?;
+    let offsets_v = status.get("prequeue_offsets")?.as_array()?;
+    let mut offsets = [0u64; wr_common::SHARDS];
+    for (slot, v) in offsets.iter_mut().zip(offsets_v) {
+        *slot = v.as_u64()?;
+    }
+    Some(Published {
+        seed,
+        participant_count,
+        offsets,
+    })
+}
+
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,18 +665,57 @@ mod tests {
     #[test]
     fn sessions_ending_as_others_start_do_not_overlap() {
         // Two back-to-back generations of two sessions each.
-        assert_eq!(peak_live(&[110, 110, 120, 120], 10), 2);
-        assert_eq!(peak_live(&[110, 110, 119, 120], 10), 3);
-        assert_eq!(peak_live(&[], 10), 0);
+        assert_eq!(
+            peak_live(
+                &[
+                    Timestamp::constant(110, 0),
+                    Timestamp::constant(110, 0),
+                    Timestamp::constant(120, 0),
+                    Timestamp::constant(120, 0)
+                ],
+                SignedDuration::from_secs(10)
+            ),
+            2
+        );
+        assert_eq!(
+            peak_live(
+                &[
+                    Timestamp::constant(110, 0),
+                    Timestamp::constant(110, 0),
+                    Timestamp::constant(119, 0),
+                    Timestamp::constant(120, 0)
+                ],
+                SignedDuration::from_secs(10)
+            ),
+            3
+        );
+        assert_eq!(peak_live(&[], SignedDuration::from_secs(10)), 0);
     }
 
     #[test]
     fn a_full_origin_is_fully_occupied() {
         // Two slots, refilled exactly as each session ends.
-        let ends = [110, 110, 120, 120, 130, 130];
-        assert_eq!(occupancy(&ends, 10, 2), Some(1.0));
-        let half = [110, 120, 130];
-        assert_eq!(occupancy(&half, 10, 2), Some(0.5));
+        let full = [
+            Timestamp::constant(110, 0),
+            Timestamp::constant(110, 0),
+            Timestamp::constant(120, 0),
+            Timestamp::constant(120, 0),
+            Timestamp::constant(130, 0),
+            Timestamp::constant(130, 0),
+        ];
+        assert_eq!(
+            occupancy(&full, SignedDuration::from_secs(10), 2),
+            Some(1.0)
+        );
+        let half = [
+            Timestamp::constant(110, 0),
+            Timestamp::constant(120, 0),
+            Timestamp::constant(130, 0),
+        ];
+        assert_eq!(
+            occupancy(&half, SignedDuration::from_secs(10), 2),
+            Some(0.5)
+        );
     }
 
     #[test]
