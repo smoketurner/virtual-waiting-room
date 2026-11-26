@@ -61,6 +61,8 @@ pub struct Record {
     pub live_join: bool,
     pub position_known_ms: Option<u64>,
     pub admitted_ms: Option<u64>,
+    /// When the session `generate_token` minted ends, epoch seconds.
+    pub session_ends: Option<u64>,
     pub outcome: Outcome,
     pub join_throttled: u32,
     pub capacity_refusals: u32,
@@ -102,6 +104,7 @@ struct Visitor<'a> {
     first_ask_at: Option<Instant>,
     cursor_samples: Vec<(Instant, u64)>,
     capacity_misses: u32,
+    capacity_refusals: u32,
     record: Record,
 }
 
@@ -157,6 +160,7 @@ pub async fn visit(world: Arc<World>, mut rng: Rng, arrive_at: Instant, no_show:
         first_ask_at: None,
         cursor_samples: Vec::new(),
         capacity_misses: 0,
+        capacity_refusals: 0,
         record: Record {
             request_id,
             arrived_ms,
@@ -165,6 +169,7 @@ pub async fn visit(world: Arc<World>, mut rng: Rng, arrive_at: Instant, no_show:
             live_join: false,
             position_known_ms: None,
             admitted_ms: None,
+            session_ends: None,
             outcome: Outcome::StillWaiting,
             join_throttled: 0,
             capacity_refusals: 0,
@@ -174,7 +179,7 @@ pub async fn visit(world: Arc<World>, mut rng: Rng, arrive_at: Instant, no_show:
     let outcome = v.run(no_show).await;
     v.record.outcome = outcome;
     v.record.join_throttled = v.join_throttles;
-    v.record.capacity_refusals = v.capacity_misses;
+    v.record.capacity_refusals = v.capacity_refusals;
     v.record
 }
 
@@ -373,10 +378,15 @@ impl Visitor<'_> {
                 .get("serving_state")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
-            let target = s
-                .get("target_rate")
-                .and_then(serde_json::Value::as_f64)
-                .unwrap_or(0.0);
+            // The page's expectedRate: a full origin turns over once a session.
+            let number = |k: &str| s.get(k).and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+            let session = number("session_seconds");
+            let concurrency = number("origin_concurrency");
+            let target = if session > 0.0 {
+                concurrency / session
+            } else {
+                0.0
+            };
             match state {
                 "closed" => {
                     known = None;
@@ -469,7 +479,14 @@ impl Visitor<'_> {
                 match self.redeem().await {
                     Redeem::Admitted => return Outcome::Admitted,
                     Redeem::Stop(why) => return Outcome::GaveUp(why),
-                    Redeem::AtCapacity => {
+                    // The page's 425: a slot not yet free, asked again at the
+                    // floor.
+                    Redeem::NotYet => {
+                        self.capacity_refusals += 1;
+                        self.capacity_misses = 0;
+                        self.next_ms = self.policy.floor;
+                    }
+                    Redeem::Busy => {
                         self.capacity_misses += 1;
                         let factor =
                             2f64.powi(i32::try_from(self.capacity_misses.min(6)).unwrap_or(6));
@@ -482,7 +499,8 @@ impl Visitor<'_> {
                 }
             } else {
                 let ahead = position.saturating_sub(serving);
-                self.next_ms = if ahead == 0 {
+                // The page: within one origin's worth of the front, the floor.
+                self.next_ms = if ahead == 0 || ahead as f64 <= concurrency {
                     self.policy.floor
                 } else {
                     self.interval_for(ahead, self.rate(target))
@@ -509,6 +527,11 @@ impl Visitor<'_> {
                 .and_then(|b| b.get("admitted").and_then(serde_json::Value::as_bool))
                 == Some(true) =>
             {
+                if self.record.session_ends.is_none() {
+                    self.record.session_ends = res
+                        .json()
+                        .and_then(|b| b.get("expires_at").and_then(serde_json::Value::as_u64));
+                }
                 let cookies: Vec<(String, String)> = res
                     .set_cookies
                     .iter()
@@ -535,7 +558,8 @@ impl Visitor<'_> {
             }
             403 => Redeem::Stop("not the holder of this place"),
             410 => Redeem::Stop("visit already used"),
-            425 | 429 | 500..=599 => Redeem::AtCapacity,
+            425 => Redeem::NotYet,
+            429 | 500..=599 => Redeem::Busy,
             _ => Redeem::Again,
         }
     }
@@ -543,7 +567,8 @@ impl Visitor<'_> {
 
 enum Redeem {
     Admitted,
-    AtCapacity,
+    NotYet,
+    Busy,
     Again,
     Stop(&'static str),
 }

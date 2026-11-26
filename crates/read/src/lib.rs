@@ -166,16 +166,18 @@ pub struct StatusResponse {
     /// Operator broadcast text for the waiting page. Absent when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
-    /// The operator's target admission rate in visitors per second, absent
-    /// until one is set.
+    /// How many visitors the origin takes at once, absent until set.
     ///
-    /// Published so a waiting visitor gets a wait estimate on their first poll
-    /// rather than after a minute of watching the cursor. It is a target, not a
-    /// measurement — the controller corrects releases against a no-show rate,
-    /// so the cursor's real speed differs — which is why a client should prefer
-    /// the movement it observes once it has enough of it.
+    /// Published with `session_seconds` so a waiting visitor gets a wait
+    /// estimate on their first poll rather than after a minute of watching the
+    /// cursor: the origin admits about `origin_concurrency` every
+    /// `session_seconds`. It is an expectation, not a measurement -- no-shows
+    /// move the cursor faster -- which is why a client should prefer the
+    /// movement it observes once it has enough of it.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub target_rate: Option<u32>,
+    pub origin_concurrency: Option<u32>,
+    /// How long an admitted visitor's session lasts.
+    pub session_seconds: u64,
     /// The adaptive poll policy (#69), absent when Terraform has
     /// not set one — the client then keeps its own fixed-interval default.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -219,11 +221,16 @@ pub enum ResolvedQueueNum {
 }
 
 /// Builds the `/status` payload from the counters item, the deploy-time poll
-/// policy (`None` when Terraform has not set one), and `now` (epoch seconds),
-/// which resolves the stored admission control against the fail-open epoch
-/// (issue #71).
+/// policy (`None` when Terraform has not set one), the session length, and
+/// `now` (epoch seconds), which resolves the stored admission control against
+/// the fail-open epoch (issue #71).
 #[must_use]
-pub fn status(counters: &Counters, poll_policy: Option<PollPolicy>, now: u64) -> StatusResponse {
+pub fn status(
+    counters: &Counters,
+    poll_policy: Option<PollPolicy>,
+    session_seconds: u64,
+    now: u64,
+) -> StatusResponse {
     StatusResponse {
         event_id: counters.event_id.clone(),
         phase: counters.phase,
@@ -236,7 +243,8 @@ pub fn status(counters: &Counters, poll_policy: Option<PollPolicy>, now: u64) ->
         prequeue_offsets: counters.prequeue_offsets,
         shuffle_seed: counters.shuffle_seed.map(hex::encode),
         message: counters.message.clone(),
-        target_rate: counters.target_rate,
+        origin_concurrency: counters.origin_concurrency,
+        session_seconds,
         poll_policy,
         starts_at: counters.starts_at,
     }
@@ -312,7 +320,7 @@ mod tests {
             participant_count: Some(opened.participant_count()),
             prequeue_offsets: Some(offsets),
             message: None,
-            target_rate: None,
+            origin_concurrency: None,
             stored_control: StoredControl::Open,
             fail_open_until: 0,
             starts_at: None,
@@ -340,12 +348,12 @@ mod tests {
             participant_count: None,
             prequeue_offsets: None,
             message: None,
-            target_rate: None,
+            origin_concurrency: None,
             stored_control: StoredControl::Open,
             fail_open_until: 0,
             starts_at: None,
         };
-        let json = serde_json::to_value(status(&counters, None, 0)).unwrap();
+        let json = serde_json::to_value(status(&counters, None, 3600, 0)).unwrap();
         assert_eq!(json["phase"], "pre_queue");
         assert!(json.get("participant_count").is_none());
         assert!(json.get("prequeue_offsets").is_none());
@@ -360,7 +368,7 @@ mod tests {
     fn status_publishes_the_seed_once_opened() {
         let counters = opened_counters([1; SHARDS], [0xAB; 32]);
         assert!(counters.open_outputs().is_some());
-        let json = serde_json::to_value(status(&counters, None, 0)).unwrap();
+        let json = serde_json::to_value(status(&counters, None, 3600, 0)).unwrap();
         assert_eq!(json["shuffle_seed"], "ab".repeat(32));
     }
 
@@ -371,7 +379,7 @@ mod tests {
         // indices, and check the result against the positions the room serves.
         let counts = [3, 0, 5, 1, 0, 0, 2, 0, 0, 4];
         let counters = opened_counters(counts, [42u8; 32]);
-        let json = serde_json::to_value(status(&counters, None, 0)).unwrap();
+        let json = serde_json::to_value(status(&counters, None, 3600, 0)).unwrap();
 
         let seed = Seed(
             hex::decode(json["shuffle_seed"].as_str().unwrap())
@@ -408,7 +416,7 @@ mod tests {
             *b = i as u8;
         }
         let counters = opened_counters([1; SHARDS], seed);
-        let json = serde_json::to_value(status(&counters, None, 0)).unwrap();
+        let json = serde_json::to_value(status(&counters, None, 3600, 0)).unwrap();
         let published = json["shuffle_seed"].as_str().unwrap();
         assert_eq!(published.len(), 64);
         assert_eq!(published, published.to_lowercase());
@@ -422,7 +430,7 @@ mod tests {
         // an event that has no start time.
         let mut counters = opened_counters([1; SHARDS], [7u8; 32]);
         counters.starts_at = None;
-        let json = serde_json::to_value(status(&counters, None, 0)).unwrap();
+        let json = serde_json::to_value(status(&counters, None, 3600, 0)).unwrap();
         assert!(json.get("starts_at").is_none());
     }
 
@@ -430,7 +438,7 @@ mod tests {
     fn status_publishes_the_scheduled_start() {
         let mut counters = opened_counters([1; SHARDS], [7u8; 32]);
         counters.starts_at = Some(1_800_000_000);
-        let json = serde_json::to_value(status(&counters, None, 0)).unwrap();
+        let json = serde_json::to_value(status(&counters, None, 3600, 0)).unwrap();
         assert_eq!(json["starts_at"], 1_800_000_000_u64);
     }
 
@@ -440,7 +448,7 @@ mod tests {
         // client that cannot read it from /status cannot construct a request
         // that passes the edge validator.
         let counters = opened_counters([1; SHARDS], [7u8; 32]);
-        let json = serde_json::to_value(status(&counters, None, 0)).unwrap();
+        let json = serde_json::to_value(status(&counters, None, 3600, 0)).unwrap();
         assert_eq!(json["event_id"], "evt-1");
         assert!(json["event_id"].as_str().is_some_and(|s| !s.is_empty()));
     }
@@ -448,7 +456,7 @@ mod tests {
     #[test]
     fn status_exposes_open_outputs_when_active() {
         let counters = opened_counters([2, 2, 2, 2, 2, 0, 0, 0, 0, 0], [3u8; 32]);
-        let json = serde_json::to_value(status(&counters, None, 0)).unwrap();
+        let json = serde_json::to_value(status(&counters, None, 3600, 0)).unwrap();
         assert_eq!(json["phase"], "active");
         assert_eq!(json["participant_count"], 10);
         assert_eq!(json["serving_position"], 5);
@@ -459,39 +467,40 @@ mod tests {
     fn status_surfaces_the_broadcast_message_when_set() {
         let mut counters = opened_counters([1; SHARDS], [7u8; 32]);
         counters.message = Some("Doors open at noon".to_owned());
-        let json = serde_json::to_value(status(&counters, None, 0)).unwrap();
+        let json = serde_json::to_value(status(&counters, None, 3600, 0)).unwrap();
         assert_eq!(json["message"], "Doors open at noon");
     }
 
     #[test]
     fn status_omits_the_message_when_absent() {
         let counters = opened_counters([1; SHARDS], [7u8; 32]);
-        let json = serde_json::to_value(status(&counters, None, 0)).unwrap();
+        let json = serde_json::to_value(status(&counters, None, 3600, 0)).unwrap();
         assert!(json.get("message").is_none());
     }
 
     #[test]
-    fn status_publishes_the_target_rate_when_set() {
+    fn status_publishes_the_origin_concurrency_when_set() {
         let mut counters = opened_counters([1; SHARDS], [7u8; 32]);
-        counters.target_rate = Some(250);
-        let json = serde_json::to_value(status(&counters, None, 0)).unwrap();
-        assert_eq!(json["target_rate"], 250);
+        counters.origin_concurrency = Some(250);
+        let json = serde_json::to_value(status(&counters, None, 3600, 0)).unwrap();
+        assert_eq!(json["origin_concurrency"], 250);
+        assert_eq!(json["session_seconds"], 3600);
     }
 
     #[test]
-    fn status_omits_the_target_rate_when_unset() {
+    fn status_omits_the_origin_concurrency_when_unset() {
         // A waiting page must be able to tell "no rate set" from "rate is
         // zero": the first means the operator has not started admitting and no
         // estimate can be made, the second would read as an infinite wait.
         let counters = opened_counters([1; SHARDS], [7u8; 32]);
-        let json = serde_json::to_value(status(&counters, None, 0)).unwrap();
-        assert!(json.get("target_rate").is_none());
+        let json = serde_json::to_value(status(&counters, None, 3600, 0)).unwrap();
+        assert!(json.get("origin_concurrency").is_none());
     }
 
     #[test]
     fn status_omits_poll_policy_when_unset() {
         let counters = opened_counters([1; SHARDS], [7u8; 32]);
-        let json = serde_json::to_value(status(&counters, None, 0)).unwrap();
+        let json = serde_json::to_value(status(&counters, None, 3600, 0)).unwrap();
         assert!(json.get("poll_policy").is_none());
     }
 
@@ -503,7 +512,7 @@ mod tests {
             ceiling_ms: 30000,
             divisor: 10,
         };
-        let json = serde_json::to_value(status(&counters, Some(policy), 0)).unwrap();
+        let json = serde_json::to_value(status(&counters, Some(policy), 3600, 0)).unwrap();
         assert_eq!(json["poll_policy"]["floor_ms"], 5000);
         assert_eq!(json["poll_policy"]["ceiling_ms"], 30000);
         assert_eq!(json["poll_policy"]["divisor"], 10);
@@ -664,7 +673,7 @@ mod tests {
         #[test]
         fn the_published_seed_decodes_back_to_the_bytes_it_encodes(bytes in any::<[u8; 32]>()) {
             let counters = opened_counters([1; SHARDS], bytes);
-            let published = status(&counters, None, 0).shuffle_seed;
+            let published = status(&counters, None, 3600, 0).shuffle_seed;
             prop_assert_eq!(hex::decode(published.unwrap_or_default()), Ok(bytes.to_vec()));
         }
     }
@@ -674,17 +683,17 @@ mod tests {
         // Active event -> running; pause it -> paused; fail-open -> fail_open.
         let mut counters = opened_counters([1; SHARDS], [7u8; 32]);
         assert_eq!(
-            serde_json::to_value(status(&counters, None, 0)).unwrap()["serving_state"],
+            serde_json::to_value(status(&counters, None, 3600, 0)).unwrap()["serving_state"],
             "running"
         );
         counters.stored_control = StoredControl::Paused;
         assert_eq!(
-            serde_json::to_value(status(&counters, None, 0)).unwrap()["serving_state"],
+            serde_json::to_value(status(&counters, None, 3600, 0)).unwrap()["serving_state"],
             "paused"
         );
         counters.fail_open_until = 100;
         assert_eq!(
-            serde_json::to_value(status(&counters, None, 50)).unwrap()["serving_state"],
+            serde_json::to_value(status(&counters, None, 3600, 50)).unwrap()["serving_state"],
             "fail_open"
         );
     }
@@ -695,7 +704,7 @@ mod tests {
         let mut counters = opened_counters([1; SHARDS], [7u8; 32]);
         counters.phase = Phase::Idle;
         assert_eq!(
-            serde_json::to_value(status(&counters, None, 0)).unwrap()["serving_state"],
+            serde_json::to_value(status(&counters, None, 3600, 0)).unwrap()["serving_state"],
             "closed"
         );
     }
@@ -711,7 +720,7 @@ mod tests {
             participant_count: None,
             prequeue_offsets: None,
             message: None,
-            target_rate: None,
+            origin_concurrency: None,
             stored_control: StoredControl::Open,
             fail_open_until: 0,
             starts_at: None,

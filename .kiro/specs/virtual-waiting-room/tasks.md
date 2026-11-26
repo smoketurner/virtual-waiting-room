@@ -11,7 +11,7 @@ The build-state record for requirements.md. Requirement IDs in brackets; decisio
 ### 1a. Data and counter
 
 - [x] Four tables (`Counters`, `PreQueue`, `Positions`, `Tokens`), on-demand, PITR, `warm_throughput_*` as variables [O1]
-- [x] `Counters` event item: sequences, `phase` (incl. `maintenance`), `target_rate`, `shuffle_seed`, `operator_message`, `admission_control` + `fail_open_until`; `prequeue_counter` and `arrivals` striped ×10 as separate items (ADR-0015)
+- [x] `Counters` event item: sequences, `phase` (incl. `maintenance`), `origin_concurrency`, `shuffle_seed`, `operator_message`, `admission_control` + `fail_open_until`; `prequeue_counter` and `arrivals` striped ×10 as separate items (ADR-0015)
 - [x] Batch range claim via one `UpdateItem ADD` / `ALL_NEW`, incremented by the **valid** count only [F2.2, F2.6]
 - [x] Every position write guarded by `attribute_not_exists(request_id)` [F2.5]
 - [ ] `max_throughput_*` table variables (DESIGN §5.5) — Partial: not built.
@@ -42,7 +42,7 @@ The build-state record for requirements.md. Requirement IDs in brackets; decisio
 
 ### 1e. Read path
 
-- [x] `/_wr/v1/status` (phase, serving position, rate, message in one payload) and `/_wr/v1/queue_num`, served by the `read` Lambda [F3.1]. `/queue_pos_expiry` went with expiry (ADR-0031) and `/public_key` with signed URLs (ADR-0021).
+- [x] `/_wr/v1/status` (phase, serving position, origin concurrency and session length, message in one payload) and `/_wr/v1/queue_num`, served by the `read` Lambda [F3.1]. `/queue_pos_expiry` went with expiry (ADR-0031) and `/public_key` with signed URLs (ADR-0021).
 - [x] Adaptive poll interval from a Terraform-set `poll_policy` — [#69](https://github.com/smoketurner/virtual-waiting-room/issues/69) [N10, ADR-0023]
 
 ### 1f. Admission, session, and outflow control
@@ -53,10 +53,10 @@ The build-state record for requirements.md. Requirement IDs in brackets; decisio
 - [x] Session scoped per event, optional IP binding — [#61](https://github.com/smoketurner/virtual-waiting-room/issues/61) (ADR-0036); `request_id` redeemable only with its possession secret — [#62](https://github.com/smoketurner/virtual-waiting-room/issues/62) (ADR-0035) [F3.5]
 - [x] Cross-language credential and rule conformance vectors checked against the shipped gate function [ADR-0021 §6]
 - [x] `StoredControl` + `fail_open_until`; `/_wr/admin/fail_open` and `/_wr/admin/recover` mirrored to the gate (ADR-0009, ADR-0019)
-- [x] No-show compensating controller, 10 s cadence as a durable function (ADR-0022) [F3.2, F3.8]
+- [x] No-show compensating controller metering origin concurrency from an admission log, 10 s cadence as a durable function (ADR-0022, ADR-0041) [F3.2, F3.8]
 - [ ] Automatic fail-open on a backend outage — [#58](https://github.com/smoketurner/virtual-waiting-room/issues/58) [F4.1, F4.2, F4.3] — Partial: the time-limited mechanism is built and operator-engaged; nothing trips it automatically.
 - [ ] Revoke an admission — [#63](https://github.com/smoketurner/virtual-waiting-room/issues/63) — no design chosen (ADR-0021 §5.2).
-- [ ] Concurrency term in the control law — [#65](https://github.com/smoketurner/virtual-waiting-room/issues/65) — nothing reports completion or abandonment; needs a new design.
+- [ ] Concurrency term in the control law — [#65](https://github.com/smoketurner/virtual-waiting-room/issues/65) — Partial: the controller keeps at most `origin_concurrency` sessions live, counting each as live for its whole length (ADR-0041); nothing reports completion or abandonment, so a visitor who leaves early holds their slot until the session ends.
 - Retired: separately signed token (F3.6), sliding session (F3.7), session completion (F3.10) — ADR-0032; position expiry (F3.9) — ADR-0031.
 
 ### 1g. Abuse mitigation
@@ -67,8 +67,8 @@ The build-state record for requirements.md. Requirement IDs in brackets; decisio
 ### 1h. Operator surface
 
 - [x] Operator message in the `/status` payload [F5.3]
-- [x] Position and estimated wait from the measured admission rate, on the waiting page [F5.4]
-- [x] Admin actions: phase, rate, message, start_time, open_now, force_maintenance, pause, resume, fail_open, recover, rules, ip_binding
+- [x] Position and estimated wait from the measured cursor speed, falling back to origin concurrency per session length, on the waiting page [F5.4]
+- [x] Admin actions: phase, concurrency, message, start_time, open_now, force_maintenance, pause, resume, fail_open, recover, rules, ip_binding
 - [ ] Every operator action scriptable, no console dependency [F5.5] — Partial: every action is an HTTP endpoint, but the only auth is the browser OIDC session, and every POST needs that session's `csrf` form field and a same-origin request (#243); no machine-caller path (ADR-0016).
 - [x] Admin UI: one Axum Lambda, askama templates, one self-contained stylesheet (ADR-0018), no React [F7.1, F7.2, F7.5]
 - [x] UI is a thin client over the same `/_wr/admin/*` actions [F7.3]
@@ -115,7 +115,7 @@ The build-state record for requirements.md. Requirement IDs in brackets; decisio
 - [ ] `/status` origin RPS flat from 10K to 1M waiters [C4]
 - [ ] Fail-open: waiting room returning 5xx, origin reachable [F4.1]
 - [ ] Session continuity across N pages [F3.5]
-- [ ] No-show: 30% no-shows at 500/min target converges on 500/min [F3.8]
+- [ ] No-show: with 30% no-shows the origin's slots stay nearly full [F3.8]
 - [ ] Standby activation within ~125 s; unprotected paths unqueued [F0.4, F0.6]
 - [ ] Spike in < 5 s drops no joins [C5]
 - [ ] Event isolation under one event at its ceiling [N9]

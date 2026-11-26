@@ -3,7 +3,8 @@
 //! The controller reads and writes one table. The event's own state is a
 //! single-item `GetItem`/`UpdateItem`. The arrivals shards are separate items
 //! under their own partition keys, read with one `BatchGetItem` and each given
-//! its cap with its own `UpdateItem`.
+//! its cap with its own `UpdateItem`. The admission log is one more item,
+//! replaced whole each pass.
 
 use std::collections::HashMap;
 
@@ -11,12 +12,16 @@ use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
 use aws_sdk_dynamodb::types::AttributeValue;
-use wr_common::expr::{Key, SHARD_CAP_ATTR, SHARD_COUNT_ATTR, SHARD_INDEX_ATTR, Update};
+use wr_common::expr::{
+    ADMISSION_LOG_ATTR, ADMISSION_PROVIDED_ATTR, Key, SHARD_CAP_ATTR, SHARD_COUNT_ATTR,
+    SHARD_INDEX_ATTR, Update,
+};
 use wr_common::{Phase, SHARDS, Shard, StoredControl};
 use wr_common::{shard_cap_of, shard_count_of, shard_index_of};
 
 use crate::{
-    ControllerState, PassDecision, PassInputs, ReleaseOutcome, ShardBudget, Store, StoreError,
+    AdmissionLog, ControllerState, LogEntry, PassDecision, PassInputs, ReleaseOutcome, ShardBudget,
+    Store, StoreError,
 };
 
 /// A live `DynamoDB` store bound to the counters table.
@@ -24,15 +29,22 @@ pub struct DynamoStore {
     client: Client,
     counters_table: String,
     event_id: String,
+    session_secs: u64,
 }
 
 impl DynamoStore {
     #[must_use]
-    pub fn new(client: Client, counters_table: String, event_id: String) -> Self {
+    pub fn new(
+        client: Client,
+        counters_table: String,
+        event_id: String,
+        session_secs: u64,
+    ) -> Self {
         Self {
             client,
             counters_table,
             event_id,
+            session_secs,
         }
     }
 
@@ -40,6 +52,12 @@ impl DynamoStore {
     pub fn event_id(&self) -> &str {
         &self.event_id
     }
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 fn num(item: &HashMap<String, AttributeValue>, attr: &str) -> u64 {
@@ -92,10 +110,12 @@ impl Store for DynamoStore {
             fail_open_until: num(item, "fail_open_until"),
             inputs: PassInputs {
                 shards: self.read_shards(event_id).await?,
+                shards_read_at: now_secs(),
                 serving_counter: num(item, "serving_counter"),
                 queue_counter: num(item, "queue_counter"),
-                target_rate: u32::try_from(num(item, "target_rate")).unwrap_or(0),
-                last_open_pass_at: num(item, "last_open_pass_at"),
+                origin_concurrency: u32::try_from(num(item, "origin_concurrency")).unwrap_or(0),
+                session_secs: self.session_secs,
+                log: self.read_log(event_id).await?,
             },
         })
     }
@@ -111,17 +131,13 @@ impl Store for DynamoStore {
             .update_item()
             .table_name(&self.counters_table)
             .set_key(Some(Key::Event { event_id }.build()))
-            .update_expression("SET serving_counter = :next, last_open_pass_at = :at")
+            .update_expression("SET serving_counter = :next")
             .condition_expression(
                 "attribute_not_exists(serving_counter) OR serving_counter = :expected",
             )
             .expression_attribute_values(
                 ":next",
                 AttributeValue::N(decision.next_serving_counter.to_string()),
-            )
-            .expression_attribute_values(
-                ":at",
-                AttributeValue::N(decision.last_open_pass_at.to_string()),
             )
             .expression_attribute_values(
                 ":expected",
@@ -142,6 +158,27 @@ impl Store for DynamoStore {
             }
             Err(e) => Err(StoreError(format!("update_item release: {e}"))),
         }
+    }
+
+    async fn write_log(&self, event_id: &str, log: &AdmissionLog) -> Result<(), StoreError> {
+        let write = Update::new()
+            .set(ADMISSION_LOG_ATTR, entries_to_attr(log))
+            .set(
+                ADMISSION_PROVIDED_ATTR,
+                AttributeValue::N(log.provided.to_string()),
+            )
+            .build();
+        self.client
+            .update_item()
+            .table_name(&self.counters_table)
+            .set_key(Some(Key::AdmissionLog { event_id }.build()))
+            .update_expression(write.expression)
+            .set_expression_attribute_names(Some(write.names))
+            .set_expression_attribute_values(Some(write.values))
+            .send()
+            .await
+            .map_err(|e| StoreError(format!("update_item admission log: {e}")))?;
+        Ok(())
     }
 
     async fn write_caps(&self, event_id: &str, caps: &[u64; SHARDS]) -> Result<(), StoreError> {
@@ -173,6 +210,35 @@ impl Store for DynamoStore {
 }
 
 impl DynamoStore {
+    /// The admission log, read consistently: a log missing the latest pass
+    /// would only count more sessions live, but there is no reason to.
+    ///
+    /// An absent log is the first pass's. An unreadable one is read as empty,
+    /// which counts every admission so far as live: nobody more is admitted
+    /// until the passes logged from here on reach back a session length.
+    async fn read_log(&self, event_id: &str) -> Result<AdmissionLog, StoreError> {
+        let out = self
+            .client
+            .get_item()
+            .table_name(&self.counters_table)
+            .set_key(Some(Key::AdmissionLog { event_id }.build()))
+            .consistent_read(true)
+            .send()
+            .await
+            .map_err(|e| StoreError(format!("get_item admission log: {e}")))?;
+        let Some(item) = out.item() else {
+            return Ok(AdmissionLog::default());
+        };
+        Ok(log_from_item(item).unwrap_or_else(|| {
+            tracing::error!(
+                event_id,
+                event = "admission_log_unreadable",
+                "admission log could not be read; counting every admission as live"
+            );
+            AdmissionLog::default()
+        }))
+    }
+
     /// One `BatchGetItem` over the ten arrivals shards, read consistently: the
     /// caps written from this read are `taken` plus a share, so a stale count
     /// would re-grant budget that has already been spent.
@@ -210,6 +276,38 @@ impl DynamoStore {
             .map_or_default(Vec::as_slice);
         shards_from_items(items)
     }
+}
+
+/// The log's entries as a flat list of numbers, each its time then its count.
+fn entries_to_attr(log: &AdmissionLog) -> AttributeValue {
+    let mut numbers = Vec::with_capacity(log.entries.len() * 2);
+    for entry in &log.entries {
+        numbers.push(AttributeValue::N(entry.at.to_string()));
+        numbers.push(AttributeValue::N(entry.admitted.to_string()));
+    }
+    AttributeValue::L(numbers)
+}
+
+fn log_from_item(item: &HashMap<String, AttributeValue>) -> Option<AdmissionLog> {
+    let provided = item
+        .get(ADMISSION_PROVIDED_ATTR)?
+        .as_n()
+        .ok()?
+        .parse::<u64>()
+        .ok()?;
+    let (pairs, rest) = item.get(ADMISSION_LOG_ATTR)?.as_l().ok()?.as_chunks::<2>();
+    if !rest.is_empty() {
+        return None;
+    }
+    let mut entries = Vec::with_capacity(pairs.len());
+    for [at, admitted] in pairs {
+        let read = |v: &AttributeValue| v.as_n().ok().and_then(|n| n.parse::<u64>().ok());
+        entries.push(LogEntry {
+            at: read(at)?,
+            admitted: read(admitted)?,
+        });
+    }
+    Some(AdmissionLog { entries, provided })
 }
 
 /// Folds `BatchGetItem` responses into the per-shard budgets. A shard with no
@@ -300,6 +398,53 @@ mod tests {
         let shards = shards_from_items(&[shard_item(0, 3, Some(4)), corrupt]).unwrap();
         assert_eq!(shards[0], ShardBudget { taken: 3, cap: 4 });
         assert_eq!(unused_total(shards), 1);
+    }
+
+    fn log_item(log: &AdmissionLog) -> HashMap<String, AttributeValue> {
+        HashMap::from([
+            (ADMISSION_LOG_ATTR.to_owned(), entries_to_attr(log)),
+            (
+                ADMISSION_PROVIDED_ATTR.to_owned(),
+                AttributeValue::N(log.provided.to_string()),
+            ),
+        ])
+    }
+
+    #[test]
+    fn the_log_round_trips_through_its_item() {
+        let log = AdmissionLog {
+            entries: vec![
+                LogEntry {
+                    at: 100,
+                    admitted: 0,
+                },
+                LogEntry {
+                    at: 110,
+                    admitted: u64::MAX,
+                },
+            ],
+            provided: 250,
+        };
+        assert_eq!(log_from_item(&log_item(&log)), Some(log));
+        let empty = AdmissionLog::default();
+        assert_eq!(log_from_item(&log_item(&empty)), Some(empty));
+    }
+
+    #[test]
+    fn a_malformed_log_is_unreadable() {
+        let n = |v: &str| AttributeValue::N(v.to_owned());
+        let with_entries = |entries: AttributeValue| {
+            HashMap::from([
+                (ADMISSION_LOG_ATTR.to_owned(), entries),
+                (ADMISSION_PROVIDED_ATTR.to_owned(), n("0")),
+            ])
+        };
+        assert!(log_from_item(&with_entries(AttributeValue::L(vec![n("1")]))).is_none());
+        assert!(log_from_item(&with_entries(AttributeValue::L(vec![n("1"), n("x")]))).is_none());
+        assert!(log_from_item(&with_entries(AttributeValue::S("1,2".to_owned()))).is_none());
+        let mut missing = log_item(&AdmissionLog::default());
+        missing.remove(ADMISSION_PROVIDED_ATTR);
+        assert!(log_from_item(&missing).is_none());
     }
 
     fn unused_total(shards: [ShardBudget; SHARDS]) -> u64 {

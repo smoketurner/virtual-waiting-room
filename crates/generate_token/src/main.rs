@@ -12,10 +12,7 @@
 use std::env;
 
 use generate_token::dynamo::DynamoStore;
-use generate_token::{
-    Admission, DEFAULT_SESSION_TTL_SECS, Denied, Minting, Store, admit, session_set_cookie,
-    viewer_ip,
-};
+use generate_token::{Admission, Denied, Minting, Store, admit, session_set_cookie, viewer_ip};
 use lambda_http::{Body, Error, Request, RequestExt, Response, run, service_fn};
 use tracing::info;
 use wr_common::{PossessionSecret, SigningKey};
@@ -74,20 +71,19 @@ async fn init() -> Result<AppState<DynamoStore>, Error> {
         event_id: env::var("EVENT_ID")?,
         session_cookie_name: env::var("SESSION_COOKIE_NAME")
             .unwrap_or_else(|_| "vwr_session".to_owned()),
-        // Absent is a real choice — the default is a sensible hour. A value
-        // that is *present* and unparseable is a typo in the deployment, and
-        // silently substituting the default means the operator's chosen
-        // session lifetime is not the one in force. That difference is
-        // invisible until a visitor is logged out mid-checkout, which is
-        // exactly the failure `session_ttl_seconds` exists to prevent.
-        session_ttl_secs: match env::var("SESSION_TTL_SECS") {
-            Err(_unset) => DEFAULT_SESSION_TTL_SECS,
-            Ok(raw) => raw.parse().map_err(|_| {
-                Error::from(format!(
-                    "SESSION_TTL_SECS is set to {raw:?}, which is not a whole number of seconds"
-                ))
-            })?,
-        },
+        // Required, with no default: the controller counts a slot as taken
+        // for exactly this long, so a session minted for longer than it
+        // counts is a visitor over the origin's limit.
+        session_ttl_secs: session_ttl_secs()?,
+    })
+}
+
+fn session_ttl_secs() -> Result<u64, Error> {
+    let raw = env::var("SESSION_TTL_SECS")?;
+    raw.parse().map_err(|_| {
+        Error::from(format!(
+            "SESSION_TTL_SECS is set to {raw:?}, which is not a whole number of seconds"
+        ))
     })
 }
 
@@ -258,7 +254,7 @@ mod tests {
                     shuffle_seed: Some([7u8; 32]),
                     participant_count: Some(100),
                     prequeue_offsets: Some([0u64; SHARDS]),
-                    target_rate: Some(10),
+                    origin_concurrency: Some(10),
                     message: None,
                     stored_control: wr_common::StoredControl::Open,
                     fail_open_until: 0,

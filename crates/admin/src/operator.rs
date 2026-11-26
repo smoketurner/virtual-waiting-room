@@ -399,8 +399,8 @@ mod tests {
     }
 
     #[derive(serde::Deserialize)]
-    struct RateForm {
-        rate: String,
+    struct ConcurrencyForm {
+        concurrency: String,
     }
 
     /// A router shaped like the console's: actions that take [`Operator`], one
@@ -416,10 +416,12 @@ mod tests {
                 }),
             )
             .route(
-                "/_wr/admin/rate",
-                post(|_: Operator, Form(form): Form<RateForm>| async move {
-                    format!("rate {}", form.rate)
-                }),
+                "/_wr/admin/concurrency",
+                post(
+                    |_: Operator, Form(form): Form<ConcurrencyForm>| async move {
+                        format!("concurrency {}", form.concurrency)
+                    },
+                ),
             )
             .layer(axum::middleware::from_fn_with_state(gate, guard_writes))
             .layer(axum::middleware::from_fn(arrival_layer))
@@ -467,27 +469,27 @@ mod tests {
     async fn the_handler_still_reads_its_own_form_after_the_guard_read_it() {
         let response = app("op@example.com")
             .oneshot(post_form(
-                "/_wr/admin/rate",
+                "/_wr/admin/concurrency",
                 Some(SESSION_ID),
-                "rate=25&csrf=the-session-token",
+                "concurrency=25&csrf=the-session-token",
             ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(text(response).await, "rate 25");
+        assert_eq!(text(response).await, "concurrency 25");
     }
 
     #[tokio::test]
     async fn a_post_without_the_token_is_forbidden() {
         for body in [
             "",
-            "rate=25",
+            "concurrency=25",
             "csrf=",
             "csrf=the-session-toke",
             "csrf=other",
         ] {
             let response = app("op@example.com")
-                .oneshot(post_form("/_wr/admin/rate", Some(SESSION_ID), body))
+                .oneshot(post_form("/_wr/admin/concurrency", Some(SESSION_ID), body))
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::FORBIDDEN, "body {body:?}");
@@ -529,10 +531,10 @@ mod tests {
         for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
             for path in [
                 "/_wr/admin/pause",
-                "/_wr/admin/rate",
+                "/_wr/admin/concurrency",
                 "/_wr/admin/not_written_yet",
             ] {
-                let mut request = post_form(path, Some(SESSION_ID), "rate=1");
+                let mut request = post_form(path, Some(SESSION_ID), "concurrency=1");
                 *request.method_mut() = method.clone();
                 let response = app("op@example.com").oneshot(request).await.unwrap();
                 assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {path}");
@@ -610,7 +612,7 @@ mod tests {
     async fn an_oversized_form_is_refused_before_it_is_parsed() {
         let body: &'static str = Box::leak("a".repeat(MAX_FORM_BYTES + 1).into_boxed_str());
         let response = app("op@example.com")
-            .oneshot(post_form("/_wr/admin/rate", Some(SESSION_ID), body))
+            .oneshot(post_form("/_wr/admin/concurrency", Some(SESSION_ID), body))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);

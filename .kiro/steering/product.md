@@ -2,7 +2,7 @@
 
 A virtual waiting room for AWS. It absorbs traffic spikes that would take a site down
 (ticket on-sales, product drops, registration windows) and meters visitors into the operator's
-origin at a rate the origin can survive.
+origin no faster than it can serve them: never more at once than it takes.
 
 ## Who it is for
 
@@ -45,10 +45,10 @@ so only the scheduled mode is served end to end.
   is not the write count — it is that a published seed, offsets and count let a third party
   recompute every position (F1.5). That checks the arithmetic, not that the seed was drawn
   fairly (ADR-0040).
-- **Closed-loop admission.** Admissions are metered against a budget granted at the target rate,
-  and budget nobody took releases more of the queue, so no-shows are compensated (up to about 43%
-  of the line) and the origin runs at the capacity the operator paid for. A spent budget holds the
-  queue back so visitors already invited are admitted first.
+- **Closed-loop admission.** Admissions are metered against a budget of the origin's free slots,
+  so no more than `origin_concurrency` sessions are ever live, and budget nobody took releases
+  more of the queue, so no-shows are compensated and the origin runs at the capacity the operator
+  paid for.
 - **Fails open.** If the waiting room is unavailable, visitors reach the site. A waiting room
   that fails closed turns its own outage into the operator's.
   **Only half-held today** (#58): the mechanism exists — an operator engages fail-open and the

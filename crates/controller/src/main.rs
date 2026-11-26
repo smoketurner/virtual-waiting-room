@@ -41,7 +41,16 @@ async fn main() -> Result<(), lambda_runtime::Error> {
     let client = aws_sdk_dynamodb::Client::new(&config);
     let counters_table = std::env::var("COUNTERS_TABLE")?;
     let event_id = std::env::var("EVENT_ID")?;
-    let store = Arc::new(DynamoStore::new(client, counters_table, event_id));
+    // Required, and the same value `generate_token` mints with: a session the
+    // controller thinks has ended while the gate still honours it is a visitor
+    // over the origin's limit.
+    let session_secs: u64 = std::env::var("SESSION_TTL_SECS")?.parse()?;
+    let store = Arc::new(DynamoStore::new(
+        client,
+        counters_table,
+        event_id,
+        session_secs,
+    ));
 
     // Force one real read in the Init phase so the aws-lc-rs jitter-entropy seed
     // and the TLS handshake land on boosted Init CPU rather than the first

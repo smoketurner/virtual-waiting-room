@@ -51,7 +51,7 @@ module "core" {
 
   # Seeded at apply so the stack serves without an operator driving a script or
   # the dashboard first.
-  admission_rate     = var.admission_rate
+  origin_concurrency = var.origin_concurrency
   gate_rules         = var.gate_rules
   starts_at          = var.starts_at
   starts_at_timezone = var.starts_at_timezone

@@ -26,8 +26,8 @@ use admin::scheduler::SchedulerStore;
 use admin::sessions::{PendingLogin, SessionStore};
 use admin::templates::Dashboard;
 use admin::{
-    ApplyError, EdgeConfigStore, apply_fail_open, apply_force_maintenance, apply_ip_binding,
-    apply_message, apply_open_now, apply_pause, apply_phase, apply_rate, apply_recover,
+    ApplyError, EdgeConfigStore, apply_concurrency, apply_fail_open, apply_force_maintenance,
+    apply_ip_binding, apply_message, apply_open_now, apply_pause, apply_phase, apply_recover,
     apply_resume, apply_set_rules, apply_start_time, format_rules, parse_rules,
 };
 use askama::Template;
@@ -219,7 +219,7 @@ async fn main() -> Result<(), Error> {
         .route("/admin/callback", get(callback))
         .route("/admin/logout", post(logout))
         .route("/admin/phase", post(set_phase))
-        .route("/admin/rate", post(set_rate))
+        .route("/admin/concurrency", post(set_concurrency))
         .route("/admin/message", post(set_message))
         .route("/admin/start_time", post(set_start_time))
         .route("/admin/open_now", post(open_now))
@@ -492,7 +492,7 @@ async fn dashboard(State(state): State<Shared>, headers: HeaderMap, now: Arrival
             // Rules live only in the KeyValueStore (issue #71), not in
             // ControlState, so the current ruleset is a second read. A
             // failure here must not break the whole dashboard — the operator
-            // still needs to see phase/rate/message/admission — so it is
+            // still needs to see phase/concurrency/message/admission — so it is
             // logged and the rules form is hidden rather than shown empty:
             // an empty textarea is indistinguishable from a real dormant
             // ruleset, and submitting it would overwrite the real one.
@@ -573,21 +573,21 @@ async fn set_phase(
 }
 
 #[derive(Deserialize)]
-struct RateForm {
-    rate: String,
+struct ConcurrencyForm {
+    concurrency: String,
 }
 
-async fn set_rate(
+async fn set_concurrency(
     State(state): State<Shared>,
     Operator(session): Operator,
     now: ArrivalTime,
-    Form(form): Form<RateForm>,
+    Form(form): Form<ConcurrencyForm>,
 ) -> Response {
     finish(
-        apply_rate(
+        apply_concurrency(
             &state.store,
             &state.event_id,
-            &form.rate,
+            &form.concurrency,
             &session.email,
             now,
         )

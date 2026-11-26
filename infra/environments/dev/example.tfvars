@@ -67,9 +67,10 @@ poll_divisor    = 10
 # operator driving a script or the dashboard first. The control plane owns all
 # of it from there: Terraform writes these once and then ignores changes.
 
-# Visitors per second. Zero would release nobody, forever, while the controller
-# logged a successful pass every ten seconds, so there is no zero default.
-admission_rate = 5
+# Visitors on the origin at once. Zero would admit nobody, forever, while the
+# controller logged a successful pass every ten seconds, so there is no zero
+# default.
+origin_concurrency = 100
 
 # Which requests the gate covers, one rule per line, in the same grammar the
 # dashboard's Set rules form takes. Empty (the default) is dormant: every
@@ -90,11 +91,12 @@ admission_rate = 5
 # starts_at_timezone = "America/New_York"
 
 # --- Sessions -----------------------------------------------------------------
-# How long an admitted visitor's session cookie lasts. Nothing renews it at the
-# edge, so a visitor still on the origin when it lapses is returned to the
-# queue: set it comfortably longer than the worst realistic time on the origin,
-# not tightly around the average.
-session_ttl_seconds = 3600
+# How long an admitted visitor has on the origin, such as the time to complete
+# a purchase. Each session holds one slot of origin_concurrency for exactly this
+# long, so the room admits about origin_concurrency visitors per session length.
+# Nothing renews it at the edge: a visitor still on the origin when it lapses is
+# returned to the queue.
+session_ttl_seconds = 900
 
 # --- Flat-rate plan and edge protection (ADR-0038) ---------------------------
 # null stays on pay-as-you-go. "BUSINESS" ($200/month) or "PREMIUM" subscribes

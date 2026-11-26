@@ -119,10 +119,10 @@ variable "poll_divisor" {
 # control plane owns all three from there: Terraform writes them once and then
 # ignores changes.
 
-variable "admission_rate" {
-  description = "Target admission rate in visitors per second. Seeded onto the event item so the controller drains from the first apply; changed live from the dashboard."
+variable "origin_concurrency" {
+  description = "How many visitors the origin takes at once. Seeded onto the event item so the controller admits from the first apply; changed live from the dashboard."
   type        = number
-  default     = 5
+  default     = 100
 }
 
 variable "gate_rules" {
@@ -164,9 +164,9 @@ variable "acm_certificate_arn" {
 # --- Sessions -----------------------------------------------------------------
 
 variable "session_ttl_seconds" {
-  description = "How long an admitted visitor's session cookie is valid. Set it comfortably longer than the worst realistic time on the origin: when it lapses the visitor is returned to the queue, and nothing renews it at the edge."
+  description = "How long an admitted visitor has on the origin, such as the time to complete a purchase. Each session holds a slot of origin_concurrency for exactly this long, so the room admits about origin_concurrency visitors per session length. When it lapses the visitor is returned to the queue; nothing renews it at the edge."
   type        = number
-  default     = 3600
+  default     = 900
 }
 
 # --- Flat-rate plan and edge protection (ADR-0038) ---------------------------

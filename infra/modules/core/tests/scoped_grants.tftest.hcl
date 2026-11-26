@@ -138,8 +138,8 @@ run "each_writer_reaches_only_its_own_items" {
   assert {
     condition = toset(one(one([
       for s in data.aws_iam_policy_document.controller.statement : s if s.sid == "AdvanceCounters"
-    ]).condition).values) == toset(["EVT#an-event-id", "EVT#an-event-id#AR#*"])
-    error_message = "the controller touches the event item and the arrivals shards"
+    ]).condition).values) == toset(["EVT#an-event-id", "EVT#an-event-id#AR#*", "EVT#an-event-id#LOG"])
+    error_message = "the controller touches the event item, the arrivals shards and its admission log"
   }
 
   assert {

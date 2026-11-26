@@ -55,7 +55,7 @@ pub struct Dashboard {
     /// means all three landed — and an absent one means "not yet open" no
     /// matter what the phase says.
     pub opened: bool,
-    pub target_rate: String,
+    pub origin_concurrency: String,
     pub message: String,
     /// The raw broadcast message (empty string when unset), for pre-filling the
     /// input value so the operator sees the current message is still set. The
@@ -63,11 +63,11 @@ pub struct Dashboard {
     /// the JSON state view.
     #[serde(skip)]
     pub message_raw: String,
-    /// The stored rate as the form should show it: the bare number, or empty
-    /// when unset. `target_rate` renders "not set" for display, which would
+    /// The stored concurrency as the form should show it: the bare number, or empty
+    /// when unset. `origin_concurrency` renders "not set" for display, which would
     /// land in the input as literal text. Render-only, like `message_raw`.
     #[serde(skip)]
-    pub target_rate_raw: String,
+    pub origin_concurrency_raw: String,
     /// The four lifecycle phases in order, each marked `done`, `current` or
     /// `todo`, so the template can draw where the event is instead of
     /// describing it. `maintenance` is not a step: it is an override reachable
@@ -250,8 +250,8 @@ impl Dashboard {
             queue_counter: state.queue_counter,
             participant_count: dash(state.participant_count.map(|n| n.to_string())),
             opened: state.participant_count.is_some(),
-            target_rate: dash(state.target_rate.map(|n| n.to_string())),
-            target_rate_raw: state.target_rate.map_or_default(|n| n.to_string()),
+            origin_concurrency: dash(state.origin_concurrency.map(|n| n.to_string())),
+            origin_concurrency_raw: state.origin_concurrency.map_or_default(|n| n.to_string()),
             message: dash(state.message.clone()),
             message_raw: state.message.clone().unwrap_or_default(),
             admission_control: resolved.as_wire_str().to_owned(),
@@ -345,11 +345,11 @@ mod tests {
             serving_counter: 42,
             queue_counter: 1000,
             participant_count: Some(1000),
-            target_rate: Some(500),
+            origin_concurrency: Some(500),
             message: Some("Doors open at noon".to_owned()),
             stored_control: wr_common::StoredControl::Open,
             fail_open_until: 0,
-            last_action: Some("set_rate".to_owned()),
+            last_action: Some("set_concurrency".to_owned()),
             last_action_by: Some("op@example.com".to_owned()),
             last_action_at: Some("2026-09-09T22:00:00Z".to_owned()),
             last_action_time: jiff::Timestamp::from_millisecond(1_788_000_000_000).ok(),
@@ -719,7 +719,7 @@ mod tests {
         // JavaScript disabled.
         for action in [
             "action=\"/_wr/admin/phase\"",
-            "action=\"/_wr/admin/rate\"",
+            "action=\"/_wr/admin/concurrency\"",
             "action=\"/_wr/admin/message\"",
             "action=\"/_wr/admin/force_maintenance\"",
         ] {
@@ -741,7 +741,7 @@ mod tests {
     fn absent_optionals_render_as_dash() {
         let mut s = state();
         s.participant_count = None;
-        s.target_rate = None;
+        s.origin_concurrency = None;
         s.message = None;
         let html = Dashboard::from_state(&s, 0).render().unwrap();
         assert!(html.contains("not set"));

@@ -18,7 +18,7 @@ and what is built is tracked in its `tasks.md`.
 | F0.2 | Each phase MUST serve an operator-authored page. | Idle shows event information before the pre-queue opens; post-event shows outcome and next steps. |
 | F0.3 | The system MUST support **scheduled** events with a known start time. | A configured event opens at its scheduled time. |
 | F0.4 | The system MUST support **standby** mode: dormant year-round, activating automatically when inflow crosses an operator-configured threshold. | Below threshold, visitors pass through untouched. Above it, new visitors are queued without operator action. |
-| F0.5 | Both modes MUST run simultaneously on one origin. | A scheduled room on `/product/x` with a low admission rate coexists with standby protection across the whole site. |
+| F0.5 | Both modes MUST run simultaneously on one origin. | A scheduled room on `/product/x` with a low origin concurrency coexists with standby protection across the whole site. |
 | F0.6 | The operator MUST be able to declare which requests are protected, by path, header, cookie, or user agent. | An unprotected path is never queued, in any mode. |
 | F0.7 | Standby activation MUST be observable and manually overridable. | Operator can force-activate or force-dormant; state is visible in metrics. |
 | F0.8 | The system MUST support a **maintenance mode** that parks all visitors on an operator page. | Enabling it holds every visitor regardless of mode or capacity. |
@@ -52,11 +52,11 @@ activation queues first-in, first-out (FIFO).
 | ID | Requirement | Acceptance |
 |---|---|---|
 | F3.1 | A visitor MUST be able to read their own position and the current serving position. | `GET /queue_num` and `GET /status` return correct values. |
-| F3.2 | The operator MUST be able to control admission rate during the event. | `POST /_wr/admin/rate` changes the target rate; effect visible within the cache TTL. |
+| F3.2 | The operator MUST be able to control the origin concurrency, how many admitted visitors the origin holds at once, during the event. | `POST /_wr/admin/concurrency` changes the limit; no more sessions than it are ever live, and the change takes effect within one controller pass. |
 | F3.3 | Admitted visitors MUST receive a cryptographically verifiable credential. | The session cookie is signed; the edge gate verifies it locally, with no backend call. |
 | F3.4 | The protected origin MUST be unreachable without a valid session. | A request with no credential, an expired one, or one for another event is refused at the edge. |
 | F3.5 | Once a visitor's position is reached, the system MUST establish a **session** so they are not re-checked on every subsequent request. | A visitor navigates to a second page without re-presenting anything and is not re-queued. |
-| F3.8 | Admission rate control MUST compensate for **no-shows**, admitted visitors who never arrive at the origin. | With a 30% no-show rate and a target of 500/min, origin arrivals converge on 500/min, not 350. One visitor counts as one arrival however many times they call `/_wr/v1/generate_token`. |
+| F3.8 | Admission control MUST compensate for **no-shows**, released visitors who never arrive at the origin. | With a 30% no-show rate the origin's slots stay nearly full, not 70% full. One visitor counts once however many times they call `/_wr/v1/generate_token`. |
 
 ### 1.5 Failure behaviour
 
@@ -76,7 +76,7 @@ activation queues first-in, first-out (FIFO).
 | F5.2 | The waiting room page MUST be brandable by the client without forking the module. | Client supplies template assets; no code change required. |
 | F5.3 | The operator MUST be able to publish a message to waiting visitors during an event. | Message appears on the waiting page within the cache TTL. |
 | F5.4 | Waiting visitors MUST see their position and an estimated wait time. | Both displayed and updated as the queue advances. |
-| F5.5 | Every operator action MUST be available through an API, not only a console. | Rate change, reset, pause, message publish, and mode override all scriptable. |
+| F5.5 | Every operator action MUST be available through an API, not only a console. | Concurrency change, reset, pause, message publish, and mode override all scriptable. |
 
 ### 1.7 Abuse mitigation
 
@@ -143,8 +143,8 @@ Contractual deliverables. Without these the capacity requirements in §2 are not
 |---|---|---|
 | O1 | DynamoDB tables MUST be pre-warmed before each event. | Warm throughput ≥ the event's target write rate, verified before T−0 by the dashboard's Readiness panel ([RUNBOOK.md](RUNBOOK.md)). |
 | O2 | Service quota increases MUST be filed with lead time. | API Gateway RPS and DynamoDB per-table WRU confirmed raised before T−0; the Readiness panel shows the limits in force. |
-| O3 | A load test at the event's target rate MUST be executed before the event. | Report produced and reviewed with the client. |
-| O4 | The operator MUST be able to adjust admission rate, hold, or stop mid-event. | Every control is a dashboard form; [RUNBOOK.md](RUNBOOK.md) says what each does and what a waiting visitor sees. |
+| O3 | A load test at the event's origin concurrency MUST be executed before the event. | Report produced and reviewed with the client. |
+| O4 | The operator MUST be able to adjust the origin concurrency, hold, or stop mid-event. | Every control is a dashboard form; [RUNBOOK.md](RUNBOOK.md) says what each does and what a waiting visitor sees. |
 | O5 | New WAF rules MUST be observed in Count mode before being promoted to Block. | No rule enters Block without one event's worth of Count data. |
 | O6 | Cost MUST be modelled per client before the event. | Written estimate covering CloudFront, WAF, Bot Control, DynamoDB, and pre-warming. |
 

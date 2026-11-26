@@ -27,6 +27,7 @@ struct Ctx {
     /// The adaptive poll policy (#69), parsed once at cold start
     /// from Terraform-set env vars. `None` when any is absent or invalid.
     poll_policy: Option<PollPolicy>,
+    session_seconds: u64,
 }
 
 #[tokio::main]
@@ -47,6 +48,7 @@ async fn main() -> Result<(), Error> {
         event_id: std::env::var("EVENT_ID")?,
         counters_cache: CountersCache::new(COUNTERS_TTL),
         poll_policy: load_poll_policy(),
+        session_seconds: std::env::var("SESSION_TTL_SECS")?.parse()?,
     };
 
     lambda_http::run(service_fn(|req: Request| route(&ctx, req))).await
@@ -93,7 +95,10 @@ async fn handle_status(ctx: &Ctx) -> Result<Response<Body>, Error> {
     let Some(counters) = load_counters(ctx).await? else {
         return json(404, &serde_json::json!({ "error": "event not found" }));
     };
-    json(200, &status(&counters, ctx.poll_policy, now_secs()))
+    json(
+        200,
+        &status(&counters, ctx.poll_policy, ctx.session_seconds, now_secs()),
+    )
 }
 
 fn now_secs() -> u64 {

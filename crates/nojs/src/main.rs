@@ -5,9 +5,7 @@ use std::env;
 
 use askama::Template as _;
 use generate_token::dynamo::DynamoStore;
-use generate_token::{
-    DEFAULT_SESSION_TTL_SECS, Minting, Store, admit, session_set_cookie, viewer_ip,
-};
+use generate_token::{Minting, Store, admit, session_set_cookie, viewer_ip};
 use lambda_http::http::{Method, StatusCode};
 use lambda_http::{Body, Error, Request, Response, run, service_fn};
 use nojs::page::{WaitHtml, encode_component};
@@ -71,15 +69,14 @@ async fn init() -> Result<AppState<DynamoStore, SqsJoinQueue>, Error> {
         event_id: env::var("EVENT_ID")?,
         session_cookie_name: env::var("SESSION_COOKIE_NAME")
             .unwrap_or_else(|_| "vwr_session".to_owned()),
-        // Present and unparseable is a deployment typo, not a default, for the
-        // reason generate_token gives.
-        session_ttl_secs: match env::var("SESSION_TTL_SECS") {
-            Err(_unset) => DEFAULT_SESSION_TTL_SECS,
-            Ok(raw) => raw.parse().map_err(|_| {
+        // Required, for the reason generate_token gives.
+        session_ttl_secs: {
+            let raw = env::var("SESSION_TTL_SECS")?;
+            raw.parse().map_err(|_| {
                 Error::from(format!(
                     "SESSION_TTL_SECS is set to {raw:?}, which is not a whole number of seconds"
                 ))
-            })?,
+            })?
         },
     })
 }
@@ -334,7 +331,7 @@ mod tests {
                 shuffle_seed: Some([7u8; 32]),
                 participant_count: Some(0),
                 prequeue_offsets: Some([0u64; SHARDS]),
-                target_rate: Some(10),
+                origin_concurrency: Some(10),
                 message: None,
                 stored_control: wr_common::StoredControl::Open,
                 fail_open_until: 0,

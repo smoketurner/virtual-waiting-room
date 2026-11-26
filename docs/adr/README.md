@@ -42,8 +42,9 @@ One record per decision. Each states the context, the decision, and its conseque
 | [0036](0036-optional-session-ip-binding.md) | Sessions can be bound to the visitor's network, off by default |
 | [0037](0037-no-javascript-queue.md) | A visitor without JavaScript queues through a small server-rendered path |
 | [0038](0038-edge-web-acl-on-flat-rate-plan.md) | A place in the queue costs a WAF challenge, and the API answers only CloudFront |
-| [0039](0039-meter-admissions-not-the-cursor.md) | Meter admissions with a budget taken at issuance; the no-show estimator is removed (amends 0022, 0033) |
+| [0039](0039-meter-admissions-not-the-cursor.md) | Meter admissions with a budget taken at issuance; the no-show estimator is removed (amends 0022, 0033; budget law amended by 0041) |
 | [0040](0040-what-the-published-seed-proves.md) | The published seed proves the arithmetic, not the draw; a beacon-derived seed is not adopted |
+| [0041](0041-meter-origin-concurrency.md) | Meter origin concurrency: the budget is the free slots, counted from fixed-length sessions (amends 0039) |
 
 ## Open
 

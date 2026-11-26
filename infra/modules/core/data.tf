@@ -18,6 +18,7 @@ locals {
   counters_event_key           = "EVT#${var.event_id}"
   counters_prequeue_shard_keys = "EVT#${var.event_id}#PQ#*"
   counters_arrivals_shard_keys = "EVT#${var.event_id}#AR#*"
+  counters_admission_log_key   = "EVT#${var.event_id}#LOG"
 }
 
 # Trust policy for the assign_position Lambda execution role.
@@ -365,8 +366,8 @@ data "aws_iam_policy_document" "admin" {
 }
 
 # Execution-role permissions for the controller: read and advance the event's
-# Counters item (serving_counter, smoothing state), sum and settle the arrivals
-# shards, plus logs. It holds nothing on Positions or the pre-queue shards.
+# Counters item, sum and cap the arrivals shards, keep its admission log, plus
+# logs. It holds nothing on Positions or the pre-queue shards.
 data "aws_iam_policy_document" "controller" {
   statement {
     sid    = "AdvanceCounters"
@@ -382,7 +383,11 @@ data "aws_iam_policy_document" "controller" {
     condition {
       test     = "ForAllValues:StringLike"
       variable = "dynamodb:LeadingKeys"
-      values   = [local.counters_event_key, local.counters_arrivals_shard_keys]
+      values = [
+        local.counters_event_key,
+        local.counters_arrivals_shard_keys,
+        local.counters_admission_log_key,
+      ]
     }
   }
 

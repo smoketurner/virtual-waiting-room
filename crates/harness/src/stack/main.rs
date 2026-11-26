@@ -11,7 +11,7 @@
 //! follow the waiting page's protocol.
 //!
 //! ```text
-//! cargo run -p harness --bin stack -- --visitors 20000 --rate 200 --countdown 60
+//! cargo run -p harness --bin stack -- --visitors 20000 --concurrency 2000 --session 60 --countdown 60
 //! cargo run -p harness --bin stack -- --visitors 100000 --arrival herd --herd-window 10
 //! ```
 //!
@@ -57,7 +57,8 @@ enum Arrival {
 #[derive(Debug, Clone)]
 struct Args {
     visitors: usize,
-    rate: u32,
+    concurrency: u32,
+    session: u64,
     countdown: u64,
     arrival: Arrival,
     herd_window: u64,
@@ -83,7 +84,8 @@ fn parse_args() -> Result<Args> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let mut a = Args {
         visitors: 2000,
-        rate: 50,
+        concurrency: 500,
+        session: 60,
         countdown: 30,
         arrival: Arrival::Late,
         herd_window: 10,
@@ -109,7 +111,8 @@ fn parse_args() -> Result<Args> {
         let mut value = || argv.next().context(format!("{flag} needs a value"));
         match flag.as_str() {
             "--visitors" => a.visitors = value()?.parse()?,
-            "--rate" => a.rate = value()?.parse()?,
+            "--concurrency" => a.concurrency = value()?.parse()?,
+            "--session" => a.session = value()?.parse()?,
             "--countdown" => a.countdown = value()?.parse()?,
             "--arrival" => {
                 a.arrival = match value()?.as_str() {
@@ -220,7 +223,7 @@ async fn run() -> Result<Verdict> {
     aws::create_tables(&ddb, &tables).await?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let open_at = now + args.countdown;
-    aws::seed_event(&ddb, &tables, &event_id, args.rate, open_at).await?;
+    aws::seed_event(&ddb, &tables, &event_id, args.concurrency, open_at).await?;
     let mut key_bytes = [0u8; 32];
     Rng::new(args.seed ^ 0x006b_6579).fill(&mut key_bytes);
     let signing_key = base64::engine::general_purpose::STANDARD.encode(key_bytes);
@@ -287,6 +290,7 @@ async fn run() -> Result<Verdict> {
             ("POLL_FLOOR_MS", "5000".to_owned()),
             ("POLL_CEILING_MS", "30000".to_owned()),
             ("POLL_DIVISOR", "10".to_owned()),
+            ("SESSION_TTL_SECS", args.session.to_string()),
         ]),
         log_dir: &logs,
     })
@@ -299,7 +303,7 @@ async fn run() -> Result<Verdict> {
         max_environments: args.max_environments,
         env: common(&[
             ("SESSION_COOKIE_NAME", "vwr_session".to_owned()),
-            ("SESSION_TTL_SECS", "3600".to_owned()),
+            ("SESSION_TTL_SECS", args.session.to_string()),
             ("SIGNING_KEY_PARAMETER", SIGNING_KEY_PARAMETER.to_owned()),
             ("SIGNING_KEY_FINGERPRINT", "local".to_owned()),
         ]),
@@ -378,6 +382,7 @@ async fn run() -> Result<Verdict> {
         ddb.clone(),
         tables.counters.clone(),
         event_id.clone(),
+        args.session,
     );
     let controller_task = {
         let event_id = event_id.clone();
@@ -399,7 +404,11 @@ async fn run() -> Result<Verdict> {
     };
 
     // The visitors.
-    let expected_drain = args.visitors as u64 / u64::from(args.rate.max(1));
+    // A full origin turns over once a session length, and a slot is seen free
+    // up to a pass after its session ends.
+    let turnover = args.session + controller::INTERVAL_SECS;
+    let expected_drain =
+        (args.visitors as u64).div_ceil(u64::from(args.concurrency.max(1))) * turnover;
     let last_arrival = match args.arrival {
         Arrival::Herd => args.countdown + args.herd_window,
         Arrival::Late | Arrival::Uniform => args.countdown,
@@ -413,8 +422,8 @@ async fn run() -> Result<Verdict> {
         protected_path: PROTECTED_PATH.to_owned(),
     });
     say(&format!(
-        "{} visitors, admission {}/s, opening in {} s, deadline in {budget} s",
-        args.visitors, args.rate, args.countdown
+        "{} visitors, {} at once for {} s each, opening in {} s, deadline in {budget} s",
+        args.visitors, args.concurrency, args.session, args.countdown
     ));
     let mut rng = Rng::new(args.seed);
     let mut handles = Vec::with_capacity(args.visitors);
@@ -673,11 +682,11 @@ struct Evidence<'a> {
 fn build_report(e: &Evidence<'_>) -> Report {
     let mut r = Report::default();
     let args = e.args;
-    let rate = f64::from(args.rate);
     let seconds = e.elapsed.as_secs();
 
     r.fact("visitors", args.visitors);
-    r.fact("admission rate (target, per second)", args.rate);
+    r.fact("origin concurrency", args.concurrency);
+    r.fact("session length (s)", args.session);
     r.fact(
         "arrival",
         format!("{:?}, countdown {} s", args.arrival, args.countdown),
@@ -823,55 +832,36 @@ fn build_report(e: &Evidence<'_>) -> Report {
     let admissions = e.metrics.origin_series("protected", seconds);
     let total_admitted: u64 = admissions.iter().sum();
     r.fact("admissions reaching the origin", total_admitted);
-    let interval = controller::INTERVAL_SECS as f64;
-    let mut worst = (0.0f64, 0usize, 0u64);
-    for width in [1usize, 10, 30, 60, 120] {
-        let (n, start) = report::busiest_window(&admissions, width);
-        // What the budget allows: the grants for the window's own seconds, one
-        // pass's grant landing inside it, and the most budget that can be
-        // outstanding when it starts.
-        let allowed =
-            rate * (width as f64 + interval) + rate * interval * controller::BURST_INTERVALS as f64;
-        let ratio = n as f64 / allowed;
-        r.fact(
-            format!("busiest {width:>3} s of admissions"),
+    let (busiest, start) = report::busiest_window(&admissions, 1);
+    r.fact(
+        "busiest second of admissions",
+        format!("{busiest} (from t={start} s)"),
+    );
+    let sessions: Vec<u64> = e.records.iter().filter_map(|x| x.session_ends).collect();
+    let peak = report::peak_live(&sessions, args.session);
+    let (first_start, live) = report::live_by_second(&sessions, args.session);
+    r.fact("first session start (epoch s)", first_start);
+    r.series.insert("live sessions per second".to_owned(), live);
+    r.series
+        .insert("admissions per second".to_owned(), admissions.clone());
+    let limit = u64::from(args.concurrency);
+    r.check(
+        "No more sessions are ever live than the origin takes",
+        peak <= limit,
+        format!("most live at once: {peak} against {limit}"),
+    );
+    // While visitors are still waiting, the origin should be close to full.
+    // It runs a little under at each turnover: a slot is seen free up to a
+    // pass after its session ends, and its replacement has to poll in.
+    if let Some(occupancy) = report::occupancy(&sessions, args.session, limit) {
+        r.check(
+            "The origin stays near its limit while visitors are waiting",
+            occupancy >= 0.85,
             format!(
-                "{n} (from t={start} s; {:.2}x the target rate)",
-                n as f64 / (rate * width as f64)
+                "{:.0}% of the slots held, from the first admission to the last",
+                occupancy * 100.0
             ),
         );
-        if ratio > worst.0 {
-            worst = (ratio, width, n);
-        }
-    }
-    r.check(
-        "No window admits more than its time at the target rate plus the budget's burst",
-        worst.0 <= 1.0,
-        format!(
-            "worst window: {} s with {} admissions, {:.0}% of what the budget allows",
-            worst.1,
-            worst.2,
-            worst.0 * 100.0
-        ),
-    );
-    let first = admissions.iter().position(|&n| n > 0);
-    let last = admissions.iter().rposition(|&n| n > 0);
-    if let (Some(first), Some(last)) = (first, last) {
-        let (from, to) = (first + 60, last.saturating_sub(30));
-        if to > from + 30 {
-            let steady: u64 = admissions[from..to].iter().sum();
-            let mean = steady as f64 / (to - from) as f64;
-            r.check(
-                "Steady admissions run at the target rate",
-                (mean / rate - 1.0).abs() <= 0.1,
-                format!("{mean:.1}/s from t={from} s to t={to} s against {rate}/s"),
-            );
-        } else {
-            r.fact(
-                "steady admission rate",
-                "not measured: the drain was too short",
-            );
-        }
     }
 
     // --- the edge -----------------------------------------------------------

@@ -245,11 +245,11 @@ pub trait Store {
     /// last mutation is older than the debounce window (`now - DEBOUNCE`).
     /// It also stamps the audit fields and `last_action_epoch_ms` atomically.
     /// Returns `Conflict` if the guard fails (lost race or too-fast).
-    fn set_rate(
+    fn set_concurrency(
         &self,
         event_id: &str,
         expected: Option<u32>,
-        rate: u32,
+        concurrency: u32,
         actor: &str,
         now: ArrivalTime,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
@@ -283,7 +283,7 @@ pub trait Store {
     /// Moves the stored control from `from` to `to`, guarded on the stored
     /// value still being `from` (so a transition that already happened is a
     /// no-op `Conflict`, making the action idempotent) and on the debounce
-    /// window; stamps `action` and the audit fields atomically. `target_rate` is
+    /// window; stamps `action` and the audit fields atomically. `origin_concurrency` is
     /// untouched, so resuming restores the configured rate. Never touches
     /// `fail_open_until` — the two are orthogonal (issue #71).
     fn set_stored_control(
@@ -377,12 +377,12 @@ pub struct ControlState {
     pub serving_counter: u64,
     pub queue_counter: u64,
     pub participant_count: Option<u64>,
-    pub target_rate: Option<u32>,
+    pub origin_concurrency: Option<u32>,
     pub message: Option<String>,
     /// The operator's stored admission override (issue #71: never `FailOpen`,
     /// which is resolved from `fail_open_until` for display). While it is
     /// anything but `Open` the controller admits nobody and the queue and
-    /// positions stay intact; `target_rate` is preserved across a hold.
+    /// positions stay intact; `origin_concurrency` is preserved across a hold.
     pub stored_control: StoredControl,
     /// Epoch-seconds fail-open deadline; `0` means no window is in force.
     /// Orthogonal to `stored_control`: an operator can queue a pause during a
@@ -407,10 +407,10 @@ pub struct ControlState {
     pub starts_at_timezone: Option<String>,
 }
 
-/// The upper sanity bound on the admission target rate (ADR-0017 §4): a
-/// per-second admission ceiling that stops a fat-fingered runaway value from
-/// being written. Chosen well above any realistic origin capacity.
-pub const MAX_ADMISSION_RATE: u32 = 100_000;
+/// The upper sanity bound on the origin concurrency (ADR-0017 §4): stops a
+/// fat-fingered runaway value from being written. Chosen well above any
+/// realistic origin capacity.
+pub const MAX_ORIGIN_CONCURRENCY: u32 = 100_000;
 
 /// Debounce window for control-plane mutations (ADR-0017 defensive controls):
 /// two mutations to the same event closer together than this are rejected as
@@ -427,7 +427,7 @@ pub(crate) const DEBOUNCE_MILLIS: i64 = 2_000;
 /// vocabulary has a single source of truth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdminAction {
-    SetRate,
+    SetConcurrency,
     SetMessage,
     Pause,
     Resume,
@@ -460,7 +460,7 @@ impl AdminAction {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::SetRate => "set_rate",
+            Self::SetConcurrency => "set_concurrency",
             Self::SetMessage => "set_message",
             Self::Pause => "pause",
             Self::Resume => "resume",
@@ -499,10 +499,10 @@ pub enum ActionError {
     IllegalTransition { from: Phase, to: Phase },
     /// The rate value could not be parsed as a positive integer.
     #[error("invalid rate")]
-    InvalidRate,
+    InvalidConcurrency,
     /// The rate exceeds the admission ceiling (ADR-0017 §4).
     #[error("rate exceeds the maximum of {max}")]
-    RateTooHigh { max: u32 },
+    ConcurrencyTooHigh { max: u32 },
     /// The fail-open duration could not be parsed as a positive integer, or
     /// exceeds [`MAX_FAIL_OPEN_MINUTES`].
     #[error("invalid fail-open duration")]
@@ -810,23 +810,25 @@ fn debounce_check(state: &ControlState, now: ArrivalTime) -> Result<(), ActionEr
 ///
 /// # Errors
 ///
-/// [`ActionError::InvalidRate`] if not a positive integer;
-/// [`ActionError::RateTooHigh`] over the ceiling; [`ActionError::TooFast`] inside
+/// [`ActionError::InvalidConcurrency`] if not a positive integer;
+/// [`ActionError::ConcurrencyTooHigh`] over the ceiling; [`ActionError::TooFast`] inside
 /// the debounce window; store errors otherwise.
-pub async fn apply_rate<S: Store>(
+pub async fn apply_concurrency<S: Store>(
     store: &S,
     event_id: &str,
-    rate: &str,
+    concurrency: &str,
     actor: &str,
     now: ArrivalTime,
 ) -> Result<u32, ApplyError> {
-    let rate: u32 = rate.parse().map_err(|_| ActionError::InvalidRate)?;
-    if rate == 0 {
-        return Err(ActionError::InvalidRate.into());
+    let concurrency: u32 = concurrency
+        .parse()
+        .map_err(|_| ActionError::InvalidConcurrency)?;
+    if concurrency == 0 {
+        return Err(ActionError::InvalidConcurrency.into());
     }
-    if rate > MAX_ADMISSION_RATE {
-        return Err(ActionError::RateTooHigh {
-            max: MAX_ADMISSION_RATE,
+    if concurrency > MAX_ORIGIN_CONCURRENCY {
+        return Err(ActionError::ConcurrencyTooHigh {
+            max: MAX_ORIGIN_CONCURRENCY,
         }
         .into());
     }
@@ -835,9 +837,9 @@ pub async fn apply_rate<S: Store>(
     };
     debounce_check(&state, now)?;
     store
-        .set_rate(event_id, state.target_rate, rate, actor, now)
+        .set_concurrency(event_id, state.origin_concurrency, concurrency, actor, now)
         .await?;
-    Ok(rate)
+    Ok(concurrency)
 }
 
 /// Holds admission: the queue keeps forming and nobody is admitted. Legal only
@@ -864,7 +866,7 @@ pub async fn apply_pause<S: Store>(
     .await
 }
 
-/// Releases a hold, restoring the configured `target_rate`. Legal only from
+/// Releases a hold, restoring the configured `origin_concurrency`. Legal only from
 /// `Paused`, and debounced.
 ///
 /// # Errors
@@ -1443,7 +1445,7 @@ mod tests {
 
     struct FakeStore {
         phase: Mutex<Phase>,
-        rate: Mutex<Option<u32>>,
+        concurrency: Mutex<Option<u32>>,
         message: Mutex<Option<String>>,
         control: Mutex<StoredControl>,
         fail_open_until: Mutex<u64>,
@@ -1481,7 +1483,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 phase: Mutex::new(Phase::Idle),
-                rate: Mutex::new(None),
+                concurrency: Mutex::new(None),
                 message: Mutex::new(None),
                 control: Mutex::new(StoredControl::Open),
                 fail_open_until: Mutex::new(0),
@@ -1701,7 +1703,7 @@ mod tests {
                     serving_counter: 0,
                     queue_counter: 0,
                     participant_count: *self.participant_count.lock().unwrap(),
-                    target_rate: *self.rate.lock().unwrap(),
+                    origin_concurrency: *self.concurrency.lock().unwrap(),
                     message: self.message.lock().unwrap().clone(),
                     stored_control: *self.control.lock().unwrap(),
                     fail_open_until: *self.fail_open_until.lock().unwrap(),
@@ -1735,19 +1737,19 @@ mod tests {
             std::future::ready(result)
         }
 
-        fn set_rate(
+        fn set_concurrency(
             &self,
             _event_id: &str,
             _expected: Option<u32>,
-            rate: u32,
+            concurrency: u32,
             actor: &str,
             now: ArrivalTime,
         ) -> impl Future<Output = Result<(), StoreError>> + Send {
             let result = if self.conflict {
                 Err(StoreError::Conflict)
             } else {
-                *self.rate.lock().unwrap() = Some(rate);
-                self.stamp_audit(AdminAction::SetRate, actor, now);
+                *self.concurrency.lock().unwrap() = Some(concurrency);
+                self.stamp_audit(AdminAction::SetConcurrency, actor, now);
                 Ok(())
             };
             std::future::ready(result)
@@ -2615,14 +2617,14 @@ mod tests {
         // mutation reads.
         //
         // Timeline mirrored from the report: opA's open arrived at T=1000; a
-        // concurrent opB's `set_rate` landed during the open invoke at T=1100,
+        // concurrent opB's `set_concurrency` landed during the open invoke at T=1100,
         // advancing the anchor; opA's `stamp_action(now=1000)` then runs
         // against an anchor (`1100`) newer than itself. The fix's
         // anti-regression guard rejects the stamp (`Conflict`), the open still
-        // reports `Opened`, and the audit line keeps opB's `set_rate`.
+        // reports `Opened`, and the audit line keeps opB's `set_concurrency`.
         let store = FakeStore::with_phase(Phase::PreQueue);
         // The concurrent writer's already-landed audit row.
-        *store.last_action.lock().unwrap() = Some("set_rate".to_owned());
+        *store.last_action.lock().unwrap() = Some("set_concurrency".to_owned());
         *store.last_action_by.lock().unwrap() = Some("opB@x".to_owned());
         *store.last_action_at.lock().unwrap() = Some(ts(1_100).timestamp().to_string());
         *store.last_time.lock().unwrap() = Some(ts(1_100).timestamp());
@@ -2640,7 +2642,7 @@ mod tests {
         let state = store.load("evt").await.unwrap().unwrap();
         assert_eq!(
             state.last_action.as_deref(),
-            Some("set_rate"),
+            Some("set_concurrency"),
             "audit label"
         );
         assert_eq!(
@@ -2673,7 +2675,7 @@ mod tests {
         // older-anchor case.)
         let store = FakeStore::with_phase(Phase::PreQueue);
         // A prior, strictly older mutation that the open must advance past.
-        *store.last_action.lock().unwrap() = Some("set_rate".to_owned());
+        *store.last_action.lock().unwrap() = Some("set_concurrency".to_owned());
         *store.last_action_by.lock().unwrap() = Some("opB@x".to_owned());
         *store.last_time.lock().unwrap() = Some(ts(500).timestamp());
         let opener = FakeOpener::reporting(OpenNow::Opened);
@@ -2694,7 +2696,7 @@ mod tests {
         // Bug (sibling of #186): `apply_fail_open` performs the yielding KVStore
         // read-modify-write and only then stamps `last_action_epoch_ms`
         // unconditionally, so a concurrent operator's debounced mutation that
-        // landed during that read-modify-write (here opB's `set_rate` at
+        // landed during that read-modify-write (here opB's `set_concurrency` at
         // T=1100, against opA's `fail_open` arrival at T=1000) had its newer
         // anchor overwritten by the older arrival stamp — regressing the
         // debounce anchor by the RMW width and opening a bounded debounce
@@ -2703,7 +2705,7 @@ mod tests {
         let store = FakeStore::with_phase(Phase::Active);
         let concurrent_at = ts(1_100).timestamp();
         // The concurrent writer's already-landed audit row + anchor.
-        *store.last_action.lock().unwrap() = Some("set_rate".to_owned());
+        *store.last_action.lock().unwrap() = Some("set_concurrency".to_owned());
         *store.last_action_by.lock().unwrap() = Some("opB@x".to_owned());
         *store.last_action_at.lock().unwrap() = Some(concurrent_at.to_string());
         *store.last_time.lock().unwrap() = Some(concurrent_at);
@@ -2727,7 +2729,7 @@ mod tests {
         // action, not the older fail_open's arrival attribution.
         assert_eq!(
             store.last_action.lock().unwrap().as_deref(),
-            Some("set_rate"),
+            Some("set_concurrency"),
             "audit label"
         );
         assert_eq!(
@@ -2752,7 +2754,7 @@ mod tests {
         // asserts the older-anchor happy path.)
         let store = FakeStore::with_phase(Phase::Active);
         let prior_at = ts(500).timestamp();
-        *store.last_action.lock().unwrap() = Some("set_rate".to_owned());
+        *store.last_action.lock().unwrap() = Some("set_concurrency".to_owned());
         *store.last_time.lock().unwrap() = Some(prior_at);
         let edge = FakeEdgeStore::default();
 
@@ -2842,7 +2844,7 @@ mod tests {
     async fn set_rules_does_not_regress_a_newer_concurrent_anchor() {
         // Bug (sibling of #186, audit-only row): `apply_set_rules` performs the
         // yielding KVStore read-modify-write and only then stamps
-        // `last_action_epoch_ms` unconditionally. A concurrent opB `set_rate`
+        // `last_action_epoch_ms` unconditionally. A concurrent opB `set_concurrency`
         // at T=1100 landing during that read-modify-write (against opA's
         // `set_rules` arrival at T=1000) had its newer anchor overwritten by
         // the older arrival stamp. The fix guards the stamp — the audit row
@@ -2850,7 +2852,7 @@ mod tests {
         // landed), and the anchor + audit line stay on opB's later action.
         let store = FakeStore::with_phase(Phase::Active);
         let concurrent_at = ts(1_100).timestamp();
-        *store.last_action.lock().unwrap() = Some("set_rate".to_owned());
+        *store.last_action.lock().unwrap() = Some("set_concurrency".to_owned());
         *store.last_action_by.lock().unwrap() = Some("opB@x".to_owned());
         *store.last_action_at.lock().unwrap() = Some(concurrent_at.to_string());
         *store.last_time.lock().unwrap() = Some(concurrent_at);
@@ -2876,7 +2878,7 @@ mod tests {
         );
         assert_eq!(
             store.last_action.lock().unwrap().as_deref(),
-            Some("set_rate"),
+            Some("set_concurrency"),
             "audit label"
         );
         assert_eq!(
@@ -2893,7 +2895,7 @@ mod tests {
         // line records the ruleset change, exactly as before.
         let store = FakeStore::with_phase(Phase::Active);
         let prior_at = ts(500).timestamp();
-        *store.last_action.lock().unwrap() = Some("set_rate".to_owned());
+        *store.last_action.lock().unwrap() = Some("set_concurrency".to_owned());
         *store.last_time.lock().unwrap() = Some(prior_at);
         let edge = FakeEdgeStore::default();
         let rules = vec![ProtectionRule::Cookie("loyalty_member".to_owned())];
@@ -2928,7 +2930,7 @@ mod tests {
     async fn recover_does_not_regress_a_newer_concurrent_anchor() {
         // `apply_recover` shares `set_fail_open_until`, so the guard covers it
         // too. It writes `DynamoDB` first, then the KVStore; on the race path
-        // (opB's `set_rate` at T=1100 landed during opA's `recover` arrival at
+        // (opB's `set_concurrency` at T=1100 landed during opA's `recover` arrival at
         // T=1000) the guarded write conflicts and the fallback clears
         // `fail_open_until` alone — the break-glass clear still reaches the
         // controller, the newer anchor + audit line are preserved, and the
@@ -2937,7 +2939,7 @@ mod tests {
         let store = FakeStore::with_phase(Phase::Active);
         let concurrent_at = ts(1_100).timestamp();
         *store.fail_open_until.lock().unwrap() = 1_000_000;
-        *store.last_action.lock().unwrap() = Some("set_rate".to_owned());
+        *store.last_action.lock().unwrap() = Some("set_concurrency".to_owned());
         *store.last_action_by.lock().unwrap() = Some("opB@x".to_owned());
         *store.last_action_at.lock().unwrap() = Some(concurrent_at.to_string());
         *store.last_time.lock().unwrap() = Some(concurrent_at);
@@ -2960,7 +2962,7 @@ mod tests {
         );
         assert_eq!(
             store.last_action.lock().unwrap().as_deref(),
-            Some("set_rate"),
+            Some("set_concurrency"),
             "audit label"
         );
         assert_eq!(
@@ -3080,15 +3082,15 @@ mod tests {
 
     #[tokio::test]
     async fn apply_phase_overwrites_prior_audit_from_a_different_action() {
-        // A phase transition after a set_rate must update the audit line to
+        // A phase transition after a set_concurrency must update the audit line to
         // set_phase, proving set_phase does not leave the prior action's
         // stamp in place (the bug).
         let store = FakeStore::with_phase(Phase::Active);
-        apply_rate(&store, "evt", "500", "rate-op", ts(1_000))
+        apply_concurrency(&store, "evt", "500", "rate-op", ts(1_000))
             .await
             .unwrap();
         let state = store.load("evt").await.unwrap().unwrap();
-        assert_eq!(state.last_action.as_deref(), Some("set_rate"));
+        assert_eq!(state.last_action.as_deref(), Some("set_concurrency"));
         assert_eq!(state.last_action_by.as_deref(), Some("rate-op"));
 
         apply_phase(&store, "evt", "post_event", "phase-op", ts(2_000))
@@ -3104,24 +3106,24 @@ mod tests {
     async fn rate_rejects_zero_and_nonnumeric() {
         let store = FakeStore::with_phase(Phase::Active);
         assert!(matches!(
-            apply_rate(&store, "evt", "0", "op@x", ts(1000))
+            apply_concurrency(&store, "evt", "0", "op@x", ts(1000))
                 .await
                 .unwrap_err(),
-            ApplyError::Action(ActionError::InvalidRate)
+            ApplyError::Action(ActionError::InvalidConcurrency)
         ));
         assert!(matches!(
-            apply_rate(&store, "evt", "fast", "op@x", ts(1000))
+            apply_concurrency(&store, "evt", "fast", "op@x", ts(1000))
                 .await
                 .unwrap_err(),
-            ApplyError::Action(ActionError::InvalidRate)
+            ApplyError::Action(ActionError::InvalidConcurrency)
         ));
         assert_eq!(
-            apply_rate(&store, "evt", "500", "op@x", ts(1000))
+            apply_concurrency(&store, "evt", "500", "op@x", ts(1000))
                 .await
                 .unwrap(),
             500
         );
-        assert_eq!(*store.rate.lock().unwrap(), Some(500));
+        assert_eq!(*store.concurrency.lock().unwrap(), Some(500));
     }
 
     #[tokio::test]
@@ -3144,16 +3146,16 @@ mod tests {
     #[tokio::test]
     async fn rate_over_ceiling_is_rejected() {
         let store = FakeStore::with_phase(Phase::Active);
-        let over = (u64::from(MAX_ADMISSION_RATE) + 1).to_string();
+        let over = (u64::from(MAX_ORIGIN_CONCURRENCY) + 1).to_string();
         assert!(matches!(
-            apply_rate(&store, "evt", &over, "op@x", ts(1000)).await,
-            Err(ApplyError::Action(ActionError::RateTooHigh { .. }))
+            apply_concurrency(&store, "evt", &over, "op@x", ts(1000)).await,
+            Err(ApplyError::Action(ActionError::ConcurrencyTooHigh { .. }))
         ));
         assert!(
-            apply_rate(
+            apply_concurrency(
                 &store,
                 "evt",
-                &MAX_ADMISSION_RATE.to_string(),
+                &MAX_ORIGIN_CONCURRENCY.to_string(),
                 "op@x",
                 ts(1000)
             )
@@ -3235,19 +3237,19 @@ mod tests {
     #[tokio::test]
     async fn second_mutation_within_debounce_window_is_rejected() {
         let store = FakeStore::with_phase(Phase::Active);
-        apply_rate(&store, "evt", "500", "op@x", ts(1000))
+        apply_concurrency(&store, "evt", "500", "op@x", ts(1000))
             .await
             .unwrap();
         // A second mutation 100ms later (< DEBOUNCE) is rejected.
         assert!(matches!(
-            apply_rate(&store, "evt", "600", "op@x", ts(1100)).await,
+            apply_concurrency(&store, "evt", "600", "op@x", ts(1100)).await,
             Err(ApplyError::Action(ActionError::TooFast))
         ));
         // The rate did not change.
-        assert_eq!(*store.rate.lock().unwrap(), Some(500));
+        assert_eq!(*store.concurrency.lock().unwrap(), Some(500));
         // After the window, it succeeds.
         assert!(
-            apply_rate(&store, "evt", "600", "op@x", ts(1000 + DEBOUNCE_MILLIS))
+            apply_concurrency(&store, "evt", "600", "op@x", ts(1000 + DEBOUNCE_MILLIS))
                 .await
                 .is_ok()
         );
@@ -3262,18 +3264,18 @@ mod tests {
         // an operator can do moves the stamp back into the past.
         let store = FakeStore::with_phase(Phase::Active);
         let ahead = ts(60_000);
-        apply_rate(&store, "evt", "500", "op@x", ahead)
+        apply_concurrency(&store, "evt", "500", "op@x", ahead)
             .await
             .unwrap();
         assert_eq!(*store.last_time.lock().unwrap(), Some(ahead.timestamp()));
 
-        apply_rate(&store, "evt", "600", "op@x", ts(1_000))
+        apply_concurrency(&store, "evt", "600", "op@x", ts(1_000))
             .await
             .unwrap();
-        assert_eq!(*store.rate.lock().unwrap(), Some(600));
+        assert_eq!(*store.concurrency.lock().unwrap(), Some(600));
         // And the debounce itself still works from the recovered stamp.
         assert!(matches!(
-            apply_rate(&store, "evt", "700", "op@x", ts(1_100)).await,
+            apply_concurrency(&store, "evt", "700", "op@x", ts(1_100)).await,
             Err(ApplyError::Action(ActionError::TooFast))
         ));
     }
@@ -3298,7 +3300,7 @@ mod tests {
     async fn force_maintenance_is_not_debounced() {
         let store = FakeStore::with_phase(Phase::Active);
         // A recent mutation sets the debounce clock.
-        apply_rate(&store, "evt", "500", "op@x", ts(1000))
+        apply_concurrency(&store, "evt", "500", "op@x", ts(1000))
             .await
             .unwrap();
         // Force maintenance immediately after still applies (emergency stop).

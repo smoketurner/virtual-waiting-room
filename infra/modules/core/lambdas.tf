@@ -97,6 +97,8 @@ resource "aws_lambda_function" "read" {
       POLL_FLOOR_MS   = tostring(var.poll_floor_ms)
       POLL_CEILING_MS = tostring(var.poll_ceiling_ms)
       POLL_DIVISOR    = tostring(var.poll_divisor)
+      # Published on /status for the wait estimate.
+      SESSION_TTL_SECS = tostring(var.session_ttl_seconds)
     })
   }
 
@@ -406,6 +408,8 @@ resource "aws_lambda_function" "controller" {
     variables = merge(local.dynamo_lambda_env, {
       COUNTERS_TABLE = aws_dynamodb_table.counters.name
       EVENT_ID       = var.event_id
+      # A slot is held this long: the same value the minting functions use.
+      SESSION_TTL_SECS = tostring(var.session_ttl_seconds)
     })
   }
 

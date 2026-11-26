@@ -185,7 +185,7 @@ impl Store for DynamoStore {
             serving_counter: num("serving_counter").unwrap_or(0),
             queue_counter: num("queue_counter").unwrap_or(0),
             participant_count: num("participant_count"),
-            target_rate: num("target_rate").and_then(|n| u32::try_from(n).ok()),
+            origin_concurrency: num("origin_concurrency").and_then(|n| u32::try_from(n).ok()),
             message: item.get("message").and_then(|v| v.as_s().ok()).cloned(),
             stored_control: wr_common::stored_control_of(item),
             fail_open_until: num("fail_open_until").unwrap_or(0),
@@ -234,11 +234,11 @@ impl Store for DynamoStore {
         send_guarded(req, "phase").await
     }
 
-    async fn set_rate(
+    async fn set_concurrency(
         &self,
         event_id: &str,
         expected: Option<u32>,
-        rate: u32,
+        concurrency: u32,
         actor: &str,
         now: ArrivalTime,
     ) -> Result<(), StoreError> {
@@ -248,14 +248,14 @@ impl Store for DynamoStore {
             .table_name(&self.counters_table)
             .set_key(Some(Key::Event { event_id }.build()))
             .update_expression(
-                "SET target_rate = :r, last_action = :a, last_action_by = :by, \
+                "SET origin_concurrency = :r, last_action = :a, last_action_by = :by, \
                  last_action_at = :at, last_action_epoch_ms = :ms",
             )
-            .expression_attribute_values(":r", AttributeValue::N(rate.to_string()));
-        req = apply_audit_values(req, crate::AdminAction::SetRate, actor, now);
-        req = guard_expected_rate(req, expected);
+            .expression_attribute_values(":r", AttributeValue::N(concurrency.to_string()));
+        req = apply_audit_values(req, crate::AdminAction::SetConcurrency, actor, now);
+        req = guard_expected_concurrency(req, expected);
         req = guard_debounce(req, now);
-        send_guarded(req, "rate").await
+        send_guarded(req, "origin concurrency").await
     }
 
     async fn set_message(
@@ -314,7 +314,7 @@ impl Store for DynamoStore {
         req = apply_audit_values(req, action, actor, now);
         // The debounce boundary lives in the single shared `guard_debounce`
         // helper so the admission-control transition uses the same inclusive
-        // cutoff as `set_rate` and `set_message`.
+        // cutoff as `set_concurrency` and `set_message`.
         req = guard_debounce(req, now);
         send_guarded(req, "admission_control").await
     }
@@ -399,7 +399,7 @@ impl Store for DynamoStore {
         };
 
         req = apply_audit_values(req, action, actor, now);
-        // Debounced like set_rate and set_message: scheduling is a routine
+        // Debounced like set_concurrency and set_message: scheduling is a routine
         // control, not the break-glass that set_fail_open_until is.
         req = guard_debounce(req, now);
         send_guarded(req, wr_common::STARTS_AT_ATTR).await
@@ -438,7 +438,7 @@ impl Store for DynamoStore {
         // Audit fields only -- the action's real effect landed elsewhere (the
         // open's own conditional write) -- but this runs *after* a yielding
         // network call (the open invoke), so a concurrent debounced mutation
-        // (`set_rate`, `set_message`, ...) can advance `last_action*` and
+        // (`set_concurrency`, `set_message`, ...) can advance `last_action*` and
         // `last_action_epoch_ms` between that effect and this `UpdateItem`.
         // `last_action_epoch_ms` is also the anchor `DEBOUNCE_PREDICATE` reads,
         // so the stamp is guarded against regression: it applies only when no
@@ -513,13 +513,13 @@ fn audit_timestamp(now: Timestamp) -> String {
     now.strftime("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
-/// Adds the expected-prior-rate guard (lost-race safety).
-fn guard_expected_rate(req: UpdateReq, expected: Option<u32>) -> UpdateReq {
+/// Adds the expected-prior-concurrency guard (lost-race safety).
+fn guard_expected_concurrency(req: UpdateReq, expected: Option<u32>) -> UpdateReq {
     match expected {
         Some(r) => req
-            .condition_expression("target_rate = :exp")
+            .condition_expression("origin_concurrency = :exp")
             .expression_attribute_values(":exp", AttributeValue::N(r.to_string())),
-        None => req.condition_expression("attribute_not_exists(target_rate)"),
+        None => req.condition_expression("attribute_not_exists(origin_concurrency)"),
     }
 }
 
@@ -907,7 +907,7 @@ mod tests {
             .expect("create_table");
 
         // Seed: a concurrent writer already advanced the anchor to T=1100, with
-        // an audit row attributing the latest action to opB's set_rate. The store
+        // an audit row attributing the latest action to opB's set_concurrency. The store
         // addresses the row by the `EVT#<event_id>` prefixed key (`Key::Event`),
         // so the seed and the assertions use that exact key, not the bare id.
         let key = Key::Event { event_id: "evt" }.build();
@@ -916,7 +916,10 @@ mod tests {
             .table_name(&table)
             .set_item(Some(key.clone()))
             .item("last_action_epoch_ms", AttributeValue::N("1100".to_owned()))
-            .item("last_action", AttributeValue::S("set_rate".to_owned()))
+            .item(
+                "last_action",
+                AttributeValue::S("set_concurrency".to_owned()),
+            )
             .item("last_action_by", AttributeValue::S("opB@x".to_owned()))
             .send()
             .await
@@ -962,12 +965,12 @@ mod tests {
             Some("1100"),
             "anchor must not regress to the older fail_open arrival"
         );
-        // (3) The audit row was NOT overwritten: still opB's set_rate.
+        // (3) The audit row was NOT overwritten: still opB's set_concurrency.
         assert_eq!(
             item.get("last_action")
                 .and_then(|v| v.as_s().ok())
                 .map(std::string::String::as_str),
-            Some("set_rate"),
+            Some("set_concurrency"),
             "audit label must stay on the concurrent writer"
         );
         assert_eq!(
@@ -1135,11 +1138,11 @@ mod tests {
 
     #[test]
     fn combine_debounce_ands_the_predicate_onto_an_existing_guard() {
-        // A prior guard (expected-rate or admission-control) is preserved and
+        // A prior guard (expected-concurrency or admission-control) is preserved and
         // the inclusive debounce predicate is AND-ed after it.
         assert_eq!(
-            combine_debounce(Some("target_rate = :exp")).as_str(),
-            "target_rate = :exp AND (attribute_not_exists(last_action_epoch_ms) \
+            combine_debounce(Some("origin_concurrency = :exp")).as_str(),
+            "origin_concurrency = :exp AND (attribute_not_exists(last_action_epoch_ms) \
              OR last_action_epoch_ms <= :cutoff)"
         );
         // `set_message` has no prior guard: the predicate stands alone.
