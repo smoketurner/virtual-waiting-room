@@ -1,6 +1,9 @@
 # ADR-0013: Separate cache behaviours to preserve request collapsing
 
-**Status:** Accepted
+**Status:** Accepted. The behaviours stand. Two details have changed since: `/status` publishes
+`origin_concurrency` and the session length rather than an admission rate
+([0041](0041-meter-origin-concurrency.md)), and the poll interval is adaptive between a 5 s floor
+and a 30 s ceiling rather than a fixed 10 s ([0023](0023-adaptive-poll-interval.md)).
 
 ## Context
 

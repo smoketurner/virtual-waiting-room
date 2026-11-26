@@ -33,7 +33,8 @@ Two pairs are easy to confuse:
   Recover. Press Resume as well.
 
 Every action is stamped "last changed by X at T". Two changes within 2 seconds are rejected as too
-fast, to defeat double-clicks; Force maintenance, Phase, Fail open and Recover are exempt.
+fast, to defeat double-clicks; Force maintenance, Phase, Fail open, Recover, the protection rules
+and IP binding are exempt.
 
 ---
 
@@ -72,8 +73,12 @@ items (O1, O2) days ahead; the panel shows limits in force, not pending requests
 
 On the day (**manual**):
 
-- [ ] **The stack answers.** `uv run scripts/smoke_test.py` registers, opens and checks that no two
-      visitors share a position.
+- [ ] **The stack answers.** Only before registration opens, never once a visitor has registered:
+      `uv run scripts/smoke_test.py` first runs `scripts/reset-env.py`, which deletes every
+      registration, position and operator session, rewrites the event item (origin concurrency
+      back to the script's 5) and disables the open schedule. It then registers 12 visitors, opens
+      the event and checks that no two share a position. Afterwards reset the event again and set
+      the concurrency and start time from the dashboard.
 - [ ] **You can log in to the dashboard.** Check early: OIDC misconfiguration only shows up when
       you need it.
 - [ ] **The gate covers the right paths.** The panel counts rules; it cannot judge them. Load a
@@ -184,8 +189,8 @@ nothing. It cannot be undone: everyone waiting is assigned their place at that m
 
 ## The alarms
 
-Each is named `<name_prefix>-<alarm>` and fires on a single occurrence; none happens in normal
-operation.
+Each is named `<name_prefix>-<alarm>` and fires on a single occurrence, except `join-queue-age`,
+which needs two consecutive minutes; none happens in normal operation.
 
 | Alarm | What happened | What to do |
 |---|---|---|

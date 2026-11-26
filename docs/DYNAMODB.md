@@ -36,9 +36,10 @@ Positions  {request_id}               bare
 ```
 
 Keys are tagged only where a table holds more than one kind of item; in `PreQueue` and
-`Positions` a tag would disambiguate nothing and cost bytes in one key per visitor. Every key is
-built by `wr_common::expr::Key`, which returns the whole key map so the attribute name is written
-once too; no call site formats a key. A `Shard` can only be constructed in `0..10`.
+`Positions` a tag would disambiguate nothing and cost bytes in one key per visitor. Every key
+value is built by `wr_common::expr::Key`, which also returns the whole key map so the attribute
+name need be written only once; no call site formats a tagged key. Three reads of the bare-id
+tables (`read`'s two and `generate_token`'s `PreQueue` read) still name the key attribute by hand. A `Shard` can only be constructed in `0..10`.
 
 `event_id` may not contain `#` (Terraform validation): `EVT#a#PQ#1` would be both event `a`'s
 shard 1 and event `a#PQ#1`'s item. The `Update` and `Condition` builders bind every attribute name
@@ -79,7 +80,7 @@ counted from, and `p`, how many slots the cursor has been moved for so far
 |---|---|
 | `PreQueue` | `r` request id, `s` shard, `l` local index, `t` registration time, `h` possession digest |
 | `Positions` | `request_id`, `queue_position`, `entry_time`, `status` (`issued`/`admitted`), `admitted_at`, `h`, `ttl` |
-| `Tokens` `SESS#` | `subject`, `email`, `expires_at` |
+| `Tokens` `SESS#` | `subject`, `email`, `csrf`, `expires_at` |
 | `Tokens` `PKCE#` | `pkce_verifier`, `nonce`, `expires_at` |
 
 `h` is the digest of the visitor's possession secret
@@ -104,7 +105,7 @@ same guarded mark; every session minted for the row expires from it (#237).
 | `read` | `Counters` | `GetItem` event | Eventual, 1 s in-process cache | ≤ 1/s per execution environment |
 | `read` | `PreQueue` | `GetItem` | Eventual | 1 per `/_wr/v1/queue_num` |
 | `read` | `Positions` | `GetItem` | Eventual | 1 per `/_wr/v1/queue_num` with no `PreQueue` row, or a straggler |
-| `generate_token`, `nojs` | `Counters` | `GetItem` event | Strong | 1 per call |
+| `generate_token`, `nojs` | `Counters` | `GetItem` event | Strong | At most 1 per second per execution environment (§8) |
 | `generate_token`, `nojs` | `Positions` | `GetItem` | Strong | 1 per call |
 | `generate_token`, `nojs` | `PreQueue` | `GetItem` | Eventual | 1 per call |
 | `generate_token`, `nojs` | `Counters` | `UpdateItem ADD n 1` on a random arrival shard, guarded on `n < c` | — | 1–3 per first admission |
@@ -114,7 +115,7 @@ same guarded mark; every session minted for the row expires from it (#237).
 | `controller` | `Counters` | `GetItem` admission log | Strong | 1 per pass |
 | `controller` | `Counters` | `UpdateItem` cursor, guarded | — | 1 per open pass |
 | `controller` | `Counters` | `UpdateItem` admission log | — | 1 per open pass |
-| `controller` | `Counters` | `UpdateItem SET c` on each arrival shard | — | 10 per open pass |
+| `controller` | `Counters` | `UpdateItem SET c` (and `n` if absent) on each arrival shard | — | 10 per open pass |
 | `admin` | `Counters` | `GetItem`; guarded `UpdateItem` per action | Eventual | Operator actions |
 | `admin` | `Tokens` | `PutItem` session/login; `GetItem` session; `DeleteItem` logout; `DeleteItem ALL_OLD` to consume a login | Eventual | Operator logins |
 
@@ -230,7 +231,7 @@ The controller reads its admission log consistently too, though a log missing th
 would only count more sessions live.
 
 `generate_token`'s `Counters` read is consistent when made, but each execution environment holds
-the item for one second (`MEMO_SECS`), as `read` does: every admission attempt, refused or not,
+the item for one second (`MEMO`), as `read` does: every admission attempt, refused or not,
 would otherwise be a read on one partition key. The cursor moves every ten seconds, and a pause
 takes effect at most a second late. The same environment does not retry a shard it saw refuse a
 take for one second, so a spent budget is not also a stream of failed conditional writes.
@@ -304,7 +305,7 @@ waiters and a 5.75 s mean interval: roughly 87,000 RRU/s, over twice the default
 
 There is no `Scan`. The controller's former `Positions` scan for expiry was removed
 ([ADR-0031](adr/0031-remove-controller-driven-expiry.md)); a position is live until its row is
-gone. `Positions.ttl` is `now + 86,400` (`POSITION_TTL_SECS`) at each write and is reclamation
+gone. `Positions.ttl` is `now + 86,400` (`POSITION_TTL`) at each write and is reclamation
 only: nothing reads it, and DynamoDB may take days to delete an expired row. Unused admission
 budget is what compensates for visitors who never arrive.
 
@@ -328,7 +329,7 @@ no TTL.
 | Single-partition write | 1,000 WCU/s | No | `queue_counter` below a batch size of about 40 at 40,000 joins/s |
 | Single-partition read | 3,000 RCU/s | No | The `Counters` item, absorbed by the in-process cache (§10) |
 | Per-table write, on-demand | 40,000 WRU/s | Yes | `Positions` writes at 40,000 joins/s |
-| Per-table read, on-demand | 40,000 RRU/s | Yes | `PreQueue` at the first-ask spike, 21 % used (§10) |
+| Per-table read, on-demand | 40,000 RRU/s | Yes | `PreQueue` at the first-ask spike, 10 % used (§10) |
 | Cold or long-idle table | ~4,000 writes/s, ~12,000 reads/s | By pre-warming | Every un-warmed event |
 | Warm throughput minimum | 4,000 write, 12,000 read units | No | The Terraform variable validation |
 | Item size | 400 KB | No | Not binding; every item is under 1 KB |

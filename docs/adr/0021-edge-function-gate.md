@@ -2,7 +2,9 @@
 
 **Status:** Accepted. The spike measured everything that could have invalidated the approach and
 
-> **Narrowed by [0032](0032-remove-the-origin-authorizer.md).** The origin authorizer was removed, so this is now the gate rather than the gate for CloudFront deployments.
+> **Narrowed by [0032](0032-remove-the-origin-authorizer.md).** The origin authorizer was removed, so this is now the gate rather than the gate for CloudFront deployments, and the authorizer path described below (`bypass_ttl_secs`, sliding sessions) is gone.
+>
+> **Amended by [0024](0024-jws-credentials.md) and [0036](0036-optional-session-ip-binding.md).** The credential is a JWS with derived keys, not the kind-byte encoding of §6, and the network claim this record drops is back as the optional `cip`. No writer stamps `now + settle_secs`: Terraform seeds `enforce_from` as `0` and the admin writer carries it through.
 none of it did: the runtime verifies an unchanged `wr_common::crypto` credential, the gate fits in
 4,759 of 10,240 bytes, the hot path costs 11 of 100 compute utilization, and a configuration change
 reaches an edge in a median of 31 seconds. What remains in §5 are design decisions — what trips

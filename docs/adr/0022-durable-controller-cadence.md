@@ -13,7 +13,10 @@
 > Diagnosed and closed in [#76](https://github.com/smoketurner/virtual-waiting-room/issues/76).
 
 **Status:** Accepted. The SDK it depends on was an experimental preview when adopted (§5) and is
-generally available as of 1.0.0 (§7).
+generally available as of 1.0.0 (§7). The control law is amended by
+[0039](0039-meter-admissions-not-the-cursor.md) and again by
+[0041](0041-meter-origin-concurrency.md): a pass grants the free slots counted from the admission
+log, not elapsed seconds, which is equally why a skipped pass is safe.
 
 ## 1. Context
 

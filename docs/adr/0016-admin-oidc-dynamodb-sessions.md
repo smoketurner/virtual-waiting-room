@@ -1,6 +1,7 @@
 # ADR-0016: Authenticate the admin UI with OIDC, backed by DynamoDB
 
-**Status:** Accepted
+**Status:** Accepted. As built, the `Tokens` keys are `SESS#<id>` and `PKCE#<state>`, and
+`jsonwebtoken` uses its `aws_lc_rs` feature, not `rust_crypto`.
 
 ## Context
 

@@ -11,7 +11,7 @@ The build-state record for requirements.md. Requirement IDs in brackets; decisio
 ### 1a. Data and counter
 
 - [x] Four tables (`Counters`, `PreQueue`, `Positions`, `Tokens`), on-demand, PITR, `warm_throughput_*` as variables [O1]
-- [x] `Counters` event item: sequences, `phase` (incl. `maintenance`), `origin_concurrency`, `shuffle_seed`, `operator_message`, `admission_control` + `fail_open_until`; `prequeue_counter` and `arrivals` striped ×10 as separate items (ADR-0015)
+- [x] `Counters` event item: sequences, `phase` (incl. `maintenance`), `origin_concurrency`, `shuffle_seed`, `message`, `admission_control` + `fail_open_until`; `prequeue_counter` and `arrivals` striped ×10 as separate items (ADR-0015)
 - [x] Batch range claim via one `UpdateItem ADD` / `ALL_NEW`, incremented by the **valid** count only [F2.2, F2.6]
 - [x] Every position write guarded by `attribute_not_exists(request_id)` [F2.5]
 - [ ] `max_throughput_*` table variables (DESIGN §5.5) — Partial: not built.

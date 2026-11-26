@@ -8,8 +8,8 @@ the data layer, and [`adr/`](./adr/) the reasoning behind each decision.
 ## 1. Summary
 
 The system deploys into the customer's own AWS account. It runs no always-on compute and no
-cache tier. One deployment serves one event: `event_id` is a Terraform variable, baked into every
-Lambda's environment as `EVENT_ID`.
+cache tier. One deployment serves one event: `event_id` is a Terraform variable, baked into each
+Lambda's environment as `EVENT_ID`, except `open_event`, which takes it from the invocation payload.
 
 Three decisions carry the design:
 
@@ -30,7 +30,7 @@ flat-rate plan only, a WAF web ACL.
 | Function | Trigger | Timeout | What it does |
 |---|---|---|---|
 | `assign_position` | SQS event source mapping | 30 s | Consumes join batches; claims pre-queue indices or live positions; writes rows |
-| `open_event` | EventBridge Scheduler one-shot, or `/_wr/admin/open_now` | 30 s | Folds the shard counts into offsets and writes the open |
+| `open_event` | EventBridge Scheduler one-shot, or `/_wr/admin/open_now` | 900 s | Folds the shard counts into offsets and writes the open |
 | `read` | API Gateway | 10 s | `GET /_wr/v1/status`, `GET /_wr/v1/queue_num` |
 | `controller` | EventBridge Scheduler `rate(1 minute)` | 30 s | Durable function; meters admission in six 10 s passes |
 | `generate_token` | API Gateway | 10 s | Checks the position, claims the admission, records the arrival, signs the session cookie |
@@ -39,8 +39,9 @@ flat-rate plan only, a WAF web ACL.
 
 Every function runs `provided.al2023` at 256 MB on the architecture named in `terraform.tfvars`,
 and every function deploys a real build; there is no placeholder artifact. `assign_position` and
-`nojs` carry reserved concurrency (`nojs` defaults to 5, so a flood of form posts throttles there
-rather than in `generate_token`).
+`nojs` carry reserved concurrency as a cap (`nojs` defaults to 5, so a flood of form posts
+throttles there rather than in `generate_token`); `open_event` (1) and `controller` carry it as a
+guarantee, so the burst cannot throttle the open or a pass.
 
 ## 3. Request paths
 
@@ -64,7 +65,7 @@ protected: CloudFront [/*, CloudFront Function at viewer-request]
              ├─ no rule matches, or a valid session cookie → customer origin (or the demo fixture)
              └─ otherwise → 302 to /_wr/waiting.html, or 403 JSON for XHR
 
-open:      EventBridge Scheduler at(start time)   [always created; disabled until the operator sets it]
+open:      EventBridge Scheduler at(start time)   [always created; disabled unless `starts_at` is set, or until the operator sets it]
              → open_event → BatchGetItem ×10 shards → one guarded UpdateItem
 
 meter:     EventBridge Scheduler rate(1 minute)   [always created]
@@ -191,8 +192,8 @@ shard and index come from `GET /_wr/v1/queue_num`.
 - polls at the floor while within `origin_concurrency` of the front, since it is released as soon
   as the next sessions end;
 - polls at `clamp(floor, ceiling, secondsAhead × 1000 / divisor)` plus up to 30 % jitter, from the
-  Terraform-set `poll_policy` ([ADR-0023](adr/0023-adaptive-poll-interval.md)), defaulting to a
-  fixed 5 s;
+  Terraform-set `poll_policy` ([ADR-0023](adr/0023-adaptive-poll-interval.md)): by default a 5 s
+  floor, a 30 s ceiling and a divisor of 10. A `/status` that carries no policy gets a fixed 5 s;
 - stops polling while the tab is hidden and catches up when it is visible, never faster than the
   floor;
 - re-joins with the same request id after eight consecutive 404s from `/_wr/v1/queue_num`, enough to
@@ -218,7 +219,7 @@ rather than bunched with the next; the function has reserved concurrency
 A pass runs only when `phase = active` and the resolved admission control is `Open`; otherwise it
 writes nothing. A pass that fails is skipped (`controller_pass_failed`) and the
 cadence carries on; the next pass computes the same free slots from the same state. An
-execution whose first pass finds the phase `idle` or `post_event` ends there, since such an event
+execution ends at the first pass that finds the phase `idle` or `post_event`, since such an event
 only becomes active through `pre_queue` and an open; that is most of the controller's cost
 between events (N1), and it means an operator who goes idle → pre_queue → open inside one minute
 waits for the next execution before admission starts.
@@ -356,8 +357,8 @@ paths (`/_wr/v1/join|status|queue_num|generate_token`), earned by a challenge on
 rate-limits per token and per IP (per-IP join limits escalate to CAPTCHA); and runs the AWS
 managed rules (Anti-DDoS, IP reputation, Bot Control common, anonymous IP) in Count until
 `waf_managed_rules_mode = "enforce"`. The no-JavaScript paths and `waiting.html` are never
-challenged; they get a strict per-IP limit, anonymous-network blocking, and `nojs_enabled = false`
-to close them for an event.
+challenged; they get a strict per-IP limit, anonymous-network blocking (counted, not blocked,
+until the managed rules are enforced), and `nojs_enabled = false` to close them for an event.
 
 **No-JavaScript queue** ([ADR-0037](adr/0037-no-javascript-queue.md)). `waiting.html`'s
 `<noscript>` form posts to `/_wr/v1/enter`, which mints the same UUIDv7 and possession secret the
@@ -376,7 +377,7 @@ The admin Lambda serves an Axum router behind an API Gateway greedy proxy:
 | `/_wr/admin`, `/_wr/admin/state` | GET | Dashboard (with the readiness panel, whose read of the distribution the `edge` module grants on its own distribution, #250) and JSON state |
 | `/_wr/admin/login`, `/_wr/admin/callback` | GET | OIDC Authorization Code + PKCE ([ADR-0016](adr/0016-admin-oidc-dynamodb-sessions.md)). The callback answers a meta-refresh page, so the `SameSite=Strict` session cookie it sets is sent on the way to the dashboard |
 | `/_wr/admin/logout` | POST | Ends the session. Like every POST, needs the session's `csrf` form field |
-| `/_wr/admin/phase` | POST | Phase transition from an expected prior phase; refuses `active`, which only the open can set |
+| `/_wr/admin/phase` | POST | Phase transition from an expected prior phase; refuses `active` for an event the open has not opened, so it only returns an opened event from maintenance |
 | `/_wr/admin/start_time` | POST | Sets or clears the start time and arms the open schedule |
 | `/_wr/admin/open_now` | POST | Invokes `open_event` now |
 | `/_wr/admin/concurrency`, `/_wr/admin/message` | POST | Origin concurrency (guarded on the prior value), operator broadcast |
@@ -442,5 +443,7 @@ would let two events share tables (`event_id` may not contain `#`), but nothing 
 parameterised per event, and `Positions` rows carry no `event_id`.
 
 **What if the signing key is compromised?** It mints admission for the whole event. Rotate by
-forcing `random_bytes.signing_key` to regenerate and applying, which invalidates every live
-session, so it is a between-events operation.
+raising `signing_key_generation` and applying. The gate goes on accepting the previous
+generation as `kp`, so a single rotation keeps sessions minted under the compromised key valid
+until they expire; raise it twice to drop that key at once, which sends every live session back
+to the waiting page.

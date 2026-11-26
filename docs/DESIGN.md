@@ -13,7 +13,8 @@ The waiting room meters visitors into an origin at a rate the origin can sustain
   they are assigned randomized positions
   ([ADR-0001](adr/0001-randomize-pre-queue-assignment.md)).
 - **Standby.** The gate stays deployed with no protection rules, so every request passes
-  through. Once an operator writes rules, matching visitors are queued first-in, first-out.
+  through. Once an operator writes rules and opens the event, matching visitors are queued
+  first-in, first-out.
 
 Admission is a signed session cookie. A CloudFront Function at the edge verifies it locally, with
 no call to the backend.
@@ -66,7 +67,7 @@ no call to the backend.
         → UpdateItem serving_counter (the slots due free by the next pass, plus a
           no-show correction), the log, then cap c on each arrivals shard
         │
-  Visitor polls /_wr/v1/status until serving_position ≥ own position
+  Visitor polls /_wr/v1/status until serving_position > own position
         │
   POST /_wr/v1/generate_token (request_id + possession secret, ADR-0035)
         1. event admitting? (phase active, resolve(stored control, fail_open_until, now));
@@ -117,7 +118,7 @@ the KeyValueStore (the ruleset's only store) by read-modify-write, and stamps `r
 | Phase state | The `phase` attribute on the event's `Counters` item. `maintenance` is one of its values, not a separate override |
 | Seed | Terraform writes the item at `idle`, or at `pre_queue` when `starts_at` is set, then ignores changes to it |
 | Scheduled open | An EventBridge Scheduler `at()` schedule invokes `open_event`. It is created disabled unless `starts_at` is set, and `/_wr/admin/start_time` arms it ([ADR-0025](adr/0025-operator-owned-seal-schedule.md)) |
-| Manual transitions | `/_wr/admin/phase` makes any transition except to `active`, which only the open writes. `/_wr/admin/open_now` invokes `open_event` |
+| Manual transitions | `/_wr/admin/phase` moves idle → pre_queue, active → post_event, and out of maintenance. It writes `active` only for an event the open has already opened, and `maintenance` is `/_wr/admin/force_maintenance`. `/_wr/admin/open_now` invokes `open_event` |
 | Visitor-facing state | `/_wr/v1/status` carries `phase` and a derived `serving_state` ([ADR-0019](adr/0019-visitor-facing-serving-state.md)) |
 
 **Protection rules** (path, header, cookie or user agent, evaluated at the gate) select what is
@@ -131,7 +132,8 @@ intent; standby is FIFO because an unplanned spike's arrival order carries infor
 
 **Not built:** automatic standby activation (a CloudWatch alarm on CloudFront `Requests` →
 EventBridge; [#60](https://github.com/smoketurner/virtual-waiting-room/issues/60), [`tasks.md`](../.kiro/specs/virtual-waiting-room/tasks.md)
-Phase 1b). Today an operator leaves dormancy by writing rules.
+Phase 1b). Today an operator leaves dormancy by writing rules, moving the event to `pre_queue`
+and opening it: the open of an empty cohort is what starts the live-join sequence (§4.1).
 
 ## 4. Pre-queue and position assignment
 
@@ -317,7 +319,8 @@ Keys are built only in `wr_common::expr`.
 `wr_common::resolve(stored, fail_open_until, now)` is the only producer of
 `AdmissionControl::FailOpen`. A pre-queue shard item `EVT#{event_id}#PQ#{s}` holds its count
 `n`. An arrivals shard item `EVT#{event_id}#AR#{s}` holds `n`, the admissions taken, and `c`, the
-cap they may be taken up to. `event_id` may not contain `#`.
+cap they may be taken up to. The controller's admission log `EVT#{event_id}#LOG` holds the total
+admitted at each pass (§7). `event_id` may not contain `#`.
 
 **`PreQueue`** (PK `r`) has the attributes `s`, `l`, `t` and `h`. The names are short because
 DynamoDB bills attribute names on every write and the table holds one row per visitor. The table
@@ -325,7 +328,7 @@ is never scanned.
 
 **`Positions`** (PK `request_id`) has the attributes `queue_position`, `entry_time`
 (server-stamped and authoritative), `status` (`issued` / `admitted`, [ADR-0033](adr/0033-admission-claimed-once-per-visitor.md)),
-`h` and `ttl`. A live joiner gets a row at join. A pre-queue member gets one at admission.
+`admitted_at` (which the session's expiry is counted from), `h` and `ttl`. A live joiner gets a row at join. A pre-queue member gets one at admission.
 `ttl` only reclaims storage. It is never an admission deadline
 ([ADR-0031](adr/0031-remove-controller-driven-expiry.md)).
 
@@ -470,9 +473,9 @@ allowlist is re-checked on every request.
 | Path | Purpose |
 |---|---|
 | `/_wr/admin`, `/_wr/admin/state`, `/_wr/admin/login`, `/_wr/admin/callback`, `/_wr/admin/logout` | Dashboard with the readiness panel (issue #70), its state as JSON, the OIDC session |
-| `/_wr/admin/phase`, `/_wr/admin/open_now`, `/_wr/admin/start_time` | Any transition except to `active`; open now; set T−0 and arm the schedule |
+| `/_wr/admin/phase`, `/_wr/admin/open_now`, `/_wr/admin/start_time` | Phase transition (not to `active` before the open); open now; set T−0 and arm the schedule |
 | `/_wr/admin/concurrency`, `/_wr/admin/message` | Origin concurrency; broadcast message |
-| `/_wr/admin/pause`, `/_wr/admin/resume`, `/_wr/admin/force_maintenance` | Hold or resume admission (queue and rate kept); emergency full stop ([ADR-0017](adr/0017-andon-cord-emergency-controls.md)) |
+| `/_wr/admin/pause`, `/_wr/admin/resume`, `/_wr/admin/force_maintenance` | Hold or resume admission (queue and origin concurrency kept); emergency full stop ([ADR-0017](adr/0017-andon-cord-emergency-controls.md)) |
 | `/_wr/admin/fail_open`, `/_wr/admin/recover` | Set (≤ 1,440 min) or clear the fail-open epoch; a pause still in force applies once it clears |
 | `/_wr/admin/rules`, `/_wr/admin/ip_binding` | Replace the gate ruleset (§2.3); session IP binding on/off ([ADR-0036](adr/0036-optional-session-ip-binding.md)) |
 
@@ -747,7 +750,7 @@ proportion.
 | F0.1–F0.8: lifecycle, modes, protection rules, maintenance (standby auto-activation not built) | §2.3, §3 |
 | F1.1–F1.5, C1, C2: pre-queue, randomized atomic assignment, auditability | §4 |
 | F2.1–F2.6, C3, C5: live join, uniqueness, gaps, idempotent and malformed joins | §4.5, §5, §6 |
-| F3.1–F3.5, F3.8: position, rate control, session, gate, no-show compensation | §2.3, §7, §8 |
+| F3.1–F3.5, F3.8: position, origin concurrency, session, gate, no-show compensation | §2.3, §7, §8 |
 | F4.1–F4.5: fail-open, lost-join recovery, 429 retry | §6, §10 |
 | F5.1–F5.5, O4: operator surface | §8, §9 |
 | C4, N7, N10, O5: polling load, edge mitigation, Count-then-Block | §8, §12 |

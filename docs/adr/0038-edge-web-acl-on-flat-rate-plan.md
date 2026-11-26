@@ -103,7 +103,7 @@ between events, so the default is neither.
   at worst it sees a CAPTCHA.
 
 Everything used is within the Business plan's allowance: individual rules only, no rule groups
-of our own, 13–14 rules against its 50.
+of our own, 14–15 rules against its 50.
 
 ## 3. Consequences
 
