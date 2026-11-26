@@ -20,17 +20,22 @@ path = "src/bin/stack/main.rs"
 
 [dependencies]
 anyhow = { workspace = true, features = ["std"] }
+assign_position = { workspace = true }
 aws-config = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 aws-sdk-dynamodb = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 aws-sdk-ssm = { workspace = true, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 axum = { workspace = true, features = ["http1", "tokio"] }
 base64 = { workspace = true, features = ["std"] }
 controller = { workspace = true }
+generate_token = { workspace = true }
 jiff = { workspace = true, features = ["std"] }
-serde = { workspace = true, features = ["derive", "std"] }
+open_event = { workspace = true }
+read = { workspace = true }
 reqwest = { workspace = true, features = ["json", "rustls-tls-webpki-roots-no-provider", "http2"] }
 rustls = { workspace = true, features = ["aws_lc_rs", "std", "tls12"] }
+serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true, features = ["std"] }
+thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync", "process", "net", "io-util", "fs"] }
 wr-common = { workspace = true }
 

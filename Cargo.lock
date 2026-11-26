@@ -1593,17 +1593,22 @@ name = "harness"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "assign_position",
  "aws-config",
  "aws-sdk-dynamodb",
  "aws-sdk-ssm",
  "axum",
  "base64 0.23.1",
  "controller",
+ "generate_token",
  "jiff 1.0.1",
+ "open_event",
+ "read",
  "reqwest",
  "rustls",
  "serde",
  "serde_json",
+ "thiserror 2.0.21",
  "tokio",
  "wr-common",
 ]

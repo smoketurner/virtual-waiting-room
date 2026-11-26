@@ -57,8 +57,11 @@ tower-http = { version = "=0.7.1", default-features = false }
 tracing = { version = "=0.1.44", default-features = false }
 tracing-subscriber = { version = "=0.3.23", default-features = false }
 uuid = { version = "=1.29.3", default-features = false }
+assign_position = { path = "crates/assign_position", version = "=0.1.0" }
 controller = { path = "crates/controller", version = "=0.1.0" }
 generate_token = { path = "crates/generate_token", version = "=0.1.0" }
+open_event = { path = "crates/open_event", version = "=0.1.0" }
+read = { path = "crates/read", version = "=0.1.0" }
 wr-common = { path = "crates/wr-common", version = "=0.1.0" }
 
 [workspace.lints.clippy]

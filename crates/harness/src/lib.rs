@@ -4,11 +4,12 @@
 //!
 //! They run on tokio's clock, so a run can use real time or paused time. What
 //! answers the edge's calls is a [`backend::Backend`]: the shipped binaries in
-//! `stack`.
+//! `stack`, or the functions' own logic over [`memory::Memory`].
 
 pub mod backend;
 pub mod clock;
 pub mod edge;
+pub mod memory;
 pub mod metrics;
 pub mod queue;
 pub mod report;
