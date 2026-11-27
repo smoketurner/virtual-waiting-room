@@ -9,7 +9,7 @@
 //! under one budget and distribute nothing. Readers that need them fetch them
 //! explicitly.
 
-use jiff::Timestamp;
+use jiff::{SignedDuration, Timestamp};
 use std::collections::HashMap;
 
 use aws_sdk_dynamodb::types::AttributeValue;
@@ -19,6 +19,7 @@ use crate::crypto::SecretDigest;
 use crate::expr::STARTS_AT_ATTR;
 use crate::ids::{Phase, StoredControl};
 use crate::permutation::{Assignment, CohortOffsets, SHARDS, Seed};
+use crate::turns::{Call, TurnState, calls_of, turn_of};
 
 /// What has happened to a `Positions` row.
 ///
@@ -140,6 +141,9 @@ pub struct Counters {
     /// scheduled start has passed must be told it is opening, so collapsing the
     /// two would erase a distinction the read path needs.
     pub starts_at: Option<Timestamp>,
+    /// The recent calls, oldest first: which places in line each pass
+    /// called, and where their held spots are counted.
+    pub calls: Vec<Call>,
 }
 
 /// The fixed pre-queue index space and permutation seed, once the event has
@@ -154,7 +158,27 @@ pub struct OpenOutputs {
     pub seed: Seed,
 }
 
+/// How long after `starts_at` a join still counts as on time and goes into the
+/// draw. The first seconds of a sale are when people refreshing for it arrive.
+pub const DRAW_GRACE: SignedDuration = SignedDuration::from_secs(15);
+
 impl Counters {
+    /// Where the place in line `place` stands at `now`: not yet called, its
+    /// turn, or its turn passed.
+    #[must_use]
+    pub fn turn_of(&self, place: u64, now: Timestamp) -> TurnState {
+        turn_of(&self.calls, self.serving_counter, place, now)
+    }
+
+    /// The last moment a join can be accepted and still go into the draw:
+    /// [`DRAW_GRACE`] after `starts_at`. `None` for an event with no scheduled
+    /// start, which takes every join until it opens.
+    #[must_use]
+    pub fn draw_cutoff(&self) -> Option<Timestamp> {
+        self.starts_at
+            .map(|at| at.checked_add(DRAW_GRACE).unwrap_or(Timestamp::MAX))
+    }
+
     /// `Some` once the open has written the seed, cohort size, and offsets;
     /// `None` before.
     ///
@@ -278,6 +302,7 @@ impl Counters {
             // Stored as 0 when no window is in force.
             fail_open_until: when("fail_open_until").filter(|&until| until > Timestamp::UNIX_EPOCH),
             starts_at: when(STARTS_AT_ATTR),
+            calls: calls_of(item),
         }
     }
 }
@@ -549,6 +574,7 @@ mod tests {
             stored_control: StoredControl::Open,
             fail_open_until: None,
             starts_at: None,
+            calls: Vec::new(),
         }
     }
 
@@ -576,6 +602,22 @@ mod tests {
         counters.prequeue_offsets = Some([0, 0, 0, 1, 1, 1, 2, 2, 2, 2]);
         let opened = counters.open_outputs().unwrap();
         assert_eq!(opened.offsets.participant_count(), 3);
+    }
+
+    #[test]
+    fn the_draw_closes_the_grace_window_after_the_scheduled_start() {
+        let unscheduled = unopened_counters(Phase::PreQueue);
+        assert_eq!(unscheduled.draw_cutoff(), None);
+        let scheduled = Counters {
+            starts_at: Some(Timestamp::constant(1_000, 0)),
+            ..unopened_counters(Phase::PreQueue)
+        };
+        assert_eq!(scheduled.draw_cutoff(), Some(Timestamp::constant(1_015, 0)));
+        let at_the_end_of_time = Counters {
+            starts_at: Some(Timestamp::MAX),
+            ..unopened_counters(Phase::PreQueue)
+        };
+        assert_eq!(at_the_end_of_time.draw_cutoff(), Some(Timestamp::MAX));
     }
 
     fn opened_counters(counts: [u64; SHARDS]) -> Counters {

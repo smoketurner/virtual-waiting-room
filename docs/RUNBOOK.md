@@ -13,13 +13,13 @@ One deployment serves one event and is torn down afterwards.
 | Control | What it does | What a waiting visitor sees |
 |---|---|---|
 | **Set concurrency** | Changes how many visitors the origin takes at once | The queue moves faster or slower |
-| **Pause** | Holds admission; the queue keeps forming | Still queued, place kept, not moving |
-| **Resume** | Releases the hold at the configured concurrency | The queue moves again |
+| **Pause** | Holds admission; the queue keeps forming. A turn called before the pause keeps its 2-minute clock, so a pause longer than that makes those visitors miss their turn | Still queued, place kept, not moving; a visitor whose turn passes during the pause takes a new place at the back |
+| **Resume** | Lifts the hold at the configured concurrency | The queue moves again |
 | **Fail open** | For a fixed number of minutes, every request reaches the origin, admitted or not | Nothing; they are through |
 | **Recover** | Ends the fail-open window early | Back to the queue, unless admitted meanwhile |
 | **Force maintenance** | Full stop; the event is down | An outage page, not a queue |
 | **Phase** | Moves the lifecycle phase (out of maintenance, to `post_event`) | The page for that phase |
-| **Open now** | Opens the event immediately instead of at the scheduled start | Their place, and the queue starts moving |
+| **Open now** | Moves the start to now and opens the event 15 s later instead of at the scheduled start | Their place, and the queue starts moving |
 | **Start time** | Sets the scheduled open and its timezone | A countdown during the pre-queue |
 | **Set message** | Publishes a line of text to the waiting page | The message, within about 5 s |
 | **Protection rules** | Replaces the gate's ruleset | Protected paths start or stop sending them to the queue |
@@ -94,7 +94,7 @@ On the day (**manual**):
 Enter how many visitors the origin can serve at once, as a whole number. No more admitted visitors
 than that hold a live session at any moment, and there is no burst beyond it, but the open admits
 that many at once, so the origin must survive the whole limit arriving together. Each session holds
-its slot for `session_ttl_seconds` (set at deploy, [`DEPLOY.md`](./DEPLOY.md#choosing-the-session-lifetime)),
+its spot for `session_ttl_seconds` (set at deploy, [`DEPLOY.md`](./DEPLOY.md#choosing-the-session-lifetime)),
 whether or not the visitor is still there, so throughput is the concurrency divided by the session
 length: at the 900 s default, a limit of 100 admits about 400 an hour. Lowering the limit below the
 sessions already live admits nobody until enough of them have ended. 0 is rejected; use Pause to
@@ -119,7 +119,7 @@ In order:
 1. **Is the event open?** An unopened pre-queue event has no seed, and `/queue_num` answers "not
    yet open" to everyone. Press **Open now**.
 2. **Is admission paused?** The badge at the top shows paused, open or fail open. Press **Resume**.
-3. **Is the origin concurrency unset?** Set it. With every slot holding a live session, the queue
+3. **Is the origin concurrency unset?** Set it. With every spot holding a live session, the queue
    moves only as sessions end.
 4. **Is the phase `maintenance`?** Move it back to `active` with the Phase control.
 5. **Is `admission_control_unreadable` firing?** The controller is holding admission because the
@@ -182,8 +182,12 @@ None of this binds a place to a person.
 
 ### Opening early
 
-**Open now** performs the same guarded open as the schedule, so the schedule firing later does
-nothing. It cannot be undone: everyone waiting is assigned their place at that moment.
+**Open now** first moves the event's start time to the moment you press it, then performs the same
+guarded open as the schedule, so the schedule firing later does nothing. Anyone who joins within
+15 seconds of the press is still in the random draw, and nobody is let in during those 15 seconds.
+It cannot be undone: everyone waiting is assigned their place when the 15 seconds are up. If the
+open itself fails, the start time has still moved and the console still records the press; the
+error is shown, and pressing **Open now** again retries.
 
 ---
 
@@ -196,9 +200,9 @@ which needs two consecutive minutes; none happens in normal operation.
 |---|---|---|
 | `join_dropped` | A join reached SQS and was discarded (malformed body, or an `event_id` that does not match). The visitor got a 200 | Check `event_id` in `terraform.tfvars` against the event item. A mismatch drops **every** join |
 | `join-dlq-not-empty` | A join was received 10 times without being written and was dead-lettered | Check `assign_position`'s logs. The messages are in the dead-letter queue and can be redriven |
-| `arrival_record_failed` | A unit of the admission budget could not be taken, so the visitor was **not** admitted and will ask again | Harmless once. If continuous, admission has stopped: check `generate_token`'s logs and its grant on the `Counters` table |
+| `arrival_record_failed` | A called visitor's held spot could not be taken, so they were **not** admitted and will ask again | Harmless once. If continuous, admission has stopped: check `generate_token`'s logs and its grant on the `Counters` table |
 | `arrival_shard_draw_failed` | Same, one step earlier | As above |
-| `admission_claim_failed` | The write that marks a visitor admitted did not land; they were admitted anyway | Harmless once. If continuous, every reload takes a second unit of budget, so fewer people are admitted than the concurrency allows, never more |
+| `admission_claim_failed` | The write that marks a visitor admitted did not land; they were admitted anyway | Harmless once. If continuous, every reload takes a second spot, so fewer people are admitted than the concurrency allows, never more |
 | `admission_control_unreadable` | The stored admission control could not be parsed; the controller is holding admission | The queue has stopped. Pause, then Resume |
 | `rules_audit_failed` | The ruleset changed but its audit stamp did not | Gate is correct; "last changed by" is stale. No visitor impact |
 | `fail_open_audit_lost` | Fail-open changed but its audit stamp lost a race | Change took effect; "last changed by" is stale. No visitor impact |
@@ -215,9 +219,11 @@ These are logged (`$.fields.event`) without an alarm of their own:
 
 | Event | What happened | What to do |
 |---|---|---|
-| `controller_pass_failed` | One controller pass failed and was skipped; the next computes the same free slots from the same state | Harmless once. If continuous the queue has stopped: check the `controller` function's logs |
+| `controller_pass_failed` | One controller pass failed and was skipped; the next computes the same free spots from the same state | Harmless once. If continuous the queue has stopped: check the `controller` function's logs |
 | `open_drain_timed_out` | The join queue had not caught up when the open reached its 900 s deadline, so it went ahead; joins still queued are numbered behind the cohort | Check `assign_position`'s concurrency and the tables' pre-warming before the next event |
-| `open_drain_unreadable` | The open could not read the join queue and did not wait for it | Check `open_event`'s `sqs:GetQueueAttributes` grant |
+| `open_drain_unreadable` | The open could not read the join queue's waiting count, or the pre-queue and deferred-join counts, and did not wait for the queue | Check `open_event`'s `sqs:GetQueueAttributes` grant and its read of the `Counters` shard items |
+| `open_cutoff_unreadable` | The open could not read when the draw closes and did not wait for the 15 s window | Joins in the window may be behind the cohort. Check `open_event`'s logs and its `Counters` read |
+| `open_before_draw_cutoff` | The draw closes later than the open can wait, so it opened first; joins accepted in between are numbered behind the cohort | The start time was moved past the open's timeout. Check the start time before the next open |
 | `nojs_join_resent` | A no-JavaScript join had not registered after 60 s and was sent again | Expected occasionally. Many at once means the join consumer is behind |
 | `nojs_join_lost` | A no-JavaScript join never registered after three resends; the visitor was shown the form again | Check the join queue, its dead-letter queue and `assign_position` |
 | `admin_login_refused` | A login was refused: not on the allowlist, or the provider did not say the email is verified | If every login is refused for `email_verified`, the provider omits the claim: set `oidc_require_email_verified = false` |

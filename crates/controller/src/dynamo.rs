@@ -1,10 +1,10 @@
 //! The `aws-sdk-dynamodb`-backed [`Store`] for the controller.
 //!
 //! The controller reads and writes one table. The event's own state is a
-//! single-item `GetItem`/`UpdateItem`. The arrivals shards are separate items
-//! under their own partition keys, read with one `BatchGetItem` and each given
-//! its cap with its own `UpdateItem`. The admission log is one more item,
-//! replaced whole each pass.
+//! single-item `GetItem`/`UpdateItem`. The arrivals counters are separate items
+//! under their own partition keys, ten to a shelf, read with `BatchGetItem` and
+//! each given its cap with its own `UpdateItem`. The admission log is one more
+//! item, replaced whole each pass.
 
 use jiff::{SignedDuration, Timestamp};
 use std::collections::HashMap;
@@ -14,16 +14,19 @@ use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
 use aws_sdk_dynamodb::types::AttributeValue;
 use wr_common::expr::{
-    ADMISSION_LOG_ATTR, ADMISSION_PROVIDED_ATTR, Key, SHARD_CAP_ATTR, SHARD_COUNT_ATTR,
-    SHARD_INDEX_ATTR, Update,
+    ADMISSION_LOG_ATTR, Key, SHARD_CAP_ATTR, SHARD_COUNT_ATTR, SHARD_INDEX_ATTR, SHELF_INDEX_ATTR,
+    Update,
 };
-use wr_common::{Counters, Phase, SHARDS, Shard, StoredControl};
+use wr_common::{CALLS_ATTR, Counters, Phase, SHARDS, Shard, Shelf, StoredControl, calls_to_attr};
 use wr_common::{shard_cap_of, shard_count_of, shard_index_of};
 
 use crate::{
-    AdmissionLog, ControllerState, LogEntry, PassDecision, PassInputs, ReleaseOutcome, ShardBudget,
-    Store, StoreError,
+    AdmissionLog, CallOutcome, ControllerState, LogEntry, PassDecision, PassInputs, ShardBudget,
+    Shelves, Store, StoreError,
 };
+
+/// The most keys one `BatchGetItem` takes.
+const BATCH_GET_LIMIT: usize = 100;
 
 /// A live `DynamoDB` store bound to the counters table.
 pub struct DynamoStore {
@@ -105,41 +108,46 @@ impl Store for DynamoStore {
             );
         }
 
+        let counters = Counters::from_item(event_id, item);
         Ok(ControllerState {
             phase,
             stored_control,
-            fail_open_until: Counters::from_item(event_id, item).fail_open_until,
+            fail_open_until: counters.fail_open_until,
             inputs: PassInputs {
-                shards: self.read_shards(event_id).await?,
+                shelves: self.read_shelves(event_id).await?,
                 shards_read_at: whole_second_now(),
                 serving_counter: num(item, "serving_counter"),
                 queue_counter: num(item, "queue_counter"),
                 origin_concurrency: u32::try_from(num(item, "origin_concurrency")).unwrap_or(0),
                 session: self.session,
                 log: self.read_log(event_id).await?,
+                draw_cutoff: counters.draw_cutoff(),
+                calls: counters.calls,
             },
         })
     }
 
-    async fn write_release(
+    async fn write_call(
         &self,
         event_id: &str,
         decision: &PassDecision,
         expected_serving_counter: u64,
-    ) -> Result<ReleaseOutcome, StoreError> {
+    ) -> Result<CallOutcome, StoreError> {
         let result = self
             .client
             .update_item()
             .table_name(&self.counters_table)
             .set_key(Some(Key::Event { event_id }.build()))
-            .update_expression("SET serving_counter = :next")
+            .update_expression("SET serving_counter = :next, #calls = :calls")
             .condition_expression(
                 "attribute_not_exists(serving_counter) OR serving_counter = :expected",
             )
+            .expression_attribute_names("#calls", CALLS_ATTR)
             .expression_attribute_values(
                 ":next",
                 AttributeValue::N(decision.next_serving_counter.to_string()),
             )
+            .expression_attribute_values(":calls", calls_to_attr(&decision.calls))
             .expression_attribute_values(
                 ":expected",
                 AttributeValue::N(expected_serving_counter.to_string()),
@@ -148,26 +156,22 @@ impl Store for DynamoStore {
             .await;
 
         match result {
-            Ok(_) => Ok(ReleaseOutcome::Advanced),
+            Ok(_) => Ok(CallOutcome::Called),
             Err(SdkError::ServiceError(se))
                 if matches!(
                     se.err(),
                     UpdateItemError::ConditionalCheckFailedException(_)
                 ) =>
             {
-                Ok(ReleaseOutcome::LostRace)
+                Ok(CallOutcome::LostRace)
             }
-            Err(e) => Err(StoreError(format!("update_item release: {e}"))),
+            Err(e) => Err(StoreError(format!("update_item call: {e}"))),
         }
     }
 
     async fn write_log(&self, event_id: &str, log: &AdmissionLog) -> Result<(), StoreError> {
         let write = Update::new()
             .set(ADMISSION_LOG_ATTR, entries_to_attr(log))
-            .set(
-                ADMISSION_PROVIDED_ATTR,
-                AttributeValue::N(log.provided.to_string()),
-            )
             .build();
         self.client
             .update_item()
@@ -182,23 +186,39 @@ impl Store for DynamoStore {
         Ok(())
     }
 
-    async fn write_caps(&self, event_id: &str, caps: &[u64; SHARDS]) -> Result<(), StoreError> {
+    async fn write_caps(
+        &self,
+        event_id: &str,
+        shelf: Shelf,
+        caps: &[u64; SHARDS],
+    ) -> Result<(), StoreError> {
         for (index, cap) in caps.iter().enumerate() {
             let shard = Shard::new(index)
                 .ok_or_else(|| StoreError(format!("shard index {index} out of range")))?;
             // The count is created at zero beside the cap: `generate_token`
-            // takes budget with `n < c`, and a comparison against an absent
-            // attribute is false, so a shard with a cap and no count would
-            // admit nobody.
+            // takes a spot with `n < c`, and a comparison against an absent
+            // attribute is false, so a counter with a cap and no count would
+            // let nobody in.
             let grant = Update::new()
                 .set(SHARD_CAP_ATTR, AttributeValue::N(cap.to_string()))
                 .set(SHARD_INDEX_ATTR, AttributeValue::N(index.to_string()))
+                .set(
+                    SHELF_INDEX_ATTR,
+                    AttributeValue::N(shelf.index().to_string()),
+                )
                 .set_if_not_exists(SHARD_COUNT_ATTR, AttributeValue::N("0".to_owned()))
                 .build();
             self.client
                 .update_item()
                 .table_name(&self.counters_table)
-                .set_key(Some(Key::ArrivalsShard { event_id, shard }.build()))
+                .set_key(Some(
+                    Key::ArrivalsShard {
+                        event_id,
+                        shelf,
+                        shard,
+                    }
+                    .build(),
+                ))
                 .update_expression(grant.expression)
                 .set_expression_attribute_names(Some(grant.names))
                 .set_expression_attribute_values(Some(grant.values))
@@ -240,42 +260,53 @@ impl DynamoStore {
         }))
     }
 
-    /// One `BatchGetItem` over the ten arrivals shards, read consistently: the
-    /// caps written from this read are `taken` plus a share, so a stale count
-    /// would re-grant budget that has already been spent.
-    async fn read_shards(&self, event_id: &str) -> Result<[ShardBudget; SHARDS], StoreError> {
-        let keys: Vec<_> = (0..SHARDS)
-            .filter_map(Shard::new)
-            .map(|shard| Key::ArrivalsShard { event_id, shard }.build())
+    /// Every shelf's arrivals counters, read consistently: the caps written
+    /// from this read are `taken` plus a share, so a stale count would hold
+    /// spots that have already been taken. `BatchGetItem` takes 100 keys, so
+    /// the 140 are read in two.
+    async fn read_shelves(&self, event_id: &str) -> Result<Shelves, StoreError> {
+        let keys: Vec<_> = Shelf::all()
+            .flat_map(|shelf| {
+                (0..SHARDS).filter_map(Shard::new).map(move |shard| {
+                    Key::ArrivalsShard {
+                        event_id,
+                        shelf,
+                        shard,
+                    }
+                    .build()
+                })
+            })
             .collect();
 
-        let request = aws_sdk_dynamodb::types::KeysAndAttributes::builder()
-            .set_keys(Some(keys))
-            .consistent_read(true)
-            .build()
-            .map_err(|e| StoreError(format!("build arrivals keys: {e}")))?;
+        let mut items = Vec::with_capacity(keys.len());
+        for chunk in keys.chunks(BATCH_GET_LIMIT) {
+            let request = aws_sdk_dynamodb::types::KeysAndAttributes::builder()
+                .set_keys(Some(chunk.to_vec()))
+                .consistent_read(true)
+                .build()
+                .map_err(|e| StoreError(format!("build arrivals keys: {e}")))?;
 
-        let out = self
-            .client
-            .batch_get_item()
-            .request_items(&self.counters_table, request)
-            .send()
-            .await
-            .map_err(|e| StoreError(format!("batch_get_item arrivals: {e}")))?;
+            let out = self
+                .client
+                .batch_get_item()
+                .request_items(&self.counters_table, request)
+                .send()
+                .await
+                .map_err(|e| StoreError(format!("batch_get_item arrivals: {e}")))?;
 
-        // A partial batch must not be folded: a shard that was not returned
-        // would read as holding no budget and having admitted nobody.
-        if out
-            .unprocessed_keys()
-            .is_some_and(|u| u.contains_key(&self.counters_table))
-        {
-            return Err(StoreError("arrivals read incomplete; retry".to_owned()));
+            // A partial batch must not be folded: a counter that was not
+            // returned would read as holding nothing and having let nobody in.
+            if out
+                .unprocessed_keys()
+                .is_some_and(|u| u.contains_key(&self.counters_table))
+            {
+                return Err(StoreError("arrivals read incomplete; retry".to_owned()));
+            }
+            if let Some(found) = out.responses().and_then(|r| r.get(&self.counters_table)) {
+                items.extend(found.iter().cloned());
+            }
         }
-        let items = out
-            .responses()
-            .and_then(|r| r.get(&self.counters_table))
-            .map_or_default(Vec::as_slice);
-        shards_from_items(items)
+        shelves_from_items(&items)
     }
 }
 
@@ -290,12 +321,6 @@ fn entries_to_attr(log: &AdmissionLog) -> AttributeValue {
 }
 
 fn log_from_item(item: &HashMap<String, AttributeValue>) -> Option<AdmissionLog> {
-    let provided = item
-        .get(ADMISSION_PROVIDED_ATTR)?
-        .as_n()
-        .ok()?
-        .parse::<u64>()
-        .ok()?;
     let (pairs, rest) = item.get(ADMISSION_LOG_ATTR)?.as_l().ok()?.as_chunks::<2>();
     if !rest.is_empty() {
         return None;
@@ -312,35 +337,44 @@ fn log_from_item(item: &HashMap<String, AttributeValue>) -> Option<AdmissionLog>
             admitted: read(admitted)?,
         });
     }
-    Some(AdmissionLog { entries, provided })
+    Some(AdmissionLog { entries })
 }
 
-/// Folds `BatchGetItem` responses into the per-shard budgets. A shard with no
-/// item has admitted nobody and holds no budget.
+/// Folds `BatchGetItem` responses into every shelf's counters. A counter with
+/// no item has let nobody in and holds nothing.
 ///
-/// An item with a readable index and an unreadable count is corruption, and an
-/// error: defaulting it to zero would grant that shard a cap far below what it
-/// has already taken, closing it. An absent cap is not -- `generate_token`
-/// creates a shard's count only through a cap, but a shard never granted one
-/// is a legitimate state for the first pass to find.
-fn shards_from_items(
-    items: &[HashMap<String, AttributeValue>],
-) -> Result<[ShardBudget; SHARDS], StoreError> {
-    let mut shards = [ShardBudget::default(); SHARDS];
+/// An item with a readable place and an unreadable count is corruption, and an
+/// error: defaulting it to zero would give that counter a cap far below what
+/// has already been taken from it, closing it. An absent cap is not --
+/// `generate_token` creates a counter's count only through a cap, but a
+/// counter never given one is a legitimate state for the first pass to find.
+fn shelves_from_items(items: &[HashMap<String, AttributeValue>]) -> Result<Shelves, StoreError> {
+    let mut shelves: Shelves = [[ShardBudget::default(); SHARDS]; wr_common::SHELVES];
     for item in items {
         let Some(index) = shard_index_of(item) else {
             continue;
         };
+        let Some(shelf) = item
+            .get(SHELF_INDEX_ATTR)
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse::<usize>().ok())
+            .and_then(Shelf::new)
+        else {
+            continue;
+        };
         let taken = shard_count_of(item)
             .ok_or_else(|| StoreError("arrivals item has an unreadable count".to_owned()))?;
-        if let Some(slot) = shards.get_mut(index) {
-            *slot = ShardBudget {
+        if let Some(counter) = shelves
+            .get_mut(shelf.index())
+            .and_then(|counters| counters.get_mut(index))
+        {
+            *counter = ShardBudget {
                 taken,
                 cap: shard_cap_of(item).unwrap_or(0),
             };
         }
     }
-    Ok(shards)
+    Ok(shelves)
 }
 
 #[cfg(test)]
@@ -349,8 +383,17 @@ mod tests {
 
     use super::*;
 
-    fn shard_item(shard: usize, taken: u64, cap: Option<u64>) -> HashMap<String, AttributeValue> {
+    fn counter_item(
+        shelf: usize,
+        shard: usize,
+        taken: u64,
+        cap: Option<u64>,
+    ) -> HashMap<String, AttributeValue> {
         let mut item = HashMap::from([
+            (
+                SHELF_INDEX_ATTR.to_owned(),
+                AttributeValue::N(shelf.to_string()),
+            ),
             (
                 SHARD_INDEX_ATTR.to_owned(),
                 AttributeValue::N(shard.to_string()),
@@ -370,49 +413,51 @@ mod tests {
     }
 
     #[test]
-    fn a_shard_with_no_item_has_taken_nothing_and_holds_no_budget() {
-        let items = vec![shard_item(0, 3, Some(5)), shard_item(2, 5, Some(5))];
-        let shards = shards_from_items(&items).unwrap();
-        assert_eq!(shards[0], ShardBudget { taken: 3, cap: 5 });
-        assert_eq!(shards[1], ShardBudget::default());
-        assert_eq!(shards[2].unused(), 0);
+    fn each_counter_lands_on_its_own_shelf_and_a_missing_one_holds_nothing() {
+        let items = vec![
+            counter_item(0, 0, 3, Some(5)),
+            counter_item(13, 2, 5, Some(9)),
+        ];
+        let shelves = shelves_from_items(&items).unwrap();
+        assert_eq!(shelves[0][0], ShardBudget { taken: 3, cap: 5 });
+        assert_eq!(shelves[13][2], ShardBudget { taken: 5, cap: 9 });
+        assert_eq!(shelves[0][1], ShardBudget::default());
+        assert_eq!(crate::admitted(&shelves), 8);
     }
 
     #[test]
-    fn a_shard_without_a_cap_holds_no_budget() {
-        let shards = shards_from_items(&[shard_item(4, 9, None)]).unwrap();
-        assert_eq!(shards[4], ShardBudget { taken: 9, cap: 0 });
-        assert_eq!(shards[4].unused(), 0);
+    fn a_counter_without_a_cap_holds_nothing() {
+        let shelves = shelves_from_items(&[counter_item(1, 4, 9, None)]).unwrap();
+        assert_eq!(shelves[1][4], ShardBudget { taken: 9, cap: 0 });
+        assert_eq!(shelves[1][4].untaken(), 0);
     }
 
     #[test]
     fn an_item_with_an_unreadable_count_is_an_error_not_a_zero_count() {
-        let corrupt = HashMap::from([(
-            SHARD_INDEX_ATTR.to_owned(),
-            AttributeValue::N("3".to_owned()),
-        )]);
-        assert!(shards_from_items(&[shard_item(0, 3, Some(4)), corrupt]).is_err());
+        let mut corrupt = counter_item(0, 3, 0, None);
+        corrupt.remove(SHARD_COUNT_ATTR);
+        assert!(shelves_from_items(&[counter_item(0, 0, 3, Some(4)), corrupt]).is_err());
     }
 
     #[test]
-    fn an_item_with_an_unreadable_index_is_skipped() {
-        let corrupt = HashMap::from([(
-            SHARD_COUNT_ATTR.to_owned(),
-            AttributeValue::N("9".to_owned()),
-        )]);
-        let shards = shards_from_items(&[shard_item(0, 3, Some(4)), corrupt]).unwrap();
-        assert_eq!(shards[0], ShardBudget { taken: 3, cap: 4 });
-        assert_eq!(unused_total(shards), 1);
+    fn an_item_with_an_unreadable_place_is_skipped() {
+        let mut no_shard = counter_item(0, 0, 9, None);
+        no_shard.remove(SHARD_INDEX_ATTR);
+        let mut no_shelf = counter_item(0, 1, 9, None);
+        no_shelf.remove(SHELF_INDEX_ATTR);
+        let off_the_end = counter_item(wr_common::SHELVES, 1, 9, None);
+        let shelves = shelves_from_items(&[
+            counter_item(0, 0, 3, Some(4)),
+            no_shard,
+            no_shelf,
+            off_the_end,
+        ])
+        .unwrap();
+        assert_eq!(crate::admitted(&shelves), 3);
     }
 
     fn log_item(log: &AdmissionLog) -> HashMap<String, AttributeValue> {
-        HashMap::from([
-            (ADMISSION_LOG_ATTR.to_owned(), entries_to_attr(log)),
-            (
-                ADMISSION_PROVIDED_ATTR.to_owned(),
-                AttributeValue::N(log.provided.to_string()),
-            ),
-        ])
+        HashMap::from([(ADMISSION_LOG_ATTR.to_owned(), entries_to_attr(log))])
     }
 
     #[test]
@@ -428,7 +473,6 @@ mod tests {
                     admitted: u64::MAX,
                 },
             ],
-            provided: 250,
         };
         assert_eq!(log_from_item(&log_item(&log)), Some(log));
         let empty = AdmissionLog::default();
@@ -438,21 +482,11 @@ mod tests {
     #[test]
     fn a_malformed_log_is_unreadable() {
         let n = |v: &str| AttributeValue::N(v.to_owned());
-        let with_entries = |entries: AttributeValue| {
-            HashMap::from([
-                (ADMISSION_LOG_ATTR.to_owned(), entries),
-                (ADMISSION_PROVIDED_ATTR.to_owned(), n("0")),
-            ])
-        };
+        let with_entries =
+            |entries: AttributeValue| HashMap::from([(ADMISSION_LOG_ATTR.to_owned(), entries)]);
         assert!(log_from_item(&with_entries(AttributeValue::L(vec![n("1")]))).is_none());
         assert!(log_from_item(&with_entries(AttributeValue::L(vec![n("1"), n("x")]))).is_none());
         assert!(log_from_item(&with_entries(AttributeValue::S("1,2".to_owned()))).is_none());
-        let mut missing = log_item(&AdmissionLog::default());
-        missing.remove(ADMISSION_PROVIDED_ATTR);
-        assert!(log_from_item(&missing).is_none());
-    }
-
-    fn unused_total(shards: [ShardBudget; SHARDS]) -> u64 {
-        crate::unused_budget(shards)
+        assert!(log_from_item(&HashMap::new()).is_none());
     }
 }

@@ -486,6 +486,46 @@ test("a redemption answered 'gone' drops the place and stops", async () => {
   assert.equal(client.win.localStorage.getItem("vwr_identity"), null);
 });
 
+// A turn that passed before the page took it: the spot went to the next
+// place in line, so the page takes a new place at the back and says why.
+test("a redemption answered 'turn passed' takes a new place and keeps waiting", async () => {
+  const admitted = admittedRoute();
+  let missed = true;
+  let draw = 0;
+  const client = loadClient({
+    // A fresh identity each time one is minted, so the new place is told apart.
+    randomValues: (a) => a.fill((draw += 1)),
+    route: (url) => {
+      if (url.startsWith("/_wr/v1/generate_token") && missed) {
+        missed = false;
+        return jsonResponse(410, {
+          admitted: false,
+          error: "the turn for position 50 has passed",
+          reason: "turn_missed",
+        });
+      }
+      return admitted(url);
+    },
+  });
+  await client.flush();
+  assert.equal(client.win.location.replacedTo, undefined);
+  assert.notEqual(client.lastTimer(), undefined, "still waiting");
+  assert.match(client.elements.headline.textContent, /turn passed/);
+  const identity = client.win.localStorage.getItem("vwr_identity");
+  assert.ok(identity, "a new identity is stored");
+
+  // The next poll joins again, under the new identity.
+  const joinsBefore = client.calls.filter((c) => c.url.startsWith("/_wr/v1/join")).length;
+  client.clock.now += client.lastTimer().ms;
+  client.fireLastTimer();
+  await client.flush();
+  const joins = client.calls.filter((c) => c.url.startsWith("/_wr/v1/join"));
+  assert.equal(joins.length, joinsBefore + 1, "joined again");
+  const rejoined = JSON.parse(joins[joins.length - 1].opts.body).request_id;
+  assert.equal(rejoined, identity.split(".")[0]);
+  assert.notEqual(rejoined, JSON.parse(joins[0].opts.body).request_id);
+});
+
 // ADR-0039: the visitor's turn has come but the admission budget is spent.
 test("a redemption answered 'at capacity' keeps polling and is admitted on a later try", async () => {
   const admitted = admittedRoute();

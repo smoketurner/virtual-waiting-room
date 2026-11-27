@@ -64,7 +64,8 @@ activation queues FIFO.
 
 **F1.3** — As an operator, I want ordering that early registration cannot game.
 - WHEN T−0 is reached, THE SYSTEM SHALL assign pre-queue positions in **randomized** order, and SHALL NOT make the ordering predictable before that moment.
-- Acceptance: No correlation between position and registration time; positions uniformly distributed; the permutation key does not exist before T−0.
+- THE SYSTEM SHALL treat a join accepted within 15 s after T−0 as a pre-queue participant (ADR-0043).
+- Acceptance: No correlation between position and registration time; positions uniformly distributed; the permutation key does not exist before T−0; membership is decided by when SQS accepted the join, not when it was processed.
 
 **F1.4** — As an operator, I want assignment not to delay opening.
 - WHEN T−0 is reached, THE SYSTEM SHALL complete pre-queue position assignment promptly.
@@ -78,7 +79,7 @@ activation queues FIFO.
 
 **F2.1** — As a live arrival, I want a position behind the pre-queue.
 - WHEN a visitor joins after the event opens, THE SYSTEM SHALL assign a position in arrival order.
-- Acceptance: A visitor joining at T+5min receives a position after all pre-queue participants.
+- Acceptance: A visitor joining at T+5min receives a position after all pre-queue participants; joins after the draw closes are let in in the order SQS accepted them, to within a few seconds.
 
 **F2.2** — As a visitor, I want a unique position.
 - THE SYSTEM SHALL NOT issue any queue position twice.
@@ -123,9 +124,9 @@ activation queues FIFO.
 - Acceptance: A visitor navigates to a second page without re-presenting anything and is not re-queued.
 
 **F3.8** — As an operator, I want the origin kept full despite no-shows.
-- THE SYSTEM SHALL compensate admission control for **no-shows**.
+- THE SYSTEM SHALL compensate admission control for **no-shows**, called visitors who never arrive at the origin, without letting anyone take another visitor's turn.
 - THE SYSTEM SHALL count each admitted visitor once however many times they call `/_wr/v1/generate_token`.
-- Acceptance: With a 30% no-show rate the origin's slots stay nearly full, not 70% full; three reloads take one slot, not three.
+- Acceptance: A called visitor's spot is held for them alone for 2 minutes (longer at the open) and then called for the next place in line; with a 30% no-show rate and the default 900 s session the origin's spots stay above 80% full; three reloads take one spot, not three.
 
 ### 1.5 Failure behaviour
 
@@ -260,7 +261,7 @@ pre-event preparation in §4.
 - Acceptance: One event at its throughput ceiling does not increase join latency or error rate for another.
 
 **N10** — THE SYSTEM SHALL make client polling cost scale with distance to the front, not with waiting visitors × a fixed interval.
-- Acceptance: Poll count is O(log) in the starting wait; the harness client-request total under `--polling backoff` is materially below `--polling hold-position` at identical settings.
+- Acceptance: Poll count is O(log) in the starting wait; the client's request total is materially below a fixed-interval client's at identical settings.
 
 ---
 

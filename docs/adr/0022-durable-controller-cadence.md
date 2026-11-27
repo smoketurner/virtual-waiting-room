@@ -16,7 +16,9 @@
 generally available as of 1.0.0 (§7). The control law is amended by
 [0039](0039-meter-admissions-not-the-cursor.md) and again by
 [0041](0041-meter-origin-concurrency.md): a pass grants the free slots counted from the admission
-log, not elapsed seconds, which is equally why a skipped pass is safe.
+log, not elapsed seconds, which is equally why a skipped pass is safe. Amended by
+[0043](0043-held-turns-and-join-order.md): a pass calls as many places in line as there are free
+spots, less the spots still held for earlier calls, and holds a spot for each.
 
 ## 1. Context
 

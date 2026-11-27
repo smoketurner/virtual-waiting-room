@@ -16,12 +16,12 @@ them, and the invariants a change must not break. It does not repeat the narrati
 | `assign_position` | SQS consumer: pre-queue registration or live-join claim | DESIGN §4.1, §5.2 |
 | `open_event` | T−0: the one conditional open write | DESIGN §4.2 |
 | `read` | `/_wr/v1/status`, `/_wr/v1/queue_num` | DESIGN §4.2, §8 |
-| `generate_token` | Admission check, one admission claim, arrival count, session mint | DESIGN §2.3, §8 |
+| `generate_token` | Admission and turn check, takes the visitor's held spot, marks the admission, mints the session | DESIGN §2.3, §7, §8 |
 | `nojs` | `/_wr/v1/enter`, `/_wr/v1/wait`. Admits only through `generate_token::admit` ([ADR-0037](../../../docs/adr/0037-no-javascript-queue.md)) | DESIGN §8 |
-| `controller` | Durable function: six 10 s passes per `rate(1 minute)` ([ADR-0022](../../../docs/adr/0022-durable-controller-cadence.md)), metering origin concurrency ([ADR-0041](../../../docs/adr/0041-meter-origin-concurrency.md)) | DESIGN §7 |
+| `controller` | Durable function: six 10 s passes per `rate(1 minute)` ([ADR-0022](../../../docs/adr/0022-durable-controller-cadence.md)), metering origin concurrency ([ADR-0041](../../../docs/adr/0041-meter-origin-concurrency.md)) by calling as many places as there are free spots and holding a spot for each ([ADR-0043](../../../docs/adr/0043-held-turns-and-join-order.md)) | DESIGN §7 |
 | `admin` | Axum + askama operator UI/API behind OIDC + PKCE. The only writer of the gate KeyValueStore after apply ([ADR-0016](../../../docs/adr/0016-admin-oidc-dynamodb-sessions.md), [ADR-0018](../../../docs/adr/0018-admin-vouch-design-language.md)) | DESIGN §8, §9 |
-| `wr-common` | `permutation`, `ids`, `items`, `expr`, `crypto`, `rules`, re-exported flat | DESIGN §4.3, §5.5 |
-| `harness` | Load harness for the polling and cost model | DESIGN §12 |
+| `wr-common` | `permutation`, `ids`, `items`, `expr`, `crypto`, `rules`, `turns` (calls, shelves, held turns), `http`, re-exported flat | DESIGN §4.3, §5.5, §7 |
+| `harness` | `make stack` (the shipped binaries against the AWS Emulator) and `make sim` (the libraries on simulated time), each checking the design's claims | [`docs/LOCAL_STACK.md`](../../../docs/LOCAL_STACK.md) |
 | Waiting page (`edge/pages/`) | `waiting.html` + `waiting.js` in S3 under `/_wr/*`, ungated | DESIGN §8, §9 |
 
 Every Lambda crate is split into `lib.rs` (pure logic, generic over a `Store` trait), `dynamo.rs`
@@ -35,7 +35,7 @@ by its event) and `main.rs` (wiring). Tests mock the `Store`, never the logic.
 | `POST /_wr/v1/join` | `{request_id, event_id, h}` with `h = base64url(SHA-256(secret))`, schema-validated (400). 200 means enqueued, not assigned. A non-success SQS outcome returns 502 |
 | `GET /_wr/v1/status` | Phase, `serving_state`, `serving_position`, `origin_concurrency` (absent when unset), `session_seconds`, message, `starts_at`, `poll_policy`. After the open it adds `shuffle_seed` (hex), `participant_count` and `prequeue_offsets`. Min TTL 1 s, path-only cache key, no cookies |
 | `GET /_wr/v1/queue_num` | 200 position, 404 re-join with the **same** `request_id`, 409 not yet open |
-| `POST /_wr/v1/generate_token` | `request_id` + possession secret ([ADR-0035](../../../docs/adr/0035-request-id-proof-of-possession.md)) → `Set-Cookie` session |
+| `POST /_wr/v1/generate_token` | `request_id` + possession secret ([ADR-0035](../../../docs/adr/0035-request-id-proof-of-possession.md)) → `Set-Cookie` session. 425 not called yet (or the held spot not yet written); 410 with `reason: "turn_missed"` when the turn passed, or `"visit_over"` when the session has run out |
 | Session cookie | HS256 JWS: `aud` event, `sub` request id, `iat`, `exp`, plus an optional IP tag ([ADR-0024](../../../docs/adr/0024-jws-credentials.md), [ADR-0036](../../../docs/adr/0036-optional-session-ip-binding.md)) |
 | Gate config `c` | `{v: 1, s: enforce_from, f: fail_open_until, r: rules, b?: bind_ip}`. Under ~1 KB. Terraform seeds it. `admin` read-modify-writes it under the read-time ETag |
 | Gate refusal | 302 to `/_wr/waiting.html` for navigation, 403 JSON for XHR, with a reason: `none` / `signature` / `event` / `expired` / `ip` |
@@ -46,11 +46,12 @@ by its event) and `main.rs` (wiring). Tests mock the `Store`, never the logic.
 Four on-demand tables with PITR. DESIGN §5.5 lists the attributes and
 [`docs/DYNAMODB.md`](../../../docs/DYNAMODB.md) lists every access pattern.
 
-- `Counters` (PK `event_id`): the event item `EVT#{id}`, plus shard items `EVT#{id}#PQ#{s}` and
-  `EVT#{id}#AR#{s}`, each holding `n` (an arrivals shard also holds its cap `c`), and the
-  controller's admission log `EVT#{id}#LOG` (`h`, `p`).
+- `Counters` (PK `event_id`): the event item `EVT#{id}` (with `calls`, the recent calls), plus
+  shard items `EVT#{id}#PQ#{s}` and `EVT#{id}#DF#{s}`, each holding `n`, 26 shelves of ten
+  arrivals counters `EVT#{id}#AR#{shelf}#{s}`, each holding `n`, its cap `c` and its shelf `f`,
+  and the controller's admission log `EVT#{id}#LOG` (`h`).
 - `PreQueue` (PK `r`): `{s, l, t, h}`.
-- `Positions` (PK `request_id`): `{queue_position, entry_time, status, h, ttl}`.
+- `Positions` (PK `request_id`): `{queue_position, entry_time, status, admitted_at, h, ttl}`.
 - `Tokens` (PK `request_id`): `SESS#` / `PKCE#` admin rows.
 
 Every key is built in `wr_common::expr`. `event_id` may not contain `#`. A tag goes on a key only
@@ -67,8 +68,10 @@ A change that breaks one of these is a fairness or safety failure, not a refacto
    it changes every position.
 2. **The open is one conditional write**, guarded by `attribute_not_exists(shuffle_seed) AND
    phase = pre_queue`. It sets the seed, `N`, the offsets, `queue_counter = N` and the phase
-   together. It reads the ten shard counters and never the rows, after waiting, up to its 900 s
-   timeout, for the join queue to catch up (#239).
+   together. It reads the ten shard counters and never the rows. It writes nothing before the
+   draw closes, 15 s after `starts_at`, then waits, up to its 900 s timeout, for the join queue to
+   catch up (#239). A join is in the draw by when SQS accepted it, never when it was processed
+   ([ADR-0043](../../../docs/adr/0043-held-turns-and-join-order.md)).
 3. **No seed before T−0.** Nothing can compute a position before the open.
 4. **Contiguous assembly.** The shard offsets are a prefix sum, so the indices are exactly
    `[0, N)`. A burned index is a gap nobody holds.
@@ -78,8 +81,8 @@ A change that breaks one of these is a fairness or safety failure, not a refacto
    records, and every row write carries `attribute_not_exists`. Malformed records are dropped and
    never retried.
 7. **The pre-queue shard is a server-side random draw** per batch (`Shard::random`, issue #59),
-   never derived from `request_id`. The arrivals shard an admission takes its unit of budget from
-   (`n < c`, ADR-0039) is random per admission.
+   never derived from `request_id`. The first arrivals counter an admission tries on its call's
+   shelf is random per admission.
 8. **Sequences are never sharded.** `queue_counter` and `serving_counter` stay on the event item.
    Striped counters are separate items, not attributes
    ([ADR-0015](../../../docs/adr/0015-stripe-prequeue-counter.md)).
@@ -88,9 +91,11 @@ A change that breaks one of these is a fairness or safety failure, not a refacto
    gets a session but is not counted again.
 10. **`FailOpen` is never stored.** Storage holds `StoredControl` (`open`/`paused`) and the
     `fail_open_until` epoch. Only `wr_common::resolve` produces `FailOpen`.
-11. **Controller arithmetic is checked or saturating.** The budget is never more than
-    `origin_concurrency` minus the live sessions, and the cursor never passes `queue_counter + 1`.
-    The controller expires nothing ([ADR-0031](../../../docs/adr/0031-remove-controller-driven-expiry.md)).
+11. **Controller arithmetic is checked or saturating.** Spots in use plus spots held never exceed
+    `origin_concurrency`, and now serving never passes `queue_counter + 1`. A held spot is taken
+    only from its own call's shelf, and a shelf a counted call still uses is never reused
+    ([ADR-0043](../../../docs/adr/0043-held-turns-and-join-order.md)). The controller expires
+    nothing ([ADR-0031](../../../docs/adr/0031-remove-controller-driven-expiry.md)).
 12. **A session is signed under a derived key**, never the raw secret. Rust and the gate agree
     byte for byte, as proven by the vectors in `crates/wr-common/tests/vectors/session.json`
     against `infra/modules/edge/tests/gate.conformance.test.js`.
@@ -113,7 +118,7 @@ These are tracked in [`tasks.md`](tasks.md):
 - automatic fail-open (#58)
 - a per-visitor position limit (#59)
 - session revocation (#63)
-- a completion signal that frees a slot when a visitor leaves early (#65)
+- a completion signal that frees a spot when a visitor leaves early (#65)
 - live metrics for F5.1
 - an OpenAPI spec (N8)
 - GovCloud

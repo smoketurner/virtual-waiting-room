@@ -1,7 +1,9 @@
 # ADR-0041: Meter origin concurrency, not a rate
 
 **Status:** Accepted. Amends [0039](0039-meter-admissions-not-the-cursor.md): the budget and the
-cursor law it describes are replaced; taking a unit at issuance is kept.
+cursor law it describes are replaced; taking a unit at issuance is kept. Amended by
+[0043](0043-held-turns-and-join-order.md): the no-show correction and calling a pass early are
+replaced by held turns.
 
 ## 1. Context
 

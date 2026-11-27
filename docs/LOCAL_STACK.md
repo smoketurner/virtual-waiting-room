@@ -35,14 +35,19 @@ make sim SIM_ARGS="--visitors 500000 --concurrency 1000 --session 900 --countdow
   conditions and DynamoDB's 1,000 writes/s per key.
 - The gate verifies the session cookie with `wr_common::Session`, which the conformance vectors
   hold to the CloudFront Function.
-- `--tickets` sells 1 to 4 tickets to each admitted visitor; at the last one the operator sets a
-  sold-out message and ends the event, and the visitors still waiting leave.
+- `--tickets` sells 1 to 4 tickets to each admitted visitor (`--tickets-each` fixes the number);
+  at the last one the operator sets a sold-out message and ends the event, and the visitors still
+  waiting leave.
+- `--after-open N` adds N visitors who arrive after the others, over the herd window starting
+  `--after-open-from` seconds after the open, so the draw window and the order after it can be
+  checked. Both are `make sim` flags only.
 - It cannot show what only the shipped system can: the binaries, their `DynamoDB` expressions,
   the JavaScript gate and page, eventually consistent reads, and each environment's own cache.
   `make stack` checks those.
 
-On the stack's calibration scenario (seed 41) the two agree: 90% of the slots held, at most 400
-live against 400, arrival to admission 292 s against 294 s at the median.
+On the stack's calibration scenario (`--visitors 2000 --concurrency 400 --session 120
+--countdown 30 --seed 41`) the sim holds 90% of the spots, at most 400 live against 400, with
+arrival to admission 302 s at the median.
 
 ## What runs, and what stands in
 
@@ -64,18 +69,22 @@ live against 400, arrival to admission 292 s against 294 s at the median.
 - The open runs, and every cohort position recomputes from the seed, count and offsets `/status`
   publishes plus the `PreQueue` rows, distinct and inside `[0, N)`.
 - A cohort position is uncorrelated with when the visitor registered.
-- Every join accepted before the open is in the cohort, not numbered behind it.
+- Every join accepted before the draw closes (15 s after the start) is in the cohort, not
+  numbered behind it.
+- Nobody who joined after the draw closed takes a spot someone who joined before it needed, and
+  those who joined after it are let in in the order they joined, to within a few seconds.
 - No more sessions are ever live than `--concurrency`, counted from the session end each
   `generate_token` answer gives.
-- The origin holds at least 85% of its slots from the first admission to the last.
+- The origin holds at least 85% of its spots from the first admission to the last.
 - `/status` reaches its origin at most about once a second, however many are waiting.
-- The gate never passes a request because it failed, and the shipped page's visitors pass it.
-- No accepted join is dead-lettered, no function fails or logs an error, and DynamoDB answers
-  every call it does not throttle.
+- The gate never passes a request because it failed, and, in `make stack`, the visitors running
+  the shipped `waiting.js` are admitted and pass it.
+- No accepted join is dead-lettered and no function fails or logs an error; in `make stack`,
+  DynamoDB also answers every call it does not throttle.
 
 The report separates these from two checks on the harness itself: every invocation found an
-environment within API Gateway's 29 s, and the gate sidecar answered every request. When either
-fails the machine was saturated, and the run says it is inconclusive.
+environment within API Gateway's 29 s, and the gate sidecar answered every protected request.
+When either fails the machine was saturated, and the run says it is inconclusive.
 
 ## What it cannot show
 
@@ -92,31 +101,19 @@ fails the machine was saturated, and the run says it is inconclusive.
   (`--scale`), which keeps the shape of the crowd against the throttles.
 - **A real session length in a short run.** A run lasts about `visitors / concurrency` session
   lengths, so runs use sessions of a minute or two. The turnover lag is a fixed few seconds, so a
-  short session overstates its share; at 900 s it is about a tenth of what a 120 s run shows.
+  short session overstates its share; at 900 s it is about a tenth of what a 120 s run shows. A
+  no-show's spot is held for 2 minutes and a pass whatever the session length, so a short session
+  overstates what no-shows cost too.
 
 ## Findings
 
-Each row is one run, reproducible with its seed. Every check passed in all of them.
+Each row is one `make sim` run unless marked, reproducible with its seed.
 
 | Run | Result |
 |---|---|
-| `--visitors 2000 --concurrency 400 --session 120 --countdown 30 --seed 31` | At most 400 sessions live against 400. The origin held 90% of its slots; at each turnover it dips for about a pass while the ended sessions are seen free and their replacements come in |
-| `--visitors 2000 --concurrency 400 --session 120 --countdown 30 --no-show 0.3 --duplicate-rate 0.05 --seed 32` | With 30% no-shows, at most 399 live and 87% of the slots held (F3.8). 95 duplicate deliveries, no duplicate position |
-| `--visitors 100000 --scale 0.1 --arrival herd --herd-window 10 --seed 11`, at commit `2d6cf3a` | A one-tenth model of a million arriving at the open, measured on the join path, which origin concurrency does not change. Half had a position in 2.7 min, 99% in 6.3; the open's drain wait ran 11 s and took 7,329 of them into the cohort |
-| `--visitors 500 --dynamodb http://127.0.0.1:18080 --seed 22`, at commit `2d6cf3a` | The same checks with `ExtendDB` as the DynamoDB backend |
-
-What the runs changed:
-
-- **Sessions that start together end together.** The first concurrency run held 81% of the slots:
-  the controller saw a slot free a pass late, then a pass later again because of a safety margin,
-  and the people released for it were polling slowly or backing off on a 425. The log is now
-  stamped at the second the shards were read, which makes the margin unnecessary; a visitor within
-  `origin_concurrency` of the front polls at the floor; and a 425 is asked again at the floor.
-- **Throttled registrants lost their place in the cohort.** The page retried a join refused at the
-  end of a countdown at its 30 s closed-event interval, so it landed after the open and was numbered
-  behind everyone. The page now retries a throttled registration at the 5 s floor without backing
-  off, which lands it inside the open's drain wait.
-- **The open's drain wait always ran its length under continuous traffic**, because it waited for
-  the queue to read empty twice. It now waits for the queue to catch up, for as long as its
-  timeout allows (ADR-0042).
-- **The page retried a 429 or a 5xx from `/generate_token` at its 5 s floor.** It now backs off.
+| `--visitors 2000 --concurrency 400 --session 120 --countdown 30 --seed 31` | Every check passes. At most 400 sessions live against 400, and the origin holds 90% of its spots; at each turnover it dips for about a pass while the ended sessions are seen free and the visitors called for them come in |
+| `--visitors 2000 --concurrency 400 --session 120 --countdown 30 --no-show 0.3 --duplicate-rate 0.05 --seed 32` | Fails the 85% check: with 30% no-shows the origin holds 62% of its spots, at most 301 live. A no-show's spot is held for 2 minutes and a pass, longer than this 120 s session. 94 duplicate deliveries, no duplicate position |
+| `--visitors 5000 --concurrency 500 --session 900 --countdown 600 --no-show 0.3 --seed 32` | Every check passes. At the default session length the same no-show share holds 93% of the spots (F3.8) |
+| `--visitors 500000 --concurrency 1000 --session 900 --countdown 1800 --tickets 20000` | Every check passes. 433,100 in the cohort, 8,063 buyers, sold out 9,120 s after the countdown began; 98% of the spots held; about one `/status` origin fetch a second; 341 s of wall clock |
+| `--visitors 100000 --concurrency 5000 --session 60 --scale 0.1 --arrival herd --herd-window 10 --seed 11` | A one-tenth model of a million arriving at the open. Half had a position in 2.0 min, 90% in 4.2, 99% in 5.7, at 3.9 join 429s a visitor; 10,849 joined in the draw window and are in the cohort. Fails two checks: 4,579 of the later joiners were let in while someone who joined over 5 s before them still waited (at most 28 s out of order), and the origin held 83% of its spots |
+| `make stack`, `--visitors 500 --dynamodb http://127.0.0.1:18080 --seed 22`, at commit `2d6cf3a` | The same checks with `ExtendDB` as the DynamoDB backend |

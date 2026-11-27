@@ -17,6 +17,7 @@ data "aws_partition" "current" {}
 locals {
   counters_event_key           = "EVT#${var.event_id}"
   counters_prequeue_shard_keys = "EVT#${var.event_id}#PQ#*"
+  counters_deferred_shard_keys = "EVT#${var.event_id}#DF#*"
   counters_arrivals_shard_keys = "EVT#${var.event_id}#AR#*"
   counters_admission_log_key   = "EVT#${var.event_id}#LOG"
 }
@@ -44,6 +45,8 @@ data "aws_iam_policy_document" "assign_position" {
       "sqs:ReceiveMessage",
       "sqs:DeleteMessage",
       "sqs:GetQueueAttributes",
+      # A join that arrives before the open is written is sent back for seconds.
+      "sqs:ChangeMessageVisibility",
     ]
     resources = [aws_sqs_queue.join.arn]
   }
@@ -57,8 +60,8 @@ data "aws_iam_policy_document" "assign_position" {
     resources = [aws_dynamodb_table.positions.arn]
   }
 
-  # Reads the event item, claims a block on it, and bumps a pre-queue shard.
-  # Never an arrivals shard.
+  # Reads the event item, claims a block on it, bumps a pre-queue shard, and
+  # counts joins sent back to wait for the open. Never an arrivals shard.
   statement {
     sid    = "ReadAndClaimCounters"
     effect = "Allow"
@@ -71,7 +74,11 @@ data "aws_iam_policy_document" "assign_position" {
     condition {
       test     = "ForAllValues:StringLike"
       variable = "dynamodb:LeadingKeys"
-      values   = [local.counters_event_key, local.counters_prequeue_shard_keys]
+      values = [
+        local.counters_event_key,
+        local.counters_prequeue_shard_keys,
+        local.counters_deferred_shard_keys,
+      ]
     }
   }
 
@@ -140,7 +147,12 @@ data "aws_iam_policy_document" "open_event" {
     condition {
       test     = "ForAllValues:StringLike"
       variable = "dynamodb:LeadingKeys"
-      values   = [local.counters_event_key, local.counters_prequeue_shard_keys]
+      # The deferred shards are what it counts as cleared while it waits.
+      values = [
+        local.counters_event_key,
+        local.counters_prequeue_shard_keys,
+        local.counters_deferred_shard_keys,
+      ]
     }
   }
 

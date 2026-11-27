@@ -18,11 +18,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use controller::{
-    AdmissionLog, ControllerState, PassDecision, PassInputs, ReleaseOutcome, ShardBudget,
+    AdmissionLog, CallOutcome, ControllerState, PassDecision, PassInputs, ShardBudget, Shelves,
 };
 use jiff::{SignedDuration, Timestamp};
 use open_event::OpenValues;
-use wr_common::{Counters, Phase, PositionStatus, PreQueueItem, SHARDS, SecretDigest, Shard};
+use wr_common::{
+    Counters, Phase, PositionStatus, PreQueueItem, SHARDS, SHELVES, SecretDigest, Shard, Shelf,
+};
 
 /// `DynamoDB`'s write ceiling for one partition key.
 pub const WRITES_PER_KEY_PER_SECOND: u32 = 1_000;
@@ -42,7 +44,8 @@ struct Position {
 struct Event {
     counters: Counters,
     prequeue_shards: [u64; SHARDS],
-    arrivals_shards: [ShardBudget; SHARDS],
+    deferred_shards: [u64; SHARDS],
+    arrivals: Shelves,
     log: AdmissionLog,
 }
 
@@ -88,7 +91,8 @@ impl Memory {
                 Event {
                     counters,
                     prequeue_shards: [0; SHARDS],
-                    arrivals_shards: [ShardBudget::default(); SHARDS],
+                    deferred_shards: [0; SHARDS],
+                    arrivals: [[ShardBudget::default(); SHARDS]; SHELVES],
                     log: AdmissionLog::default(),
                 },
             );
@@ -153,12 +157,16 @@ fn event_key(event_id: &str) -> String {
     format!("EVT#{event_id}")
 }
 
+fn deferred_shard_key(event_id: &str, shard: Shard) -> String {
+    format!("EVT#{event_id}#DF#{}", shard.index())
+}
+
 fn prequeue_shard_key(event_id: &str, shard: Shard) -> String {
     format!("EVT#{event_id}#PQ#{}", shard.index())
 }
 
-fn arrivals_shard_key(event_id: &str, shard: usize) -> String {
-    format!("EVT#{event_id}#AR#{shard}")
+fn arrivals_key(event_id: &str, shelf: Shelf, shard: usize) -> String {
+    format!("EVT#{event_id}#AR#{}#{shard}", shelf.index())
 }
 
 fn position_key(request_id: &str) -> String {
@@ -221,22 +229,28 @@ impl generate_token::Store for Memory {
         }))
     }
 
-    async fn take_slot(
+    async fn take_spot(
         &self,
         event_id: &str,
+        shelf: Shelf,
         shard: Shard,
     ) -> Result<bool, generate_token::StoreError> {
         self.with(|t| {
-            t.write(arrivals_shard_key(event_id, shard.index()))
+            t.write(arrivals_key(event_id, shelf, shard.index()))
                 .map_err(|e| generate_token::StoreError(e.to_string()))?;
             let event = t.event(event_id).map_err(generate_token::StoreError)?;
-            let Some(budget) = event.arrivals_shards.get_mut(shard.index()) else {
+            let Some(budget) = event
+                .arrivals
+                .get_mut(shelf.index())
+                .and_then(|counters| counters.get_mut(shard.index()))
+            else {
                 return Err(generate_token::StoreError(format!(
-                    "shard {} out of range",
-                    shard.index()
+                    "counter {} on shelf {} out of range",
+                    shard.index(),
+                    shelf.index()
                 )));
             };
-            // `n < c`: a shard never granted a cap admits nobody.
+            // `n < c`: a counter never given a cap lets nobody in.
             if budget.taken < budget.cap {
                 budget.taken += 1;
                 Ok(true)
@@ -354,6 +368,23 @@ impl assign_position::Store for Memory {
         })
     }
 
+    async fn count_deferred(
+        &self,
+        event_id: &str,
+        shard: Shard,
+        n: u64,
+    ) -> Result<(), assign_position::StoreError> {
+        self.with(|t| {
+            t.write(deferred_shard_key(event_id, shard))
+                .map_err(|e| assign_position::StoreError(e.to_string()))?;
+            let event = t.event(event_id).map_err(assign_position::StoreError)?;
+            if let Some(count) = event.deferred_shards.get_mut(shard.index()) {
+                *count = count.saturating_add(n);
+            }
+            Ok(())
+        })
+    }
+
     async fn put_prequeue(
         &self,
         write: &assign_position::PreQueueWrite,
@@ -396,6 +427,24 @@ impl assign_position::Store for Memory {
 }
 
 impl open_event::Store for Memory {
+    async fn read_deferred_counts(
+        &self,
+        event_id: &str,
+    ) -> Result<[u64; SHARDS], open_event::StoreError> {
+        self.with(|t| {
+            t.event(event_id)
+                .map(|e| e.deferred_shards)
+                .map_err(open_event::StoreError)
+        })
+    }
+
+    async fn load_counters(
+        &self,
+        event_id: &str,
+    ) -> Result<Option<Counters>, open_event::StoreError> {
+        Ok(self.counters(event_id))
+    }
+
     async fn read_shard_counts(
         &self,
         event_id: &str,
@@ -449,33 +498,36 @@ impl controller::Store for Memory {
                 stored_control: c.stored_control,
                 fail_open_until: c.fail_open_until,
                 inputs: PassInputs {
-                    shards: event.arrivals_shards,
+                    shelves: event.arrivals,
                     serving_counter: c.serving_counter,
                     queue_counter: c.queue_counter,
                     origin_concurrency: c.origin_concurrency.unwrap_or(0),
                     session,
                     log: event.log.clone(),
                     shards_read_at,
+                    calls: c.calls.clone(),
+                    draw_cutoff: c.draw_cutoff(),
                 },
             })
         })
     }
 
-    async fn write_release(
+    async fn write_call(
         &self,
         event_id: &str,
         decision: &PassDecision,
         expected_serving_counter: u64,
-    ) -> Result<ReleaseOutcome, controller::StoreError> {
+    ) -> Result<CallOutcome, controller::StoreError> {
         self.with(|t| {
             t.write(event_key(event_id))
                 .map_err(|e| controller::StoreError(e.to_string()))?;
             let counters = &mut t.event(event_id).map_err(controller::StoreError)?.counters;
             if counters.serving_counter != expected_serving_counter {
-                return Ok(ReleaseOutcome::LostRace);
+                return Ok(CallOutcome::LostRace);
             }
             counters.serving_counter = decision.next_serving_counter;
-            Ok(ReleaseOutcome::Advanced)
+            counters.calls.clone_from(&decision.calls);
+            Ok(CallOutcome::Called)
         })
     }
 
@@ -495,17 +547,19 @@ impl controller::Store for Memory {
     async fn write_caps(
         &self,
         event_id: &str,
+        shelf: Shelf,
         caps: &[u64; SHARDS],
     ) -> Result<(), controller::StoreError> {
         self.with(|t| {
             for (index, cap) in caps.iter().enumerate() {
-                t.write(arrivals_shard_key(event_id, index))
+                t.write(arrivals_key(event_id, shelf, index))
                     .map_err(|e| controller::StoreError(e.to_string()))?;
                 if let Some(budget) = t
                     .event(event_id)
                     .map_err(controller::StoreError)?
-                    .arrivals_shards
-                    .get_mut(index)
+                    .arrivals
+                    .get_mut(shelf.index())
+                    .and_then(|counters| counters.get_mut(index))
                 {
                     budget.cap = *cap;
                 }
@@ -541,6 +595,7 @@ mod tests {
             stored_control: StoredControl::Open,
             fail_open_until: None,
             starts_at: None,
+            calls: Vec::new(),
         });
         memory
     }
@@ -554,6 +609,8 @@ mod tests {
     fn join(id: &str, secret: &PossessionSecret) -> assign_position::BatchRecord {
         assign_position::BatchRecord {
             message_id: id.to_owned(),
+            receipt_handle: id.to_owned(),
+            receives: 1,
             body: serde_json::json!({
                 "request_id": id,
                 "event_id": EVENT,
@@ -607,23 +664,16 @@ mod tests {
             Admission::Refused(Denied::StillQueued { .. })
         ));
 
-        // A pass grants a unit on every shard and reaches both positions. Each
-        // visitor takes one unit, however often they ask.
+        // A pass calls both places in line and holds a spot for each. Each
+        // visitor takes one spot, however often they ask.
         memory.update_counters(EVENT, |c| c.origin_concurrency = Some(10));
         let pass = controller::run_pass(&memory, EVENT, crate::clock::now())
             .await
             .unwrap();
-        // One past the last position issued: the cursor is exclusive.
-        assert_eq!(pass, controller::PassOutcome::Ran { released: 3 });
-        let taken = |memory: &Memory| {
-            memory.with(|t| {
-                t.events[EVENT]
-                    .arrivals_shards
-                    .iter()
-                    .map(|s| s.taken)
-                    .sum::<u64>()
-            })
-        };
+        // One past the last place given out: now serving is exclusive.
+        assert_eq!(pass, controller::PassOutcome::Ran { called: 3 });
+        let taken =
+            |memory: &Memory| memory.with(|t| controller::admitted(&t.events[EVENT].arrivals));
         for _ in 0..3 {
             assert!(matches!(
                 admit(&memory, &first, &first_secret).await,
@@ -691,48 +741,44 @@ mod tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn a_unit_is_taken_only_below_the_cap() {
-        let memory = memory();
-        let shard = Shard::new(3).unwrap();
-        assert!(
-            !generate_token::Store::take_slot(&memory, EVENT, shard)
-                .await
-                .unwrap()
-        );
-        let mut caps = [0; SHARDS];
-        caps[3] = 1;
-        controller::Store::write_caps(&memory, EVENT, &caps)
-            .await
-            .unwrap();
-        assert!(
-            generate_token::Store::take_slot(&memory, EVENT, shard)
-                .await
-                .unwrap()
-        );
-        assert!(
-            !generate_token::Store::take_slot(&memory, EVENT, shard)
-                .await
-                .unwrap()
-        );
+    fn shelf(i: usize) -> Shelf {
+        Shelf::new(i).unwrap()
     }
 
     #[tokio::test(start_paused = true)]
-    async fn the_cursor_moves_only_from_the_value_the_pass_read() {
+    async fn a_spot_is_taken_only_below_the_cap_and_only_on_its_shelf() {
+        let memory = memory();
+        let shard = Shard::new(3).unwrap();
+        let take = |on: usize| generate_token::Store::take_spot(&memory, EVENT, shelf(on), shard);
+        assert!(!take(2).await.unwrap());
+        let mut caps = [0; SHARDS];
+        caps[3] = 1;
+        controller::Store::write_caps(&memory, EVENT, shelf(2), &caps)
+            .await
+            .unwrap();
+        // Held on shelf 2, so nobody on another shelf can take it.
+        assert!(!take(5).await.unwrap());
+        assert!(take(2).await.unwrap());
+        assert!(!take(2).await.unwrap());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn now_serving_moves_only_from_the_value_the_pass_read() {
         let memory = memory();
         let state = controller::Store::read_state(&memory, EVENT).await.unwrap();
         let decision = controller::compute_pass(&state.inputs, crate::clock::now());
         assert_eq!(
-            controller::Store::write_release(&memory, EVENT, &decision, 0)
+            controller::Store::write_call(&memory, EVENT, &decision, 0)
                 .await
                 .unwrap(),
-            ReleaseOutcome::Advanced
+            CallOutcome::Called
         );
+        assert_eq!(memory.counters(EVENT).unwrap().calls, decision.calls);
         assert_eq!(
-            controller::Store::write_release(&memory, EVENT, &decision, 0)
+            controller::Store::write_call(&memory, EVENT, &decision, 0)
                 .await
                 .unwrap(),
-            ReleaseOutcome::LostRace
+            CallOutcome::LostRace
         );
     }
 
@@ -740,20 +786,18 @@ mod tests {
     async fn a_key_past_its_write_ceiling_is_throttled_until_the_next_second() {
         let memory = memory();
         let shard = Shard::new(0).unwrap();
+        let take = |on: usize, shard: Shard| {
+            generate_token::Store::take_spot(&memory, EVENT, shelf(on), shard)
+        };
         for _ in 0..WRITES_PER_KEY_PER_SECOND {
-            generate_token::Store::take_slot(&memory, EVENT, shard)
-                .await
-                .unwrap();
+            take(0, shard).await.unwrap();
         }
-        let refused = generate_token::Store::take_slot(&memory, EVENT, shard).await;
+        let refused = take(0, shard).await;
         assert!(refused.unwrap_err().0.contains("throttled"));
         // Another key is unaffected, and the next second the ceiling resets.
-        generate_token::Store::take_slot(&memory, EVENT, Shard::new(1).unwrap())
-            .await
-            .unwrap();
+        take(0, Shard::new(1).unwrap()).await.unwrap();
+        take(1, shard).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        generate_token::Store::take_slot(&memory, EVENT, shard)
-            .await
-            .unwrap();
+        take(0, shard).await.unwrap();
     }
 }

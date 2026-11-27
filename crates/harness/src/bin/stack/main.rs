@@ -11,7 +11,7 @@
 //! follow the waiting page's protocol.
 //!
 //! ```text
-//! cargo run -p harness --bin stack -- --visitors 20000 --concurrency 2000 --session 60 --countdown 60
+//! cargo run -p harness --bin stack -- --visitors 20000 --concurrency 2000 --session 300 --countdown 60
 //! cargo run -p harness --bin stack -- --visitors 100000 --arrival herd --herd-window 10
 //! ```
 //!
@@ -61,8 +61,10 @@ fn parse_args() -> Result<Args> {
     let mut a = Args {
         scenario: Scenario {
             visitors: 2000,
+            after_open: 0,
+            after_open_from: SignedDuration::ZERO,
             concurrency: 500,
-            session: SignedDuration::from_mins(1),
+            session: SignedDuration::from_mins(5),
             countdown: SignedDuration::from_secs(30),
             arrival: Arrival::Late,
             herd_window: SignedDuration::from_secs(10),
@@ -156,7 +158,7 @@ const PROTECTED_PATH: &str = "/shop/checkout";
 const SIGNING_KEY_PARAMETER: &str = "/stack/signing-key";
 
 async fn run() -> Result<Verdict> {
-    let args = parse_args()?;
+    let mut args = parse_args()?;
     std::fs::create_dir_all(&args.out)?;
     let logs = args.out.join("logs");
     std::fs::create_dir_all(&logs)?;
@@ -173,6 +175,7 @@ async fn run() -> Result<Verdict> {
 
     let started_std = std::time::Instant::now();
     let started = Instant::now();
+    let run_start = harness::clock::now();
     // Tables are per run, so a seed can be reused against a long-lived emulator.
     let run_id = format!(
         "r{}-{}",
@@ -205,7 +208,10 @@ async fn run() -> Result<Verdict> {
 
     say("creating tables and seeding the event");
     aws::create_tables(&ddb, &tables).await?;
-    let open_at = harness::clock::now() + args.scenario.countdown;
+    let open_at = args.scenario.open_at(harness::clock::now());
+    // Arrivals are timed from the start of the run, so the countdown is the
+    // exact time from it to the open, setup and rounding included.
+    args.scenario.countdown = open_at.duration_since(run_start);
     aws::seed_event(&ddb, &tables, &event_id, args.scenario.concurrency, open_at).await?;
     let mut key_bytes = [0u8; 32];
     Rng::new(args.scenario.seed ^ 0x006b_6579).fill(&mut key_bytes);
@@ -307,7 +313,7 @@ async fn run() -> Result<Verdict> {
         binary: &assign_bin,
         environments: args.assign_envs,
         max_environments: args.max_environments,
-        env: common(&[]),
+        env: common(&[("JOIN_QUEUE_URL", queue.url().to_owned())]),
         log_dir: &logs,
         timeout: Duration::from_secs(30),
     })
@@ -494,7 +500,7 @@ async fn run() -> Result<Verdict> {
         published: published.as_ref(),
         registrations: &registrations,
         opened: opened.is_ok(),
-        open_at_ms: u64::try_from(args.scenario.countdown.as_millis()).unwrap_or(u64::MAX),
+        draw_closes: open_at + wr_common::DRAW_GRACE,
         open_took,
         passes: &passes,
         elapsed,

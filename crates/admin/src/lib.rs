@@ -1127,16 +1127,12 @@ pub async fn apply_start_time<S: Store, K: OpenSchedule>(
 /// the permutation seed their position is derived from.
 ///
 /// Idempotent by construction: an open into an event the schedule already
-/// opened changes nothing. The audit stamp records that the operator asked for
-/// the open, once the open has accepted the request.
+/// opened changes nothing.
 ///
-/// The request comes first, so a refused one records nothing. The stamp is
-/// guarded against regression: if a concurrent mutation advanced
-/// `last_action_epoch_ms` past this request's arrival time during the open
-/// invoke, the stamp no-ops (`Conflict`, logged) rather than overwriting the
-/// newer writer's audit fields and debounce anchor. A failed stamp is logged
-/// rather than returned: the open is on its way either way, and reporting
-/// failure would invite an operator to press the button again.
+/// The event's start moves to now first, with the audit stamp in the same
+/// write, so the draw closes the grace window after the operator opened
+/// rather than after a later scheduled start, and the open reads that when it
+/// begins. A start that cannot be written opens nothing.
 ///
 /// # Errors
 ///
@@ -1172,17 +1168,21 @@ pub async fn apply_open_now<S: Store, O: Opener>(
     }
     debounce_check(&state, now)?;
 
+    let tz = state.starts_at_timezone.as_deref().unwrap_or("UTC");
+    store
+        .set_starts_at(
+            event_id,
+            Some((now.timestamp(), tz)),
+            AdminAction::OpenNow,
+            actor,
+            now,
+        )
+        .await?;
+
     opener
         .open_now()
         .await
         .map_err(|e| StoreError::Backend(e.to_string()))?;
-
-    if let Err(e) = store
-        .stamp_action(event_id, AdminAction::OpenNow, actor, now)
-        .await
-    {
-        tracing::error!(error = %e, event = "open_audit_failed", "open was requested but the audit stamp failed");
-    }
     Ok(())
 }
 
@@ -2543,9 +2543,25 @@ mod tests {
         assert_eq!(state.last_action.as_deref(), Some("open_now"));
         assert_eq!(state.last_action_by.as_deref(), Some("op@x"));
         assert_eq!(state.last_action_time, Some(ts(1_000).timestamp()));
+        // The draw closes the grace window after now, not after a later
+        // scheduled start.
+        assert_eq!(state.starts_at, Some(ts(1_000).timestamp()));
         // The admin writes no phase of its own: the open's conditional update
         // carries the phase along with the seed it derives from.
         assert_eq!(*store.phase.lock().unwrap(), Phase::PreQueue);
+    }
+
+    #[tokio::test]
+    async fn an_open_now_whose_start_cannot_be_written_opens_nothing() {
+        let mut store = FakeStore::with_phase(Phase::PreQueue);
+        store.starts_at_write_fails = true;
+        let opener = FakeOpener::accepting();
+        assert!(
+            apply_open_now(&store, &opener, "evt", "op@x", ts(1_000))
+                .await
+                .is_err()
+        );
+        assert_eq!(opener.calls(), 0);
     }
 
     #[tokio::test]
@@ -2559,8 +2575,10 @@ mod tests {
             matches!(err, Err(ApplyError::Store(StoreError::Backend(_)))),
             "got {err:?}"
         );
+        // The start had already moved to the press, so the draw's cutoff is
+        // the grace window after it, whichever open goes ahead.
         let state = store.load("evt").await.unwrap().unwrap();
-        assert_eq!(state.last_action, None, "a failed open audits nothing");
+        assert_eq!(state.starts_at, Some(ts(1_000).timestamp()));
     }
 
     #[tokio::test]
@@ -2615,64 +2633,6 @@ mod tests {
         apply_open_now(&store, &opener, "evt", "op@x", ts(1_000))
             .await
             .unwrap();
-    }
-
-    #[tokio::test]
-    async fn a_concurrent_writer_is_not_overwritten_by_a_later_open_stamp() {
-        // Bug (ce126ca): `stamp_action` ran after the open Lambda's yielding
-        // invoke with no condition, so a concurrent debounced mutation that
-        // landed during that invoke and advanced `last_action_epoch_ms` past
-        // the open's arrival time had its audit fields and debounce anchor
-        // overwritten by the older open stamp -- misattributing the dashboard's
-        // "latest action" line and regressing the anchor a later debounced
-        // mutation reads.
-        //
-        // Timeline mirrored from the report: opA's open arrived at T=1000; a
-        // concurrent opB's `set_concurrency` landed during the open invoke at T=1100,
-        // advancing the anchor; opA's `stamp_action(now=1000)` then runs
-        // against an anchor (`1100`) newer than itself. The fix's
-        // anti-regression guard rejects the stamp (`Conflict`), the open still
-        // reports `Opened`, and the audit line keeps opB's `set_concurrency`.
-        let store = FakeStore::with_phase(Phase::PreQueue);
-        // The concurrent writer's already-landed audit row.
-        *store.last_action.lock().unwrap() = Some("set_concurrency".to_owned());
-        *store.last_action_by.lock().unwrap() = Some("opB@x".to_owned());
-        *store.last_action_at.lock().unwrap() = Some(ts(1_100).timestamp().to_string());
-        *store.last_time.lock().unwrap() = Some(ts(1_100).timestamp());
-        let opener = FakeOpener::accepting();
-
-        apply_open_now(&store, &opener, "evt", "opA@x", ts(1_000))
-            .await
-            .unwrap();
-
-        // The swallowed stamp conflict is invisible to the operator: the open
-        // succeeded.
-        assert_eq!(opener.calls(), 1);
-        // And the audit line was NOT regressed to the older open stamp.
-        let state = store.load("evt").await.unwrap().unwrap();
-        assert_eq!(
-            state.last_action.as_deref(),
-            Some("set_concurrency"),
-            "audit label"
-        );
-        assert_eq!(
-            state.last_action_by.as_deref(),
-            Some("opB@x"),
-            "audit actor"
-        );
-        assert_eq!(
-            state.last_action_at,
-            Some(ts(1_100).timestamp().to_string()),
-            "audit timestamp"
-        );
-        assert_eq!(
-            state.last_action_time,
-            Some(ts(1_100).timestamp()),
-            "debounce anchor must not regress"
-        );
-        // The admin handler writes no phase of its own: the open's conditional
-        // update carries the phase along with the seed it derives from.
-        assert_eq!(*store.phase.lock().unwrap(), Phase::PreQueue);
     }
 
     #[tokio::test]

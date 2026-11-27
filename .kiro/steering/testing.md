@@ -27,7 +27,7 @@ visible fairness failure at 1,000,000 people. Tests are the primary evidence.
   - **Seed absence** — no position is computable before the seed is written at T−0.
   - **Contiguous assembly** — across the 10 pre-queue shards, the assembled global index space
     is exactly `[0, N)` with `N` = Σ shard counts.
-  - **Burned slot** — with an injected registration-write failure (counter incremented, no
+  - **Burned index** — with an injected registration-write failure (counter incremented, no
     `PreQueue` row), the space stays contiguous, `PRP` stays bijective, and the burned index
     resolves to a position that maps to no one (absorbed like a live-join gap, F2.3).
   - **Straggler race** — a join that raced the open claims a local index at or past its own
@@ -55,8 +55,8 @@ visible fairness failure at 1,000,000 people. Tests are the primary evidence.
   `toLowerCase()` (JS) diverge on non-ASCII input even though both read the same wire encoding.
   Regenerate with `cargo test -p wr-common -- --ignored regenerate_vectors` after a wire-format
   change; the committed file drifting from the generator fails CI. `node:vm` exercises Node's
-  `Buffer`/HMAC/base64url, not CloudFront's — it is a proxy for what was measured against a real
-  CloudFront Function while ADR-0021 was being decided, not a replacement for it.
+  `Buffer`/HMAC/base64url, not CloudFront's — it is a proxy for a real CloudFront Function, not a
+  replacement for one.
 - **Proof of possession (ADR-0035, issue #62)** — a `request_id` without its secret, with the
   wrong one, or with one in the query string mints nothing and reveals no position; the
   admission claim copies the digest so a pre-queue member's second call still verifies; a join
@@ -74,11 +74,13 @@ visible fairness failure at 1,000,000 people. Tests are the primary evidence.
   config), the refuse-on-throw path after one (an unreadable key, a throw inside the refusal: plain
   403, reason `error`, #242), and the optional previous key `kp` (#247). Suspicious paths (a dot
   segment, `;`, a backslash) matching any path rule are pinned by the cross-language vectors.
-- **The concurrency bound, no-show compensation and replacement** — simulated over many passes,
-  no more sessions are ever live than `origin_concurrency`, whatever share of the people released
-  show up; with 30% no-shows the origin's slots stay nearly full; sessions ending are replaced at
-  their rate, released a pass before they end; and lowering the limit below the live sessions
-  admits nobody until enough have ended (ADR-0039, ADR-0041).
+- **The concurrency bound, held turns and missed-turn replacement** — simulated over many passes,
+  no more sessions are ever live than `origin_concurrency`, whatever share of the people called
+  show up; a held spot is taken only from its own call's shelf; a missed turn's spot is called
+  again one pass after the turn passes, so with 30% no-shows and a 605 s session the site stays
+  above 80% full;
+  sessions ending are replaced at their rate; and lowering the limit below the spots in use calls
+  nobody until enough have ended (ADR-0041, ADR-0043).
 
 ## Not currently provable, and why
 
@@ -94,11 +96,11 @@ visible fairness failure at 1,000,000 people. Tests are the primary evidence.
 Listed so they are not rediscovered late. Each is unbuilt today; do not write the test before
 the mechanism exists.
 
-- **Bounded registration volume** (#59) — no mechanism is chosen: the identity-based one was
-  retired (ADR-0028), so there is no identifier to test "one position per identity" against.
+- **Bounded registration volume** (#59) — no mechanism is chosen and there is no identity
+  mechanism (ADR-0028), so there is no identifier to test "one position per identity" against.
   Write the test once #59 records which bound it adopts.
-- **Completion signal** (#65) — a visitor who reports leaving frees their slot before their session
-  would have ended, and the slot is granted to the next in line.
+- **Completion signal** (#65) — a visitor who reports leaving frees their spot before their session
+  would have ended, and the spot is called for the next place in line.
 - **Revocation** (#63) — no design exists yet (ADR-0021 §5.2); do not write a test against a
   mechanism that has not been chosen.
 
@@ -110,8 +112,10 @@ positions in one write, ≥10K/s (≥40K/s with quotas filed) live joins with ze
 *before* testing the live-join path or the test measures throttling, not the design.
 
 The local stack (`make stack`, `docs/LOCAL_STACK.md`) runs the shipped binaries and the shipped
-gate and page against the AWS Emulator and checks these claims on every run; it is the first
-place a change to admission, assignment or the client is proven. It does not replace a run
+gate and page against the AWS Emulator and checks these claims on every run, and `make sim` checks
+the same claims, the draw window and join order after it included, with the functions' libraries
+on simulated time at real session lengths and crowd sizes; they are the first place a change to
+admission, assignment or the client is proven. It does not replace a run
 against a deployment, which is the only proof of quotas, latency and many edge locations.
 
 ## Admin UI

@@ -43,6 +43,27 @@ impl DynamoStore {
 }
 
 impl Store for DynamoStore {
+    async fn count_deferred(&self, event_id: &str, shard: Shard, n: u64) -> Result<(), StoreError> {
+        let add = Update::new()
+            .set(
+                SHARD_INDEX_ATTR,
+                AttributeValue::N(shard.index().to_string()),
+            )
+            .add(SHARD_COUNT_ATTR, AttributeValue::N(n.to_string()))
+            .build();
+        self.client
+            .update_item()
+            .table_name(&self.counters_table)
+            .set_key(Some(Key::DeferredShard { event_id, shard }.build()))
+            .update_expression(add.expression)
+            .set_expression_attribute_names(Some(add.names))
+            .set_expression_attribute_values(Some(add.values))
+            .send()
+            .await
+            .map_err(|e| StoreError(format!("update_item deferred shard: {e}")))?;
+        Ok(())
+    }
+
     async fn claim_block(&self, event_id: &str, n: u64) -> Result<u64, StoreError> {
         // `ALL_NEW` returns the value after the add, so the claimed block is
         // `[end - n + 1, end]`.

@@ -149,12 +149,9 @@ async fn handle_wait<S: Store, Q: JoinQueue>(
                 state.session,
             )),
         ),
-        WaitOutcome::Show(WaitPage::Lost) => page(
-            StatusCode::OK,
-            &WaitPage::Lost,
-            &next,
-            Some(&clear_identity_cookie()),
-        ),
+        WaitOutcome::Show(gone @ (WaitPage::Lost | WaitPage::TurnMissed)) => {
+            page(StatusCode::OK, &gone, &next, Some(&clear_identity_cookie()))
+        }
         WaitOutcome::Show(WaitPage::Joining) => {
             handle_unanswered(state, &identity, &next, now).await
         }
@@ -284,6 +281,12 @@ mod tests {
                 stored_control: wr_common::StoredControl::Open,
                 fail_open_until: None,
                 starts_at: None,
+                // Everyone below now serving was called just now.
+                calls: vec![wr_common::Call {
+                    first: 0,
+                    until: Timestamp::now() + wr_common::TURN_HOLD,
+                    shelf: wr_common::Shelf::new(0).unwrap(),
+                }],
             })))
         }
         fn load_prequeue(
@@ -300,9 +303,10 @@ mod tests {
         {
             std::future::ready(Ok(self.position.clone()))
         }
-        fn take_slot(
+        fn take_spot(
             &self,
             _event_id: &str,
+            _shelf: wr_common::Shelf,
             _shard: Shard,
         ) -> impl std::future::Future<Output = Result<bool, StoreError>> + Send {
             std::future::ready(Ok(true))

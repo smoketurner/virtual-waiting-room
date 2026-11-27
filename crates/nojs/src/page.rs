@@ -45,6 +45,10 @@ impl WaitHtml {
                 "We couldn't confirm this place is yours",
                 "Join again to take a new place in line.",
             ),
+            WaitPage::TurnMissed => (
+                "Your turn passed while you were away",
+                "Your spot went to the next person in line. Join again to take a new place.",
+            ),
             WaitPage::JoinLost => (
                 "We couldn't get you a place in line",
                 "Your request to join didn't go through. Join again to take a place in line.",
@@ -63,6 +67,7 @@ impl WaitHtml {
             | WaitPage::Joining
             | WaitPage::Holding
             | WaitPage::Lost
+            | WaitPage::TurnMissed
             | WaitPage::JoinLost
             | WaitPage::Unavailable => None,
         };
@@ -71,7 +76,10 @@ impl WaitHtml {
             sub,
             queued,
             show_form: match page {
-                WaitPage::NotInLine | WaitPage::Lost | WaitPage::JoinLost => true,
+                WaitPage::NotInLine
+                | WaitPage::Lost
+                | WaitPage::TurnMissed
+                | WaitPage::JoinLost => true,
                 WaitPage::Joining
                 | WaitPage::Queued { .. }
                 | WaitPage::Holding

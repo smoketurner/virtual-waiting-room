@@ -32,7 +32,7 @@ activation queues first-in, first-out (FIFO).
 |---|---|---|
 | F1.1 | During the pre-queue phase, visitors MUST be held on a countdown page rather than assigned a queue position. Registering MUST cost one row write per visitor plus a share of one amortised shard-counter claim per batch. | A visitor arriving at T−10min sees a countdown and is registered; no `Positions` item and no queue position exists until the event opens. |
 | F1.2 | The countdown page MUST be servable entirely from CDN cache, so repeated views make zero calls to API Gateway, DynamoDB or SQS. Registration MUST be a separate, one-time direct write from the edge to the ingest queue, with no compute in the path. | Origin requests from page views are independent of visitor count; each visitor registers once, deduplicated across reloads wherever the browser allows client-side storage; no Lambda in the write's path. Known residuals: a storage-denied visitor takes a new place on each reload, and two reloads in one batching window can each claim. |
-| F1.3 | At T−0 the system MUST assign queue positions to pre-queue participants in **randomized** order, and the ordering MUST NOT be predictable before that moment. | Assigned position shows no correlation with registration time; positions are uniformly distributed; the permutation key does not exist before T−0. |
+| F1.3 | At T−0 the system MUST assign queue positions to pre-queue participants in **randomized** order, and the ordering MUST NOT be predictable before that moment. A join accepted within 15 s after T−0 is a pre-queue participant ([ADR-0043](adr/0043-held-turns-and-join-order.md)). | Assigned position shows no correlation with registration time; positions are uniformly distributed; the permutation key does not exist before T−0; membership is decided by when SQS accepted the join, not when it was processed. |
 | F1.4 | Position assignment for pre-queue participants MUST complete promptly at the scheduled start. | 1,000,000 participants assigned in one write; elapsed time independent of cohort size. |
 | F1.5 | The randomization MUST be recomputable after the fact. | A third party given the published seed, participant count and registration indices recomputes every position exactly. This checks the arithmetic, not that the seed was drawn fairly ([ADR-0040](adr/0040-what-the-published-seed-proves.md)). |
 
@@ -40,7 +40,7 @@ activation queues first-in, first-out (FIFO).
 
 | ID | Requirement | Acceptance |
 |---|---|---|
-| F2.1 | The system MUST accept joins after the event opens, assigning positions in arrival order. | A visitor joining at T+5min receives a position after all pre-queue participants. |
+| F2.1 | The system MUST accept joins after the event opens, assigning positions in arrival order. | A visitor joining at T+5min receives a position after all pre-queue participants; joins after the draw closes are let in in the order SQS accepted them, to within a few seconds. |
 | F2.2 | Each visitor MUST receive a unique queue position. No position may be issued twice. | Under concurrent load, the set of issued positions contains zero duplicates. |
 | F2.3 | Queue positions MAY contain gaps. | Not a defect. Gap rate is measured and reported, not eliminated. |
 | F2.4 | The client MUST supply its own request identifier (UUIDv7) when joining. | A join with no request id, or one longer than a UUID, is rejected at the gateway with 400. One that is not UUID-shaped is accepted and dropped by `assign_position` without a position; the version is not checked. |
@@ -56,7 +56,7 @@ activation queues first-in, first-out (FIFO).
 | F3.3 | Admitted visitors MUST receive a cryptographically verifiable credential. | The session cookie is signed; the edge gate verifies it locally, with no backend call. |
 | F3.4 | The protected origin MUST be unreachable without a valid session. | A request with no credential, an expired one, or one for another event is refused at the edge. |
 | F3.5 | Once a visitor's position is reached, the system MUST establish a **session** so they are not re-checked on every subsequent request. | A visitor navigates to a second page without re-presenting anything and is not re-queued. |
-| F3.8 | Admission control MUST compensate for **no-shows**, released visitors who never arrive at the origin. | With a 30% no-show rate the origin's slots stay nearly full, not 70% full. One visitor counts once however many times they call `/_wr/v1/generate_token`. |
+| F3.8 | Admission control MUST compensate for **no-shows**, called visitors who never arrive at the origin, without letting anyone take another visitor's turn. | A called visitor's spot is held for them alone for 2 minutes (longer at the open) and then called for the next place in line; with a 30% no-show rate and the default 900 s session the origin's spots stay above 80% full. One visitor counts once however many times they call `/_wr/v1/generate_token`. |
 
 ### 1.5 Failure behaviour
 
@@ -85,8 +85,8 @@ No requirement in this section is currently met: nothing binds a place to a pers
 ([ADR-0001](adr/0001-randomize-pre-queue-assignment.md)). Where the edge web ACL is attached,
 each place costs a browser challenge solve and a per-IP CAPTCHA past a limit
 ([ADR-0038](adr/0038-edge-web-acl-on-flat-rate-plan.md)); a farm of real browsers still takes
-places. Entry tickets ([ADR-0028](adr/0028-remove-entry-tickets.md)) and open-time demotion
-([ADR-0030](adr/0030-remove-open-time-demotion.md)) were removed; F6.1–F6.3 are retired below.
+places. There are no entry tickets ([ADR-0028](adr/0028-remove-entry-tickets.md)) and no
+open-time demotion ([ADR-0030](adr/0030-remove-open-time-demotion.md)); F6.1–F6.3 are retired below.
 
 ### 1.8 Operator web interface
 
@@ -131,7 +131,7 @@ pre-event preparation in §4.
 | N7 | Bot and abuse mitigation MUST be present at the edge. | The gate refuses every request without a valid session at viewer-request, and the join burst reaches SQS with no compute in the path. Every REST API method requires an API key only CloudFront holds, so a request straight to `execute-api` is refused with 403. With `flat_rate_plan_tier` set, the edge web ACL challenges every JavaScript API call and never the no-JavaScript queue ([ADR-0037](adr/0037-no-javascript-queue.md)), rate-limits per token and per IP, and runs managed rules in Count until promoted; it is off by default because on pay-as-you-go it bills against N1 ([ADR-0038](adr/0038-edge-web-acl-on-flat-rate-plan.md)). |
 | N8 | The API MUST be documented as an OpenAPI specification. | Spec published; client and admin surfaces generated from it. |
 | N9 | Concurrent events in one deployment MUST be isolated from each other. | One event driven to its throughput ceiling does not increase queue-join latency or error rate for another. |
-| N10 | Client polling cost MUST scale with distance to the front, not with waiting visitors × a fixed interval. | Poll count is O(log) in the starting wait; the harness client-request total under `--polling backoff` is materially below `--polling hold-position` at identical settings. |
+| N10 | Client polling cost MUST scale with distance to the front, not with waiting visitors × a fixed interval. | Poll count is O(log) in the starting wait; the client's request total is materially below a fixed-interval client's at identical settings. |
 
 ---
 
@@ -180,7 +180,7 @@ Never reused or renumbered. The reasoning is in the linked record.
 |---|---|---|---|
 | F3.6 | The session is signed separately from the admission token. | There is no admission token. | [ADR-0032](adr/0032-remove-the-origin-authorizer.md) |
 | F3.7 | Session lifetime supports a sliding window and a hard cap. | Sliding lived only in the removed origin authorizer; the edge does not re-issue a cookie. | [ADR-0032](adr/0032-remove-the-origin-authorizer.md) |
-| F3.9 | Queue positions expire if unused within an operator-configured period. | Controller-driven expiry was unbounded and blind to the pre-queue cohort; DynamoDB TTL reclaims rows and the no-show correction compensates. | [ADR-0031](adr/0031-remove-controller-driven-expiry.md) |
+| F3.9 | Queue positions expire if unused within an operator-configured period. | Controller-driven expiry was unbounded and blind to the pre-queue cohort; DynamoDB TTL reclaims rows and a missed turn's spot is called for the next place in line. | [ADR-0031](adr/0031-remove-controller-driven-expiry.md) |
 | F3.10 | Sessions are markable as completed or abandoned. | `/update_session` returned 501 and nothing wrote either state. | [ADR-0032](adr/0032-remove-the-origin-authorizer.md) |
 | F6.1 | Gate queue entry on a client-issued signed entry ticket, one position per identity. | Unusable without customer-side work the product does not supply. | [ADR-0028](adr/0028-remove-entry-tickets.md) |
 | F6.2 | The entry ticket is signed by the client and its subject is opaque. | Retired with F6.1. | [ADR-0028](adr/0028-remove-entry-tickets.md) |

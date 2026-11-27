@@ -6,13 +6,20 @@ use aws_lambda_events::sqs::{BatchItemFailure, SqsBatchResponse, SqsEvent, SqsMe
 use jiff::Timestamp;
 use wr_common::Shard;
 
-use crate::{BatchRecord, Store, process_batch};
+use crate::{BatchRecord, Queue, Store, process_batch};
 
 // The SqsBatchResponse / BatchItemFailure event structs are #[non_exhaustive],
 // so they cannot be built with struct-literal syntax from outside their crate;
 // Default + field assignment is the only construction path.
-/// Assigns one SQS batch of joins and returns the ids to retry.
-pub async fn handle<S: Store>(store: &S, event_id: &str, event: SqsEvent) -> SqsBatchResponse {
+/// Assigns one SQS batch of joins and returns the ids to retry. A join sent
+/// back to wait for the open is also made deliverable again sooner than the
+/// queue's visibility timeout.
+pub async fn handle<S: Store, Q: Queue>(
+    store: &S,
+    queue: &Q,
+    event_id: &str,
+    event: SqsEvent,
+) -> SqsBatchResponse {
     let records: Vec<BatchRecord> = event
         .records
         .into_iter()
@@ -43,6 +50,14 @@ pub async fn handle<S: Store>(store: &S, event_id: &str, event: SqsEvent) -> Sqs
 
     let outcome = process_batch(store, event_id, shard, &records).await;
 
+    for deferral in &outcome.deferred {
+        // A join that cannot be brought forward still returns after the
+        // visibility timeout: later, but never lost.
+        if let Err(err) = queue.defer(&deferral.receipt_handle, deferral.delay).await {
+            tracing::warn!(error = %err, "could not bring a deferred join forward");
+        }
+    }
+
     let batch_item_failures = outcome
         .failures
         .into_iter()
@@ -63,8 +78,15 @@ pub async fn handle<S: Store>(store: &S, event_id: &str, event: SqsEvent) -> Sqs
 /// reported, so it is skipped.
 fn record_from_sqs(msg: SqsMessage) -> Option<BatchRecord> {
     let sent_ms: i64 = msg.attributes.get("SentTimestamp")?.parse().ok()?;
+    let receives = msg
+        .attributes
+        .get("ApproximateReceiveCount")
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(1);
     Some(BatchRecord {
         message_id: msg.message_id?,
+        receipt_handle: msg.receipt_handle.unwrap_or_default(),
+        receives,
         body: msg.body?,
         sent_at: Timestamp::from_millisecond(sent_ms).ok()?,
     })
@@ -94,6 +116,22 @@ mod tests {
             record.sent_at,
             Timestamp::from_millisecond(1_788_000_000_250).unwrap()
         );
+    }
+
+    #[test]
+    fn a_record_carries_its_receipt_and_how_often_it_was_delivered() {
+        let mut msg = message(Some("1788000000250"));
+        msg.receipt_handle = Some("rh-1".to_owned());
+        msg.attributes
+            .insert("ApproximateReceiveCount".to_owned(), "3".to_owned());
+        let record = record_from_sqs(msg).unwrap();
+        assert_eq!(
+            (record.receipt_handle.as_str(), record.receives),
+            ("rh-1", 3)
+        );
+        // A first delivery that does not say so is a first delivery.
+        let record = record_from_sqs(message(Some("1788000000250"))).unwrap();
+        assert_eq!(record.receives, 1);
     }
 
     #[test]

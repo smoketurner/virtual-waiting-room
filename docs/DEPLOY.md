@@ -71,8 +71,8 @@ the full shape. The values you will normally set:
 | `api_throttle_rate_limit`, `api_throttle_burst_limit` | `10000`, `5000` | Stage throttle on every other method. Lower to cap what the read and admission functions can be asked for. |
 | `origin_concurrency` | `100` | How many visitors the origin takes at once, seeded onto the event. Changed live from the dashboard. |
 | `gate_rules` | `""` | Which requests the gate covers, one rule per line, same grammar as the dashboard's rules form (`p /checkout`, `c <cookie>`, `u <agent substring>`, `h <header> <value>`). Empty is dormant: everything passes through. |
-| `starts_at`, `starts_at_timezone` | `""`, `UTC` | When the event opens, local date-time with no zone, and its IANA zone. Set, the first apply seeds the event in the pre-queue phase and arms the open schedule. Empty leaves the event idle until an operator presses **Open now**. |
-| `session_ttl_seconds` | `900` | Lifetime of an admitted visitor's session, and how long each one holds a slot of `origin_concurrency`. See [below](#choosing-the-session-lifetime). |
+| `starts_at`, `starts_at_timezone` | `""`, `UTC` | When the event opens, local date-time with no zone, and its IANA zone. Set, the first apply seeds the event in the pre-queue phase and arms the open schedule. Empty leaves the event idle until an operator moves it to the pre-queue phase and presses **Open now**. |
+| `session_ttl_seconds` | `900` | Lifetime of an admitted visitor's session, and how long each one holds one of the `origin_concurrency` spots. See [below](#choosing-the-session-lifetime). |
 | `warm_throughput_write_units`, `warm_throughput_read_units` | `0` | Table pre-warm ahead of an event; 0 is none. Shortens the open's wait for the join queue; not needed for every join to be counted. |
 | `poll_floor_ms`, `poll_ceiling_ms`, `poll_divisor` | `5000`, `30000`, `10` | Adaptive poll interval published on `/status` ([ADR-0023](adr/0023-adaptive-poll-interval.md)). |
 | `flat_rate_plan_tier` | `null` | `BUSINESS` or `PREMIUM` subscribes to a CloudFront flat-rate plan and attaches the edge web ACL. See [Edge protection](#edge-protection-on-a-flat-rate-plan). |
@@ -187,7 +187,7 @@ AWS_PROFILE=dev-admin uv run scripts/smoke_test.py
 ## Secrets
 
 - **Gate signing key.** `random_bytes` generates it during apply, and Terraform writes the same
-  value to the SSM SecureString `/<name_prefix>/signing-key` (read by `generate_token`) and the
+  value to the SSM SecureString `/<name_prefix>/signing-key` (read by `generate_token` and `nojs`) and the
   KeyValueStore key `k` (read by the gate). It lives in Terraform state, which the S3 backend
   encrypts. There is one key per generation; see [Rotating keys](#rotating-keys).
 - **CloudFront-to-API key.** Generated the same way, sent by the distribution as `x-api-key`
@@ -223,7 +223,7 @@ origin when it lapses is sent back to the queue, checkout included
 ([ADR-0021](adr/0021-edge-function-gate.md), [ADR-0032](adr/0032-remove-the-origin-authorizer.md)).
 Set it longer than the worst realistic time on the origin (cart to confirmation, not the median).
 
-Each session also holds one of the origin's `origin_concurrency` slots for exactly that long,
+Each session also holds one of the origin's `origin_concurrency` spots for exactly that long,
 whether or not the visitor is still there, so the room admits about `origin_concurrency` visitors
 per session length: at the 900 s default, a limit of 100 admits about 400 an hour. A longer
 session is safer for the visitor and slower for the queue. Terraform passes the one value to every

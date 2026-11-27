@@ -4,6 +4,8 @@
 [0039](0039-meter-admissions-not-the-cursor.md) and [0041](0041-meter-origin-concurrency.md): the
 admission grace and `target_rate` are gone, a redemption answered 425 is retried at the floor and
 only a 429 or 5xx backs off, and a poll due while the tab is hidden is deferred, not dropped.
+Amended by [0043](0043-held-turns-and-join-order.md): a redemption answered 410 with
+`reason: "turn_missed"` takes a new place at once and keeps polling.
 
 ## Context
 

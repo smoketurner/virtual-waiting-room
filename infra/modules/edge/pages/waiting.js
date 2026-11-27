@@ -337,6 +337,9 @@
   // position that was never claimed.
   var eventId = null;
   var admitting = false;
+  // Set when this page's turn passed before it took it, so the new place it
+  // takes says why it is at the back of the line.
+  var missedTurn = false;
 
   // Where a successful redemption navigates: the request the gate refused
   // before sending this visitor here, preserved across the round trip by its
@@ -857,16 +860,24 @@
     // At the end of a cohort it never does: the controller stops at
     // queue_counter + 1, so the last visitor in line sits at ahead === 0.
     if (position < serving) {
+      missedTurn = false;
       say("You're next", "Letting you through…");
     } else if (ahead === 0) {
-      say("You're next", "Waiting for the next release…");
+      say("You're next", "Waiting for your number to be called…");
     } else {
-      say(
-        "You're in line",
+      var behind =
         ahead === 1
           ? "1 person ahead of you."
-          : ahead.toLocaleString() + " people ahead of you."
-      );
+          : ahead.toLocaleString() + " people ahead of you.";
+      if (missedTurn) {
+        say(
+          "Your turn passed while you were away",
+          "Your spot went to the next person in line. You have a new place at the back: " +
+            behind
+        );
+      } else {
+        say("You're in line", behind);
+      }
     }
   }
 
@@ -924,16 +935,14 @@
         window.location.replace(nextDestination());
         return;
       }
-      // Not admitted this time: the origin has had its share for the moment
-      // (a 425 while the admission budget is spent, ADR-0039), or the operator
-      // paused. Fall back to polling rather than hammering.
+      // Not let in this time: this visitor's spot is not there to take yet,
+      // or the operator paused. Fall back to polling rather than hammering.
       admitting = false;
-      // A 425 is a slot not yet free: the controller releases the people for
-      // a slot a little before its session ends. Ask again at the floor, so the
-      // slot is taken within seconds of coming free; the crowd asking is only
-      // the people released for the next slots, so this is not a storm. A 429
-      // or a 5xx is a throttle or an overloaded function, and retrying it at
-      // the floor only feeds the overload, so that backs off.
+      // A 425 is a called visitor whose held spot is not written yet: the
+      // controller writes the call a moment before the spots. Ask again at
+      // the floor, and the spot is there. A 429 or a 5xx is a throttle or an
+      // overloaded function, and retrying it at the floor only feeds the
+      // overload, so that backs off.
       var busy = res.status === 429 || res.status >= 500;
       capacityMisses = busy ? capacityMisses + 1 : 0;
       if (res.status === 403) {
@@ -944,6 +953,19 @@
           "Open the waiting room again from the link you were given to take a new place."
         );
         stop();
+      } else if (res.status === 410 && res.body && res.body.reason === "turn_missed") {
+        // This visitor's number was called and the turn passed before this
+        // page took it: the spot went to the next place in line. Take a new
+        // place at the back, as a fresh visitor would, and say why.
+        removeStored(IDENTITY_KEY);
+        forgetJoin();
+        digestPromise = null;
+        resolveIdentity();
+        missedTurn = true;
+        say(
+          "Your turn passed while you were away",
+          "Your spot went to the next person in line. Taking a new place at the back…"
+        );
       } else if (res.status === 410) {
         // This place was used and the visit it bought is over (issue #237).
         // It cannot be redeemed again, so drop it: the next load of this page

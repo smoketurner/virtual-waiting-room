@@ -23,7 +23,7 @@
 
 ### Type design
 
-- Newtypes over primitives (`EventId(String)`, `RegistrationIndex(u64)`), not bare `u64`.
+- Newtypes over primitives (`EventId(String)`, `Shelf(usize)`), not bare `u64`.
 - Enums for state machines, not boolean flags.
 - `thiserror` for libraries, `anyhow` for binaries.
 - `tracing` for logging (`error!`/`warn!`/`info!`/`debug!`), never `println!`.

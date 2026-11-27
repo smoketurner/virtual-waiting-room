@@ -60,6 +60,8 @@ pub struct Record {
     pub request_id: String,
     pub arrived_ms: u64,
     pub joined_ms: Option<u64>,
+    /// When the join was accepted, as SQS stamps it.
+    pub joined_at: Option<jiff::Timestamp>,
     pub position: Option<u64>,
     pub live_join: bool,
     pub position_known_ms: Option<u64>,
@@ -168,6 +170,7 @@ pub async fn visit(world: Arc<World>, mut rng: Rng, arrive_at: Instant, no_show:
             request_id,
             arrived_ms,
             joined_ms: None,
+            joined_at: None,
             position: None,
             live_join: false,
             position_known_ms: None,
@@ -327,6 +330,7 @@ impl Visitor<'_> {
             self.join_attempts = 0;
             if self.record.joined_ms.is_none() {
                 self.record.joined_ms = Some(ms(self.world.started, Instant::now()));
+                self.record.joined_at = Some(crate::clock::now());
             }
             return Ok(());
         }
@@ -564,6 +568,16 @@ impl Visitor<'_> {
                 }
             }
             403 => Redeem::Stop("not the holder of this place"),
+            // A visitor who stays on the page never misses their turn, so one
+            // here is the controller letting a turn pass under them.
+            410 if res
+                .json()
+                .and_then(|b| b.get("reason").and_then(|r| r.as_str().map(str::to_owned)))
+                .as_deref()
+                == Some("turn_missed") =>
+            {
+                Redeem::Stop("their turn passed while they were waiting")
+            }
             410 => Redeem::Stop("visit already used"),
             425 => Redeem::NotYet,
             429 | 500..=599 => Redeem::Busy,

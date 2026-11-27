@@ -1,8 +1,8 @@
 # ADR-0033: Admission is claimed once per visitor, and a repeat still admits
 
-**Status:** Accepted. Amended by [0039](0039-meter-admissions-not-the-cursor.md): the claim is now a
-mark made after a unit of the admission budget is taken, and the arrival count it protected is that
-budget. A repeat still admits, but into the same visit: a session asked for again expires when the
+**Status:** Accepted. Amended by [0039](0039-meter-admissions-not-the-cursor.md) and
+[0043](0043-held-turns-and-join-order.md): the claim is a mark made after the visitor takes the spot
+held for them on their call's shelf, and the arrival count it protects is those counters. A repeat still admits, but into the same visit: a session asked for again expires when the
 first one did (`admitted_at + session_ttl_seconds`, issue #237). After that `/v1/generate_token`
 answers 410 and the visitor takes a new place.
 

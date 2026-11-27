@@ -4,12 +4,14 @@
 
 use assign_position::dynamo::DynamoStore;
 use assign_position::handler::handle;
+use assign_position::sqs::JoinQueue;
 use aws_lambda_events::sqs::SqsEvent;
 use lambda_runtime::{Error, LambdaEvent, service_fn};
 
 /// Resolved once at cold start and shared across invocations.
 struct AppState {
     store: DynamoStore,
+    queue: JoinQueue,
     event_id: String,
 }
 
@@ -25,7 +27,7 @@ async fn main() -> Result<(), Error> {
     let state = init().await?;
 
     lambda_runtime::run(service_fn(|event: LambdaEvent<SqsEvent>| async {
-        Ok::<_, Error>(handle(&state.store, &state.event_id, event.payload).await)
+        Ok::<_, Error>(handle(&state.store, &state.queue, &state.event_id, event.payload).await)
     }))
     .await
 }
@@ -38,6 +40,14 @@ async fn init() -> Result<AppState, Error> {
     let positions_table = std::env::var("POSITIONS_TABLE")?;
     let event_id = std::env::var("EVENT_ID")?;
     let store = DynamoStore::new(client, counters_table, prequeue_table, positions_table);
+    let queue = JoinQueue::new(
+        aws_sdk_sqs::Client::new(&config),
+        std::env::var("JOIN_QUEUE_URL")?,
+    );
 
-    Ok(AppState { store, event_id })
+    Ok(AppState {
+        store,
+        queue,
+        event_id,
+    })
 }

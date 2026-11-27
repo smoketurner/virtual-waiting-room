@@ -374,6 +374,7 @@ mod tests {
             stored_control: StoredControl::Open,
             fail_open_until: None,
             starts_at: None,
+            calls: Vec::new(),
         }
     }
 
@@ -402,6 +403,7 @@ mod tests {
             stored_control: StoredControl::Open,
             fail_open_until: None,
             starts_at: None,
+            calls: Vec::new(),
         };
         let json = serde_json::to_value(status(
             &counters,
@@ -882,6 +884,7 @@ mod tests {
             stored_control: StoredControl::Open,
             fail_open_until: None,
             starts_at: None,
+            calls: Vec::new(),
         };
         assert_eq!(
             queue_num(&counters, &row(0, 0)),

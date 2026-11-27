@@ -268,6 +268,186 @@ pub fn occupancy(ends: &[Timestamp], session: SignedDuration, limit: u64) -> Opt
     Some(held as f64 / ((last - first) as f64 * limit as f64))
 }
 
+/// How far admission order strayed from line order: for each admitted visitor,
+/// the distance between their place among the admitted by position and by
+/// when they got in. The median and the most.
+#[must_use]
+pub fn turn_moved(records: &[Record]) -> (u64, u64) {
+    let mut admitted: Vec<(u64, u64)> = Vec::new();
+    for r in records {
+        if let (Some(position), Some(at)) = (r.position, r.admitted_ms) {
+            admitted.push((at, position));
+        }
+    }
+    admitted.sort_unstable();
+    let mut by_position: Vec<u64> = admitted.iter().map(|&(_, p)| p).collect();
+    by_position.sort_unstable();
+    let mut moved = Vec::with_capacity(admitted.len());
+    for (turn, &(_, position)) in admitted.iter().enumerate() {
+        let place = by_position.partition_point(|&p| p < position);
+        moved.push(turn.abs_diff(place) as u64);
+    }
+    moved.sort_unstable();
+    (
+        percentile(&moved, 0.5).unwrap_or(0),
+        moved.last().copied().unwrap_or(0),
+    )
+}
+
+/// How far apart two joins after the draw closes must be for the earlier one
+/// to be owed the earlier turn: a few seconds.
+pub const ORDER_SLACK: SignedDuration = SignedDuration::from_secs(5);
+
+/// Who was let in out of turn, among the visitors who stayed. Joining before
+/// the draw closes puts a visitor ahead of everyone who joins after it, and
+/// after it the line is the order the joins were accepted in, give or take
+/// [`ORDER_SLACK`].
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct OutOfTurn {
+    /// Joined before the draw closed and let in after someone who joined after
+    /// it, or never let in while someone who joined after it was.
+    pub before_overtaken: usize,
+    /// Of those, never let in.
+    pub before_never: usize,
+    /// Joined after the draw closed and let in ahead of one of those.
+    pub after_ahead: usize,
+    /// Joined after the draw closed and let in while someone who joined after
+    /// it, more than [`ORDER_SLACK`] earlier than them, was still waiting.
+    pub after_out_of_order: usize,
+    /// Of those, let in although that earlier joiner never was.
+    pub after_ahead_of_never: usize,
+    /// Joined after the draw closed and let in although, of the `k` let in
+    /// who joined after it, they were not among the first `k` to join.
+    pub after_beyond_the_first: usize,
+    /// The furthest anyone who joined after the draw closed was let in ahead
+    /// of someone who joined before them, in join time.
+    pub after_most_ahead: SignedDuration,
+}
+
+/// When a visitor was let in. Never sorts after every time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum LetIn {
+    At(u64),
+    Never,
+}
+
+impl LetIn {
+    fn of(record: &Record) -> Self {
+        record.admitted_ms.map_or(Self::Never, Self::At)
+    }
+
+    fn happened(self) -> bool {
+        match self {
+            Self::At(_) => true,
+            Self::Never => false,
+        }
+    }
+}
+
+/// A visitor who joined after the draw closed: when their join was accepted,
+/// and when they were let in.
+type Late = (Timestamp, LetIn);
+
+#[must_use]
+pub fn out_of_turn(records: &[Record], draw_closes: Timestamp) -> OutOfTurn {
+    let mut early: Vec<LetIn> = Vec::new();
+    let mut late: Vec<Late> = Vec::new();
+    for r in records {
+        let stayed = match r.outcome {
+            Outcome::NoShow => false,
+            Outcome::Admitted | Outcome::Left | Outcome::GaveUp(_) | Outcome::StillWaiting => true,
+        };
+        match r.joined_at {
+            Some(joined) if stayed && joined < draw_closes => early.push(LetIn::of(r)),
+            Some(joined) if stayed => late.push((joined, LetIn::of(r))),
+            Some(_) | None => {}
+        }
+    }
+    late.sort_unstable();
+
+    let mut out = OutOfTurn::default();
+    early_against_late(&early, &late, &mut out);
+    out.after_beyond_the_first = beyond_the_first(&late);
+    (out.after_out_of_order, out.after_ahead_of_never) = out_of_join_order(&late);
+    out.after_most_ahead = most_ahead(&late);
+    out
+}
+
+/// How those who joined before the draw closed fared against those who
+/// joined after it, once any of those was let in.
+fn early_against_late(early: &[LetIn], late: &[Late], out: &mut OutOfTurn) {
+    let Some(first_late) = late.iter().map(|&(_, l)| l).filter(|l| l.happened()).min() else {
+        return;
+    };
+    let last_early = early.iter().copied().max();
+    out.before_overtaken = early.iter().filter(|&&l| l > first_late).count();
+    out.before_never = early.iter().filter(|&&l| l == LetIn::Never).count();
+    out.after_ahead = late
+        .iter()
+        .filter(|&&(_, l)| l.happened() && last_early.is_some_and(|last| l < last))
+        .count();
+}
+
+/// Of the `k` late joiners let in, how many were not among the first `k` to
+/// join. `late` is in join order.
+fn beyond_the_first(late: &[Late]) -> usize {
+    let let_in = late.iter().filter(|(_, l)| l.happened()).count();
+    let Some(&(last_owed, _)) = let_in.checked_sub(1).and_then(|k| late.get(k)) else {
+        return 0;
+    };
+    late.iter()
+        .filter(|&&(joined, l)| l.happened() && joined > last_owed)
+        .count()
+}
+
+/// How many late joiners were let in while someone who joined more than the
+/// slack before them was still waiting, and how many of those ahead of
+/// someone never let in. `late` is in join order, so everyone owed a turn
+/// before a visitor is a prefix of it.
+fn out_of_join_order(late: &[Late]) -> (usize, usize) {
+    let (mut out_of_order, mut ahead_of_never) = (0, 0);
+    let mut latest_owed: Option<LetIn> = None;
+    let mut owed = late.iter().peekable();
+    for &(joined, let_in) in late {
+        let owed_before = joined.checked_sub(ORDER_SLACK).unwrap_or(Timestamp::MIN);
+        while let Some(&(_, l)) = owed.next_if(|(j, _)| *j < owed_before) {
+            latest_owed = latest_owed.max(Some(l));
+        }
+        match latest_owed {
+            Some(latest) if let_in.happened() && latest > let_in => {
+                out_of_order += 1;
+                if latest == LetIn::Never {
+                    ahead_of_never += 1;
+                }
+            }
+            Some(_) | None => {}
+        }
+    }
+    (out_of_order, ahead_of_never)
+}
+
+/// The furthest anyone was let in ahead of someone who joined before them:
+/// for each visitor let in, the earliest join among those let in after them.
+fn most_ahead(late: &[Late]) -> SignedDuration {
+    let mut by_let_in = late.to_vec();
+    by_let_in.sort_unstable_by_key(|&(_, l)| std::cmp::Reverse(l));
+    let mut most = SignedDuration::ZERO;
+    let mut earliest_let_in_later: Option<Timestamp> = None;
+    // Those let in at the same moment are not ahead of one another.
+    for same_moment in by_let_in.chunk_by(|a, b| a.1 == b.1) {
+        if let Some(earliest) = earliest_let_in_later {
+            for &(joined, l) in same_moment {
+                if l.happened() {
+                    most = most.max(joined.duration_since(earliest));
+                }
+            }
+        }
+        let joined_here = same_moment.iter().map(|&(joined, _)| joined).min();
+        earliest_let_in_later = earliest_let_in_later.into_iter().chain(joined_here).min();
+    }
+    most
+}
+
 /// The most admissions in any window of `width` seconds, and where it starts.
 #[must_use]
 pub fn busiest_window(series: &[u64], width: usize) -> (u64, usize) {
@@ -337,7 +517,8 @@ pub struct Evidence<'a> {
     pub registrations: &'a [Registration],
     pub opened: bool,
     /// When the open fired, ms from the start of the run.
-    pub open_at_ms: u64,
+    /// When the draw closed: the grace window after `starts_at`.
+    pub draw_closes: Timestamp,
     pub open_took: Duration,
     pub passes: &'a [Result<controller::PassOutcome, String>],
     pub elapsed: Duration,
@@ -355,6 +536,14 @@ pub fn build(e: &Evidence<'_>) -> Report {
     let seconds = e.elapsed.as_secs();
 
     r.fact("visitors", scenario.visitors);
+    r.fact(
+        "visitors arriving after the open",
+        format!(
+            "{}, from {} s after it",
+            scenario.after_open,
+            scenario.after_open_from.as_secs()
+        ),
+    );
     r.fact("origin concurrency", scenario.concurrency);
     r.fact("session length (s)", scenario.session.as_secs());
     r.fact(
@@ -432,17 +621,43 @@ pub fn build(e: &Evidence<'_>) -> Report {
     let behind = e
         .records
         .iter()
-        .filter(|x| x.live_join && x.joined_ms.is_some_and(|j| j < e.open_at_ms))
+        .filter(|x| x.live_join && x.joined_at.is_some_and(|j| j < e.draw_closes))
         .count();
     let before = e
         .records
         .iter()
-        .filter(|x| x.joined_ms.is_some_and(|j| j < e.open_at_ms))
+        .filter(|x| x.joined_at.is_some_and(|j| j < e.draw_closes))
         .count();
     r.check(
-        "Every join accepted before the open is in the cohort",
+        "Every join accepted before the draw closes is in the cohort",
         behind == 0,
-        format!("{before} joins accepted before the open, {behind} numbered behind the cohort"),
+        format!(
+            "{before} joins accepted before the draw closed, {behind} numbered behind the cohort"
+        ),
+    );
+    let turn = out_of_turn(e.records, e.draw_closes);
+    r.check(
+        "Nobody who joined after the draw closed takes a spot someone who joined before it needed",
+        turn.before_never == 0,
+        format!(
+            "{} who joined before it closed never let in while someone who joined after it was; \
+             {} stepped in after someone who joined after it, called in the same round",
+            turn.before_never, turn.before_overtaken
+        ),
+    );
+    r.check(
+        "Those who joined after the draw closed are let in in the order they joined, to within a few seconds",
+        turn.after_out_of_order == 0,
+        format!(
+            "{} let in while someone who joined over {} s before them was still waiting, {} of \
+             them ahead of someone who was never let in; the most out of order {:.1} s; {} let \
+             in who were not among the first to join after the draw closed",
+            turn.after_out_of_order,
+            ORDER_SLACK.as_secs(),
+            turn.after_ahead_of_never,
+            turn.after_most_ahead.as_secs_f64(),
+            turn.after_beyond_the_first
+        ),
     );
     if let Some(published) = e.published {
         let recomputed = audit(published, e.registrations);
@@ -503,6 +718,11 @@ pub fn build(e: &Evidence<'_>) -> Report {
     let admissions = e.metrics.origin_series("protected", seconds);
     let total_admitted: u64 = admissions.iter().sum();
     r.fact("admissions reaching the origin", total_admitted);
+    let (median_moved, most_moved) = turn_moved(e.records);
+    r.fact(
+        "turns moved from line order, median / most",
+        format!("{median_moved} / {most_moved}"),
+    );
     let (busiest, start) = busiest_window(&admissions, 1);
     r.fact(
         "busiest second of admissions",
@@ -604,6 +824,24 @@ pub fn build(e: &Evidence<'_>) -> Report {
         "controller passes",
         format!("{} ({} failed)", e.passes.len(), failed_passes),
     );
+    // Called and never let in: visitors whose turn passed, or who were
+    // called after the last of the tickets went.
+    let called: Vec<u64> = e
+        .passes
+        .iter()
+        .map(|p| match p {
+            Ok(controller::PassOutcome::Ran { called }) => *called,
+            Ok(controller::PassOutcome::NotActive(_) | controller::PassOutcome::Held(_))
+            | Err(_) => 0,
+        })
+        .collect();
+    let total_called = called.iter().fold(0u64, |t, n| t.saturating_add(*n));
+    r.fact("places in line called", total_called);
+    r.fact(
+        "places called and never let in",
+        total_called.saturating_sub(total_admitted),
+    );
+    r.series.insert("places called per pass".to_owned(), called);
     r.check(
         "No function invocation fails and no function logs an error",
         e.failed_invocations == 0 && e.logged_errors.is_empty() && failed_passes == 0,
@@ -656,6 +894,160 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn admitted(position: u64, at: u64) -> Record {
+        Record {
+            request_id: format!("r{position}"),
+            arrived_ms: 0,
+            joined_ms: Some(0),
+            joined_at: Some(Timestamp::constant(0, 0)),
+            position: Some(position),
+            live_join: false,
+            position_known_ms: Some(0),
+            admitted_ms: Some(at),
+            session_ends: None,
+            outcome: Outcome::Admitted,
+            join_throttled: 0,
+            capacity_refusals: 0,
+            requests: 0,
+        }
+    }
+
+    fn joined(joined_at: Timestamp, admitted_ms: Option<u64>, outcome: Outcome) -> Record {
+        Record {
+            joined_at: Some(joined_at),
+            admitted_ms,
+            outcome,
+            ..admitted(0, 0)
+        }
+    }
+
+    #[test]
+    fn everyone_let_in_in_turn_is_nobody_out_of_turn() {
+        let records = [
+            joined(Timestamp::constant(10, 0), Some(200), Outcome::Admitted),
+            joined(Timestamp::constant(20, 0), Some(150), Outcome::Admitted),
+            joined(Timestamp::constant(100, 0), Some(300), Outcome::Admitted),
+            joined(Timestamp::constant(110, 0), Some(400), Outcome::Admitted),
+            joined(Timestamp::constant(120, 0), None, Outcome::Left),
+        ];
+        assert_eq!(
+            out_of_turn(&records, Timestamp::constant(100, 0)),
+            OutOfTurn::default()
+        );
+        assert_eq!(
+            out_of_turn(&[], Timestamp::constant(100, 0)),
+            OutOfTurn::default()
+        );
+    }
+
+    #[test]
+    fn a_later_joiner_let_in_first_is_out_of_turn() {
+        let records = [
+            // Before the open: one let in after the first later joiner, one
+            // never let in.
+            joined(Timestamp::constant(10, 0), Some(500), Outcome::Admitted),
+            joined(Timestamp::constant(20, 0), None, Outcome::Left),
+            // After the open, the second let in before the first.
+            joined(Timestamp::constant(100, 0), Some(400), Outcome::Admitted),
+            joined(Timestamp::constant(110, 0), Some(300), Outcome::Admitted),
+        ];
+        assert_eq!(
+            out_of_turn(&records, Timestamp::constant(100, 0)),
+            OutOfTurn {
+                before_overtaken: 2,
+                before_never: 1,
+                after_ahead: 2,
+                after_out_of_order: 1,
+                after_ahead_of_never: 0,
+                after_beyond_the_first: 0,
+                after_most_ahead: SignedDuration::from_secs(10),
+            }
+        );
+    }
+
+    #[test]
+    fn an_earlier_joiner_never_let_in_puts_every_later_one_out_of_order() {
+        let records = [
+            joined(Timestamp::constant(100, 0), None, Outcome::Left),
+            joined(Timestamp::constant(110, 0), Some(300), Outcome::Admitted),
+            joined(Timestamp::constant(120, 0), Some(310), Outcome::Admitted),
+        ];
+        let turn = out_of_turn(&records, Timestamp::constant(100, 0));
+        assert_eq!((turn.after_out_of_order, turn.after_ahead_of_never), (2, 2));
+        // Two let in, and the first two to join include the one never let in.
+        assert_eq!(turn.after_beyond_the_first, 1);
+    }
+
+    #[test]
+    fn the_first_to_join_let_in_in_any_order_are_not_beyond_the_first() {
+        let records = [
+            joined(Timestamp::constant(100, 0), Some(400), Outcome::Admitted),
+            joined(Timestamp::constant(110, 0), Some(300), Outcome::Admitted),
+            joined(Timestamp::constant(120, 0), None, Outcome::Left),
+        ];
+        let turn = out_of_turn(&records, Timestamp::constant(100, 0));
+        assert_eq!(
+            (turn.after_out_of_order, turn.after_beyond_the_first),
+            (1, 0)
+        );
+    }
+
+    #[test]
+    fn a_join_a_nanosecond_before_the_draw_closes_is_before_it() {
+        let open = Timestamp::constant(100, 0);
+        let records = [
+            joined(Timestamp::constant(99, 999_999_999), None, Outcome::Left),
+            joined(open, Some(300), Outcome::Admitted),
+        ];
+        assert_eq!(out_of_turn(&records, open).before_overtaken, 1);
+    }
+
+    #[test]
+    fn joins_a_few_seconds_apart_are_owed_no_order_but_are_measured() {
+        let records = [
+            joined(Timestamp::constant(100, 0), Some(300), Outcome::Admitted),
+            joined(Timestamp::constant(103, 0), Some(200), Outcome::Admitted),
+        ];
+        let turn = out_of_turn(&records, Timestamp::constant(100, 0));
+        assert_eq!(turn.after_out_of_order, 0);
+        assert_eq!(turn.after_most_ahead, SignedDuration::from_secs(3));
+    }
+
+    #[test]
+    fn joins_within_a_second_and_no_shows_are_owed_no_order() {
+        let records = [
+            joined(Timestamp::constant(10, 0), None, Outcome::NoShow),
+            joined(Timestamp::constant(100, 0), Some(300), Outcome::Admitted),
+            joined(Timestamp::constant(100, 0), Some(200), Outcome::Admitted),
+            joined(
+                Timestamp::constant(100, 999_000_000),
+                Some(100),
+                Outcome::Admitted,
+            ),
+        ];
+        assert_eq!(
+            out_of_turn(&records, Timestamp::constant(100, 0)),
+            OutOfTurn {
+                after_most_ahead: SignedDuration::from_millis(999),
+                ..OutOfTurn::default()
+            }
+        );
+    }
+
+    #[test]
+    fn admission_in_line_order_moves_nobody() {
+        let records = [admitted(5, 10), admitted(9, 20), admitted(30, 30)];
+        assert_eq!(turn_moved(&records), (0, 0));
+        assert_eq!(turn_moved(&[]), (0, 0));
+    }
+
+    #[test]
+    fn a_visitor_let_in_ahead_of_two_moves_two_places() {
+        // Position 3 gets in first, ahead of 1 and 2, who each move one back.
+        let records = [admitted(1, 20), admitted(2, 30), admitted(3, 10)];
+        assert_eq!(turn_moved(&records), (1, 2));
+    }
 
     #[test]
     fn identical_orders_correlate_perfectly_and_reversed_ones_negatively() {

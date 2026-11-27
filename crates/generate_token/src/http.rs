@@ -121,18 +121,28 @@ fn refusal(denied: &Denied) -> Result<Response<Body>, Error> {
         Denied::NotAdmitting | Denied::NotOpen => 409,
         Denied::NotRegistered => 404,
         Denied::NotHolder => 403,
-        // Gone: the place was used and its visit is over. The page takes a
-        // new one rather than asking again.
-        Denied::SessionExpired => 410,
+        // Gone: the place was used and its visit is over, or its turn passed
+        // unused. The page takes a new one rather than asking again.
+        Denied::SessionExpired | Denied::TurnMissed { .. } => 410,
         Denied::Corrupt => 500,
     };
     let mut payload = serde_json::json!({
         "admitted": false,
         "error": denied.to_string(),
     });
-    if let Denied::StillQueued { position, serving } = denied {
-        payload["position"] = (*position).into();
-        payload["serving_position"] = (*serving).into();
+    match denied {
+        Denied::StillQueued { position, serving } => {
+            payload["position"] = (*position).into();
+            payload["serving_position"] = (*serving).into();
+        }
+        Denied::SessionExpired => payload["reason"] = "visit_over".into(),
+        Denied::TurnMissed { .. } => payload["reason"] = "turn_missed".into(),
+        Denied::NotRegistered
+        | Denied::NotAdmitting
+        | Denied::NotOpen
+        | Denied::Corrupt
+        | Denied::AtCapacity { .. }
+        | Denied::NotHolder => {}
     }
     json(status, &payload)
 }
@@ -175,9 +185,9 @@ mod tests {
         counters: Counters,
         position: Mutex<Option<crate::PositionRow>>,
         prequeue: Option<PreQueueItem>,
-        /// Units of admission budget left to take.
+        /// Held spots left to take.
         budget: Mutex<u32>,
-        /// How many units were taken — the number the controller reads.
+        /// How many spots were taken — the number the controller reads.
         arrivals: Mutex<u32>,
         /// When set, marking the row admitted fails as a store error.
         mark_fails: bool,
@@ -199,6 +209,12 @@ mod tests {
                     stored_control: wr_common::StoredControl::Open,
                     fail_open_until: None,
                     starts_at: None,
+                    // Everyone below now serving was called just now.
+                    calls: vec![wr_common::Call {
+                        first: 0,
+                        until: jiff::Timestamp::now() + wr_common::TURN_HOLD,
+                        shelf: wr_common::Shelf::new(0).unwrap(),
+                    }],
                 },
                 position: Mutex::new(Some(row(3))),
                 prequeue: None,
@@ -238,9 +254,10 @@ mod tests {
             std::future::ready(Ok(self.position.lock().unwrap().clone()))
         }
 
-        fn take_slot(
+        fn take_spot(
             &self,
             _event_id: &str,
+            _shelf: wr_common::Shelf,
             _shard: Shard,
         ) -> impl std::future::Future<Output = Result<bool, StoreError>> + Send {
             let mut budget = self.budget.lock().unwrap();

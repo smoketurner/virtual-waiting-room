@@ -1,7 +1,8 @@
 # ADR-0042: The open waits out the join backlog
 
 **Status:** Accepted. Amends [0025](0025-operator-owned-seal-schedule.md): Open now invokes the
-open asynchronously.
+open asynchronously. Amended by [0043](0043-held-turns-and-join-order.md): the draw closes 15 s
+after the start, and the open counts joins sent back to wait for it.
 
 ## 1. Context
 
