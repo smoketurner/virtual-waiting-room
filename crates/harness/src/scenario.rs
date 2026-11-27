@@ -23,6 +23,9 @@ pub enum Arrival {
     Herd,
 }
 
+/// The waiting page's poll floor every run publishes (`poll_floor_ms`).
+pub const POLL_FLOOR: SignedDuration = SignedDuration::from_secs(5);
+
 /// One run's crowd and origin.
 #[derive(Debug, Clone)]
 pub struct Scenario {

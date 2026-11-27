@@ -106,10 +106,28 @@ go into the draw rather than to the back.
   `EVT#{event_id}#DF#{shard}`, and the open's caught-up test (ADR-0042) counts them with the
   registrations. The backlog it waits for is only joins accepted before the cutoff.
 
-Order after the cutoff is then right to within a few seconds. A FIFO queue would not do better: it
+Numbering after the cutoff is then right to within a few seconds. A FIFO queue would not do better: it
 keeps order only within a message group, one group takes 300 messages a second, and high-throughput
 mode reaches its 70,000 a second only by spreading messages over many groups with no order between
 them ([SQS quotas](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/quotas-messages.html)).
+
+### 2.4 Pages learn of the open and of their turn within one poll
+
+Everyone in one call is called at the same moment, and a page learns of it at its next `/status`:
+up to the poll floor plus its 30% jitter away, from an answer up to a second old. That is 7.5 s at
+the default 5 s floor, and it is how far apart people in one call may be let in.
+
+- **A closed page does not sleep through the open.** It polls at the ceiling during the countdown,
+  but never past `starts_at` plus the 15 s window, jitter included, and at the floor once that has
+  passed. A page asleep for the ceiling would learn its number up to 39 s after the open, behind
+  people who joined after it.
+- **The first ask is made at the moment drawn for it**, not at the poll after.
+
+This holds while the API answers. When joins and number lookups take the account's whole request
+rate, a session request is refused with a 429 and the page backs off for longer than a poll, so
+people in one call are let in further apart. Every visitor needs at least a join, a lookup and a
+session request; a crowd arriving faster than the account rate allows for those needs a higher
+API Gateway quota.
 
 ## 3. What this guarantees
 
@@ -119,6 +137,9 @@ them ([SQS quotas](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSD
   failed pass calls nobody, and a call whose caps were not written holds fewer spots than it called.
 - **On time is random, and later is behind it.** Membership of the draw is decided by when the join
   was accepted.
+- **Later is in order.** Those who join after the draw closes are numbered in the order their joins
+  were accepted, to within a few seconds, and let in in line order, to within one poll, while the
+  API is not saturated.
 - **A called visitor is not refused for capacity.** Everyone called has a spot; a 425 to a called
   visitor means only that the spot is not written yet, for the moment between the call and its
   caps.

@@ -197,7 +197,10 @@ shard and index come from `GET /_wr/v1/queue_num`.
   later tick fetches `/_wr/v1/status` alone, which CloudFront collapses;
 - delays that first ask by a random slice of `min(120 s, participants / 5000 s⁻¹)` so the cohort
   does not ask at once (at 1,000,000 participants that is about 8,500 requests/s, under the
-  default 10,000/s API Gateway account throttle);
+  default 10,000/s API Gateway account throttle), and asks at the moment drawn, not a poll later;
+- before the open, polls at the ceiling but never sleeps past `starts_at` plus the 15 s draw
+  window, jitter included, and polls at the floor once that moment has passed, so a page does not
+  learn its number late behind people who joined after it;
 - asks again at the floor while a redemption is answered 425, a held spot not yet written, and
   backs off, doubling to the ceiling, on a 429 or a 5xx;
 - on a 410 with `reason: "turn_missed"`, drops its place, takes a new one at the back and says

@@ -298,6 +298,15 @@ pub fn turn_moved(records: &[Record]) -> (u64, u64) {
 /// to be owed the earlier turn: a few seconds.
 pub const ORDER_SLACK: SignedDuration = SignedDuration::from_secs(5);
 
+/// How much later than someone behind them in line a visitor may be let in.
+/// Everyone in one call is called at once, and each page learns of it at its
+/// next ask: up to the poll floor plus its 30% jitter (`JITTER_FRACTION` in
+/// `waiting.js`) away, from a `/status` up to a second old.
+fn let_in_slack() -> SignedDuration {
+    let floor = crate::scenario::POLL_FLOOR;
+    (floor + floor * 3 / 10).saturating_add(SignedDuration::from_secs(1))
+}
+
 /// Who was let in out of turn, among the visitors who stayed. Joining before
 /// the draw closes puts a visitor ahead of everyone who joins after it, and
 /// after it the line is the order the joins were accepted in, give or take
@@ -322,6 +331,21 @@ pub struct OutOfTurn {
     /// The furthest anyone who joined after the draw closed was let in ahead
     /// of someone who joined before them, in join time.
     pub after_most_ahead: SignedDuration,
+    /// Joined after the draw closed and given a place behind someone who
+    /// joined more than [`ORDER_SLACK`] after them.
+    pub after_misnumbered: usize,
+    /// The furthest, in join time, anyone who joined after the draw closed was
+    /// numbered behind someone who joined after them.
+    pub after_most_misnumbered: SignedDuration,
+    /// Joined after the draw closed and let in more than [`let_in_slack`]
+    /// after someone behind them in line, or never let in while someone
+    /// behind them was.
+    pub after_let_in_late: usize,
+    /// Of those, never let in.
+    pub after_never_let_in: usize,
+    /// The furthest anyone who joined after the draw closed and was let in
+    /// was let in after someone behind them in line.
+    pub after_most_let_in_late: SignedDuration,
 }
 
 /// When a visitor was let in. Never sorts after every time.
@@ -348,10 +372,15 @@ impl LetIn {
 /// and when they were let in.
 type Late = (Timestamp, LetIn);
 
+/// A visitor who joined after the draw closed and was given a place in line:
+/// when their join was accepted, their place, and when they were let in.
+type Placed = (Timestamp, u64, LetIn);
+
 #[must_use]
 pub fn out_of_turn(records: &[Record], draw_closes: Timestamp) -> OutOfTurn {
     let mut early: Vec<LetIn> = Vec::new();
     let mut late: Vec<Late> = Vec::new();
+    let mut placed: Vec<Placed> = Vec::new();
     for r in records {
         let stayed = match r.outcome {
             Outcome::NoShow => false,
@@ -359,7 +388,12 @@ pub fn out_of_turn(records: &[Record], draw_closes: Timestamp) -> OutOfTurn {
         };
         match r.joined_at {
             Some(joined) if stayed && joined < draw_closes => early.push(LetIn::of(r)),
-            Some(joined) if stayed => late.push((joined, LetIn::of(r))),
+            Some(joined) if stayed => {
+                late.push((joined, LetIn::of(r)));
+                if let Some(place) = r.position {
+                    placed.push((joined, place, LetIn::of(r)));
+                }
+            }
             Some(_) | None => {}
         }
     }
@@ -370,7 +404,76 @@ pub fn out_of_turn(records: &[Record], draw_closes: Timestamp) -> OutOfTurn {
     out.after_beyond_the_first = beyond_the_first(&late);
     (out.after_out_of_order, out.after_ahead_of_never) = out_of_join_order(&late);
     out.after_most_ahead = most_ahead(&late);
+    (out.after_misnumbered, out.after_most_misnumbered) = misnumbered(&mut placed);
+    (
+        out.after_let_in_late,
+        out.after_never_let_in,
+        out.after_most_let_in_late,
+    ) = let_in_late(&mut placed);
     out
+}
+
+/// How many were numbered behind someone who joined more than
+/// [`ORDER_SLACK`] after them, and the furthest anyone was: for each visitor,
+/// the latest join among those given an earlier place.
+fn misnumbered(placed: &mut [Placed]) -> (usize, SignedDuration) {
+    placed.sort_unstable_by_key(|&(_, place, _)| place);
+    let (mut count, mut most) = (0, SignedDuration::ZERO);
+    let mut latest_ahead: Option<Timestamp> = None;
+    for same_place in placed.chunk_by(|a, b| a.1 == b.1) {
+        if let Some(latest) = latest_ahead {
+            for &(joined, _, _) in same_place {
+                let by = latest.duration_since(joined);
+                most = most.max(by);
+                if by > ORDER_SLACK {
+                    count += 1;
+                }
+            }
+        }
+        let joined_here = same_place.iter().map(|&(joined, _, _)| joined).max();
+        latest_ahead = latest_ahead.max(joined_here);
+    }
+    (count, most)
+}
+
+/// How many were let in more than [`let_in_slack`] after someone behind them
+/// in line, or never while someone behind them was; how many of those were
+/// never let in; and the furthest anyone let in was: for each visitor, the
+/// earliest let in among those behind them.
+fn let_in_late(placed: &mut [Placed]) -> (usize, usize, SignedDuration) {
+    placed.sort_unstable_by_key(|&(_, place, _)| std::cmp::Reverse(place));
+    let (mut count, mut never, mut most) = (0, 0, SignedDuration::ZERO);
+    let mut earliest_behind: Option<u64> = None;
+    for same_place in placed.chunk_by(|a, b| a.1 == b.1) {
+        if let Some(behind) = earliest_behind {
+            for &(_, _, let_in) in same_place {
+                match let_in {
+                    LetIn::At(at) => {
+                        let by = SignedDuration::from_millis(
+                            i64::try_from(at.saturating_sub(behind)).unwrap_or(i64::MAX),
+                        );
+                        most = most.max(by);
+                        if by > let_in_slack() {
+                            count += 1;
+                        }
+                    }
+                    LetIn::Never => {
+                        count += 1;
+                        never += 1;
+                    }
+                }
+            }
+        }
+        let let_in_here = same_place
+            .iter()
+            .filter_map(|&(_, _, l)| match l {
+                LetIn::At(at) => Some(at),
+                LetIn::Never => None,
+            })
+            .min();
+        earliest_behind = earliest_behind.into_iter().chain(let_in_here).min();
+    }
+    (count, never, most)
 }
 
 /// How those who joined before the draw closed fared against those who
@@ -646,12 +749,28 @@ pub fn build(e: &Evidence<'_>) -> Report {
         ),
     );
     r.check(
-        "Those who joined after the draw closed are let in in the order they joined, to within a few seconds",
-        turn.after_out_of_order == 0,
+        "Those who joined after the draw closed are numbered in the order they joined, to within a few seconds",
+        turn.after_misnumbered == 0,
         format!(
-            "{} let in while someone who joined over {} s before them was still waiting, {} of \
-             them ahead of someone who was never let in; the most out of order {:.1} s; {} let \
-             in who were not among the first to join after the draw closed",
+            "{} numbered behind someone who joined over {} s after them; the most out of order \
+             {:.1} s",
+            turn.after_misnumbered,
+            ORDER_SLACK.as_secs(),
+            turn.after_most_misnumbered.as_secs_f64(),
+        ),
+    );
+    r.check(
+        "Those who joined after the draw closed are let in in line order, to within a few seconds",
+        turn.after_let_in_late == 0,
+        format!(
+            "{} let in over {:.1} s after someone behind them in line, {} of them never let in; \
+             the most {:.1} s. By join time: {} let in while someone who joined over {} s before them \
+             was still waiting, {} of them ahead of someone never let in, the most {:.1} s; {} \
+             let in who were not among the first to join after the draw closed",
+            turn.after_let_in_late,
+            let_in_slack().as_secs_f64(),
+            turn.after_never_let_in,
+            turn.after_most_let_in_late.as_secs_f64(),
             turn.after_out_of_order,
             ORDER_SLACK.as_secs(),
             turn.after_ahead_of_never,
@@ -962,6 +1081,11 @@ mod tests {
                 after_ahead_of_never: 0,
                 after_beyond_the_first: 0,
                 after_most_ahead: SignedDuration::from_secs(10),
+                after_misnumbered: 0,
+                after_most_misnumbered: SignedDuration::ZERO,
+                after_let_in_late: 0,
+                after_never_let_in: 0,
+                after_most_let_in_late: SignedDuration::ZERO,
             }
         );
     }
@@ -1033,6 +1157,78 @@ mod tests {
                 ..OutOfTurn::default()
             }
         );
+    }
+
+    fn placed(joined_at: i64, place: u64, admitted_ms: Option<u64>, outcome: Outcome) -> Record {
+        Record {
+            position: Some(place),
+            ..joined(Timestamp::constant(joined_at, 0), admitted_ms, outcome)
+        }
+    }
+
+    #[test]
+    fn the_let_in_slack_is_the_poll_floor_with_its_jitter_and_the_cache() {
+        assert_eq!(let_in_slack(), SignedDuration::from_millis(7_500));
+    }
+
+    #[test]
+    fn a_place_behind_someone_who_joined_well_after_is_misnumbered() {
+        let records = [
+            placed(100, 2, Some(1_000), Outcome::Admitted),
+            placed(103, 1, Some(1_000), Outcome::Admitted),
+            placed(110, 0, Some(1_000), Outcome::Admitted),
+        ];
+        let turn = out_of_turn(&records, Timestamp::constant(100, 0));
+        // 100 and 103 are behind 110; 103 is behind it by only 7 s, 100 by 10.
+        assert_eq!(turn.after_misnumbered, 2);
+        assert_eq!(turn.after_most_misnumbered, SignedDuration::from_secs(10));
+    }
+
+    #[test]
+    fn numbering_within_the_slack_is_measured_but_not_misnumbered() {
+        let records = [
+            placed(100, 1, Some(1_000), Outcome::Admitted),
+            placed(104, 0, Some(1_000), Outcome::Admitted),
+        ];
+        let turn = out_of_turn(&records, Timestamp::constant(100, 0));
+        assert_eq!(turn.after_misnumbered, 0);
+        assert_eq!(turn.after_most_misnumbered, SignedDuration::from_secs(4));
+    }
+
+    #[test]
+    fn let_in_well_after_someone_behind_in_line_is_late() {
+        let records = [
+            placed(100, 0, Some(20_000), Outcome::Admitted),
+            placed(101, 1, Some(15_000), Outcome::Admitted),
+            placed(102, 2, Some(12_000), Outcome::Admitted),
+        ];
+        let turn = out_of_turn(&records, Timestamp::constant(100, 0));
+        // Place 0 is 8 s after place 2; place 1 only 3 s after it.
+        assert_eq!((turn.after_let_in_late, turn.after_never_let_in), (1, 0));
+        assert_eq!(turn.after_most_let_in_late, SignedDuration::from_secs(8));
+    }
+
+    #[test]
+    fn never_let_in_while_someone_behind_was_is_late() {
+        let records = [
+            placed(100, 0, None, Outcome::Left),
+            placed(101, 1, Some(5_000), Outcome::Admitted),
+            // Nobody behind place 2 was let in, so it owed nobody.
+            placed(102, 2, None, Outcome::StillWaiting),
+        ];
+        let turn = out_of_turn(&records, Timestamp::constant(100, 0));
+        assert_eq!((turn.after_let_in_late, turn.after_never_let_in), (1, 1));
+        assert_eq!(turn.after_most_let_in_late, SignedDuration::ZERO);
+    }
+
+    #[test]
+    fn those_sharing_a_place_are_not_behind_one_another() {
+        let records = [
+            placed(100, 5, Some(30_000), Outcome::Admitted),
+            placed(120, 5, Some(1_000), Outcome::Admitted),
+        ];
+        let turn = out_of_turn(&records, Timestamp::constant(100, 0));
+        assert_eq!((turn.after_misnumbered, turn.after_let_in_late), (0, 0));
     }
 
     #[test]

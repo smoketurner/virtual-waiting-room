@@ -227,6 +227,25 @@ impl Visitor<'_> {
         tokio::time::sleep(Duration::from_secs_f64(ms.max(0.0) / 1000.0)).await;
     }
 
+    /// The page's `closedIntervalMs`: the ceiling, but never past the moment
+    /// the open can be written, jitter included, and the floor once it has
+    /// come.
+    fn closed_interval(&self, starts_at: Option<&serde_json::Value>) -> f64 {
+        let Some(starts_at) = starts_at
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|secs| jiff::Timestamp::from_second(secs).ok())
+        else {
+            return self.policy.ceiling;
+        };
+        let openable = starts_at
+            .checked_add(wr_common::DRAW_GRACE)
+            .unwrap_or(jiff::Timestamp::MAX);
+        let openable_in_ms = openable.duration_since(crate::clock::now()).as_secs_f64() * 1000.0;
+        (openable_in_ms / (1.0 + JITTER_FRACTION))
+            .floor()
+            .clamp(self.policy.floor, self.policy.ceiling)
+    }
+
     /// The page's failure backoff: double the interval, up to the ceiling.
     fn back_off(&mut self) {
         let doubled = if self.backoff_ms > 0.0 {
@@ -400,7 +419,7 @@ impl Visitor<'_> {
                         return Outcome::Left;
                     }
                     known = None;
-                    self.next_ms = self.policy.ceiling;
+                    self.next_ms = self.closed_interval(s.get("starts_at"));
                     if s.get("phase").and_then(|v| v.as_str()) == Some("pre_queue") {
                         if let Err(why) = self.join(Joining::Countdown).await {
                             return Outcome::GaveUp(why);
@@ -437,9 +456,14 @@ impl Visitor<'_> {
             }
             let position = if let Some(p) = known {
                 p
-            } else if !self.joined || self.first_ask_at.is_some_and(|t| Instant::now() < t) {
-                // No accepted join yet, or inside the first-ask spread.
+            } else if !self.joined {
                 self.next_ms = self.policy.floor;
+                self.pause().await;
+                continue;
+            } else if let Some(at) = self.first_ask_at.filter(|t| Instant::now() < *t) {
+                // Inside the first-ask spread: asked at the moment drawn for it.
+                let left = at.saturating_duration_since(Instant::now());
+                self.next_ms = self.policy.floor.min(left.as_secs_f64() * 1000.0);
                 self.pause().await;
                 continue;
             } else {

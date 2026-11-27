@@ -40,7 +40,7 @@ activation queues first-in, first-out (FIFO).
 
 | ID | Requirement | Acceptance |
 |---|---|---|
-| F2.1 | The system MUST accept joins after the event opens, assigning positions in arrival order. | A visitor joining at T+5min receives a position after all pre-queue participants; joins after the draw closes are let in in the order SQS accepted them, to within a few seconds. |
+| F2.1 | The system MUST accept joins after the event opens, assigning positions in arrival order. | A visitor joining at T+5min receives a position after all pre-queue participants; joins after the draw closes are numbered in the order SQS accepted them, to within a few seconds, and let in in line order, to within one poll, while the API is not saturated. |
 | F2.2 | Each visitor MUST receive a unique queue position. No position may be issued twice. | Under concurrent load, the set of issued positions contains zero duplicates. |
 | F2.3 | Queue positions MAY contain gaps. | Not a defect. Gap rate is measured and reported, not eliminated. |
 | F2.4 | The client MUST supply its own request identifier (UUIDv7) when joining. | A join with no request id, or one longer than a UUID, is rejected at the gateway with 400. One that is not UUID-shaped is accepted and dropped by `assign_position` without a position; the version is not checked. |

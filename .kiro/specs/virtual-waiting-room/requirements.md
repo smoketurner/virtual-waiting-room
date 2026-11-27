@@ -79,7 +79,7 @@ activation queues FIFO.
 
 **F2.1** — As a live arrival, I want a position behind the pre-queue.
 - WHEN a visitor joins after the event opens, THE SYSTEM SHALL assign a position in arrival order.
-- Acceptance: A visitor joining at T+5min receives a position after all pre-queue participants; joins after the draw closes are let in in the order SQS accepted them, to within a few seconds.
+- Acceptance: A visitor joining at T+5min receives a position after all pre-queue participants; joins after the draw closes are numbered in the order SQS accepted them, to within a few seconds, and let in in line order, to within one poll, while the API is not saturated.
 
 **F2.2** — As a visitor, I want a unique position.
 - THE SYSTEM SHALL NOT issue any queue position twice.

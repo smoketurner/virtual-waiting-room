@@ -446,7 +446,11 @@ impl Functions {
                 event_id: EVENT_ID.to_owned(),
                 counters_cache: read::CountersCache::new(Duration::from_secs(1)),
                 // The policy the dev root ships.
-                poll_policy: read::parse_poll_policy(Some("5000"), Some("30000"), Some("10")),
+                poll_policy: read::parse_poll_policy(
+                    Some(&scenario::POLL_FLOOR.as_millis().to_string()),
+                    Some("30000"),
+                    Some("10"),
+                ),
                 session,
                 monotonic: clock::monotonic,
             },

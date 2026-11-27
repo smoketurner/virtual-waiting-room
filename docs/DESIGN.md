@@ -678,8 +678,8 @@ and ~5 requests per iOS discard-and-reload.
   `/status` fetch a second throughout. 66,900 of the crowd (13%) joined behind the cohort: the
   last minute's joins exceed API Gateway's 7,000/s join limit (242,885 refusals), and a retry
   accepted after the draw closed is a live join.
-- **No T−0 herd.** Open discovery spreads over the ~39 s ceiling jitter plus `scheduleFirstAsk`'s
-  window of up to 120 s, so peak `/_wr/v1/queue_num` load is no higher than that spread alone:
+- **No T−0 herd.** Pages see the open within a poll at the floor, and `scheduleFirstAsk` spreads
+  the first ask over up to 120 s, so peak `/_wr/v1/queue_num` load is no higher than that spread:
   about 8,500/s at a million, under API Gateway's 10,000/s default
   ([#84](https://github.com/smoketurner/virtual-waiting-room/issues/84)).
 

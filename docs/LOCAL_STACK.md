@@ -71,8 +71,12 @@ arrival to admission 302 s at the median.
 - A cohort position is uncorrelated with when the visitor registered.
 - Every join accepted before the draw closes (15 s after the start) is in the cohort, not
   numbered behind it.
-- Nobody who joined after the draw closed takes a spot someone who joined before it needed, and
-  those who joined after it are let in in the order they joined, to within a few seconds.
+- Nobody who joined after the draw closed takes a spot someone who joined before it needed.
+- Those who joined after the draw closed are numbered in the order they joined, to within 5 s, and
+  let in in line order, to within 7.5 s: the poll floor plus its 30% jitter plus a `/status` up to
+  a second old, the time a page called with others takes to learn of it. The report also gives how
+  far apart they were let in by join time, which is not checked: when joins are sparse, one call
+  spans many seconds of joining.
 - No more sessions are ever live than `--concurrency`, counted from the session end each
   `generate_token` answer gives.
 - The origin holds at least 85% of its spots from the first admission to the last.

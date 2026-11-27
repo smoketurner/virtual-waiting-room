@@ -276,7 +276,10 @@ async fn run() -> Result<Verdict> {
         environments: args.read_envs,
         max_environments: args.max_environments,
         env: common(&[
-            ("POLL_FLOOR_MS", "5000".to_owned()),
+            (
+                "POLL_FLOOR_MS",
+                scenario::POLL_FLOOR.as_millis().to_string(),
+            ),
             ("POLL_CEILING_MS", "30000".to_owned()),
             ("POLL_DIVISOR", "10".to_owned()),
             (

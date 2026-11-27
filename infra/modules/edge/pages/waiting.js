@@ -43,6 +43,10 @@
   // the same few seconds as one at the floor. 0.3 at the floor gives
   // 5000..6500ms — the same window this client always used.
   var JITTER_FRACTION = 0.3;
+  // The draw closes this long after the start (wr_common::DRAW_GRACE), and
+  // the open is written after it. A closed page does not sleep past it: one
+  // that did would learn its number late, behind people who joined after it.
+  var DRAW_GRACE_MS = 15000;
   // Bounds a published policy must fall within to be trusted; see adoptPolicy.
   var MIN_MS = 1000;
   var MAX_MS = 300000;
@@ -377,6 +381,20 @@
 
   function jitter() {
     return Math.round(nextIntervalMs * (1 + Math.random() * JITTER_FRACTION));
+  }
+
+  // How long a closed event's page waits: the ceiling, but never past the
+  // moment the open can be written, jitter included, and the floor once that
+  // moment has come.
+  function closedIntervalMs(startsAt) {
+    if (typeof startsAt !== "number" || !isFinite(startsAt)) {
+      return policy.ceilingMs;
+    }
+    var openableIn = startsAt * 1000 + DRAW_GRACE_MS - Date.now();
+    return Math.min(
+      policy.ceilingMs,
+      Math.max(policy.floorMs, Math.floor(openableIn / (1 + JITTER_FRACTION)))
+    );
   }
 
   function say(headline, sub) {
@@ -1091,7 +1109,7 @@
           // that no longer exists — an operator who resets an event opens a new
           // one with a different permutation.
           forgetPosition();
-          nextIntervalMs = policy.ceilingMs;
+          nextIntervalMs = closedIntervalMs(s.starts_at);
           // A scheduled event counts down to its start; an unscheduled one has
           // no moment to name, so it keeps the original text. Branch rather
           // than render then overwrite -- both write the same two elements.
@@ -1192,8 +1210,9 @@
             if (q === null) {
               // Inside the spread window. The queue is open and moving, and
               // saying so is more honest than a spinner — this visitor has a
-              // number already, it just has not been asked for yet.
-              nextIntervalMs = policy.floorMs;
+              // number already, it just has not been asked for yet. Asked at
+              // the moment drawn for it, not a poll later.
+              nextIntervalMs = Math.min(policy.floorMs, firstAskAt - Date.now());
               say("You're in line", "Finding your number…");
               return schedule();
             }
