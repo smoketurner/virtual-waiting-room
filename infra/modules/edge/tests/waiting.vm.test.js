@@ -486,6 +486,46 @@ test("a redemption answered 'gone' drops the place and stops", async () => {
   assert.equal(client.win.localStorage.getItem("vwr_identity"), null);
 });
 
+// A turn that passed before the page took it: the spot went to the next
+// place in line, so the page takes a new place at the back and says why.
+test("a redemption answered 'turn passed' takes a new place and keeps waiting", async () => {
+  const admitted = admittedRoute();
+  let missed = true;
+  let draw = 0;
+  const client = loadClient({
+    // A fresh identity each time one is minted, so the new place is told apart.
+    randomValues: (a) => a.fill((draw += 1)),
+    route: (url) => {
+      if (url.startsWith("/_wr/v1/generate_token") && missed) {
+        missed = false;
+        return jsonResponse(410, {
+          admitted: false,
+          error: "the turn for position 50 has passed",
+          reason: "turn_missed",
+        });
+      }
+      return admitted(url);
+    },
+  });
+  await client.flush();
+  assert.equal(client.win.location.replacedTo, undefined);
+  assert.notEqual(client.lastTimer(), undefined, "still waiting");
+  assert.match(client.elements.headline.textContent, /turn passed/);
+  const identity = client.win.localStorage.getItem("vwr_identity");
+  assert.ok(identity, "a new identity is stored");
+
+  // The next poll joins again, under the new identity.
+  const joinsBefore = client.calls.filter((c) => c.url.startsWith("/_wr/v1/join")).length;
+  client.clock.now += client.lastTimer().ms;
+  client.fireLastTimer();
+  await client.flush();
+  const joins = client.calls.filter((c) => c.url.startsWith("/_wr/v1/join"));
+  assert.equal(joins.length, joinsBefore + 1, "joined again");
+  const rejoined = JSON.parse(joins[joins.length - 1].opts.body).request_id;
+  assert.equal(rejoined, identity.split(".")[0]);
+  assert.notEqual(rejoined, JSON.parse(joins[0].opts.body).request_id);
+});
+
 // ADR-0039: the visitor's turn has come but the admission budget is spent.
 test("a redemption answered 'at capacity' keeps polling and is admitted on a later try", async () => {
   const admitted = admittedRoute();
@@ -920,4 +960,81 @@ test("the freshness stamp updates on every status poll, number or not", async ()
   client.fireLastTimer();
   await client.flush();
   assert.notEqual(client.elements["updated-at"].textContent, first, "moves on the next poll");
+});
+
+// --- the open: a page does not sleep through it ------------------------------
+
+function closedStatus(startsAt) {
+  return () =>
+    jsonResponse(200, {
+      event_id: "e",
+      phase: "pre_queue",
+      serving_state: "closed",
+      starts_at: startsAt,
+      poll_policy: POLICY,
+    });
+}
+
+function closedRoute(statusFor) {
+  return (url) => {
+    if (url.startsWith("/_wr/v1/status")) {
+      return statusFor();
+    }
+    return jsonResponse(200, {}); // /_wr/v1/join
+  };
+}
+
+test("a closed page wakes no later than the moment the open can be written", async () => {
+  const now = 1_700_000_000_000;
+  // Starts in 5 s: the draw closes, and the open can be written, in 20 s.
+  const startsAt = now / 1000 + 5;
+  const client = loadClient({ now, route: closedRoute(closedStatus(startsAt)) });
+  await client.flush();
+  client.fireLastTimer(); // the first poll registered; this one waits
+  await client.flush();
+  const ms = client.lastTimer().ms;
+  assert.ok(ms >= FLOOR, `not under the floor: ${ms}`);
+  assert.ok(ms <= 20_000, `wakes by the open, jitter included: ${ms}`);
+});
+
+test("a closed page past its start asks at the floor until the open lands", async () => {
+  const now = 1_700_000_000_000;
+  const client = loadClient({ now, route: closedRoute(closedStatus(now / 1000 - 30)) });
+  await client.flush();
+  for (let i = 0; i < 3; i += 1) {
+    client.fireLastTimer();
+    await client.flush();
+    const ms = client.lastTimer().ms;
+    assert.ok(ms >= FLOOR && ms <= FLOOR * 1.3, `poll ${i} waits ${ms} ms`);
+  }
+});
+
+test("a closed page with no start time keeps the ceiling", async () => {
+  const client = loadClient({ route: closedRoute(closedStatus(undefined)) });
+  await client.flush();
+  client.fireLastTimer();
+  await client.flush();
+  assert.ok(client.lastTimer().ms >= CEILING);
+});
+
+test("after the open a page asks for its number at the moment drawn for it", async () => {
+  const random = Math.random;
+  // The draw lands 10% into a 10 s spread: 1 s after the open is seen.
+  Math.random = () => 0.1;
+  try {
+    const client = loadClient({
+      route: route(activeStatus({ participant_count: 50_000, poll_policy: POLICY }), 100),
+    });
+    await client.flush();
+    const asks = () => client.calls.filter((c) => c.url.startsWith("/_wr/v1/queue_num")).length;
+    assert.equal(asks(), 0, "not asked inside the spread");
+    const t = client.lastTimer();
+    assert.ok(t.ms <= 1_000 * 1.3, `waits for the drawn moment, not a poll: ${t.ms} ms`);
+    client.clock.now += t.ms;
+    client.fireLastTimer();
+    await client.flush();
+    assert.equal(asks(), 1, "asked once the moment has come");
+  } finally {
+    Math.random = random;
+  }
 });

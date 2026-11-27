@@ -16,7 +16,7 @@ use std::future::Future;
 
 use wr_common::{
     Counters, Phase, PositionStatus, PossessionSecret, PreQueueItem, ResolveError,
-    ResolvedPosition, SecretDigest, Session, Shard, SigningKey,
+    ResolvedPosition, SHARDS, SecretDigest, Session, Shard, Shelf, SigningKey, TurnState,
 };
 
 pub mod dynamo;
@@ -48,16 +48,16 @@ pub trait Store {
         request_id: &str,
     ) -> impl Future<Output = Result<Option<PositionRow>, StoreError>> + Send;
 
-    /// Takes one unit of the admission budget from `shard`, reporting whether
-    /// there was one to take (ADR-0039).
+    /// Takes one held spot from counter `shard` on `shelf`, reporting whether
+    /// there was one to take.
     ///
-    /// One conditional `ADD` on the arrivals shard, allowed only while its
-    /// count is below the cap the controller last wrote. It is both the meter
-    /// and the count: the controller reads the same number to see how much of
-    /// what it granted was used.
-    fn take_slot(
+    /// One conditional `ADD` on the arrivals counter, allowed only while its
+    /// count is below the cap the controller wrote. It is both the meter and
+    /// the count: the controller reads the same number to see who was let in.
+    fn take_spot(
         &self,
         event_id: &str,
+        shelf: Shelf,
         shard: Shard,
     ) -> impl Future<Output = Result<bool, StoreError>> + Send;
 
@@ -108,11 +108,15 @@ pub enum Denied {
     /// The stored registration is corrupt.
     #[error("corrupt registration")]
     Corrupt,
-    /// The visitor's turn has come, but the origin is taking no more people
-    /// this moment: the admission budget is spent until the controller's next
-    /// pass (ADR-0039). Not a refusal of the visitor -- they ask again.
+    /// The visitor's number was called, but their held spot is not there to
+    /// take yet: the controller has called them and not yet written where it
+    /// is held. Not a refusal of the visitor -- they ask again.
     #[error("at capacity; position {position} is next")]
     AtCapacity { position: u64 },
+    /// The visitor's number was called and their turn passed before they took
+    /// it. Their spot went to the next place in line; they take a new place.
+    #[error("the turn for position {position} has passed")]
+    TurnMissed { position: u64 },
     /// The visitor was admitted, and the visit that admission bought is over:
     /// a session lasts its lifetime from the first admission, however often it
     /// is asked for again (issue #237). They take a new place.
@@ -132,15 +136,11 @@ pub struct Grant {
     pub digest: SecretDigest,
     /// When this visitor was first admitted, if they have been. They are
     /// entitled to their session again until it runs out, and have already
-    /// taken their unit of budget.
+    /// taken their spot.
     pub admitted_at: Option<Timestamp>,
+    /// Where this visitor's held spot is, if they have not yet taken it.
+    pub shelf: Option<Shelf>,
 }
-
-/// How many shards one admission tries before answering "at capacity". The
-/// budget is spread evenly and takes land at random, so near the end of an
-/// interval one shard can be spent while others are not; a few draws find the
-/// room without turning a spent budget into ten refused writes per request.
-pub const SLOT_ATTEMPTS: u32 = 3;
 
 /// What a minted session is signed with and scoped to.
 pub struct Minting<'a> {
@@ -222,7 +222,10 @@ pub async fn admit<S: Store>(
     let admitted_at = if let Some(at) = grant.admitted_at {
         at
     } else {
-        if !take_any_slot(store, minting.event_id).await {
+        let Some(shelf) = grant.shelf else {
+            return Ok(Admission::Refused(Denied::Corrupt));
+        };
+        if !take_held_spot(store, minting.event_id, shelf).await {
             return Ok(Admission::Refused(Denied::AtCapacity {
                 position: grant.position,
             }));
@@ -275,26 +278,27 @@ pub async fn admit<S: Store>(
     })
 }
 
-/// Tries up to [`SLOT_ATTEMPTS`] randomly drawn shards for a unit of budget.
-///
-/// A failure to draw or to write is "no unit", not "admit anyway": the budget
-/// is what keeps the origin at its rate, so an admission that cannot be
-/// metered is not made. The visitor asks again on their next poll. Both
-/// failures are alarmed, because one that persists stops admission entirely.
-async fn take_any_slot<S: Store>(store: &S, event_id: &str) -> bool {
-    for _ in 0..SLOT_ATTEMPTS {
-        let shard = match Shard::random() {
-            Ok(shard) => shard,
-            Err(e) => {
-                tracing::error!(error = %e, event = "arrival_shard_draw_failed", "failed to draw a random shard; not admitting");
-                return false;
-            }
+/// Takes the visitor's held spot from their shelf. The call's spots are
+/// spread evenly over the shelf's counters and taken at random, so one counter
+/// can be empty while another still has this visitor's spot: every counter is
+/// tried, from a random one, before answering "at capacity".
+async fn take_held_spot<S: Store>(store: &S, event_id: &str, shelf: Shelf) -> bool {
+    let start = match Shard::random() {
+        Ok(shard) => shard.index(),
+        Err(e) => {
+            tracing::error!(error = %e, event = "arrival_shard_draw_failed", "failed to draw a random shard; not admitting");
+            return false;
+        }
+    };
+    for step in 0..SHARDS {
+        let Some(shard) = Shard::new((start + step) % SHARDS) else {
+            continue;
         };
-        match store.take_slot(event_id, shard).await {
+        match store.take_spot(event_id, shelf, shard).await {
             Ok(true) => return true,
             Ok(false) => {}
             Err(e) => {
-                tracing::error!(error = %e, event = "arrival_record_failed", "failed to take a unit of the admission budget; not admitting");
+                tracing::error!(error = %e, event = "arrival_record_failed", "failed to take a held spot; not admitting");
                 return false;
             }
         }
@@ -373,26 +377,42 @@ pub fn decide(
         });
     }
 
+    let admitted_at = match position_row {
+        Some(&PositionRow {
+            status: PositionStatus::Admitted,
+            admitted_at,
+            ..
+        }) => {
+            // A row marked admitted with no time is not one this code
+            // writes. Treating it as admitted at the epoch refuses it as
+            // expired, which is the direction that mints nothing.
+            Some(admitted_at.unwrap_or(Timestamp::UNIX_EPOCH))
+        }
+        Some(&PositionRow {
+            status: PositionStatus::Issued,
+            ..
+        })
+        | None => None,
+    };
+    // Someone already let in has their session back whenever they ask; only
+    // a visitor taking their turn needs it still to be held.
+    let shelf = match (admitted_at, counters.turn_of(position, now)) {
+        (Some(_), _) => None,
+        (None, TurnState::Held(shelf)) => Some(shelf),
+        (None, TurnState::Missed) => return Err(Denied::TurnMissed { position }),
+        (None, TurnState::NotCalled) => {
+            return Err(Denied::StillQueued {
+                position,
+                serving: counters.serving_counter,
+            });
+        }
+    };
+
     Ok(Grant {
         position,
         digest,
-        admitted_at: match position_row {
-            Some(&PositionRow {
-                status: PositionStatus::Admitted,
-                admitted_at,
-                ..
-            }) => {
-                // A row marked admitted with no time is not one this code
-                // writes. Treating it as admitted at the epoch refuses it as
-                // expired, which is the direction that mints nothing.
-                Some(admitted_at.unwrap_or(Timestamp::UNIX_EPOCH))
-            }
-            Some(&PositionRow {
-                status: PositionStatus::Issued,
-                ..
-            })
-            | None => None,
-        },
+        admitted_at,
+        shelf,
     })
 }
 
@@ -490,7 +510,17 @@ mod tests {
             stored_control: StoredControl::Open,
             fail_open_until: None,
             starts_at: None,
+            // One call, at the tests' time, holding everyone it called.
+            calls: vec![wr_common::Call {
+                first: 0,
+                until: Timestamp::constant(0, 0) + wr_common::TURN_HOLD,
+                shelf: shelf(),
+            }],
         }
+    }
+
+    fn shelf() -> Shelf {
+        Shelf::new(0).unwrap()
     }
 
     const REQ: &str = "018f3a2b-7c9d-7e1f-abcd-0123456789ab";
@@ -610,7 +640,9 @@ mod tests {
             .unwrap_err(),
             Denied::NotAdmitting
         );
-        // Once the epoch lapses, the stored Open control governs again.
+        // Once the epoch lapses, the stored Open control governs again, and
+        // the controller's next pass calls them.
+        c.calls[0].until = Timestamp::constant(1000, 0) + wr_common::TURN_HOLD;
         assert!(
             decide(
                 &c,
@@ -648,17 +680,61 @@ mod tests {
     }
 
     #[test]
+    fn a_called_visitor_whose_turn_passed_is_refused() {
+        let passed = Timestamp::constant(0, 0) + wr_common::TURN_HOLD;
+        assert_eq!(
+            decide(
+                &counters(10),
+                None,
+                Some(&row(3, PositionStatus::Issued)),
+                &secret(),
+                passed
+            ),
+            Err(Denied::TurnMissed { position: 3 })
+        );
+        // Called with no call kept that covers them: long past their turn.
+        let mut c = counters(10);
+        c.calls.clear();
+        assert_eq!(
+            decide(
+                &c,
+                None,
+                Some(&row(3, PositionStatus::Issued)),
+                &secret(),
+                Timestamp::constant(0, 0)
+            ),
+            Err(Denied::TurnMissed { position: 3 })
+        );
+    }
+
+    #[test]
+    fn a_visitor_already_let_in_has_their_session_back_after_their_turn() {
+        let passed = Timestamp::constant(0, 0) + wr_common::TURN_HOLD;
+        let grant = decide(
+            &counters(10),
+            None,
+            Some(&row(3, PositionStatus::Admitted)),
+            &secret(),
+            passed,
+        )
+        .unwrap();
+        assert_eq!(grant.shelf, None);
+        assert!(grant.admitted_at.is_some());
+    }
+
+    #[test]
     fn an_already_admitted_visitor_is_admitted_again() {
         // Their first response may never have reached them, or they reloaded.
         // Refusing would strand a visitor holding a position that is still
         // theirs, for a failure that was not theirs. What being admitted
         // already governs is whether a second unit of budget is taken, which
         // the grant reports and `admit` acts on.
-        for (status, admitted_at) in [
-            (PositionStatus::Issued, None),
+        for (status, admitted_at, held) in [
+            (PositionStatus::Issued, None, Some(shelf())),
             (
                 PositionStatus::Admitted,
                 Some(Timestamp::constant(1_700_000_000, 0)),
+                None,
             ),
         ] {
             assert_eq!(
@@ -674,6 +750,7 @@ mod tests {
                     position: 3,
                     digest: digest(),
                     admitted_at,
+                    shelf: held,
                 }
             );
         }

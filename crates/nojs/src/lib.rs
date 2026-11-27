@@ -345,6 +345,9 @@ pub enum WaitPage {
     /// The identity is not the one this place was taken with. Forgotten, so
     /// the form comes back.
     Lost,
+    /// The visitor's turn passed before they took it, and their spot went to
+    /// the next place in line. Forgotten, so the form comes back.
+    TurnMissed,
     /// The join was sent [`MAX_REJOINS`] more times and never registered
     /// (issue #251). Forgotten, so the form comes back.
     JoinLost,
@@ -358,7 +361,7 @@ impl WaitPage {
     #[must_use]
     pub const fn refresh_secs(&self) -> Option<u64> {
         match self {
-            Self::NotInLine | Self::Lost | Self::JoinLost => None,
+            Self::NotInLine | Self::Lost | Self::TurnMissed | Self::JoinLost => None,
             Self::Joining => Some(5),
             Self::Queued { ahead, .. } => Some(if *ahead < 100 { 5 } else { 20 }),
             Self::Holding => Some(30),
@@ -377,7 +380,7 @@ pub fn outcome(admission: Admission) -> WaitOutcome {
                 position,
                 ahead: position.saturating_sub(serving),
             },
-            // Their turn has come and the origin is full for the moment: the
+            // Their number is called and their spot is not written yet: the
             // front of the line, refreshing at the short interval.
             Denied::AtCapacity { position } => WaitPage::Queued { position, ahead: 0 },
             Denied::NotRegistered => WaitPage::Joining,
@@ -385,6 +388,7 @@ pub fn outcome(admission: Admission) -> WaitOutcome {
             // A used-up place is, for this visitor, the same as one that is
             // not theirs: nothing here can be redeemed, and they start again.
             Denied::NotHolder | Denied::SessionExpired => WaitPage::Lost,
+            Denied::TurnMissed { .. } => WaitPage::TurnMissed,
             Denied::Corrupt => WaitPage::Unavailable,
         }),
         Admission::EventNotFound | Admission::SignFailed => {
@@ -630,6 +634,7 @@ mod tests {
             (Denied::NotAdmitting, WaitPage::Holding),
             (Denied::NotOpen, WaitPage::Holding),
             (Denied::NotHolder, WaitPage::Lost),
+            (Denied::TurnMissed { position: 7 }, WaitPage::TurnMissed),
             (Denied::Corrupt, WaitPage::Unavailable),
         ] {
             assert_eq!(outcome(Admission::Refused(denied)), WaitOutcome::Show(page));
@@ -644,6 +649,7 @@ mod tests {
     fn a_page_that_can_change_refreshes_and_one_that_cannot_does_not() {
         assert_eq!(WaitPage::NotInLine.refresh_secs(), None);
         assert_eq!(WaitPage::Lost.refresh_secs(), None);
+        assert_eq!(WaitPage::TurnMissed.refresh_secs(), None);
         assert_eq!(WaitPage::JoinLost.refresh_secs(), None);
         assert_eq!(
             WaitPage::Queued {

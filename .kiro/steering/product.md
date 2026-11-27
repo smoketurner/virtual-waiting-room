@@ -45,10 +45,11 @@ so only the scheduled mode is served end to end.
   is not the write count — it is that a published seed, offsets and count let a third party
   recompute every position (F1.5). That checks the arithmetic, not that the seed was drawn
   fairly (ADR-0040).
-- **Closed-loop admission.** Admissions are metered against a budget of the origin's free slots,
-  so no more than `origin_concurrency` sessions are ever live, and budget nobody took releases
-  more of the queue, so no-shows are compensated and the origin runs at the capacity the operator
-  paid for.
+- **Closed-loop admission.** Each controller pass calls as many places in line as the origin
+  has free spots and holds a spot for each, so no more than `origin_concurrency` sessions are
+  ever live. A visitor who does not take their spot in time misses their turn and the spot is
+  called for the next place in line, so no-shows are compensated without anyone taking another
+  visitor's turn, and the origin runs near the capacity the operator paid for (ADR-0043).
 - **Fails open.** If the waiting room is unavailable, visitors reach the site. A waiting room
   that fails closed turns its own outage into the operator's.
   **Only half-held today** (#58): the mechanism exists — an operator engages fail-open and the

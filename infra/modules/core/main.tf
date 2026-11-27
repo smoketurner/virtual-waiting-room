@@ -355,6 +355,7 @@ resource "aws_lambda_function" "assign_position" {
       PREQUEUE_TABLE  = aws_dynamodb_table.prequeue.name
       POSITIONS_TABLE = aws_dynamodb_table.positions.name
       EVENT_ID        = var.event_id
+      JOIN_QUEUE_URL  = aws_sqs_queue.join.url
     })
   }
 

@@ -8,7 +8,7 @@ use aws_sdk_dynamodb::operation::get_item::builders::GetItemFluentBuilder;
 use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
 use aws_sdk_dynamodb::types::AttributeValue;
 use wr_common::expr::{Condition, Expression, Key, Update};
-use wr_common::{Phase, SHARDS, Shard, shard_count_of, shard_index_of};
+use wr_common::{Counters, Phase, SHARDS, Shard, shard_count_of, shard_index_of};
 
 use crate::{OpenValues, Store, StoreError};
 
@@ -61,15 +61,18 @@ impl DynamoStore {
     }
 }
 
-impl Store for DynamoStore {
-    async fn read_shard_counts(&self, event_id: &str) -> Result<[u64; SHARDS], StoreError> {
-        // One BatchGetItem across the ten shard items rather than one GetItem
-        // on a shared one. The shards are separate partition keys precisely so
-        // registration writes do not contend, which means the open has to
-        // gather them.
+impl DynamoStore {
+    /// One family of ten shard counts. One `BatchGetItem` across the ten shard
+    /// items rather than one `GetItem` on a shared one: the shards are separate
+    /// partition keys precisely so their writes do not contend, which means
+    /// the open has to gather them.
+    async fn read_counts<'k>(
+        &self,
+        key: impl Fn(Shard) -> Key<'k>,
+    ) -> Result<[u64; SHARDS], StoreError> {
         let keys: Vec<_> = (0..SHARDS)
             .filter_map(Shard::new)
-            .map(|shard| Key::PrequeueShard { event_id, shard }.build())
+            .map(|shard| key(shard).build())
             .collect();
 
         let request = aws_sdk_dynamodb::types::KeysAndAttributes::builder()
@@ -102,6 +105,31 @@ impl Store for DynamoStore {
             .and_then(|r| r.get(&self.counters_table))
             .map_or_default(Vec::as_slice);
         counts_from_shard_items(items)
+    }
+}
+
+impl Store for DynamoStore {
+    async fn load_counters(&self, event_id: &str) -> Result<Option<Counters>, StoreError> {
+        let out = self
+            .client
+            .get_item()
+            .table_name(&self.counters_table)
+            .set_key(Some(Key::Event { event_id }.build()))
+            .consistent_read(true)
+            .send()
+            .await
+            .map_err(|e| StoreError(format!("get counters: {e}")))?;
+        Ok(out.item().map(|item| Counters::from_item(event_id, item)))
+    }
+
+    async fn read_shard_counts(&self, event_id: &str) -> Result<[u64; SHARDS], StoreError> {
+        self.read_counts(|shard| Key::PrequeueShard { event_id, shard })
+            .await
+    }
+
+    async fn read_deferred_counts(&self, event_id: &str) -> Result<[u64; SHARDS], StoreError> {
+        self.read_counts(|shard| Key::DeferredShard { event_id, shard })
+            .await
     }
 
     async fn write_open(&self, event_id: &str, values: &OpenValues) -> Result<bool, StoreError> {

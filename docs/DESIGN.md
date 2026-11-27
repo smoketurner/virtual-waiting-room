@@ -7,7 +7,7 @@ sources are in §14.
 
 ## 1. Overview
 
-The waiting room meters visitors into an origin at a rate the origin can sustain. It has two modes:
+The waiting room meters visitors into an origin, never letting more onto it at once than it takes. It has two modes:
 
 - **Scheduled.** The start time is known. Early arrivals register during a countdown, and at T−0
   they are assigned randomized positions
@@ -30,7 +30,8 @@ no call to the backend.
                               DynamoDB PreQueue {r, s, l, t, h}
 
   T−0   EventBridge Scheduler → open_event
-          wait, up to 900 s, for the join queue to catch up twice running (#239)
+          wait for the draw to close at starts_at + 15 s (DRAW_GRACE)
+          then wait, within the 900 s timeout, for the join queue to catch up twice running (#239)
           BatchGetItem the 10 shard counters, then ONE UpdateItem on Counters:
             SET shuffle_seed, participant_count = N, queue_counter = N,
                 prequeue_offsets, phase = active
@@ -53,7 +54,9 @@ no call to the backend.
   assign_position
         1. classify records; drop malformed ones (counted and logged, never retried)
         2. one strongly consistent GetItem of Counters picks the path for the whole batch
-        3. live join: UpdateItem ADD queue_counter :valid_count / ALL_NEW
+        3. live join: sort by SentTimestamp, UpdateItem ADD queue_counter :valid_count / ALL_NEW;
+           not yet open and accepted after the draw closed: sent back (ChangeMessageVisibility,
+           2 s doubling) and counted on EVT#{event_id}#DF#{s}
         4. PutItem per record, ConditionExpression attribute_not_exists(request_id)
         5. return batchItemFailures for records whose write failed
 ```
@@ -62,22 +65,24 @@ no call to the backend.
 
 ```
   controller (EventBridge Scheduler rate(1 minute); a durable execution of six 10 s passes)
-        count live sessions from the admission log; grant the free slots,
-        origin_concurrency − live, as admission budget
-        → UpdateItem serving_counter (the slots due free by the next pass, plus a
-          no-show correction), the log, then cap c on each arrivals shard
+        count spots in use from the admission log and spots still held for earlier calls;
+        free = origin_concurrency − in use − held; call that many places in line
+        → UpdateItem serving_counter + calls (guarded), the log, then cap c on the
+          ten counters of the call's own shelf: one held spot per place called (ADR-0043)
         │
   Visitor polls /_wr/v1/status until serving_position > own position
         │
   POST /_wr/v1/generate_token (request_id + possession secret, ADR-0035)
         1. event admitting? (phase active, resolve(stored control, fail_open_until, now));
            the Counters item is held 1 s per execution environment
-        2. position reached?
-        3. take one unit of the admission budget (ADR-0039): conditional ADD n on a
-           randomly drawn arrivals shard while n < c (up to 3 draws), 425 when spent;
-           a shard seen spent is not asked again for 1 s;
+        2. place in line called, and its turn still held? (calls on the Counters item);
+           a turn that has passed: 410, reason turn_missed — the page takes a new place
+        3. take the held spot from the call's shelf: conditional ADD n while n < c,
+           each of its ten counters from a random one; 425 while not yet called, or
+           before the caps are written;
+           a counter seen empty is not asked again for 1 s;
            then mark Positions.status issued → admitted, stamping admitted_at. An
-           already-admitted visitor re-mints without taking a unit
+           already-admitted visitor re-mints without taking a spot
         4. sign the session (HS256 JWS, wr_common::crypto), expiring at
            admitted_at + ttl whenever it is asked for; 410 once that has passed (#237)
            → Set-Cookie
@@ -150,15 +155,22 @@ record (§5.5) with `attribute_not_exists(r)`, after deduplicating the batch. Ea
 ten items lift registration to about 10,000/s
 ([ADR-0015](adr/0015-stripe-prequeue-counter.md)).
 
-**Draining before the open.** A join answered 200 before T−0 is only in the cohort once
-`assign_position` has claimed its index, and arrivals bunch in the last minute, when the consumers
-are furthest behind. So the open first reads the join queue's waiting count
-(`sqs:GetQueueAttributes`) and the ten shard counts once a second, until twice running no more is
-waiting than the consumers counted since the last read. It waits as long as its 900 s timeout
-allows, so how fast joins arrive decides when the event opens, not who is in the cohort
+**The draw closes 15 seconds after T−0.** A join is in the cohort if SQS accepted it
+(`SentTimestamp`) before `starts_at + 15 s` (`wr_common::DRAW_GRACE`), whenever
+`assign_position` processes it: people refreshing at the start are on time, as in Queue-it's
+collection window ([ADR-0043](adr/0043-held-turns-and-join-order.md)). The open writes nothing
+before the cutoff, so nobody is let in during the window.
+
+**Draining before the open.** An on-time join is only in the cohort once `assign_position` has
+claimed its index, and arrivals bunch in the last minute, when the consumers are furthest behind.
+So after the cutoff the open reads the join queue's waiting count (`sqs:GetQueueAttributes`), the
+ten pre-queue shard counts and the ten deferred-join counts once a second, until twice running no
+more is waiting than the consumers cleared since the last read. It waits as long as its 900 s
+timeout allows, so how fast joins arrive decides when the event opens, not who is in the cohort
 ([ADR-0042](adr/0042-the-open-waits-out-the-join-backlog.md)). An empty queue is not the test:
-joins keep arriving after T−0, and under steady traffic the queue rarely reads empty twice
-([local stack](LOCAL_STACK.md#findings)). Everyone who joins during the wait is in the cohort.
+joins keep arriving after T−0, and under steady traffic the queue rarely reads empty twice. A join accepted after the cutoff that arrives during the
+wait is not in the cohort: it is sent back for 2 s, doubling with each delivery, counted on
+`EVT#{event_id}#DF#{s}`, and numbered behind the cohort once the open is written.
 In-flight batches are not waited for: they are the straggler case. A wait that reaches the
 deadline, or a queue that cannot be read, opens anyway and logs `open_drain_timed_out` or
 `open_drain_unreadable` ([#239](https://github.com/smoketurner/virtual-waiting-room/issues/239)).
@@ -291,7 +303,8 @@ plus the wait.
 
 `queue_counter` and `serving_counter` are sequences and are never sharded: summing shards cannot
 yield an ordered unique value. The pre-queue index (order-free, reassembled into `[0, N)` at T−0)
-and `arrivals` (a statistic) are striped across ten items. This is write sharding for throughput,
+the deferred-join count are striped across ten items, and the arrivals counters across ten
+items on each of 26 shelves. This is write sharding for throughput,
 not shuffle sharding for isolation ([ADR-0008](adr/0008-partition-isolation-not-shuffle-sharding.md)).
 
 Positions may have gaps: a retry after a 5xx, or a function dying between increment and write,
@@ -307,7 +320,8 @@ Keys are built only in `wr_common::expr`.
 | Attribute | Purpose |
 |---|---|
 | `phase` | `idle` / `pre_queue` / `active` / `post_event` / `maintenance` |
-| `queue_counter`, `serving_counter` | Live-join sequence; admission cursor |
+| `queue_counter`, `serving_counter` | Live-join sequence; now serving |
+| `calls` | The recent calls: each `[first place called, when its turns pass, shelf]` (§7) |
 | `shuffle_seed`, `participant_count`, `prequeue_offsets` | Open outputs, written once at T−0 |
 | `admission_control` | The stored control, `open` or `paused` only, never `fail_open` (issue #71) |
 | `fail_open_until` | Fail-open deadline in epoch seconds. `0` means no window |
@@ -318,9 +332,12 @@ Keys are built only in `wr_common::expr`.
 
 `wr_common::resolve(stored, fail_open_until, now)` is the only producer of
 `AdmissionControl::FailOpen`. A pre-queue shard item `EVT#{event_id}#PQ#{s}` holds its count
-`n`. An arrivals shard item `EVT#{event_id}#AR#{s}` holds `n`, the admissions taken, and `c`, the
-cap they may be taken up to. The controller's admission log `EVT#{event_id}#LOG` holds the total
-admitted at each pass (§7). `event_id` may not contain `#`.
+`n`, and a deferred-join shard `EVT#{event_id}#DF#{s}` the joins sent back to wait for the open.
+The arrivals counters are 26 shelves of ten, `EVT#{event_id}#AR#{shelf}#{s}`, each holding `n`, the
+spots taken, `c`, the cap they may be taken up to, and their shelf `f` and index `s`; a call's held
+spots are on its own shelf. The event item's `calls` lists the recent calls, each `[first place
+called, when its turns pass, shelf]`. The controller's admission log `EVT#{event_id}#LOG` holds the
+total let in at each pass (§7). `event_id` may not contain `#`.
 
 **`PreQueue`** (PK `r`) has the attributes `s`, `l`, `t` and `h`. The names are short because
 DynamoDB bills attribute names on every write and the table holds one row per visitor. The table
@@ -363,76 +380,87 @@ self-heal (§4.1) rides the same loop.
 
 ## 7. Outflow control
 
-The origin takes `origin_concurrency` visitors at once, and that is what the room meters: the most
-sessions live at any moment ([ADR-0041](adr/0041-meter-origin-concurrency.md),
-[#65](https://github.com/smoketurner/virtual-waiting-room/issues/65)). Admission is metered where it
-happens ([ADR-0039](adr/0039-meter-admissions-not-the-cursor.md)): `generate_token` takes one unit of
-an **admission budget** for each visitor it admits and answers 425 when there is none.
+The origin takes `origin_concurrency` visitors at once, its **spots**, and that is what the room
+meters: the most sessions live at any moment ([ADR-0041](adr/0041-meter-origin-concurrency.md),
+[#65](https://github.com/smoketurner/virtual-waiting-room/issues/65)). Each pass the controller
+**calls** as many places in line as there are free spots, and holds one spot for each of them: it
+is that visitor's **turn**, and nobody else can take the spot
+([ADR-0043](adr/0043-held-turns-and-join-order.md)). `generate_token` takes a visitor's held spot
+where it lets them in ([ADR-0039](adr/0039-meter-admissions-not-the-cursor.md)).
 
-A session ends exactly `session_ttl_seconds` after its admission, and minting it again keeps that
-end ([#237](https://github.com/smoketurner/virtual-waiting-room/issues/237)), so the sessions live
-now are the admissions of the last session length. The controller keeps an **admission log**, the
-total admitted at each pass, to count them. Each pass:
+A session ends exactly `session_ttl_seconds` after the visitor was let in, and minting it again
+keeps that end ([#237](https://github.com/smoketurner/virtual-waiting-room/issues/237)), so the
+spots in use are the people let in during the last session length. The controller keeps an
+**admission log**, the total let in at each pass, to count them. Each pass:
 
 ```
-admitted = Σ over shards of n                                  (logged at the second the shards were read)
+admitted = Σ over every shelf's counters of n                  (logged at the second they were read)
 horizon  = now − session_ttl_seconds
-live     = admitted − log[horizon]                             (the latest entry at or before it)
-budget   = origin_concurrency − live                           → written as c = n + share, per shard
-provided = origin_concurrency + log[horizon + 10 s]            (every slot, and each due free by the next pass)
-release  = provided − log.provided + ⌈min(unused, budget) / 2⌉ → serving_counter, up to queue_counter + 1
+in use   = admitted − log[horizon]                             (the latest entry at or before it)
+held     = Σ over calls not yet past their turn + 10 s of (c − n) on their shelf
+free     = origin_concurrency − in use − held
+called   = min(free, queue_counter + 1 − serving_counter)      → serving_counter + called, and a new call
+caps     = n + an even share of called, on the next shelf      → one held spot per place called
 ```
 
-The budget is the free slots, so no more than `origin_concurrency` sessions are ever live, whoever
-turns up and whenever. The log reads the latest entry at or before the horizon, so an admission
-counts as live until the first pass after its session has certainly ended: a slot is seen free up
-to one pass (10 s) late, and a log that misses a pass counts its admissions live for longer, never
-shorter. The entry is stamped with the whole second at which the shards were read, not the pass's
-start: a session starts at its request's whole second, and the request took its unit before the
-read, so no session the entry counts ends later than its stamp plus the session length.
+No more than `origin_concurrency` sessions are ever live, whoever turns up and whenever: spots in
+use plus spots held never exceed it. The log reads the latest entry at or before the horizon, so a
+session counts as in use until the first pass after it has certainly ended: a spot is seen free up
+to one pass (10 s) late, and a log that misses a pass counts its sessions for longer, never
+shorter. The entry is stamped with the whole second at which the counters were read, not the
+pass's start: a session starts at its request's whole second, and the request took its spot before
+the read, so no session the entry counts ends later than its stamp plus the session length.
 
-The cursor moves once for every slot: the limit at the open, then each session as it is due to end,
-counted a pass ahead so the people released for it are already asking when the slot is granted.
-Without that lead, sessions that started together end together and the origin sits empty while
-their replacements poll in. Unused budget is the no-show correction: a slot granted at the last
-pass and still untaken had someone released for it who did not come, so half as many again are
-released, which refills a slot nobody takes within a few passes without drawing a crowd for one
-whose visitor is merely slow. Lowering the limit below the live sessions grants nothing and releases
-nobody until enough sessions have ended. Throughput is `origin_concurrency` per session length:
-at the 900 s default, a limit of 100 admits about 400 an hour.
+**A call** is the places one pass calls, from now serving up, and the spots held for them. Its
+spots are counted on its own **shelf** of ten arrivals counters, one of 26 used in turn, and the
+event item's `calls` records each call's first place, when its turns pass and its shelf, written in
+the same guarded update that moves now serving. A turn is held for 2 minutes
+(`wr_common::TURN_HOLD`). At the open it is held longer: each waiting page waits a random slice of
+up to 2 minutes (`wr_common::OPEN_SETTLE`) before asking its place in line, so a call made less
+than 2 minutes after the draw closes holds until 4 minutes after it closed. A visitor who does not take their spot in time has missed their
+turn: the controller stops counting the spot one pass later, calls it for the next place in line,
+and `generate_token` answers the visitor 410 with `reason: "turn_missed"`; the waiting page takes a
+new place at the back. That is how the spot of a visitor who never came is filled. A shelf is never reused while
+a call on it is still counted: that pass calls nobody rather than mix two calls' spots. Lowering the
+limit below the spots in use calls nobody until enough sessions have ended. Throughput is
+`origin_concurrency` per session length: at the 900 s default, a limit of 100 lets in about 400 an
+hour.
 
-A refusal has to cost almost nothing, because while the budget is spent everyone whose turn has
-come keeps asking. Each `generate_token` execution environment remembers for one second which
-shards it saw spent, and holds the event's `Counters` item for one second, so a refusal makes no
-conditional write and does not read the hot item; a pause therefore takes effect up to a second
-late. The page asks again at its floor after a 425: the people asking are only those released for
-the next slots, about one turnover's worth, and a slot left waiting for a backed-off visitor is
-throughput lost. A visitor within `origin_concurrency` of the front polls at the floor too, because
-sessions ending release them without the cursor's measured speed saying so in advance.
+A visitor takes their spot from their own call's shelf, trying each of its ten counters from a
+random one, since the spots are spread evenly and taken at random. Each `generate_token` execution
+environment remembers for one second which counters it saw empty, and holds the event's `Counters`
+item for one second, so a counter already taken makes no conditional write and a request does not
+read the hot item; a pause therefore takes effect up to a second late. A 425 to a called visitor
+means only that their spot is not written yet, in the moment between the call and its caps, and the
+page asks again at its floor. A visitor within `origin_concurrency` of the front polls at the floor too,
+because sessions ending call them without now serving's measured speed saying so in advance.
 
 The controller is a Lambda durable function: Scheduler starts one execution a minute, which runs
 six checkpointed passes separated by 10 s durable waits. A wait suspends the execution, so it is
-not billed, and a replayed pass returns its checkpoint rather than advancing `serving_counter`
+not billed, and a replayed pass returns its checkpoint rather than moving `serving_counter`
 twice ([ADR-0022](adr/0022-durable-controller-cadence.md)). A pass runs only while the phase is
-`active` and the resolved control is `Open`. The budget and the release are both absolute, computed
-from the shards and the log rather than from the time since the last pass, so an overlapping
-execution's extra pass grants nothing twice and releases only what came due since
+`active` and the resolved control is `Open`. The free spots are absolute, computed from the
+counters, the calls and the log rather than from the time since the last pass, so an overlapping
+execution's extra pass calls nobody twice
 ([#236](https://github.com/smoketurner/virtual-waiting-room/issues/236)). A pass that loses the
-cursor race writes neither the log nor the caps. All arithmetic is checked or saturating.
+race on `serving_counter` writes neither the log nor the caps. All arithmetic is checked or
+saturating. A pause does not stop a turn's clock: a call held through a pause can pass while
+nobody can be let in.
 
 A pass that fails is skipped (`controller_pass_failed`) and the cadence carries on; the next pass
-computes the same free slots from the same state. An execution whose first pass finds the phase
+computes the same free spots from the same state. An execution whose first pass finds the phase
 `idle` or `post_event` ends there, since such an event only becomes active through `pre_queue` and
 an open; that is most of the controller's cost between events (N1), and it means an operator who
 goes idle → pre_queue → open inside one minute waits for the next execution before admission
 starts.
 
-**Arrivals** are the budget taken: `generate_token` adds to one of ten shard items, once per
-visitor. A pass reads the ten, the log and the event item, and writes the cursor, the log and each
-shard's cap. **The controller expires nothing** and never scans; the unused budget compensates for
-absentees ([ADR-0031](adr/0031-remove-controller-driven-expiry.md)).
+**Arrivals** are the spots taken: `generate_token` adds to one counter on the visitor's shelf, once
+per visitor. A pass reads the 260 counters (three `BatchGetItem` calls), the log and the event item,
+and writes now serving with the calls, the log, and the caps of the new call's shelf. **The
+controller expires nothing** and never scans; a missed turn frees an absentee's spot
+([ADR-0031](adr/0031-remove-controller-driven-expiry.md)).
 
-**Not built:** a completion signal. A visitor who finishes early holds their slot until the session
+**Not built:** a completion signal. A visitor who finishes early holds their spot until the session
 ends, because nothing reports a departure
 ([#65](https://github.com/smoketurner/virtual-waiting-room/issues/65)).
 
@@ -488,8 +516,8 @@ validate as a session ([ADR-0011](adr/0011-session-cookie-after-token.md),
 `request_id`'s possession secret (ADR-0035); the gate refuses one for another event, and, with IP
 binding on, one whose network tag does not match. A session asked for again expires when the
 first one did, so one admission is one visit however often, or by whomever, it is redeemed
-([#237](https://github.com/smoketurner/virtual-waiting-room/issues/237)). The admission token and origin authorizer are
-gone ([ADR-0032](adr/0032-remove-the-origin-authorizer.md)). **Not built:** revocation
+([#237](https://github.com/smoketurner/virtual-waiting-room/issues/237)). There is no admission
+token and no origin authorizer ([ADR-0032](adr/0032-remove-the-origin-authorizer.md)). **Not built:** revocation
 ([#63](https://github.com/smoketurner/virtual-waiting-room/issues/63)).
 
 `random_bytes.signing_key` is generated at apply, one key per generation, and the current one is
@@ -505,9 +533,9 @@ holding the old one ([#247](https://github.com/smoketurner/virtual-waiting-room/
 ### Entry gating and bots
 
 Nothing binds a position to a person: a client that mints N `request_id`s takes N places.
-Entry tickets ([ADR-0028](adr/0028-remove-entry-tickets.md)) and open-time bot demotion
-([ADR-0030](adr/0030-remove-open-time-demotion.md), F6.3) were removed; the edge web ACL below is
-what remains. **Not built:** a per-visitor position limit
+There are no entry tickets ([ADR-0028](adr/0028-remove-entry-tickets.md)) and no open-time bot
+demotion ([ADR-0030](adr/0030-remove-open-time-demotion.md), F6.3 retired); the edge web ACL below
+is the defence. **Not built:** a per-visitor position limit
 ([#59](https://github.com/smoketurner/virtual-waiting-room/issues/59)).
 
 ### Web Application Firewall (WAF)
@@ -550,7 +578,7 @@ browser session; it does not bind a place to a person.
 | Pre-event readiness | The dashboard's diagnostics panel, which makes read-only checks against the deployment (issue #70, [`RUNBOOK.md`](./RUNBOOK.md)) |
 | Branding | Waiting-page HTML, CSS and JS in S3 behind CloudFront |
 | Messaging | `/_wr/admin/message` makes one `UpdateItem`, and every waiter sees it within one `/_wr/v1/status` TTL |
-| Position and wait | `/_wr/v1/queue_num` gives the position. The client estimates the wait from the measured movement of the cursor, falling back to `origin_concurrency / session_seconds` |
+| Position and wait | `/_wr/v1/queue_num` gives the place in line. The client estimates the wait from the measured movement of now serving, falling back to `origin_concurrency / session_seconds` |
 
 `waiting.js` polls adaptively (ADR-0023): the interval scales with the visitor's distance to the
 front, between a floor and a ceiling set in Terraform (`poll_floor_ms`, `poll_ceiling_ms`,
@@ -559,7 +587,8 @@ deep-queue visitor can see it up to about 39 s late (the ceiling plus jitter). T
 accepts that delay. Consecutive failed polls, and consecutive 429s or 5xx from a redemption, double
 the interval up to the ceiling and the first success resets it
 ([#251](https://github.com/smoketurner/virtual-waiting-room/issues/251)). A 410 from
-`/_wr/v1/generate_token` drops the stored identity, so the next load takes a new place (#237).
+`/_wr/v1/generate_token` drops the stored identity, so the next load takes a new place (#237); a
+410 with `reason: "turn_missed"` takes a new place at once and keeps waiting.
 
 **Not built:** live metrics for F5.1 (queue depth, admitted, no-show rate). See [`tasks.md`](../.kiro/specs/virtual-waiting-room/tasks.md),
 Phase 1h.
@@ -604,7 +633,7 @@ See [`DEPLOY.md`](./DEPLOY.md).
   pool the control plane uses, and the controller and `open_event` have their own so they are
   never starved by it.
 - **Least privilege.** Each function's `UpdateItem` on `Counters` is scoped by leading key to the
-  items it writes: the event item, the pre-queue shards or the arrivals shards
+  items it writes: the event item, the pre-queue shards, the arrivals counters or the admission log
   ([#250](https://github.com/smoketurner/virtual-waiting-room/issues/250)). The admin's
   read of the distribution's configuration, for the readiness panel, is granted by the `edge`
   module on its own distribution, since `core` cannot name a distribution built from its outputs.
@@ -639,18 +668,18 @@ and ~5 requests per iOS discard-and-reload.
 - **iOS** suspends hidden tabs, compressing the ratio to 3.62x at hidden share 0.5 and 3.19x at
   0.75. Mobile is plausibly the majority of a consumer drop.
 - **Measured, the saving is smaller.** The ratios against the fixed-interval baseline were
-  measured with the load program at commit `788bf62`, since removed: 4.60x on `/status` alone
+  measured with a load program at commit `788bf62`: 4.60x on `/status` alone
   against 4.27x modelled, and 2.66x (late) to 2.88x (uniform) end to end at 833/s with a 180 s
   countdown, which puts adaptive at ~75–81M.
 - **A whole sale, measured.** `make sim` (all visitors in the foreground) with 500,000 visitors,
-  a 30-minute late-arrival countdown, 1,000 at once for 15 minutes and 20,000 tickets: 7,997
-  buyers sold out 2.3 h after the first arrival, and the edge answered 103M `/status` polls and
-  about 2.7M other requests, ~210 a visitor, inside Business's 125M. The origin saw about one
-  `/status` fetch a second throughout. A quarter of the crowd (115,851) joined behind the cohort:
-  the last minute's joins exceed API Gateway's 7,000/s join limit (203,292 refusals), and a retry
-  accepted after the open is a live join.
-- **No T−0 herd.** Open discovery spreads over the ~39 s ceiling jitter plus `scheduleFirstAsk`'s
-  window of up to 120 s, so peak `/_wr/v1/queue_num` load is no higher than that spread alone:
+  a 30-minute late-arrival countdown, 1,000 at once for 15 minutes and 20,000 tickets: 8,063
+  buyers sold out 2.5 h after the countdown began, and the edge answered 115M `/status` polls and
+  about 1.3M other requests, ~230 a visitor, inside Business's 125M. The origin saw about one
+  `/status` fetch a second throughout. 66,900 of the crowd (13%) joined behind the cohort: the
+  last minute's joins exceed API Gateway's 7,000/s join limit (242,885 refusals), and a retry
+  accepted after the draw closed is a live join.
+- **No T−0 herd.** Pages see the open within a poll at the floor, and `scheduleFirstAsk` spreads
+  the first ask over up to 120 s, so peak `/_wr/v1/queue_num` load is no higher than that spread:
   about 8,500/s at a million, under API Gateway's 10,000/s default
   ([#84](https://github.com/smoketurner/virtual-waiting-room/issues/84)).
 
@@ -687,8 +716,8 @@ per session length (§7).
 | Countdown, 60 min | `/_wr/v1/join` ~280/s average, ~1,400/s peak at T. `/_wr/v1/status` origin fetches are bounded by CloudFront cache nodes, not audience: tens to low hundreds a second | ~1 unit per join on `PreQueue`, plus one shard-counter write per batch of up to 100: ~1,400/s peak | ~1 unit per join (the batch's consistent duplicate check): ~1,400/s peak |
 | The open | one invoke | one conditional write | ten shard counters a second while the queue drains, then once |
 | T to about T+160 s | 1,000,000 `/_wr/v1/queue_num`, ~8,500/s peak | none | one eventually consistent `PreQueue` read each: ~4,300 units/s peak |
-| Admission | `/_wr/v1/generate_token` at `origin_concurrency / session_ttl_seconds` a second, plus the refusals of those whose turn has come | 2 units per admission (the shard take, the `Positions` mark) | ~1.5 units per admission (`Positions` consistent, `PreQueue` eventual; `Counters` is held per environment) |
-| Controller, per pass | none | 12 (the cursor, the log, ten caps) | ~12 units (the event item, the log, ten shards) |
+| Admission | `/_wr/v1/generate_token` at `origin_concurrency / session_ttl_seconds` a second | 2 units per admission (the spot taken, the `Positions` mark) | ~1.5 units per admission (`Positions` consistent, `PreQueue` eventual; `Counters` is held per environment) |
+| Controller, per pass | none | 12 (now serving with the calls, the log, one shelf's ten caps) | ~262 units (the event item, the log, 26 shelves of ten counters) |
 
 - **Most of a million are not admitted.** At the 900 s session a limit of 100 admits 400 an hour,
   and a limit of 10,000 admits 40,000. Everyone further back keeps a position and polls a cached
@@ -702,28 +731,29 @@ per session length (§7).
   and one accepted only after the open is behind the cohort.
 - **The position lookup is the largest request peak**, and the client's spread sets it: the
   first ask is spread over up to 120 s. At 60 s the same cohort peaked at ~16,600/s.
-- **A spent budget costs no writes.** A refused `generate_token` reads two per-visitor rows and
-  nothing shared (§7), so the admission rows above do not grow with the number of visitors asking.
-- **The per-key ceilings that matter** are the ten arrivals shards, 1,000 writes/s each, so
-  10,000 admissions/s, and the event's own item, which takes one `queue_counter` claim per ingest
-  batch and one cursor write per pass.
+- **Nobody asks for a spot that is not theirs.** Only called visitors ask `generate_token`, and
+  each has a held spot, so the admission rows above do not grow with the number of visitors
+  waiting.
+- **The per-key ceilings that matter** are a call's ten counters, 1,000 writes/s each, so
+  10,000 admissions/s from one call, and the event's own item, which takes one `queue_counter`
+  claim per ingest batch and one write of now serving per pass.
 - Nothing here has been run against a deployment; the load tests in
   [`tasks.md`](../.kiro/specs/virtual-waiting-room/tasks.md) are still open.
 
 ### Worst case: nobody comes early
 
-The model above assumes people arrive during the countdown. If nobody does, the open writes a
-cohort of zero and the event is a live-join queue from its first second: all 1,000,000 visitors
-post `/_wr/v1/join` when they arrive. Run on the [local stack](LOCAL_STACK.md#findings) at
+The model above assumes people arrive during the countdown. If nobody does, all 1,000,000 visitors
+post `/_wr/v1/join` at the start: the joins accepted in the 15 s draw window are the cohort, and
+everyone else is a live-join queue behind it. Run with `make sim` ([findings](LOCAL_STACK.md#findings)) at
 one-tenth scale (100,000 visitors within 10 s of T, every API Gateway limit at a tenth), which keeps
 the crowd's size relative to the throttles:
 
 | | Measured, default quotas at one-tenth scale |
 |---|---|
-| Half the crowd has a position by | 2.7 min |
-| 90% / 99% have a position by | 4.4 / 6.3 min |
-| Join requests answered 429 | 3.4 per visitor |
-| Positions | Nobody lost, no duplicate position |
+| Half the crowd has a position by | 2.0 min |
+| 90% / 99% have a position by | 4.2 / 5.7 min |
+| Join requests answered 429 | 3.9 per visitor |
+| Positions | Nobody lost, no duplicate position; 10,849 joins accepted in the draw window, in the cohort |
 
 Raising the account's API Gateway quota and the join throttle shortens the first two rows in
 proportion.
@@ -738,8 +768,8 @@ proportion.
 - **Order is arrival order only loosely.** Within such a burst a place is decided by which retry
   got through, not by who clicked first. The pre-queue exists to avoid exactly this: it randomizes
   deliberately instead of by accident.
-- **Admission is unaffected**: it fills the origin's slots from the first pass, from whoever has a
-  position by then.
+- **Admission is unaffected**: it fills the origin's spots from the first pass, from whoever has a
+  place in line by then.
 - To take such a crowd faster, raise the account's API Gateway quota and
   `api_join_throttle_rate_limit` with it.
 
@@ -750,7 +780,7 @@ proportion.
 | F0.1–F0.8: lifecycle, modes, protection rules, maintenance (standby auto-activation not built) | §2.3, §3 |
 | F1.1–F1.5, C1, C2: pre-queue, randomized atomic assignment, auditability | §4 |
 | F2.1–F2.6, C3, C5: live join, uniqueness, gaps, idempotent and malformed joins | §4.5, §5, §6 |
-| F3.1–F3.5, F3.8: position, origin concurrency, session, gate, no-show compensation | §2.3, §7, §8 |
+| F3.1–F3.5, F3.8: position, origin concurrency, session, gate, held turns | §2.3, §7, §8 |
 | F4.1–F4.5: fail-open, lost-join recovery, 429 retry | §6, §10 |
 | F5.1–F5.5, O4: operator surface | §8, §9 |
 | C4, N7, N10, O5: polling load, edge mitigation, Count-then-Block | §8, §12 |

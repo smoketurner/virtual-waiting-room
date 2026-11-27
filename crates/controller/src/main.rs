@@ -178,6 +178,6 @@ mod tests {
         assert!(!idles(&PassOutcome::NotActive(Phase::PreQueue)));
         assert!(!idles(&PassOutcome::NotActive(Phase::Maintenance)));
         assert!(!idles(&PassOutcome::Held(AdmissionControl::Paused)));
-        assert!(!idles(&PassOutcome::Ran { released: 0 }));
+        assert!(!idles(&PassOutcome::Ran { called: 0 }));
     }
 }

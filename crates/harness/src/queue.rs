@@ -99,6 +99,17 @@ impl JoinQueue {
         self.ready.notify_one();
     }
 
+    /// `ChangeMessageVisibility`: a message in flight becomes deliverable
+    /// again `delay` from now. An unknown handle, a message already deleted or
+    /// returned, is a no-op, as it is to SQS once the handle has expired.
+    pub fn change_visibility(&self, receipt_handle: &str, delay: Duration) {
+        if let Ok(mut s) = self.state.lock()
+            && let Some((_, deadline)) = s.in_flight.get_mut(receipt_handle)
+        {
+            *deadline = Instant::now() + delay;
+        }
+    }
+
     /// Messages waiting to be received: `ApproximateNumberOfMessages`.
     #[must_use]
     pub fn visible(&self) -> u64 {
@@ -242,10 +253,23 @@ impl JoinQueue {
         json!({ "Records": records })
     }
 
-    /// The SQS operations a binary makes over the wire. Only `open_event`
-    /// calls SQS, and only `GetQueueAttributes`.
+    /// The SQS operations a binary makes over the wire: `open_event`'s
+    /// `GetQueueAttributes`, and `assign_position`'s `ChangeMessageVisibility`.
     pub fn handle_wire(&self, op: &str, body: &[u8]) -> (StatusCode, serde_json::Value) {
         match op {
+            "ChangeMessageVisibility" => {
+                let request = serde_json::from_slice::<serde_json::Value>(body).unwrap_or_default();
+                let handle = request
+                    .get("ReceiptHandle")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let seconds = request
+                    .get("VisibilityTimeout")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default();
+                self.change_visibility(handle, Duration::from_secs(seconds));
+                (StatusCode::OK, json!({}))
+            }
             "GetQueueAttributes" => {
                 let url = serde_json::from_slice::<serde_json::Value>(body)
                     .ok()
@@ -271,6 +295,17 @@ impl JoinQueue {
                 json!({"__type": "com.amazonaws.sqs#UnsupportedOperation", "message": other}),
             ),
         }
+    }
+}
+
+impl assign_position::Queue for JoinQueue {
+    async fn defer(
+        &self,
+        receipt_handle: &str,
+        delay: jiff::SignedDuration,
+    ) -> Result<(), assign_position::StoreError> {
+        self.change_visibility(receipt_handle, delay.unsigned_abs());
+        Ok(())
     }
 }
 

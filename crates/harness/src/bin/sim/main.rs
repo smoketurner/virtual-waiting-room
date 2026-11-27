@@ -48,6 +48,8 @@ struct Args {
     scenario: Scenario,
     /// Tickets the origin sells before the event is ended.
     tickets: Option<u64>,
+    /// Tickets each buyer takes; without it, 1 to 4.
+    tickets_each: Option<u64>,
     pollers: usize,
     max_seconds: i64,
     out: PathBuf,
@@ -57,6 +59,8 @@ fn parse_args() -> Result<Args> {
     let mut a = Args {
         scenario: Scenario {
             visitors: 2000,
+            after_open: 0,
+            after_open_from: SignedDuration::ZERO,
             concurrency: 500,
             session: SignedDuration::from_mins(15),
             countdown: SignedDuration::from_mins(30),
@@ -68,6 +72,7 @@ fn parse_args() -> Result<Args> {
             seed: 1,
         },
         tickets: None,
+        tickets_each: None,
         pollers: 8,
         max_seconds: 7 * 24 * 3600,
         out: PathBuf::from("target/sim-runs/latest"),
@@ -77,6 +82,10 @@ fn parse_args() -> Result<Args> {
         let mut value = || argv.next().context(format!("{flag} needs a value"));
         match flag.as_str() {
             "--visitors" => a.scenario.visitors = value()?.parse()?,
+            "--after-open" => a.scenario.after_open = value()?.parse()?,
+            "--after-open-from" => {
+                a.scenario.after_open_from = SignedDuration::from_secs(value()?.parse()?);
+            }
             "--concurrency" => a.scenario.concurrency = value()?.parse()?,
             "--session" => a.scenario.session = SignedDuration::from_secs(value()?.parse()?),
             "--countdown" => a.scenario.countdown = SignedDuration::from_secs(value()?.parse()?),
@@ -96,6 +105,7 @@ fn parse_args() -> Result<Args> {
             "--scale" => a.scenario.scale = value()?.parse()?,
             "--seed" => a.scenario.seed = value()?.parse()?,
             "--tickets" => a.tickets = Some(value()?.parse()?),
+            "--tickets-each" => a.tickets_each = Some(value()?.parse()?),
             "--pollers" => a.pollers = value()?.parse()?,
             "--max-seconds" => a.max_seconds = value()?.parse()?,
             "--out" => a.out = PathBuf::from(value()?),
@@ -105,6 +115,10 @@ fn parse_args() -> Result<Args> {
     anyhow::ensure!(
         (0.0..1.0).contains(&a.scenario.no_show),
         "--no-show must be in [0, 1)"
+    );
+    anyhow::ensure!(
+        a.tickets_each != Some(0),
+        "--tickets-each must be at least 1"
     );
     Ok(a)
 }
@@ -136,12 +150,15 @@ fn main() -> ExitCode {
 }
 
 async fn run(errors: &ErrorCount) -> Result<bool> {
-    let args = parse_args()?;
+    let mut args = parse_args()?;
     std::fs::create_dir_all(&args.out)?;
-    let scenario = &args.scenario;
     let started = Instant::now();
     let run_start = clock::now();
-    let open_at = run_start + scenario.countdown;
+    let open_at = args.scenario.open_at(run_start);
+    // Arrivals are timed from the start of the run, so the countdown is the
+    // exact time to the open, rounding included.
+    args.scenario.countdown = open_at.duration_since(run_start);
+    let scenario = &args.scenario;
 
     let memory = Memory::new(scenario.session);
     memory.seed(Counters {
@@ -157,6 +174,7 @@ async fn run(errors: &ErrorCount) -> Result<bool> {
         stored_control: StoredControl::Open,
         fail_open_until: None,
         starts_at: Some(open_at),
+        calls: Vec::new(),
     });
 
     let mut key_bytes = [0u8; 32];
@@ -164,17 +182,23 @@ async fn run(errors: &ErrorCount) -> Result<bool> {
     let key = SigningKey::new(&key_bytes);
     let venue = args.tickets.map(|tickets| Venue {
         left: tickets,
+        each: args.tickets_each,
         sold: 0,
         buyers: 0,
         sold_out_at: None,
         rng: harness::rng::Rng::new(scenario.seed ^ 0x7469_636b),
     });
-    let functions = Arc::new(Functions::new(&memory, key, scenario.session, venue));
-
     let queue = Arc::new(queue::JoinQueue::new(
         "sim://join".to_owned(),
         scenario.duplicate_rate,
         scenario.seed ^ 0x5151,
+    ));
+    let functions = Arc::new(Functions::new(
+        &memory,
+        Arc::clone(&queue),
+        key,
+        scenario.session,
+        venue,
     ));
     let metrics = Arc::new(metrics::Metrics::new(started));
     let backend: Arc<dyn Backend> = functions.clone();
@@ -215,13 +239,18 @@ async fn run(errors: &ErrorCount) -> Result<bool> {
                 queue: &queue,
                 memory: &memory,
             };
-            // Lambda's 900 s less the open's own 10 s, a read a second.
-            let drain = open_event::wait_for_drain(&progress, 890, || {
-                tokio::time::sleep(Duration::from_secs(1))
-            })
+            // The scheduler invokes the open asynchronously, with Lambda's
+            // 900 s timeout.
+            let opened = open_event::open_when_ready(
+                &memory,
+                &progress,
+                EVENT_ID,
+                seed,
+                clock::now() + SignedDuration::from_mins(15),
+                clock::now,
+                |d: SignedDuration| tokio::time::sleep(d.unsigned_abs()),
+            )
             .await;
-            tracing::info!(drain = ?drain, "join queue checked before the open");
-            let opened = open_event::open_event(&memory, EVENT_ID, seed).await;
             (opened.map_err(|e| e.to_string()), t.elapsed())
         })
     };
@@ -240,8 +269,9 @@ async fn run(errors: &ErrorCount) -> Result<bool> {
         protected_path: PROTECTED_PATH.to_owned(),
     });
     say(&format!(
-        "{} visitors, {} at once for {} s each, opening in {} s, deadline in {} s",
+        "{} visitors and {} after the open, {} at once for {} s each, opening in {} s, deadline in {} s",
         scenario.visitors,
+        scenario.after_open,
         scenario.concurrency,
         scenario.session.as_secs(),
         scenario.countdown.as_secs(),
@@ -311,7 +341,7 @@ async fn run(errors: &ErrorCount) -> Result<bool> {
         published: published.as_ref(),
         registrations: &registrations,
         opened: opened.is_ok(),
-        open_at_ms: u64::try_from(scenario.countdown.as_millis()).unwrap_or(u64::MAX),
+        draw_closes: open_at + wr_common::DRAW_GRACE,
         open_took,
         passes: &passes,
         elapsed,
@@ -352,6 +382,8 @@ fn say(line: &str) {
 /// The tickets the origin has to sell.
 struct Venue {
     left: u64,
+    /// Tickets each buyer takes; `None` draws 1 to 4.
+    each: Option<u64>,
     sold: u64,
     buyers: u64,
     sold_out_at: Option<jiff::Timestamp>,
@@ -359,14 +391,16 @@ struct Venue {
 }
 
 impl Venue {
-    /// A visitor the gate let in buys 1 to 4 of what is left. Returns whether
-    /// that sold the last one.
+    /// A visitor the gate let in buys their share of what is left: `each`, or
+    /// 1 to 4. Returns whether that sold the last one.
     fn sell(&mut self) -> bool {
         if self.left == 0 {
             return false;
         }
         let draw = (self.rng.unit() * 4.0).floor();
-        let wanted = if draw >= 3.0 {
+        let wanted = if let Some(each) = self.each {
+            each
+        } else if draw >= 3.0 {
             4
         } else if draw >= 2.0 {
             3
@@ -392,6 +426,7 @@ struct Functions {
     read: read::http::Ctx<Memory>,
     generate_token: generate_token::http::AppState<Memory>,
     memory: Memory,
+    queue: Arc<queue::JoinQueue>,
     venue: Option<Mutex<Venue>>,
     /// Invocations that returned an error.
     failed: AtomicU64,
@@ -400,6 +435,7 @@ struct Functions {
 impl Functions {
     fn new(
         memory: &Memory,
+        queue: Arc<queue::JoinQueue>,
         key: SigningKey,
         session: SignedDuration,
         venue: Option<Venue>,
@@ -410,7 +446,11 @@ impl Functions {
                 event_id: EVENT_ID.to_owned(),
                 counters_cache: read::CountersCache::new(Duration::from_secs(1)),
                 // The policy the dev root ships.
-                poll_policy: read::parse_poll_policy(Some("5000"), Some("30000"), Some("10")),
+                poll_policy: read::parse_poll_policy(
+                    Some(&scenario::POLL_FLOOR.as_millis().to_string()),
+                    Some("30000"),
+                    Some("10"),
+                ),
                 session,
                 monotonic: clock::monotonic,
             },
@@ -422,6 +462,7 @@ impl Functions {
                 session,
             },
             memory: memory.clone(),
+            queue,
             venue: venue.map(Mutex::new),
             failed: AtomicU64::new(0),
         }
@@ -511,7 +552,13 @@ impl Consumer for Functions {
         Box::pin(async move {
             let event: aws_lambda_events::sqs::SqsEvent =
                 serde_json::from_value(event).map_err(|e| self.failed(e))?;
-            let response = assign_position::handler::handle(&self.memory, EVENT_ID, event).await;
+            let response = assign_position::handler::handle(
+                &self.memory,
+                self.queue.as_ref(),
+                EVENT_ID,
+                event,
+            )
+            .await;
             Ok(serde_json::to_value(response)?)
         })
     }
@@ -529,8 +576,9 @@ impl open_event::Backlog for Progress<'_> {
     }
 
     async fn counted(&self) -> Result<u64, open_event::StoreError> {
-        let counts = open_event::Store::read_shard_counts(self.memory, EVENT_ID).await?;
-        Ok(counts.iter().sum())
+        let registered = open_event::Store::read_shard_counts(self.memory, EVENT_ID).await?;
+        let deferred = open_event::Store::read_deferred_counts(self.memory, EVENT_ID).await?;
+        Ok(registered.iter().chain(&deferred).sum())
     }
 }
 
@@ -601,6 +649,7 @@ mod tests {
     fn the_venue_sells_one_to_four_and_never_more_than_it_has() {
         let mut venue = Venue {
             left: 1_000,
+            each: None,
             sold: 0,
             buyers: 0,
             sold_out_at: None,
@@ -616,6 +665,22 @@ mod tests {
         // Somewhere between all fours and all ones.
         assert!((250..=1_000).contains(&venue.buyers));
         assert!(!venue.sell(), "nothing is left to sell");
+    }
+
+    #[test]
+    fn a_venue_selling_one_each_has_a_buyer_per_ticket() {
+        let mut venue = Venue {
+            left: 3,
+            each: Some(1),
+            sold: 0,
+            buyers: 0,
+            sold_out_at: None,
+            rng: harness::rng::Rng::new(3),
+        };
+        assert!(!venue.sell());
+        assert!(!venue.sell());
+        assert!(venue.sell(), "the third sells the last");
+        assert_eq!((venue.left, venue.sold, venue.buyers), (0, 3, 3));
     }
 
     #[test]

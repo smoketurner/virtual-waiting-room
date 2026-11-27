@@ -16,7 +16,9 @@ use wr_common::expr::{
     POSITIONS_TTL_ATTR, POSSESSION_DIGEST_ATTR, QUEUE_POSITION_ATTR, SHARD_CAP_ATTR,
     SHARD_COUNT_ATTR, STATUS_ATTR, Update,
 };
-use wr_common::{Counters, PositionStatus, PreQueueItem, SHARDS, SecretDigest, Shard};
+use wr_common::{
+    Counters, PositionStatus, PreQueueItem, SHARDS, SHELVES, SecretDigest, Shard, Shelf,
+};
 
 use crate::{PositionRow, Store, StoreError};
 
@@ -24,36 +26,46 @@ use crate::{PositionRow, Store, StoreError};
 /// learned. See [`SpentShards`] and `load_counters`.
 const MEMO: SignedDuration = SignedDuration::from_secs(1);
 
-/// Which arrivals shards this execution environment last saw with no budget
+/// Which arrivals counters this execution environment last saw with no spot
 /// left, and until when it will take that as still true.
 ///
 /// A refused take is a conditional write that failed, and a failed conditional
-/// write is billed and counted against the shard's partition like one that
-/// landed. When the budget is spent, everyone whose turn has come keeps
-/// asking, so without this every refusal is up to [`crate::SLOT_ATTEMPTS`]
-/// such writes: at a million visitors that is several times what the ten
-/// shard items can take, and the throttling it causes falls on real
-/// admissions. A shard's cap only rises on a controller pass, every ten
-/// seconds, so a shard seen spent is not asked again for [`MEMO`]; the
-/// cost is that new budget is noticed up to that much late.
-#[derive(Debug, Default)]
+/// write is billed and counted against the counter's partition like one that
+/// landed. A visitor tries every counter on their shelf, so without this a
+/// shelf nearly taken costs up to ten such writes a request. A counter's cap
+/// only rises when the controller holds a new call's spots on it, so one seen
+/// empty is not asked again for [`MEMO`]; the cost is that new spots are
+/// noticed up to that much late.
+#[derive(Debug)]
 pub struct SpentShards {
-    /// Epoch seconds, per shard: atomics hold no `Timestamp`.
-    until: [AtomicI64; SHARDS],
+    /// Epoch seconds, per counter of every shelf: atomics hold no `Timestamp`.
+    until: [AtomicI64; SHARDS * SHELVES],
+}
+
+impl Default for SpentShards {
+    fn default() -> Self {
+        Self {
+            until: std::array::from_fn(|_| AtomicI64::new(i64::MIN)),
+        }
+    }
 }
 
 impl SpentShards {
-    /// Whether `shard` was seen spent recently enough to skip asking it.
+    fn slot(&self, shelf: Shelf, shard: Shard) -> Option<&AtomicI64> {
+        self.until.get(shelf.index() * SHARDS + shard.index())
+    }
+
+    /// Whether counter `shard` on `shelf` was seen empty recently enough to
+    /// skip asking it.
     #[must_use]
-    pub fn is_spent(&self, shard: Shard, now: Timestamp) -> bool {
-        self.until
-            .get(shard.index())
+    pub fn is_spent(&self, shelf: Shelf, shard: Shard, now: Timestamp) -> bool {
+        self.slot(shelf, shard)
             .is_some_and(|until| now.as_second() <= until.load(Ordering::Relaxed))
     }
 
-    /// Records that `shard` refused a take at `now`.
-    pub fn mark(&self, shard: Shard, now: Timestamp) {
-        if let Some(until) = self.until.get(shard.index()) {
+    /// Records that counter `shard` on `shelf` refused a take at `now`.
+    pub fn mark(&self, shelf: Shelf, shard: Shard, now: Timestamp) {
+        if let Some(until) = self.slot(shelf, shard) {
             until.store(
                 now.as_second().saturating_add(MEMO.as_secs()),
                 Ordering::Relaxed,
@@ -249,30 +261,41 @@ impl Store for DynamoStore {
         }
     }
 
-    async fn take_slot(&self, event_id: &str, shard: Shard) -> Result<bool, StoreError> {
+    async fn take_spot(
+        &self,
+        event_id: &str,
+        shelf: Shelf,
+        shard: Shard,
+    ) -> Result<bool, StoreError> {
         let now = Timestamp::now();
-        if self.spent.is_spent(shard, now) {
+        if self.spent.is_spent(shelf, shard, now) {
             return Ok(false);
         }
         let bump = Update::new()
             .add(SHARD_COUNT_ATTR, AttributeValue::N("1".to_owned()))
             .build();
-        // Allowed only below the cap the controller last wrote (ADR-0039). A
-        // shard with no cap yet -- an event the controller has not passed over
-        // -- fails the comparison and admits nobody, which is the right answer
-        // before anyone has been granted anything.
+        // Allowed only below the cap the controller wrote. A counter with no
+        // cap yet fails the comparison and lets nobody in, which is the right
+        // answer before any spot has been held there.
         let guard = Condition::attr_less_than(SHARD_COUNT_ATTR, SHARD_CAP_ATTR).build();
 
         let mut names = bump.names;
         names.extend(guard.names);
 
-        // The shard is its own item, so admissions do not contend with the
-        // queue_counter claims on the event's item.
+        // The counter is its own item, so taking a spot does not contend with
+        // the queue_counter claims on the event's item.
         let result = self
             .client
             .update_item()
             .table_name(&self.counters_table)
-            .set_key(Some(Key::ArrivalsShard { event_id, shard }.build()))
+            .set_key(Some(
+                Key::ArrivalsShard {
+                    event_id,
+                    shelf,
+                    shard,
+                }
+                .build(),
+            ))
             .update_expression(bump.expression)
             .condition_expression(guard.expression)
             .set_expression_attribute_names(Some(names))
@@ -288,10 +311,10 @@ impl Store for DynamoStore {
                     UpdateItemError::ConditionalCheckFailedException(_)
                 ) =>
             {
-                self.spent.mark(shard, now);
+                self.spent.mark(shelf, shard, now);
                 Ok(false)
             }
-            Err(e) => Err(StoreError(format!("update_item admission slot: {e}"))),
+            Err(e) => Err(StoreError(format!("update_item take spot: {e}"))),
         }
     }
 }
@@ -422,14 +445,18 @@ mod tests {
     #[test]
     fn a_shard_seen_spent_is_not_asked_again_until_the_memo_lapses() {
         let spent = SpentShards::default();
+        let shelf = Shelf::new(13).unwrap();
         let shard = Shard::new(3).unwrap();
         let other = Shard::new(4).unwrap();
-        assert!(!spent.is_spent(shard, Timestamp::constant(100, 0)));
-        spent.mark(shard, Timestamp::constant(100, 0));
-        assert!(spent.is_spent(shard, Timestamp::constant(100, 0)));
-        assert!(spent.is_spent(shard, Timestamp::constant(100 + MEMO.as_secs(), 0)));
-        assert!(!spent.is_spent(shard, Timestamp::constant(101 + MEMO.as_secs(), 0)));
-        // One shard running out says nothing about the others.
-        assert!(!spent.is_spent(other, Timestamp::constant(100, 0)));
+        let t = |secs| Timestamp::constant(secs, 0);
+        assert!(!spent.is_spent(shelf, shard, t(100)));
+        spent.mark(shelf, shard, t(100));
+        assert!(spent.is_spent(shelf, shard, t(100)));
+        assert!(spent.is_spent(shelf, shard, t(100 + MEMO.as_secs())));
+        assert!(!spent.is_spent(shelf, shard, t(101 + MEMO.as_secs())));
+        // One counter running out says nothing about the others, on this
+        // shelf or any other.
+        assert!(!spent.is_spent(shelf, other, t(100)));
+        assert!(!spent.is_spent(Shelf::new(0).unwrap(), shard, t(100)));
     }
 }

@@ -6,23 +6,23 @@ costs the most, because it is loaded into every session.
 
 ## Runtime and language
 
-- **Rust** on AWS Lambda, `provided.al2023`, **arm64**. Every Lambda in the system is Rust. The
+- **Rust** on AWS Lambda, `provided.al2023`, **arm64** by default (`lambda_architecture`). Every Lambda in the system is Rust. The
   one exception is the admission gate itself (issue #71): a CloudFront Function, which only runs
   JavaScript (`cloudfront-js-2.0`) — `infra/modules/edge/functions/gate.js.tftpl`.
 - No Lambda in the ingest (burst) path — API Gateway REST integrates directly with SQS
   `SendMessage`. Lambda appears only downstream of SQS and on the control/admin plane.
 - Async with `tokio`; AWS SDK for Rust.
 
-## The six Lambdas
+## The seven Lambdas
 
 | Function | Trigger | Job |
 |---|---|---|
-| `assign_position` | SQS event source mapping | Claims a contiguous position range per batch, writes `Positions` rows |
-| `open_event` | EventBridge Scheduler, one-time `at()` set by the operator on the dashboard (issue #128) | One conditional `UpdateItem` at T−0: seed, offsets, count, phase |
+| `assign_position` | SQS event source mapping | Claims a contiguous position range per batch, in `SentTimestamp` order, writes `Positions` rows; before the open, registers on-time joins and sends later ones back to wait |
+| `open_event` | EventBridge Scheduler, one-time `at()` set by the operator on the dashboard (issue #128), or `/_wr/admin/open_now` | Waits for the draw to close (`starts_at` + 15 s) and the join queue to catch up, then one conditional `UpdateItem`: seed, offsets, count, phase |
 | `read` | API Gateway | `GET /_wr/v1/status`, `GET /_wr/v1/queue_num` |
-| `generate_token` | API Gateway | Checks the position against `serving_counter`, records the arrival, mints a signed session cookie the edge gate's CloudFront Function verifies (issue #71) |
+| `generate_token` | API Gateway | Checks the place in line against `serving_counter` and its turn, takes the visitor's held spot, mints a signed session cookie the edge gate's CloudFront Function verifies (issue #71) |
 | `nojs` | API Gateway | The queue for a visitor without JavaScript (ADR-0037): a form-post join onto the same SQS queue, and a self-refreshing wait page that admits through `generate_token::admit`. Its own small reserved concurrency |
-| `controller` | EventBridge Scheduler, `rate(1 minute)` | Durable function: six 10-second passes per execution — the admission budget (ADR-0039) and `serving_counter`. Waits between passes suspend the execution rather than being billed |
+| `controller` | EventBridge Scheduler, `rate(1 minute)` | Durable function: six 10-second passes per execution — each calls as many places in line as there are free spots, moving `serving_counter`, and holds a spot for each (ADR-0043). Waits between passes suspend the execution rather than being billed |
 | `admin` | API Gateway | Axum app: operator UI and `/_wr/admin/*` actions, OIDC-authenticated |
 
 ## Cargo workspace and crates
@@ -38,7 +38,7 @@ only in the member crate that uses them):
 | Lambda runtime | `lambda_runtime`, `lambda_http`, `aws_lambda_events` |
 | Web framework (admin UI) | `axum`, `tower`, `tower-http` |
 | Async runtime | `tokio` |
-| AWS SDK | `aws-config`, `aws-sdk-dynamodb`, `aws-sdk-ssm`, `aws-smithy-types`, `aws-sdk-cloudfrontkeyvaluestore` (admin only — writes the edge gate's config, issue #71), `aws-sdk-scheduler` (admin only — sets the open schedule's time, issue #128), `aws-sdk-apigateway` and `aws-sdk-cloudfront` (admin only — read-only calls for the readiness panel, issue #70) |
+| AWS SDK | `aws-config`, `aws-sdk-dynamodb`, `aws-sdk-ssm`, `aws-sdk-sqs` (`assign_position`, `open_event`, `nojs`), `aws-smithy-types`, `aws-sdk-cloudfrontkeyvaluestore` (admin only — writes the edge gate's config, issue #71), `aws-sdk-scheduler` (admin only — sets the open schedule's time, issue #128), `aws-sdk-apigateway` and `aws-sdk-cloudfront` (admin only — read-only calls for the readiness panel, issue #70) |
 | Templating + static assets (admin UI) | `askama`, `rust-embed`, `mime_guess` |
 | Admin OIDC login (ADR-0016) | `openidconnect`, `jsonwebtoken`, `reqwest`, `rustls`, `cookie` |
 | Serialization | `serde`, `serde_json`, `serde_dynamo`, `base64` |
@@ -46,8 +46,10 @@ only in the member crate that uses them):
 | Errors and logging | `thiserror` (libs), `anyhow` (binaries), `tracing`, `tracing-subscriber` |
 | Dev | `proptest` |
 
-There is no SQS SDK dependency: API Gateway writes to the queue and `assign_position` receives
-the batch as a Lambda event. There is no Secrets Manager SDK dependency either — secrets are read
+API Gateway writes to the join queue and `assign_position` receives the batch as a Lambda event.
+`aws-sdk-sqs` is used only beside that: `open_event` reads the queue's waiting count,
+`assign_position` sends a join that arrives before the open back for a few seconds
+(`ChangeMessageVisibility`, ADR-0043), and `nojs` sends the no-JavaScript join. There is no Secrets Manager SDK dependency either — secrets are read
 from SSM.
 
 Terraform creates every schedule and owns its target, retry policy and role. The one schedule
@@ -129,10 +131,10 @@ lands on boosted Init CPU rather than the first invoke.
 |---|---|
 | Edge / CDN / request collapsing | CloudFront — polled, write, waiting-page and protected behaviours (ADR-0013) |
 | **The admission gate** | CloudFront Function (`cloudfront-js-2.0`) at viewer-request on the protected behaviour only, deciding locally from a KeyValueStore (ADR-0021, issue #71); `generate_token` signs an HMAC-SHA256 session cookie the function verifies. Sub-millisecond compute at the edge, not zero, but no round trip to the origin |
-| Bot & abuse mitigation | The REST API requires an API key only the distribution holds, so nothing bypasses the edge. On a CloudFront flat-rate plan, the edge web ACL (`flat_rate_plan_tier`) requires a WAF challenge token on every JS API call, rate-limits per token and per IP (escalating to CAPTCHA), and runs Bot Control common, anti-DDoS, IP reputation and anonymous-IP rules in Count until promoted (ADR-0038). Nothing binds a place to a person: open-time demotion (ADR-0030) and entry tickets (ADR-0028) were removed. ASN matching is unbuilt |
+| Bot & abuse mitigation | The REST API requires an API key only the distribution holds, so nothing bypasses the edge. On a CloudFront flat-rate plan, the edge web ACL (`flat_rate_plan_tier`) requires a WAF challenge token on every JS API call, rate-limits per token and per IP (escalating to CAPTCHA), and runs Bot Control common, anti-DDoS, IP reputation and anonymous-IP rules in Count until promoted (ADR-0038). Nothing binds a place to a person: there is no open-time demotion (ADR-0030) and there are no entry tickets (ADR-0028). ASN matching is unbuilt |
 | Ingest | API Gateway **REST** (regional) with request validator → SQS |
 | Buffer | SQS standard queue + DLQ (`maxReceiveCount` 10), ESM `ReportBatchItemFailures` |
-| Compute | Lambda (Rust, arm64) — the six functions above |
+| Compute | Lambda (Rust, `lambda_architecture`, arm64 by default) — the seven functions above |
 | State | DynamoDB on-demand + PITR: `Counters`, `PreQueue`, `Positions`, `Tokens` |
 | Scheduling | EventBridge Scheduler (T−0 open, controller every minute × six passes via durable waits) |
 | Secrets | **SSM Parameter Store SecureString** — the per-deployment HMAC signing key (Terraform generates it and writes the same value to the edge gate's CloudFront KeyValueStore, issue #71) and the OIDC client secret. Not Secrets Manager: a SecureString is free where a secret is $0.40/mo, which N1 does not allow |
@@ -145,18 +147,16 @@ endpoints). A VPC opt-in for ATO-constrained operators is not built (`tasks.md`)
 
 `POST /_wr/v1/join` (direct SQS integration), `GET /_wr/v1/status`, `GET /_wr/v1/queue_num`,
 `POST /_wr/v1/generate_token`, `POST /_wr/v1/enter` and `GET /_wr/v1/wait` (the no-JavaScript queue, ADR-0037), plus `/_wr/admin`, `/_wr/admin/{proxy+}` and
-`/_wr/static/{proxy+}` fronting the admin Lambda. `/queue_pos_expiry` and `/public_key` were removed
-by design with position expiry (ADR-0031) and signed URLs (ADR-0021).
+`/_wr/static/{proxy+}` fronting the admin Lambda.
 
 ## Infrastructure as code
 
 - **Terraform**, no manual console steps (N5). Modules: `core`, `edge`,
   `demo-origin` (a fixture standing in for an operator origin in the dev root).
-- No resource-count ceiling. N6 was retired: the number was satisfiable by rewriting the same
-  infrastructure — thirteen alarms as thirteen blocks breached it, the identical thirteen as
-  three `for_each` blocks did not. Judge an addition by **N1**, what it bills between events.
-  The 31 alarms now shipped cost about $3.10 a month, most of the $5 idle budget; a terraform test
-  pins the count so the next one is a decision.
+- No resource-count ceiling (N6 is retired): a resource count changes with how the same
+  infrastructure is written (`for_each` or separate blocks), not with what it does. Judge an
+  addition by **N1**, what it bills between events. The 31 alarms cost about $3.10 a month, most
+  of the $5 idle budget; a terraform test pins the count so the next one is a decision.
 - API documented as **OpenAPI** (N8) — **not built**.
 
 ## Admin web interface
@@ -165,10 +165,9 @@ A **single Axum-based Rust Lambda** rendering server-side HTML with **askama** c
 templates.
 
 - Styled with the **Vouch design language** as a self-contained plain-CSS stylesheet embedded in
-  the binary via `rust-embed` (ADR-0018, which superseded the Cloudscape design tokens and their
-  `extract_tokens.py` build step). No React, no bundler, no runtime npm dependency.
+  the binary via `rust-embed` (ADR-0018). No React, no bundler, no runtime npm dependency.
 - Auth is **OIDC Authorization Code + PKCE** with sessions and pending logins in the `Tokens`
-  table (ADR-0016, superseding SigV4). API Gateway auth is `NONE` because the Lambda is the
+  table (ADR-0016). API Gateway auth is `NONE` because the Lambda is the
   enforcement point.
 - Interactivity = plain HTML `<form>` POSTs to the same `/_wr/admin/*` actions plus a small
   vanilla-JS metrics poller. Core actions work with JavaScript disabled.

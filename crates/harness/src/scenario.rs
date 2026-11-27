@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use jiff::SignedDuration;
+use jiff::{RoundMode, SignedDuration, Timestamp, TimestampRound, Unit};
 use tokio::task::JoinHandle;
 
 use crate::edge::Throttles;
@@ -23,10 +23,18 @@ pub enum Arrival {
     Herd,
 }
 
+/// The waiting page's poll floor every run publishes (`poll_floor_ms`).
+pub const POLL_FLOOR: SignedDuration = SignedDuration::from_secs(5);
+
 /// One run's crowd and origin.
 #[derive(Debug, Clone)]
 pub struct Scenario {
+    /// Visitors who arrive as [`Self::arrival`] says.
     pub visitors: usize,
+    /// Visitors who arrive after them, over the herd window starting
+    /// [`Self::after_open_from`] after the open.
+    pub after_open: usize,
+    pub after_open_from: SignedDuration,
     /// How many sessions the origin takes at once.
     pub concurrency: u32,
     /// How long each session lasts.
@@ -58,6 +66,19 @@ impl Scenario {
         Duration::from_secs_f64(secs.max(0.0))
     }
 
+    /// When the event opens for a run starting at `now`: the countdown later,
+    /// rounded up to the whole second `starts_at` is stored as.
+    #[must_use]
+    pub fn open_at(&self, now: Timestamp) -> Timestamp {
+        let at = now + self.countdown;
+        at.round(
+            TimestampRound::new()
+                .smallest(Unit::Second)
+                .mode(RoundMode::Ceil),
+        )
+        .unwrap_or(at)
+    }
+
     /// How long the run may take: the last arrival, half as long again as a
     /// full origin takes to admit everyone, and five minutes, at most `max`.
     #[must_use]
@@ -65,10 +86,14 @@ impl Scenario {
         // A full origin turns over once a session length, and a slot is seen
         // free up to a pass after its session ends.
         let turnover = self.session + controller::INTERVAL;
-        let rounds = (self.visitors as u64).div_ceil(u64::from(self.concurrency.max(1)));
+        let everyone = self.visitors.saturating_add(self.after_open) as u64;
+        let rounds = everyone.div_ceil(u64::from(self.concurrency.max(1)));
         let drain = turnover * i32::try_from(rounds).unwrap_or(i32::MAX);
         let last_arrival = match self.arrival {
             Arrival::Herd => self.countdown + self.herd_window,
+            Arrival::Late | Arrival::Uniform if self.after_open > 0 => {
+                self.countdown + self.after_open_from + self.herd_window
+            }
             Arrival::Late | Arrival::Uniform => self.countdown,
         };
         (last_arrival + drain * 3 / 2 + SignedDuration::from_mins(5)).min(max)
@@ -92,15 +117,20 @@ impl Scenario {
     #[must_use]
     pub fn spawn_visitors(&self, world: &Arc<World>) -> Vec<JoinHandle<Record>> {
         let mut rng = Rng::new(self.seed);
-        let mut handles = Vec::with_capacity(self.visitors);
-        for _ in 0..self.visitors {
+        let mut handles = Vec::with_capacity(self.visitors.saturating_add(self.after_open));
+        for i in 0..self.visitors.saturating_add(self.after_open) {
             let mut v = rng.fork();
-            let arrive = world.started + self.arrival_after(v.unit());
+            let after = if i < self.visitors {
+                self.arrival_after(v.unit())
+            } else {
+                (self.countdown + self.after_open_from + self.herd_window.mul_f64(v.unit()))
+                    .unsigned_abs()
+            };
             let no_show = v.unit() < self.no_show;
             handles.push(tokio::spawn(visitor::visit(
                 Arc::clone(world),
                 v,
-                arrive,
+                world.started + after,
                 no_show,
             )));
         }
@@ -144,6 +174,8 @@ mod tests {
     fn scenario(arrival: Arrival) -> Scenario {
         Scenario {
             visitors: 2_000,
+            after_open: 0,
+            after_open_from: SignedDuration::ZERO,
             concurrency: 400,
             session: SignedDuration::from_mins(2),
             countdown: SignedDuration::from_secs(30),
@@ -164,6 +196,17 @@ mod tests {
             let herd = scenario(Arrival::Herd).arrival_after(u);
             assert!(herd >= Duration::from_secs(30) && herd <= Duration::from_secs(40));
         }
+    }
+
+    #[test]
+    fn the_open_falls_on_the_whole_second_at_or_after_the_countdown() {
+        let s = scenario(Arrival::Late);
+        let now = Timestamp::constant(1_000, 250_000_000);
+        assert_eq!(s.open_at(now), Timestamp::constant(1_031, 0));
+        assert_eq!(
+            s.open_at(Timestamp::constant(1_000, 0)),
+            Timestamp::constant(1_030, 0)
+        );
     }
 
     #[test]

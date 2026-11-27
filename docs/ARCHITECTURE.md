@@ -1,6 +1,6 @@
 # Architecture
 
-A virtual waiting room holds visitors during a traffic spike and releases them into an origin
+A virtual waiting room holds visitors during a traffic spike and lets them into an origin
 no faster than the origin can serve them: never more at once than `origin_concurrency`. This document is a tour of the deployed system as built, read from
 `crates/` and `infra/`. [`DESIGN.md`](./DESIGN.md) gives the design, [`DYNAMODB.md`](./DYNAMODB.md)
 the data layer, and [`adr/`](./adr/) the reasoning behind each decision.
@@ -33,7 +33,7 @@ flat-rate plan only, a WAF web ACL.
 | `open_event` | EventBridge Scheduler one-shot, or `/_wr/admin/open_now` | 900 s | Folds the shard counts into offsets and writes the open |
 | `read` | API Gateway | 10 s | `GET /_wr/v1/status`, `GET /_wr/v1/queue_num` |
 | `controller` | EventBridge Scheduler `rate(1 minute)` | 30 s | Durable function; meters admission in six 10 s passes |
-| `generate_token` | API Gateway | 10 s | Checks the position, claims the admission, records the arrival, signs the session cookie |
+| `generate_token` | API Gateway | 10 s | Checks the place in line and its turn, takes the held spot, marks the visitor admitted, signs the session cookie |
 | `nojs` | API Gateway | 10 s | The queue for a visitor without JavaScript: `POST /_wr/v1/enter`, `GET /_wr/v1/wait` ([ADR-0037](adr/0037-no-javascript-queue.md)) |
 | `admin` | API Gateway | 10 s | Axum operator UI and control plane |
 
@@ -66,7 +66,8 @@ protected: CloudFront [/*, CloudFront Function at viewer-request]
              └─ otherwise → 302 to /_wr/waiting.html, or 403 JSON for XHR
 
 open:      EventBridge Scheduler at(start time)   [always created; disabled unless `starts_at` is set, or until the operator sets it]
-             → open_event → BatchGetItem ×10 shards → one guarded UpdateItem
+             → open_event → wait for the draw to close (starts_at + 15 s) and the join queue to catch up
+             → BatchGetItem ×10 shards → one guarded UpdateItem
 
 meter:     EventBridge Scheduler rate(1 minute)   [always created]
              → controller, six durable passes 10 s apart → DynamoDB
@@ -125,27 +126,37 @@ valid record in the batch takes the same path:
 | State | Path |
 |---|---|
 | The open has run (`shuffle_seed`, `participant_count`, `prequeue_offsets` all present), in any phase | Live join |
-| Not opened, phase `pre_queue` | Pre-queue registration |
+| Not opened, phase `pre_queue`, accepted before the draw closes | Pre-queue registration |
+| Not opened, phase `pre_queue`, accepted after the draw closes | Sent back for 2 s (doubling per delivery) and counted on `EVT#{event_id}#DF#{s}` |
 | Not opened, any other phase, or no `Counters` item | Every record fails and retries |
 
 The branch is on the open outputs, not the phase: an operator can walk the phase back after an
 open without undoing the index space. Refusing joins before setup matters because the open's
 `SET queue_counter = N` would overwrite any earlier live increment and collide positions.
 
+**The draw closes 15 s after `starts_at`.** Which path a join takes before the open is decided by
+its `SentTimestamp`, when SQS accepted it, against `starts_at + 15 s`, not by when it is processed
+([ADR-0043](adr/0043-held-turns-and-join-order.md)). A join sent back calls
+`ChangeMessageVisibility` (`JOIN_QUEUE_URL`, `sqs:ChangeMessageVisibility`); ten deliveries cover
+about 34 minutes, so none is dead-lettered while the open runs. A live batch is sorted by
+`SentTimestamp` before its block is claimed.
+
 **Pre-queue.** The invocation draws one shard uniformly at random (issue #59), drops duplicates
 within the batch and any id that already has a `PreQueue` row, and claims a contiguous block of
 local indices on that shard with one `ADD n`. Each row `{r, s, l, t, h}` is written with
 `attribute_not_exists(r)`. Shard striping is [ADR-0015](adr/0015-stripe-prequeue-counter.md).
 
-**The open.** `open_event` first waits for the join consumers to catch up: once a second it reads
-the queue's waiting count and the shard counts, until twice running no more is waiting than was
-counted since the last read, for as long as its 900 s timeout allows, and opens regardless (#239;
-`open_drain_timed_out`, `open_drain_unreadable`). It then reads the ten
+**The open.** `open_event` writes nothing before the draw closes. It then waits for the join
+consumers to catch up: once a second it reads the queue's waiting count, the pre-queue shard counts
+and the deferred-join counts, until twice running no more is waiting than was cleared since the
+last read, for as long as its 900 s timeout allows, and opens regardless (#239;
+`open_drain_timed_out`, `open_drain_unreadable`, `open_before_draw_cutoff`). It then reads the ten
 shard counts with one consistent `BatchGetItem`, computes
 `offset[s] = Σ counts[0..s)` and `N`, and writes seed, `N`, offsets, `queue_counter = N` and
 `phase = active` in one `UpdateItem` guarded by `attribute_not_exists(shuffle_seed) AND phase =
 :pre_queue`. A double-fire or retry fails the guard and reports `AlreadyOpen`. Both the schedule
-and `/_wr/admin/open_now` go through this one function.
+and `/_wr/admin/open_now` go through this one function; `open_now` first moves `starts_at` to the
+press, so the draw closes 15 s after it.
 
 **Position on read.** `position = PRP(shuffle_seed, offset[s] + l, N)`. The PRP is a 4-round
 balanced Feistel network over the smallest power of four ≥ `N`, cycle-walked into `[0, N)`, with
@@ -186,10 +197,15 @@ shard and index come from `GET /_wr/v1/queue_num`.
   later tick fetches `/_wr/v1/status` alone, which CloudFront collapses;
 - delays that first ask by a random slice of `min(120 s, participants / 5000 s⁻¹)` so the cohort
   does not ask at once (at 1,000,000 participants that is about 8,500 requests/s, under the
-  default 10,000/s API Gateway account throttle);
-- asks again at the floor while a redemption is answered 425, a slot not yet free, and backs off,
-  doubling to the ceiling, on a 429 or a 5xx;
-- polls at the floor while within `origin_concurrency` of the front, since it is released as soon
+  default 10,000/s API Gateway account throttle), and asks at the moment drawn, not a poll later;
+- before the open, polls at the ceiling but never sleeps past `starts_at` plus the 15 s draw
+  window, jitter included, and polls at the floor once that moment has passed, so a page does not
+  learn its number late behind people who joined after it;
+- asks again at the floor while a redemption is answered 425, a held spot not yet written, and
+  backs off, doubling to the ceiling, on a 429 or a 5xx;
+- on a 410 with `reason: "turn_missed"`, drops its place, takes a new one at the back and says
+  why ([ADR-0043](adr/0043-held-turns-and-join-order.md));
+- polls at the floor while within `origin_concurrency` of the front, since it is called as soon
   as the next sessions end;
 - polls at `clamp(floor, ceiling, secondsAhead × 1000 / divisor)` plus up to 30 % jitter, from the
   Terraform-set `poll_policy` ([ADR-0023](adr/0023-adaptive-poll-interval.md)): by default a 5 s
@@ -218,42 +234,46 @@ rather than bunched with the next; the function has reserved concurrency
 
 A pass runs only when `phase = active` and the resolved admission control is `Open`; otherwise it
 writes nothing. A pass that fails is skipped (`controller_pass_failed`) and the
-cadence carries on; the next pass computes the same free slots from the same state. An
+cadence carries on; the next pass computes the same free spots from the same state. An
 execution ends at the first pass that finds the phase `idle` or `post_event`, since such an event
 only becomes active through `pre_queue` and an open; that is most of the controller's cost
 between events (N1), and it means an operator who goes idle → pre_queue → open inside one minute
 waits for the next execution before admission starts.
 
-The origin takes `origin_concurrency` visitors at once, and that is the most sessions the
-controller lets be live ([ADR-0041](adr/0041-meter-origin-concurrency.md)). A session ends exactly
-`session_ttl_seconds` after its admission, so the live ones are the admissions of the last session
-length, counted from the **admission log** `EVT#{event_id}#LOG`: the total admitted at each recent
-pass, and `provided`, how many slots the cursor has been moved for. Each open pass:
+The origin takes `origin_concurrency` visitors at once, its spots, and that is the most sessions
+the controller lets be live ([ADR-0041](adr/0041-meter-origin-concurrency.md)). A session ends
+exactly `session_ttl_seconds` after the visitor was let in, so the spots in use are the people let
+in during the last session length, counted from the **admission log** `EVT#{event_id}#LOG`: the
+total let in at each recent pass. Each open pass calls as many places in line as there are free
+spots and holds a spot for each ([ADR-0043](adr/0043-held-turns-and-join-order.md)):
 
 ```
-admitted = Σ shards n                                          // logged at the shard read's second
+admitted = Σ over 26 shelves × 10 counters of n                // logged at the read's second
 horizon  = now − session_ttl_seconds
-live     = admitted − log[horizon]                             // latest entry at or before it
-unused   = Σ shards (c − n)
-budget   = origin_concurrency − live                           // caps: c = n + an even share
-provided = origin_concurrency + log[horizon + 10 s]
-release  = provided − log.provided + ⌈min(unused, budget) / 2⌉
-next     = clamp(serving_counter + release, serving_counter, queue_counter + 1)
+in use   = admitted − log[horizon]                             // latest entry at or before it
+held     = Σ calls not past their turn + 10 s, of Σ (c − n) on the call's shelf
+free     = origin_concurrency − in use − held
+called   = min(free, queue_counter + 1 − serving_counter)
+next     = serving_counter + called                            // with a new call on the next shelf
+caps     = n + an even share of called, on that shelf's ten counters
 ```
 
-The budget is the free slots, so no more than `origin_concurrency` sessions are ever live. A slot
-is seen free up to one pass (10 s) after its session ends. The cursor moves once for every slot: the
-limit at the open, then each session a pass before it is due to end, so its replacement is already
-asking when the slot is granted. Unused budget is the no-show correction: half as many again are
-released for a slot left untaken ([ADR-0039](adr/0039-meter-admissions-not-the-cursor.md)).
-Lowering the limit below the live sessions admits nobody until enough have ended. Throughput is
-`origin_concurrency` per session length. All arithmetic saturates, and the cursor never passes
-`queue_counter + 1`. The cursor write is guarded on `serving_counter = :expected`; a pass that
-loses it writes neither the log nor the caps. The log is then one `UpdateItem`, and the caps one
-`UpdateItem` per shard, absolute values, so writing them twice grants nothing twice.
+Spots in use plus spots held never exceed `origin_concurrency`. A spot is seen free up to one pass
+(10 s) after its session ends. Each call is recorded in the event item's `calls` — its first place
+in line, when its turns pass, and its shelf — in the same update as now serving, guarded on
+`serving_counter = :expected`; a pass that loses the race writes neither the log nor the caps. A
+turn is held for 2 minutes (`TURN_HOLD`); a call made less than 2 minutes (`OPEN_SETTLE`) after
+the draw closes is held until 4 minutes after it closed, since the waiting pages spread their first
+ask over those 2 minutes. A spot not taken in time stops being counted one pass (`TURN_MARGIN`,
+10 s) after the turn passes and is called for the next place in line: that is how the spot of a
+visitor who never came is filled. A shelf still counted is never reused; that pass calls nobody.
+Lowering the limit below the spots in use calls nobody until enough sessions have ended. Throughput
+is `origin_concurrency` per session length. All arithmetic saturates, and now serving never passes
+`queue_counter + 1`. The log is then one `UpdateItem`, and the caps one `UpdateItem` per counter,
+absolute values, so writing them twice holds nothing twice.
 
-The controller expires nothing. A position lives until DynamoDB TTL reclaims its row 24 hours
-after its last write, and the unused budget compensates for absentees
+The controller expires nothing. A place in line lives until DynamoDB TTL reclaims its row 24 hours
+after its last write, and a missed turn frees an absentee's spot
 ([ADR-0031](adr/0031-remove-controller-driven-expiry.md)).
 
 ### 7.2 Minting the session
@@ -274,7 +294,8 @@ shard's opened count is the visitor's place whatever `Positions` holds, the same
 | A straggler row with no live position | 404 |
 | Corrupt row | 500 |
 | `position ≥ serving_counter` | 425, keep polling |
-| Admission budget spent | 425, keep polling |
+| Called, and the turn has passed | 410 with `reason: "turn_missed"`, take a new place at the back |
+| Called, and the held spot is not written yet | 425, keep polling |
 | Already admitted, and `admitted_at + session_ttl_seconds` has passed | 410, take a new place |
 
 Admission control is resolved by `wr_common::resolve(stored, fail_open_until, now)`; `FailOpen` is
@@ -282,21 +303,19 @@ never stored. The `Counters` item is held for one second per execution environme
 holds it, so the admission path does not put a read per attempt on one partition key; a pause
 takes effect up to a second late.
 
-A visitor not yet admitted then **takes one unit of the admission budget**
-([ADR-0039](adr/0039-meter-admissions-not-the-cursor.md)): an `UpdateItem ADD n 1` on a randomly
-drawn arrivals shard, conditional on `n < c`, trying up to three shards. With none to take the
-answer is 425 and the page asks again, and the environment does not ask a shard it saw spent
-for another second, so a refusal costs no write. A failed draw or write is also "no unit"
-(`arrival_shard_draw_failed`, `arrival_record_failed`): an admission that cannot be metered is not
-made. The `Positions` row is then marked `status = admitted`, guarded by
+A visitor not yet admitted then **takes their held spot**: an `UpdateItem ADD n 1` on a counter of
+their own call's shelf, conditional on `n < c`, trying each of the ten from a random one. The
+environment does not ask a counter it saw empty for another second, so a counter already taken
+costs no write. A failed draw or write is also "no spot" (`arrival_shard_draw_failed`,
+`arrival_record_failed`): an admission that cannot be metered is not made. The `Positions` row is then marked `status = admitted`, guarded by
 `attribute_not_exists(request_id) OR status = issued`, which creates a pre-queue member's row. A
 visitor whose row is already admitted (reload, second tab, lost response) gets their session
-again without taking a unit. It is the same visit, not a new one: the mark stamps `admitted_at`
+again without taking a spot. It is the same visit, not a new one: the mark stamps `admitted_at`
 once, every session for the row expires at `admitted_at + session_ttl_seconds`, and after that the
 answer is 410 ([#237](https://github.com/smoketurner/virtual-waiting-room/issues/237)). Otherwise a
 place that had reached the front could be handed around and mint full-length sessions for as long
 as its row lived. A failed mark (`admission_claim_failed`) still admits; a later call takes a
-second unit, which admits fewer people, never more.
+second spot, which admits fewer people, never more.
 
 The session is a compact JWS (HS256) signed under a key derived from the deployment secret with a
 per-kind label ([ADR-0024](adr/0024-jws-credentials.md)), carrying the event as `aud`, the expiry,
@@ -306,7 +325,7 @@ and a keyed tag of the viewer's IPv4 address or IPv6 /64 from `CloudFront-Viewer
 <session_cookie_name>=<jws>; Path=/; Max-Age=<session_ttl_seconds>; Secure; HttpOnly; SameSite=Lax
 ```
 
-`session_ttl_seconds` defaults to 900, and each session holds one of the origin's slots for that
+`session_ttl_seconds` defaults to 900, and each session holds one of the origin's spots for that
 long. Terraform passes it as `SESSION_TTL_SECS` to `generate_token`, `nojs`, `controller` and
 `read`, which all require it, so the session the gate enforces is the one the controller counts.
 The signing key is read from SSM once at cold start.
@@ -407,9 +426,9 @@ proven. The core ones:
 | In domain | `prop_in_domain` |
 | Uniform | `prop_uniform_by_decile` (χ² over 10 deciles at `n = 10,000`, below the p = 0.001 critical value) |
 | Keys distinct | `shard_keys_are_distinct_partition_keys`, `the_tokens_table_key_space_does_not_collide_across_kinds` |
-| Concurrency bounded | `no_more_sessions_are_ever_live_than_the_origin_takes`, `lowering_the_limit_below_the_live_sessions_admits_nobody`, `a_pass_never_panics_rewinds_or_grants_past_the_limit` |
-| No-show correction | `the_origin_stays_nearly_full_despite_no_shows` |
-| Sessions replaced | `sessions_ending_are_replaced_at_their_rate`, `replacements_are_released_a_pass_before_sessions_end`, `a_session_frees_its_slot_once_its_length_has_passed` |
+| Concurrency bounded | `no_more_visitors_are_ever_on_the_site_than_the_origin_takes`, `lowering_the_limit_below_the_spots_in_use_calls_nobody`, `a_pass_never_panics_moves_back_or_calls_past_the_limit` |
+| Held turns | `spots_held_for_an_earlier_call_are_not_called_again`, `a_missed_turn_frees_its_spot_one_pass_after_the_hold`, `a_shelf_a_counted_call_still_uses_is_never_reused`, `a_call_soon_after_the_draw_closes_holds_until_every_page_knows_its_place`, `the_origin_stays_nearly_full_despite_no_shows` |
+| Sessions replaced | `sessions_ending_are_replaced_at_their_rate`, `a_session_frees_its_spot_once_its_length_has_passed` |
 | Gate conformance | `infra/modules/edge/tests/gate.conformance.test.js` |
 
 ## 12. Known gaps
@@ -428,7 +447,7 @@ shape how the built system behaves:
   returns to the queue; set it longer than the worst realistic visit.
 - **The admin Lambda can read the signing key.** Its KeyValueStore grant covers `k` as well as the
   config, and IAM cannot narrow it.
-- **No completion signal** (#65). A visitor who finishes early holds their slot until the session
+- **No completion signal** (#65). A visitor who finishes early holds their spot until the session
   ends, because nothing reports a departure.
 - **GovCloud has no gate.** CloudFront Functions are not offered there (N4).
 

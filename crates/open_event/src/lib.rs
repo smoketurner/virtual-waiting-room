@@ -18,7 +18,8 @@
 
 use std::future::Future;
 
-use wr_common::{CohortError, CohortOffsets, SHARDS};
+use jiff::{SignedDuration, Timestamp};
+use wr_common::{CohortError, CohortOffsets, Counters, SHARDS};
 
 pub mod dynamo;
 pub mod sqs;
@@ -49,6 +50,18 @@ pub enum OpenResult {
 
 /// The persistence port the open drives.
 pub trait Store {
+    /// The event's `Counters` item, for when its draw closes.
+    fn load_counters(
+        &self,
+        event_id: &str,
+    ) -> impl Future<Output = Result<Option<Counters>, StoreError>> + Send;
+
+    /// Reads the 10 shard counts of joins sent back to wait for the open.
+    fn read_deferred_counts(
+        &self,
+        event_id: &str,
+    ) -> impl Future<Output = Result<[u64; SHARDS], StoreError>> + Send;
+
     /// Reads the 10 pre-queue shard counts for the event.
     fn read_shard_counts(
         &self,
@@ -244,6 +257,77 @@ where
     Drain::TimedOut { waiting }
 }
 
+/// The pause between reads of the join queue while it drains.
+pub const DRAIN_PAUSE: SignedDuration = SignedDuration::from_secs(1);
+
+/// What the open keeps of its deadline for the open itself: one `BatchGetItem`
+/// and one conditional `UpdateItem`.
+pub const OPEN_RESERVE: SignedDuration = SignedDuration::from_secs(10);
+
+/// How many reads of the join queue fit before `deadline`, keeping
+/// [`OPEN_RESERVE`] for the open itself.
+#[must_use]
+pub fn drain_polls(deadline: Timestamp, now: Timestamp) -> u32 {
+    let left = deadline
+        .duration_since(now)
+        .saturating_sub(OPEN_RESERVE)
+        .max(SignedDuration::ZERO);
+    u32::try_from(left.as_secs() / DRAIN_PAUSE.as_secs()).unwrap_or(u32::MAX)
+}
+
+/// Opens the event once its draw has closed and the join queue has caught up
+/// on the joins accepted before then, as long as `deadline` allows.
+///
+/// A join accepted before the draw's cutoff is on time, so nothing is written
+/// before it. Neither wait is a reason not to open: a cutoff past what the
+/// deadline allows, or a read that fails, opens without it.
+///
+/// # Errors
+///
+/// The open itself failed; see [`open_event`].
+pub async fn open_when_ready<S, B, C, Z, F>(
+    store: &S,
+    backlog: &B,
+    event_id: &str,
+    seed: [u8; 32],
+    deadline: Timestamp,
+    now: C,
+    sleep: Z,
+) -> Result<OpenResult, StoreError>
+where
+    S: Store,
+    B: Backlog,
+    C: Fn() -> Timestamp,
+    Z: Fn(SignedDuration) -> F,
+    F: Future<Output = ()>,
+{
+    let latest = deadline.checked_sub(OPEN_RESERVE).unwrap_or(Timestamp::MIN);
+    match store.load_counters(event_id).await {
+        Ok(counters) => {
+            if let Some(cutoff) = counters.as_ref().and_then(Counters::draw_cutoff) {
+                if cutoff > latest {
+                    tracing::warn!(
+                        %cutoff,
+                        event = "open_before_draw_cutoff",
+                        "the draw closes after the open must go ahead; joins accepted between are numbered behind the cohort"
+                    );
+                }
+                let wait = cutoff.min(latest).duration_since(now());
+                if wait.is_positive() {
+                    sleep(wait).await;
+                }
+            }
+        }
+        Err(err) => {
+            tracing::error!(error = %err, event = "open_cutoff_unreadable", "could not read when the draw closes; opening without waiting for it");
+        }
+    }
+    let polls = drain_polls(deadline, now());
+    let drain = wait_for_drain(backlog, polls, || sleep(DRAIN_PAUSE)).await;
+    tracing::info!(drain = ?drain, "join queue checked before the open");
+    open_event(store, event_id, seed).await
+}
+
 /// The phase the open leaves the event in.
 #[must_use]
 pub fn opened_phase() -> wr_common::Phase {
@@ -273,6 +357,8 @@ mod tests {
         /// wrong-phase rejection the real `DynamoDB` guard produces.
         phase: Phase,
         written: Mutex<Option<OpenValues>>,
+        starts_at: Option<Timestamp>,
+        counters_fail: bool,
     }
 
     impl FakeStore {
@@ -282,16 +368,58 @@ mod tests {
                 already_open,
                 phase: Phase::PreQueue,
                 written: Mutex::new(None),
+                starts_at: None,
+                counters_fail: false,
+            }
+        }
+
+        fn starting(starts_at: Timestamp) -> Self {
+            Self {
+                starts_at: Some(starts_at),
+                ..Self::new([0; SHARDS], false)
             }
         }
     }
 
     impl Store for FakeStore {
+        fn load_counters(
+            &self,
+            event_id: &str,
+        ) -> impl Future<Output = Result<Option<Counters>, StoreError>> + Send {
+            let counters = Counters {
+                event_id: event_id.to_owned(),
+                phase: self.phase,
+                queue_counter: 0,
+                serving_counter: 0,
+                shuffle_seed: None,
+                participant_count: None,
+                prequeue_offsets: None,
+                message: None,
+                origin_concurrency: None,
+                stored_control: wr_common::StoredControl::Open,
+                fail_open_until: None,
+                starts_at: self.starts_at,
+                calls: Vec::new(),
+            };
+            std::future::ready(if self.counters_fail {
+                Err(StoreError("get_item counters: boom".to_owned()))
+            } else {
+                Ok(Some(counters))
+            })
+        }
+
         fn read_shard_counts(
             &self,
             _event_id: &str,
         ) -> impl Future<Output = Result<[u64; SHARDS], StoreError>> + Send {
             std::future::ready(Ok(self.counts))
+        }
+
+        fn read_deferred_counts(
+            &self,
+            _event_id: &str,
+        ) -> impl Future<Output = Result<[u64; SHARDS], StoreError>> + Send {
+            std::future::ready(Ok([0; SHARDS]))
         }
 
         fn write_open(
@@ -408,7 +536,19 @@ mod tests {
         // way the original bug misreported it.
         struct ReadFails;
         impl Store for ReadFails {
+            fn load_counters(
+                &self,
+                _event_id: &str,
+            ) -> impl Future<Output = Result<Option<Counters>, StoreError>> + Send {
+                std::future::ready(Ok(None))
+            }
             fn read_shard_counts(
+                &self,
+                _event_id: &str,
+            ) -> impl Future<Output = Result<[u64; SHARDS], StoreError>> + Send {
+                std::future::ready(Ok([0; SHARDS]))
+            }
+            fn read_deferred_counts(
                 &self,
                 _event_id: &str,
             ) -> impl Future<Output = Result<[u64; SHARDS], StoreError>> + Send {
@@ -501,6 +641,88 @@ mod tests {
             let index = reads.saturating_sub(1).min(self.counted.len() - 1);
             std::future::ready(Ok(self.counted[index]))
         }
+    }
+
+    /// Runs `open_when_ready` at `now` against an empty queue, returning what
+    /// it opened and every pause it took.
+    async fn open_at(
+        store: &FakeStore,
+        now: Timestamp,
+        deadline: Timestamp,
+    ) -> (Result<OpenResult, StoreError>, Vec<SignedDuration>) {
+        let pauses = Mutex::new(Vec::new());
+        let backlog = ScriptedBacklog::new(vec![Ok(0)]);
+        let opened = open_when_ready(
+            store,
+            &backlog,
+            "evt-1",
+            [3u8; 32],
+            deadline,
+            || now,
+            |d| {
+                pauses.lock().unwrap().push(d);
+                std::future::ready(())
+            },
+        )
+        .await;
+        (opened, pauses.into_inner().unwrap())
+    }
+
+    const T0: Timestamp = Timestamp::constant(1_000_000, 0);
+
+    #[tokio::test]
+    async fn the_open_waits_for_the_draw_to_close_before_writing() {
+        let store = FakeStore::starting(T0);
+        let (opened, pauses) = open_at(&store, T0, T0 + SignedDuration::from_mins(15)).await;
+        assert!(matches!(opened, Ok(OpenResult::Opened(_))));
+        // The grace window, then the drain's one pause between its two reads.
+        assert_eq!(pauses, vec![wr_common::DRAW_GRACE, DRAIN_PAUSE]);
+    }
+
+    #[tokio::test]
+    async fn an_open_after_the_cutoff_or_unscheduled_does_not_wait_for_it() {
+        let late = FakeStore::starting(T0);
+        let (_, pauses) = open_at(
+            &late,
+            T0 + SignedDuration::from_mins(1),
+            T0 + SignedDuration::from_mins(16),
+        )
+        .await;
+        assert_eq!(pauses, vec![DRAIN_PAUSE]);
+        let unscheduled = FakeStore::new([0; SHARDS], false);
+        let (_, pauses) = open_at(&unscheduled, T0, T0 + SignedDuration::from_mins(15)).await;
+        assert_eq!(pauses, vec![DRAIN_PAUSE]);
+    }
+
+    #[tokio::test]
+    async fn a_cutoff_past_the_deadline_waits_only_as_long_as_the_open_can() {
+        let store = FakeStore::starting(T0 + SignedDuration::from_hours(1));
+        let deadline = T0 + SignedDuration::from_mins(15);
+        let (opened, pauses) = open_at(&store, T0, deadline).await;
+        assert!(matches!(opened, Ok(OpenResult::Opened(_))));
+        assert_eq!(
+            pauses.first(),
+            Some(&(SignedDuration::from_mins(15) - OPEN_RESERVE))
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_cutoff_opens_without_waiting_for_it() {
+        let store = FakeStore {
+            counters_fail: true,
+            ..FakeStore::starting(T0)
+        };
+        let (opened, pauses) = open_at(&store, T0, T0 + SignedDuration::from_mins(15)).await;
+        assert!(matches!(opened, Ok(OpenResult::Opened(_))));
+        assert_eq!(pauses, vec![DRAIN_PAUSE]);
+    }
+
+    #[test]
+    fn the_drain_runs_until_the_open_must_go_ahead() {
+        let now = Timestamp::constant(1_000, 0);
+        assert_eq!(drain_polls(now + SignedDuration::from_mins(15), now), 890);
+        assert_eq!(drain_polls(now + SignedDuration::from_secs(10), now), 0);
+        assert_eq!(drain_polls(now, now + SignedDuration::from_secs(5)), 0);
     }
 
     #[tokio::test]

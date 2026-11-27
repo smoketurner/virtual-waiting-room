@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use aws_sdk_dynamodb::types::AttributeValue;
 
 use crate::permutation::Shard;
+use crate::turns::Shelf;
 
 /// The partition key attribute of the `Counters` table.
 const KEY_ATTR: &str = "event_id";
@@ -74,9 +75,9 @@ pub const SHARD_CAP_ATTR: &str = "c";
 /// epoch seconds and the total admitted when it read the shards.
 pub const ADMISSION_LOG_ATTR: &str = "h";
 
-/// How many slots the cursor has been moved for, in all: the origin's limit
-/// plus every session due to have ended by the pass after the last.
-pub const ADMISSION_PROVIDED_ATTR: &str = "p";
+/// The attribute an arrivals counter records its shelf in, beside its own
+/// index, for the same reason.
+pub const SHELF_INDEX_ATTR: &str = "f";
 
 /// The attribute the event's scheduled start is stored in, epoch seconds.
 ///
@@ -163,9 +164,18 @@ pub enum Key<'a> {
     /// increment costs exactly one write unit rather than the size of a growing
     /// shared item.
     PrequeueShard { event_id: &'a str, shard: Shard },
-    /// One arrivals shard, incremented when a visitor claims their admission
-    /// and summed by the controller to measure the no-show rate.
-    ArrivalsShard { event_id: &'a str, shard: Shard },
+    /// One arrivals counter on one shelf: a call's held spots are taken here,
+    /// and the controller sums every counter on every shelf to count who has
+    /// been let in.
+    ArrivalsShard {
+        event_id: &'a str,
+        shelf: Shelf,
+        shard: Shard,
+    },
+    /// One shard counting joins accepted after the draw closed that arrived
+    /// before the open was written, and were sent back to wait for it. The
+    /// open counts them as cleared from the queue.
+    DeferredShard { event_id: &'a str, shard: Shard },
     /// The controller's log of how many had been admitted when, which is how it
     /// knows how many sessions are still live. Read and written by the
     /// controller alone, so it is kept off the event's item, which every
@@ -189,6 +199,7 @@ impl Key<'_> {
             Key::Event { .. }
             | Key::PrequeueShard { .. }
             | Key::ArrivalsShard { .. }
+            | Key::DeferredShard { .. }
             | Key::AdmissionLog { .. } => KEY_ATTR,
             Key::OidcSession { .. } | Key::PkceTransaction { .. } => TOKENS_KEY_ATTR,
             Key::Prequeue { .. } => PREQUEUE_KEY_ATTR,
@@ -204,8 +215,13 @@ impl Key<'_> {
             Key::PrequeueShard { event_id, shard } => {
                 format!("EVT#{event_id}#PQ#{}", shard.index())
             }
-            Key::ArrivalsShard { event_id, shard } => {
-                format!("EVT#{event_id}#AR#{}", shard.index())
+            Key::ArrivalsShard {
+                event_id,
+                shelf,
+                shard,
+            } => format!("EVT#{event_id}#AR#{}#{}", shelf.index(), shard.index()),
+            Key::DeferredShard { event_id, shard } => {
+                format!("EVT#{event_id}#DF#{}", shard.index())
             }
             Key::AdmissionLog { event_id } => format!("EVT#{event_id}#LOG"),
             Key::OidcSession { session_id } => format!("SESS#{session_id}"),
@@ -462,10 +478,19 @@ mod tests {
         assert_eq!(
             Key::ArrivalsShard {
                 event_id: "evt",
+                shelf: Shelf::new(12).unwrap(),
                 shard: shard(3)
             }
             .value(),
-            "EVT#evt#AR#3"
+            "EVT#evt#AR#12#3"
+        );
+        assert_eq!(
+            Key::DeferredShard {
+                event_id: "evt",
+                shard: shard(3)
+            }
+            .value(),
+            "EVT#evt#DF#3"
         );
         assert_eq!(Key::AdmissionLog { event_id: "evt" }.value(), "EVT#evt#LOG");
         assert_eq!(Key::OidcSession { session_id: "abc" }.value(), "SESS#abc");
@@ -495,18 +520,33 @@ mod tests {
             "a shard must not collide with the Counters item"
         );
 
-        let arrivals: BTreeSet<String> = (0..SHARDS)
+        let arrivals: BTreeSet<String> = Shelf::all()
+            .flat_map(|shelf| {
+                (0..SHARDS).map(move |s| {
+                    Key::ArrivalsShard {
+                        event_id: "evt",
+                        shelf,
+                        shard: shard(s),
+                    }
+                    .value()
+                })
+            })
+            .collect();
+        assert_eq!(arrivals.len(), SHARDS * crate::turns::SHELVES);
+        let deferred: BTreeSet<String> = (0..SHARDS)
             .map(|s| {
-                Key::ArrivalsShard {
+                Key::DeferredShard {
                     event_id: "evt",
                     shard: shard(s),
                 }
                 .value()
             })
             .collect();
-        assert_eq!(arrivals.len(), SHARDS);
-        // The two counter families must not collide with each other either.
+        assert_eq!(deferred.len(), SHARDS);
+        // The counter families must not collide with each other either.
         assert!(prequeue.is_disjoint(&arrivals));
+        assert!(prequeue.is_disjoint(&deferred));
+        assert!(arrivals.is_disjoint(&deferred));
     }
 
     #[test]

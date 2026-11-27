@@ -27,10 +27,10 @@ record that moved it. There is no 0020.
 | [0018](0018-admin-vouch-design-language.md) | Style the admin UI with the Vouch design language (supersedes 0014's styling) |
 | [0019](0019-visitor-facing-serving-state.md) | Express the visitor-facing serving state as one enum |
 | [0021](0021-edge-function-gate.md) | Gate the protected origin with a CloudFront Function (narrowed by 0032; amended by 0024, 0036) |
-| [0022](0022-durable-controller-cadence.md) | Build the controller's 10-second cadence from durable waits (control law amended by 0039, 0041) |
-| [0023](0023-adaptive-poll-interval.md) | Scale the client poll interval with distance to the front (amended by 0031, 0039, 0041) |
+| [0022](0022-durable-controller-cadence.md) | Build the controller's 10-second cadence from durable waits (control law amended by 0039, 0041, 0043) |
+| [0023](0023-adaptive-poll-interval.md) | Scale the client poll interval with distance to the front (amended by 0031, 0039, 0041, 0043) |
 | [0024](0024-jws-credentials.md) | Carry credentials as a JWS (amends 0011; amended by 0032) |
-| [0025](0025-operator-owned-seal-schedule.md) | The operator owns the open schedule's time; Terraform owns the schedule (revised: Open now, and `active` is not operator-settable) |
+| [0025](0025-operator-owned-seal-schedule.md) | The operator owns the open schedule's time; Terraform owns the schedule (revised: Open now, and `active` is not operator-settable; amended by 0042, 0043) |
 | [0026](0026-entry-tickets.md) | One position per identity, from a customer-signed entry ticket (superseded by 0028) |
 | [0027](0027-ticket-delivery-fragment-not-query.md) | Deliver the entry ticket by cookie, or by URL fragment — never a query string (superseded by 0028) |
 | [0028](0028-remove-entry-tickets.md) | Remove entry tickets: nothing could use them without customer-side work we do not supply |
@@ -38,16 +38,17 @@ record that moved it. There is no 0020.
 | [0030](0030-remove-open-time-demotion.md) | Remove open-time demotion: never enabled, sixteen concepts, and a room-wide refusal if one chunk item went unread |
 | [0031](0031-remove-controller-driven-expiry.md) | Remove controller-driven expiry: an unbounded Scan six times a minute that could not see the pre-queue cohort |
 | [0032](0032-remove-the-origin-authorizer.md) | Remove the origin authorizer: nothing invoked it, and as wired it forwarded every request |
-| [0033](0033-admission-claimed-once-per-visitor.md) | Admission is claimed once per visitor, and a repeat still admits (amended by 0039) |
+| [0033](0033-admission-claimed-once-per-visitor.md) | Admission is claimed once per visitor, and a repeat still admits (amended by 0039, 0043) |
 | [0034](0034-single-region-failure-domain.md) | The waiting room is single-region, and fails open around a regional impairment |
 | [0035](0035-request-id-proof-of-possession.md) | A request id is redeemed only with the secret it joined with (amends 0010) |
 | [0036](0036-optional-session-ip-binding.md) | Sessions can be bound to the visitor's network, off by default |
 | [0037](0037-no-javascript-queue.md) | A visitor without JavaScript queues through a small server-rendered path |
 | [0038](0038-edge-web-acl-on-flat-rate-plan.md) | A place in the queue costs a WAF challenge, and the API answers only CloudFront |
-| [0039](0039-meter-admissions-not-the-cursor.md) | Meter admissions with a budget taken at issuance; the no-show estimator is removed (amends 0022, 0033; budget law amended by 0041) |
+| [0039](0039-meter-admissions-not-the-cursor.md) | Meter admissions with a budget taken at issuance; the no-show estimator is removed (amends 0022, 0033; budget law amended by 0041; taking a spot amended by 0043) |
 | [0040](0040-what-the-published-seed-proves.md) | The published seed proves the arithmetic, not the draw; a beacon-derived seed is not adopted |
-| [0041](0041-meter-origin-concurrency.md) | Meter origin concurrency: the budget is the free slots, counted from fixed-length sessions (amends 0039) |
-| [0042](0042-the-open-waits-out-the-join-backlog.md) | The open waits for the join queue to catch up, however long; Open now invokes it asynchronously (amends 0025) |
+| [0041](0041-meter-origin-concurrency.md) | Meter origin concurrency: the budget is the free slots, counted from fixed-length sessions (amends 0039; amended by 0043) |
+| [0042](0042-the-open-waits-out-the-join-backlog.md) | The open waits for the join queue to catch up, however long; Open now invokes it asynchronously (amends 0025; amended by 0043) |
+| [0043](0043-held-turns-and-join-order.md) | Held turns: each called visitor's spot is held for them; the draw closes 15 s after the start; later joins numbered by when they were accepted (amends 0022, 0023, 0025, 0033, 0039, 0041, 0042) |
 
 ## Open
 

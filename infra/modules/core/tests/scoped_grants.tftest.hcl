@@ -124,15 +124,15 @@ run "each_writer_reaches_only_its_own_items" {
   assert {
     condition = toset(one(one([
       for s in data.aws_iam_policy_document.assign_position.statement : s if s.sid == "ReadAndClaimCounters"
-    ]).condition).values) == toset(["EVT#an-event-id", "EVT#an-event-id#PQ#*"])
-    error_message = "assign_position touches the event item and the pre-queue shards"
+    ]).condition).values) == toset(["EVT#an-event-id", "EVT#an-event-id#PQ#*", "EVT#an-event-id#DF#*"])
+    error_message = "assign_position touches the event item, the pre-queue shards and the deferred-join shards"
   }
 
   assert {
     condition = toset(one(one([
       for s in data.aws_iam_policy_document.open_event.statement : s if s.sid == "ReadAndOpenCounters"
-    ]).condition).values) == toset(["EVT#an-event-id", "EVT#an-event-id#PQ#*"])
-    error_message = "open_event reads the pre-queue shards and writes the event item"
+    ]).condition).values) == toset(["EVT#an-event-id", "EVT#an-event-id#PQ#*", "EVT#an-event-id#DF#*"])
+    error_message = "open_event reads the pre-queue and deferred-join shards and writes the event item"
   }
 
   assert {
@@ -165,6 +165,23 @@ run "the_admission_functions_log_only_to_their_own_groups" {
 
 # The open waits for the join queue to drain (issue #239), so it has to be told
 # which queue and allowed to read its depth -- and nothing more.
+run "assign_position_can_send_a_join_back_to_the_queue" {
+  command = plan
+
+  assert {
+    condition     = aws_lambda_function.assign_position.environment[0].variables["JOIN_QUEUE_URL"] == aws_sqs_queue.join.url
+    error_message = "assign_position must be pointed at the join queue it sends early joins back to"
+  }
+
+  assert {
+    condition = contains(flatten([
+      for s in data.aws_iam_policy_document.assign_position.statement : tolist(s.actions)
+      if contains(s.resources, aws_sqs_queue.join.arn)
+    ]), "sqs:ChangeMessageVisibility")
+    error_message = "assign_position needs sqs:ChangeMessageVisibility to send a join back for seconds rather than the visibility timeout"
+  }
+}
+
 run "the_open_can_read_the_join_queue_depth_and_only_that" {
   command = plan
 

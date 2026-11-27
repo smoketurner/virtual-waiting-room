@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project
 
 A virtual waiting room that deploys into a customer's own AWS account: it holds visitors
-during a traffic spike and meters them into the origin at a controlled rate. Rust Lambdas
+during a traffic spike and meters them into the origin, never more at once than it takes. Rust Lambdas
 plus Terraform; no always-on compute. Status is MVP — the scheduled pre-queue and live-join
 paths are implemented and deployable.
 
@@ -80,35 +80,44 @@ Position assignment has two paths:
   `s` drawn at random per ingest batch (issue #59), local index `l` from a striped counter (ADR-0015). At T−0
   `open_event` folds the ten shard counts into prefix offsets and a cohort size and writes
   seed + offsets + count + phase in **one conditional `UpdateItem`** guarded by
-  `attribute_not_exists(shuffle_seed)`, so a double-fire opens exactly once. A visitor's
+  `attribute_not_exists(shuffle_seed) AND phase = pre_queue`, so a double-fire opens exactly once. A visitor's
   position is `PRP(seed, offset[s] + l, N)`, computed on read — never stored (ADR-0002), and
   `queue_counter` starts at `N` so live joiners are numbered behind the whole cohort. The open
   reads the ten shard counters and never the rows, so the write costs the same at a million
-  registrations as at ten. Before it reads them it waits for the join queue to catch up, as long as its
-  900 s timeout allows, so joins accepted before T−0 are in the cohort rather than behind it
-  (issue #239, ADR-0042).
-- **Live join.** `assign_position` claims a contiguous block with one
-  `UpdateItem ADD queue_counter :n / ALL_NEW`, incrementing by the count of **valid** records
-  only, then writes each row with `attribute_not_exists(request_id)`. Gaps are acceptable;
+  registrations as at ten. The draw closes 15 s after T−0 (`wr_common::DRAW_GRACE`): a join is in it
+  if SQS accepted it (`SentTimestamp`) before `starts_at + 15 s`, whenever it is processed. The open
+  writes nothing before that cutoff, then waits for the join queue to catch up, as long as its 900 s
+  timeout allows, so on-time joins are in the cohort rather than behind it (issue #239, ADR-0042,
+  ADR-0043). A join accepted after the cutoff that arrives before the open is written is sent back
+  with `ChangeMessageVisibility` (2 s, doubling per delivery; `assign_position` gets
+  `JOIN_QUEUE_URL` and `sqs:ChangeMessageVisibility` for it) and counted on
+  `EVT#{event_id}#DF#{shard}`, which the open counts as cleared.
+- **Live join.** `assign_position` sorts the batch by `SentTimestamp`, claims a contiguous block
+  with one `UpdateItem ADD queue_counter :n / ALL_NEW`, incrementing by the count of **valid**
+  records only, then writes each row with `attribute_not_exists(request_id)`. Gaps are acceptable;
   duplicates are not.
 
-Admission is metered where it happens (ADR-0039) and bounded by **origin concurrency**
-(ADR-0041): the most sessions live at once. A session ends exactly `session_ttl_seconds` after
-its admission (900 s by default, the time to complete a purchase), so the live ones are the
-admissions of the last session length. `controller` runs six passes per `rate(1 minute)` execution
-(10 s cadence) and keeps an **admission log** (`EVT#{event_id}#LOG`: the total admitted at each
-pass) to count them. Each pass grants the free slots, `origin_concurrency` minus the live sessions,
-as an **admission budget** (a cap `c` on each arrivals shard), and advances `serving_counter` by the
-slots due free by the next pass, one pass early, plus half of any slot left untaken through the
-last pass (the no-show correction). Throughput is therefore `origin_concurrency` per session
+Admission is bounded by **origin concurrency** (ADR-0041): the ticket site's spots, the most
+sessions live at once. A session ends exactly `session_ttl_seconds` after the visitor was let in
+(900 s by default, the time to complete a purchase), so the spots in use are the people let in
+during the last session length. `controller` runs six passes per `rate(1 minute)` execution
+(10 s cadence) and keeps an **admission log** (`EVT#{event_id}#LOG`: the total let in at each
+pass) to count them. Each pass works out the free spots — `origin_concurrency`, less the spots in
+use, less the spots still held for earlier calls — and **calls** that many places in line, moving
+`serving_counter` (now serving) past them (ADR-0043). Each called visitor's spot is **held** for
+them for `wr_common::TURN_HOLD` (2 min; a call made less than `OPEN_SETTLE`, 2 min, after the draw
+closes is held until 4 min after it closed, because the waiting pages spread their first ask over
+those 2 min), on that call's own **shelf** of ten arrivals counters, one of 26 used in turn. Nobody
+else can take a held spot; one not taken in time is a missed turn, and one pass later
+(`TURN_MARGIN`, 10 s) the spot is called for the next place in line. Throughput is therefore `origin_concurrency` per session
 length. `SESSION_TTL_SECS` is required by every function that mints or counts a session and must
 be the same value: a session that outlives the controller's count is a visitor over the limit. It is a **Lambda durable
 function** (ADR-0022): each pass is a checkpointed durable step and each 10 s gap a durable
 wait that suspends the execution instead of holding the invocation open, so the waiting is not
 billed. The SDK (`aws-durable-execution-sdk`) is generally available and pinned exactly. It does
-not expire positions: a row lives until its DynamoDB TTL reclaims it (ADR-0031), and the unused
-budget is what compensates for absentees. A failed pass is skipped and the next computes the
-same free slots from the same state; an execution that finds the event `idle` or `post_event` ends after one pass.
+not expire positions: a row lives until its DynamoDB TTL reclaims it (ADR-0031), and a missed
+turn is what frees an absentee's spot. A failed pass is skipped and the next computes the
+same free spots from the same state; an execution that finds the event `idle` or `post_event` ends after one pass.
 
 **The gate is a CloudFront Function** (ADR-0021, issue #71), associated at viewer-request with the
 protected behaviour only — never distribution-wide, since Functions bill per invocation and a
@@ -122,15 +131,17 @@ than passes; only an unreadable config passes, marked (#242). `event_id` and the
 cookie name are templated into the function's own source rather than carried in the
 KeyValueStore value, so Terraform stays their single source of truth.
 
-`generate_token` mints the session cookie the gate verifies: it checks the visitor's position
+`generate_token` mints the session cookie the gate verifies: it checks the visitor's place in line
 against `serving_counter` (resolving the operator's admission control through
 `wr_common::resolve(StoredControl, fail_open_until, now)` — `FailOpen` is never a stored string,
-only an epoch), takes one unit of the admission budget (a conditional `ADD n` on a random arrivals
-shard while `n < c`; 425 when spent), and signs an HMAC-SHA256 session credential
-(`wr_common::crypto`). A visitor already marked admitted re-mints without taking a unit, into the
-same visit: every session expires at `admitted_at + ttl`, and after that the answer is 410 (issue
-#237). It is the only writer of the shards' `n`, which is both the meter and what the controller
-reads back.
+only an epoch), finds the visitor's call in the `Counters` item's `calls`, takes their held spot
+from that call's shelf (a conditional `ADD n` while `n < c`, trying each of the shelf's ten counters
+from a random one; 425 while not yet called, or in the moment before the spot is written), and signs an HMAC-SHA256
+session credential (`wr_common::crypto`). A turn that has passed is 410 with
+`reason: "turn_missed"`, and the waiting page takes a new place at the back. A visitor already
+marked admitted re-mints without taking a spot, into the same visit: every session expires at
+`admitted_at + ttl`, and after that the answer is 410 (issue #237). It is the only writer of the
+counters' `n`, which is both the meter and what the controller reads back.
 
 The signing key is generated by `random_bytes.signing_key` during apply, one per generation.
 Terraform writes the current one to both readers: the SSM SecureString the Lambdas read, and the
@@ -145,9 +156,10 @@ sessions already issued last until they expire, and the rotation after that drop
 
 `wr-common` is the single shared library, laid out as `permutation` (Feistel PRP + shard
 assembly), `ids` + `items` (newtypes, `Phase`, `StoredControl`/`AdmissionControl`/`resolve`,
-DynamoDB item shapes), `expr` (update/condition fragments), `crypto` (token and session signing),
-and `rules` (`ProtectionRule` + its compact KeyValueStore-sized wire encoding, shared by
-`admin`'s edge-gate writer and mirrored by the CloudFront Function). Its whole public surface is re-exported flat, so callers write `wr_common::Phase`
+DynamoDB item shapes), `expr` (update/condition fragments), `crypto` (session signing, the possession digest, IP tags),
+`rules` (`ProtectionRule` + its compact KeyValueStore-sized wire encoding, shared by
+`admin`'s edge-gate writer and mirrored by the CloudFront Function), and `turns` (calls, shelves,
+`TURN_HOLD`/`OPEN_SETTLE`/`TURN_MARGIN`, `turn_of`). Its whole public surface is re-exported flat, so callers write `wr_common::Phase`
 rather than a path that encodes which layer a type lives in.
 `crates/wr-common/tests/vectors.rs` generates the cross-language conformance vectors
 `infra/modules/edge/tests/*.conformance.test.js` check the CloudFront Function against.
@@ -183,8 +195,9 @@ actions must work with JavaScript disabled, and the UI adds no capability the ad
 Four DynamoDB tables, all on-demand with PITR: `Counters` (PK `event_id`), `PreQueue` (PK `r`),
 `Positions` (PK `request_id`), `Tokens` (PK `request_id`).
 
-The event's own `Counters` item holds the sequences, phase, seed, origin concurrency, message, and
-the operator's admission override: `admission_control` (the `StoredControl` wire string, `open` or
+The event's own `Counters` item holds the sequences, phase, seed, origin concurrency, message, the
+recent calls (`calls`: each call's first place in line, when its turns pass, and its shelf, written
+with `serving_counter`), and the operator's admission override: `admission_control` (the `StoredControl` wire string, `open` or
 `paused` only — never `fail_open`, issue #71) and `fail_open_until` (an
 `Option<Timestamp>` deadline, stored as epoch seconds with `0` for no window). `wr_common::resolve(stored, fail_open_until, now)` is the only thing that
 produces the third, resolved value, `AdmissionControl::FailOpen`; nothing parses it back out of
@@ -199,8 +212,10 @@ one row. `Positions` and `PreQueue` hold one kind each and
 take bare ids: a tag there disambiguates nothing and costs bytes in the partition key of every
 row, of which there is one per visitor.
 
-`prequeue_counter` and `arrivals` are order-free and striped ×10, **as separate items** keyed
-`EVT#{event_id}#PQ#{shard}` and `EVT#{event_id}#AR#{shard}`, each holding one attribute `n`.
+`prequeue_counter` and the deferred-join count are order-free and striped ×10, **as separate items**
+keyed `EVT#{event_id}#PQ#{shard}` and `EVT#{event_id}#DF#{shard}`, each holding one attribute `n`.
+The arrivals counters are 26 shelves of ten, `EVT#{event_id}#AR#{shelf}#{shard}`, each with its
+count `n`, cap `c`, and its shelf and counter index; a call's held spots are on its own shelf.
 The event's own item is `EVT#{event_id}`; the controller's admission log is `EVT#{event_id}#LOG`,
 which only the controller reads. Every key is built by `wr_common::expr`, never at
 the call site, and `event_id` may not contain `#` — the separator would let one event's shard
@@ -274,7 +289,7 @@ most often:
 - `allow_attributes = "deny"` means you cannot silently `#[allow]` a lint. Fix the cause.
   `unwrap_used`, `panic`, `todo`, `print_stdout` are denied workspace-wide.
 - Controller and permutation arithmetic must be checked or saturating — the release profile
-  has no overflow checks, and a wrapped subtraction there releases a damaging burst.
+  has no overflow checks, and a wrapped subtraction there lets in a damaging burst.
 - Newtypes over primitives, enums over boolean flags. The *stored* admission form is
   `StoredControl` (`Open`/`Paused`) plus a `fail_open_until` epoch (issue #71): `resolve()` is
   the only thing that produces the third value, `FailOpen`, so it can
@@ -290,9 +305,9 @@ most often:
 Correctness is the product here: a duplicate position or a non-uniform permutation is a
 visible fairness failure at a million people. `.kiro/steering/testing.md` lists the mechanisms
 that must stay proven — bijectivity and uniformity of the PRP, the frozen wire encoding
-vectors, contiguous shard assembly, burned slots, the straggler-racing-the-open case, zero
+vectors, contiguous shard assembly, burned indices, the straggler-racing-the-open case, zero
 duplicate positions under concurrency, token/session non-interchangeability, cross-language
-credential and rule conformance with the edge gate (issue #71), and no-show convergence. Use
+credential and rule conformance with the edge gate (issue #71), and held turns. Use
 `proptest` for the permutation and counter, and mock the AWS boundary via the `Store` trait
 rather than mocking logic.
 

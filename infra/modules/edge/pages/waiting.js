@@ -43,6 +43,10 @@
   // the same few seconds as one at the floor. 0.3 at the floor gives
   // 5000..6500ms — the same window this client always used.
   var JITTER_FRACTION = 0.3;
+  // The draw closes this long after the start (wr_common::DRAW_GRACE), and
+  // the open is written after it. A closed page does not sleep past it: one
+  // that did would learn its number late, behind people who joined after it.
+  var DRAW_GRACE_MS = 15000;
   // Bounds a published policy must fall within to be trusted; see adoptPolicy.
   var MIN_MS = 1000;
   var MAX_MS = 300000;
@@ -337,6 +341,9 @@
   // position that was never claimed.
   var eventId = null;
   var admitting = false;
+  // Set when this page's turn passed before it took it, so the new place it
+  // takes says why it is at the back of the line.
+  var missedTurn = false;
 
   // Where a successful redemption navigates: the request the gate refused
   // before sending this visitor here, preserved across the round trip by its
@@ -374,6 +381,20 @@
 
   function jitter() {
     return Math.round(nextIntervalMs * (1 + Math.random() * JITTER_FRACTION));
+  }
+
+  // How long a closed event's page waits: the ceiling, but never past the
+  // moment the open can be written, jitter included, and the floor once that
+  // moment has come.
+  function closedIntervalMs(startsAt) {
+    if (typeof startsAt !== "number" || !isFinite(startsAt)) {
+      return policy.ceilingMs;
+    }
+    var openableIn = startsAt * 1000 + DRAW_GRACE_MS - Date.now();
+    return Math.min(
+      policy.ceilingMs,
+      Math.max(policy.floorMs, Math.floor(openableIn / (1 + JITTER_FRACTION)))
+    );
   }
 
   function say(headline, sub) {
@@ -857,16 +878,24 @@
     // At the end of a cohort it never does: the controller stops at
     // queue_counter + 1, so the last visitor in line sits at ahead === 0.
     if (position < serving) {
+      missedTurn = false;
       say("You're next", "Letting you through…");
     } else if (ahead === 0) {
-      say("You're next", "Waiting for the next release…");
+      say("You're next", "Waiting for your number to be called…");
     } else {
-      say(
-        "You're in line",
+      var behind =
         ahead === 1
           ? "1 person ahead of you."
-          : ahead.toLocaleString() + " people ahead of you."
-      );
+          : ahead.toLocaleString() + " people ahead of you.";
+      if (missedTurn) {
+        say(
+          "Your turn passed while you were away",
+          "Your spot went to the next person in line. You have a new place at the back: " +
+            behind
+        );
+      } else {
+        say("You're in line", behind);
+      }
     }
   }
 
@@ -924,16 +953,14 @@
         window.location.replace(nextDestination());
         return;
       }
-      // Not admitted this time: the origin has had its share for the moment
-      // (a 425 while the admission budget is spent, ADR-0039), or the operator
-      // paused. Fall back to polling rather than hammering.
+      // Not let in this time: this visitor's spot is not there to take yet,
+      // or the operator paused. Fall back to polling rather than hammering.
       admitting = false;
-      // A 425 is a slot not yet free: the controller releases the people for
-      // a slot a little before its session ends. Ask again at the floor, so the
-      // slot is taken within seconds of coming free; the crowd asking is only
-      // the people released for the next slots, so this is not a storm. A 429
-      // or a 5xx is a throttle or an overloaded function, and retrying it at
-      // the floor only feeds the overload, so that backs off.
+      // A 425 is a called visitor whose held spot is not written yet: the
+      // controller writes the call a moment before the spots. Ask again at
+      // the floor, and the spot is there. A 429 or a 5xx is a throttle or an
+      // overloaded function, and retrying it at the floor only feeds the
+      // overload, so that backs off.
       var busy = res.status === 429 || res.status >= 500;
       capacityMisses = busy ? capacityMisses + 1 : 0;
       if (res.status === 403) {
@@ -944,6 +971,19 @@
           "Open the waiting room again from the link you were given to take a new place."
         );
         stop();
+      } else if (res.status === 410 && res.body && res.body.reason === "turn_missed") {
+        // This visitor's number was called and the turn passed before this
+        // page took it: the spot went to the next place in line. Take a new
+        // place at the back, as a fresh visitor would, and say why.
+        removeStored(IDENTITY_KEY);
+        forgetJoin();
+        digestPromise = null;
+        resolveIdentity();
+        missedTurn = true;
+        say(
+          "Your turn passed while you were away",
+          "Your spot went to the next person in line. Taking a new place at the back…"
+        );
       } else if (res.status === 410) {
         // This place was used and the visit it bought is over (issue #237).
         // It cannot be redeemed again, so drop it: the next load of this page
@@ -1069,7 +1109,7 @@
           // that no longer exists — an operator who resets an event opens a new
           // one with a different permutation.
           forgetPosition();
-          nextIntervalMs = policy.ceilingMs;
+          nextIntervalMs = closedIntervalMs(s.starts_at);
           // A scheduled event counts down to its start; an unscheduled one has
           // no moment to name, so it keeps the original text. Branch rather
           // than render then overwrite -- both write the same two elements.
@@ -1170,8 +1210,9 @@
             if (q === null) {
               // Inside the spread window. The queue is open and moving, and
               // saying so is more honest than a spinner — this visitor has a
-              // number already, it just has not been asked for yet.
-              nextIntervalMs = policy.floorMs;
+              // number already, it just has not been asked for yet. Asked at
+              // the moment drawn for it, not a poll later.
+              nextIntervalMs = Math.min(policy.floorMs, firstAskAt - Date.now());
               say("You're in line", "Finding your number…");
               return schedule();
             }

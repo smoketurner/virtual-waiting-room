@@ -56,7 +56,7 @@
 //! The batch logic is generic over the [`Store`] port so it runs without AWS;
 //! the SDK-backed implementation lives in `dynamo`.
 
-use jiff::Timestamp;
+use jiff::{SignedDuration, Timestamp};
 use std::collections::HashSet;
 use std::future::Future;
 
@@ -65,6 +65,7 @@ use wr_common::{Assignment, Counters, Phase, SecretDigest, Shard};
 
 pub mod dynamo;
 pub mod handler;
+pub mod sqs;
 
 /// A join message body enqueued by the ingest API.
 #[derive(Debug, Clone, Deserialize)]
@@ -82,6 +83,10 @@ pub struct JoinMessage {
 #[derive(Debug, Clone)]
 pub struct BatchRecord {
     pub message_id: String,
+    /// What SQS needs to change when this message is next delivered.
+    pub receipt_handle: String,
+    /// How many times SQS has delivered it, this time included.
+    pub receives: u32,
     pub body: String,
     /// When SQS accepted the join: the registration's time.
     pub sent_at: Timestamp,
@@ -173,6 +178,46 @@ pub trait Store {
         &self,
         request_ids: &[String],
     ) -> impl Future<Output = Result<HashSet<String>, StoreError>> + Send;
+
+    /// Adds `n` to one deferral shard: joins accepted after the draw closed
+    /// that were sent back to wait for the open.
+    fn count_deferred(
+        &self,
+        event_id: &str,
+        shard: Shard,
+        n: u64,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+}
+
+/// The join queue, for sending a message back to wait.
+pub trait Queue {
+    /// Makes the message with `receipt_handle` deliverable again after
+    /// `delay`, instead of after the queue's visibility timeout.
+    fn defer(
+        &self,
+        receipt_handle: &str,
+        delay: SignedDuration,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send;
+}
+
+/// The longest a deferred join waits between deliveries.
+const MAX_DEFERRAL: SignedDuration = SignedDuration::from_secs(1024);
+
+/// How long a join waits for the open before it is delivered again, on its
+/// `receives`th delivery: 2 s, doubling each time. Ten deliveries cover about
+/// 34 minutes, longer than the open can take, so a join is never
+/// dead-lettered while waiting for it.
+#[must_use]
+pub fn deferral_delay(receives: u32) -> SignedDuration {
+    let exponent = receives.clamp(1, 10);
+    SignedDuration::from_secs(1i64 << exponent).min(MAX_DEFERRAL)
+}
+
+/// A join sent back to wait for the open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Deferral {
+    pub receipt_handle: String,
+    pub delay: SignedDuration,
 }
 
 /// The result of a single conditional position or pre-queue write.
@@ -195,6 +240,9 @@ pub struct StoreError(pub String);
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct BatchOutcome {
     pub failures: Vec<String>,
+    /// Of the failures, the joins sent back to wait for the open, and for how
+    /// long.
+    pub deferred: Vec<Deferral>,
 }
 
 /// Why a record was permanently rejected: never retried, never
@@ -354,7 +402,42 @@ pub async fn process_batch<S: Store>(
     if live_path {
         process_live_batch(store, event_id, valid, &mut outcome).await;
     } else if counters.phase == Phase::PreQueue {
-        process_prequeue_batch(store, event_id, shard, valid, &mut outcome).await;
+        // A join accepted after the draw's cutoff is behind everyone in it,
+        // even when it is processed before the open is written: it waits for
+        // its redelivery, when the live path numbers it.
+        let cutoff = counters.draw_cutoff();
+        let (before, after): (Vec<_>, Vec<_>) = valid
+            .into_iter()
+            .partition(|(_, _, sent_at)| cutoff.is_none_or(|t| *sent_at < t));
+        if !after.is_empty() {
+            tracing::info!(
+                event = "join_after_open_deferred",
+                deferred = after.len(),
+                "joins accepted after the draw's cutoff wait for the open to be written"
+            );
+        }
+        for (message_id, _, _) in &after {
+            outcome.failures.push(message_id.clone());
+            if let Some(record) = records.iter().find(|r| &r.message_id == message_id) {
+                outcome.deferred.push(Deferral {
+                    receipt_handle: record.receipt_handle.clone(),
+                    delay: deferral_delay(record.receives),
+                });
+            }
+        }
+        if !after.is_empty() {
+            // Counted so the open knows the queue is being cleared of joins it
+            // need not wait for. A lost count only makes the open wait longer.
+            if let Err(err) = store
+                .count_deferred(event_id, shard, after.len() as u64)
+                .await
+            {
+                tracing::warn!(error = %err, "could not count deferred joins");
+            }
+        }
+        if !before.is_empty() {
+            process_prequeue_batch(store, event_id, shard, before, &mut outcome).await;
+        }
     } else {
         // An unopened event in a non-`PreQueue` phase has no live-join sequence
         // to claim from and no pre-queue to register into, so neither path can
@@ -407,9 +490,11 @@ async fn registered_ids_or_unknown<S: Store>(store: &S, request_ids: &[String]) 
 async fn process_live_batch<S: Store>(
     store: &S,
     event_id: &str,
-    valid: Vec<(String, JoinMessage, Timestamp)>,
+    mut valid: Vec<(String, JoinMessage, Timestamp)>,
     outcome: &mut BatchOutcome,
 ) {
+    // Numbered in the order the joins were accepted, as far as one batch can.
+    valid.sort_by_key(|(_, _, sent_at)| *sent_at);
     let n = valid.len() as u64;
     let end = match store.claim_block(event_id, n).await {
         Ok(end) => end,
@@ -621,6 +706,8 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
+    use jiff::SignedDuration;
+
     use wr_common::{CohortOffsets, SHARDS, StoredControl};
 
     use super::*;
@@ -651,6 +738,7 @@ mod tests {
         prequeue_seen: Mutex<Vec<String>>,
         prequeue_claim_fails: bool,
         fail_prequeue_write_for: Option<String>,
+        deferred_counts: Mutex<[u64; SHARDS]>,
 
         // `load_counters` canned responses, consumed in call order; the last
         // value repeats once the queue is down to one. `None` per response
@@ -691,6 +779,7 @@ mod tests {
                 counters_calls: Mutex::new(0),
                 already_registered: Mutex::new(HashSet::new()),
                 registered_ids_fails: false,
+                deferred_counts: Mutex::new([0; SHARDS]),
             }
         }
     }
@@ -793,6 +882,16 @@ mod tests {
             std::future::ready(result)
         }
 
+        fn count_deferred(
+            &self,
+            _event_id: &str,
+            shard: Shard,
+            n: u64,
+        ) -> impl std::future::Future<Output = Result<(), StoreError>> + Send {
+            self.deferred_counts.lock().unwrap()[shard.index()] += n;
+            std::future::ready(Ok(()))
+        }
+
         fn registered_ids(
             &self,
             request_ids: &[String],
@@ -814,6 +913,8 @@ mod tests {
     fn rec(message_id: &str, request_id: &str) -> BatchRecord {
         BatchRecord {
             message_id: message_id.to_owned(),
+            receipt_handle: format!("rh-{message_id}"),
+            receives: 1,
             body: format!(r#"{{"request_id":"{request_id}","event_id":"evt-1","h":"{DIGEST}"}}"#),
             sent_at: SENT_AT,
         }
@@ -836,6 +937,7 @@ mod tests {
             stored_control: StoredControl::Open,
             fail_open_until: None,
             starts_at: None,
+            calls: Vec::new(),
         }
     }
 
@@ -861,6 +963,7 @@ mod tests {
             stored_control: StoredControl::Open,
             fail_open_until: None,
             starts_at: None,
+            calls: Vec::new(),
         }
     }
 
@@ -908,6 +1011,8 @@ mod tests {
             rec("m1", VALID_ID),
             BatchRecord {
                 message_id: "m2".to_owned(),
+                receipt_handle: "rh-m2".to_owned(),
+                receives: 1,
                 body: "not json".to_owned(),
                 sent_at: SENT_AT,
             },
@@ -928,6 +1033,8 @@ mod tests {
         let store = FakeStore::default();
         let body = |h: &str| BatchRecord {
             message_id: "m".to_owned(),
+            receipt_handle: "rh-m".to_owned(),
+            receives: 1,
             body: format!(r#"{{"request_id":"{VALID_ID}","event_id":"evt-1"{h}}}"#),
             sent_at: SENT_AT,
         };
@@ -950,6 +1057,8 @@ mod tests {
         let store = FakeStore::default();
         let records = vec![BatchRecord {
             message_id: "m1".to_owned(),
+            receipt_handle: "rh-m1".to_owned(),
+            receives: 1,
             body: "garbage".to_owned(),
             sent_at: SENT_AT,
         }];
@@ -1300,6 +1409,176 @@ mod tests {
         assert_eq!(outcome.failures, Vec::<String>::new());
         assert_eq!(store.prequeue_writes.lock().unwrap().len(), 3);
         assert!(store.writes.lock().unwrap().is_empty());
+    }
+
+    fn sent(message_id: &str, request_id: &str, sent_at: Timestamp) -> BatchRecord {
+        BatchRecord {
+            sent_at,
+            ..rec(message_id, request_id)
+        }
+    }
+
+    fn scheduled_at(starts_at: Timestamp) -> FakeStore {
+        let counters = Counters {
+            starts_at: Some(starts_at),
+            ..counters_with_phase(Phase::PreQueue)
+        };
+        let store = FakeStore::default();
+        *store.counters_sequence.lock().unwrap() = VecDeque::from([Some(counters)]);
+        store
+    }
+
+    #[tokio::test]
+    async fn a_join_accepted_at_or_after_the_cutoff_waits_and_claims_nothing() {
+        let store = scheduled_at(SENT_AT);
+        let cutoff = SENT_AT + wr_common::DRAW_GRACE;
+        let records = vec![
+            sent("m0", "018f3a2b-7c9d-7e1f-8000-0123456789ab", cutoff),
+            sent(
+                "m1",
+                "018f3a2b-7c9d-7e1f-8001-0123456789ab",
+                cutoff + SignedDuration::from_secs(1),
+            ),
+        ];
+        let outcome = run_open(&store, &records).await;
+        assert_eq!(outcome.failures, vec!["m0".to_owned(), "m1".to_owned()]);
+        assert!(store.prequeue_writes.lock().unwrap().is_empty());
+        assert!(store.writes.lock().unwrap().is_empty());
+        assert_eq!(*store.shard_counters.lock().unwrap(), [0; SHARDS]);
+    }
+
+    #[tokio::test]
+    async fn a_batch_either_side_of_the_cutoff_registers_only_the_earlier_joins() {
+        let start = SENT_AT;
+        let store = scheduled_at(start);
+        let cutoff = start + wr_common::DRAW_GRACE;
+        let records = vec![
+            sent(
+                "m0",
+                "018f3a2b-7c9d-7e1f-8000-0123456789ab",
+                cutoff - SignedDuration::from_millis(1),
+            ),
+            sent("m1", "018f3a2b-7c9d-7e1f-8001-0123456789ab", cutoff),
+            sent(
+                "m2",
+                "018f3a2b-7c9d-7e1f-8002-0123456789ab",
+                start - SignedDuration::from_mins(10),
+            ),
+            // Inside the grace window: on time.
+            sent(
+                "m3",
+                "018f3a2b-7c9d-7e1f-8003-0123456789ab",
+                start + SignedDuration::from_secs(5),
+            ),
+        ];
+        let outcome = run_open(&store, &records).await;
+        assert_eq!(outcome.failures, vec!["m1".to_owned()]);
+        let mut registered: Vec<String> = store
+            .prequeue_writes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|w| w.request_id.clone())
+            .collect();
+        registered.sort_unstable();
+        assert_eq!(
+            registered,
+            vec![
+                "018f3a2b-7c9d-7e1f-8000-0123456789ab".to_owned(),
+                "018f3a2b-7c9d-7e1f-8002-0123456789ab".to_owned(),
+                "018f3a2b-7c9d-7e1f-8003-0123456789ab".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_deferred_join_waits_twice_as_long_each_time() {
+        let secs: Vec<i64> = (0..=12).map(|n| deferral_delay(n).as_secs()).collect();
+        assert_eq!(
+            secs,
+            vec![2, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 1024, 1024]
+        );
+        // Nine waits before the tenth delivery, the last the queue makes
+        // before dead-lettering: longer than the open's 900 s.
+        let waited: i64 = (1..10).map(|n| deferral_delay(n).as_secs()).sum();
+        assert!(waited > 900, "{waited} s");
+    }
+
+    #[tokio::test]
+    async fn a_deferred_join_is_sent_back_for_its_delay_and_counted() {
+        let store = scheduled_at(SENT_AT);
+        let late = SENT_AT + wr_common::DRAW_GRACE;
+        let records = vec![
+            BatchRecord {
+                receives: 3,
+                ..sent("m0", "018f3a2b-7c9d-7e1f-8000-0123456789ab", late)
+            },
+            sent("m1", "018f3a2b-7c9d-7e1f-8001-0123456789ab", late),
+            sent("m2", "018f3a2b-7c9d-7e1f-8002-0123456789ab", SENT_AT),
+        ];
+        let outcome = run_open(&store, &records).await;
+        assert_eq!(outcome.failures, vec!["m0".to_owned(), "m1".to_owned()]);
+        assert_eq!(
+            outcome.deferred,
+            vec![
+                Deferral {
+                    receipt_handle: "rh-m0".to_owned(),
+                    delay: SignedDuration::from_secs(8),
+                },
+                Deferral {
+                    receipt_handle: "rh-m1".to_owned(),
+                    delay: SignedDuration::from_secs(2),
+                },
+            ]
+        );
+        assert_eq!(store.deferred_counts.lock().unwrap()[0], 2);
+        assert_eq!(store.prequeue_writes.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_live_batch_is_numbered_in_the_order_its_joins_were_accepted() {
+        let store = FakeStore::default();
+        let records = vec![
+            sent(
+                "m0",
+                "018f3a2b-7c9d-7e1f-8000-0123456789ab",
+                SENT_AT + SignedDuration::from_millis(30),
+            ),
+            sent("m1", "018f3a2b-7c9d-7e1f-8001-0123456789ab", SENT_AT),
+            sent(
+                "m2",
+                "018f3a2b-7c9d-7e1f-8002-0123456789ab",
+                SENT_AT + SignedDuration::from_millis(10),
+            ),
+        ];
+        let outcome = run_open(&store, &records).await;
+        assert_eq!(outcome.deferred, Vec::<Deferral>::new());
+        let mut writes = store.writes.lock().unwrap().clone();
+        writes.sort_by_key(|w| w.position);
+        let order: Vec<&str> = writes.iter().map(|w| w.request_id.as_str()).collect();
+        assert_eq!(
+            order,
+            vec![
+                "018f3a2b-7c9d-7e1f-8001-0123456789ab",
+                "018f3a2b-7c9d-7e1f-8002-0123456789ab",
+                "018f3a2b-7c9d-7e1f-8000-0123456789ab",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_event_with_no_scheduled_open_registers_every_join() {
+        let store = FakeStore::default();
+        *store.counters_sequence.lock().unwrap() =
+            VecDeque::from([Some(counters_with_phase(Phase::PreQueue))]);
+        let records = vec![sent(
+            "m0",
+            "018f3a2b-7c9d-7e1f-8000-0123456789ab",
+            Timestamp::MAX,
+        )];
+        let outcome = run_open(&store, &records).await;
+        assert_eq!(outcome.failures, Vec::<String>::new());
+        assert_eq!(store.prequeue_writes.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
